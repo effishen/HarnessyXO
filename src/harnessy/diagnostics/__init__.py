@@ -1,0 +1,35 @@
+from .file_operations import file_path_identity, inspect_file_fingerprint, log_file_operation
+from .logging import (
+    DiagnosticsManager,
+    capture_system_snapshot,
+    configure_diagnostics,
+    collect_existing_diagnostics,
+    diagnostics,
+    environment_claim_diagnostics,
+    get_logger,
+    log_event,
+    log_stream_event,
+    record_context_tuning,
+    refresh_diagnostics_bundle,
+    shell_command_diagnostics,
+    shell_result_diagnostics,
+)
+
+__all__ = [
+    'DiagnosticsManager',
+    'capture_system_snapshot',
+    'configure_diagnostics',
+    'collect_existing_diagnostics',
+    'diagnostics',
+    'environment_claim_diagnostics',
+    'file_path_identity',
+    'inspect_file_fingerprint',
+    'log_file_operation',
+    'get_logger',
+    'log_event',
+    'log_stream_event',
+    'record_context_tuning',
+    'refresh_diagnostics_bundle',
+    'shell_command_diagnostics',
+    'shell_result_diagnostics',
+]

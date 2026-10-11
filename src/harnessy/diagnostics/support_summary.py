@@ -1,0 +1,382 @@
+"""Bounded, content-free incident index for a support export.
+
+This reads logs only. It never opens a workspace database or claims that a
+nearby operation is a proven lock holder.
+"""
+from __future__ import annotations
+
+from collections import Counter
+from datetime import datetime
+import hashlib
+import json
+from pathlib import Path
+from typing import Any
+
+_CHANNELS = ('harnessy', 'runtime', 'database', 'tools', 'backend')
+_TAIL_BYTES = 2 * 1024 * 1024
+_MAX_ROWS = 20000
+_MAX_INCIDENTS = 20
+_CONTEXT_SECONDS = 30.0
+_ERROR_EVENTS = frozenset({
+    'agent_run_error', 'headless_run_error', 'uncaught_exception',
+    'sqlite_operation_error', 'tool_execution_error', 'request_error',
+    'environment_command_timeout', 'workspace_environment_shutdown_stop_failed',
+})
+
+
+def _vm_failure_classification(row: dict[str, Any]) -> str | None:
+    event = row.get('event')
+    if event == 'vm_startup_observation':
+        if row.get('outcome') == 'controller_timeout':
+            return 'vm_controller_timeout'
+        if row.get('outcome') == 'controller_error':
+            if row.get('controller_failure_kind') == 'ssh_requirement_wait_failed':
+                return 'vm_ssh_requirement_failed'
+            code = row.get('controller_returncode')
+            return 'vm_controller_interrupted' if type(code) is int and code < 0 else 'vm_startup_failed'
+    if event == 'environment_command_timeout':
+        return 'vm_controller_timeout'
+    action = row.get('controller_action')
+    if event == 'environment_command_finished' and isinstance(action, str) and action in {'start', 'stop', 'create', 'delete', 'edit', 'clone', 'snapshot', 'restart', 'factory-reset'}:
+        code = row.get('returncode')
+        if type(code) is int and code != 0:
+            return 'vm_controller_interrupted' if code < 0 else 'vm_controller_failed'
+    if event == 'workspace_environment_shutdown_stop_failed':
+        return 'vm_shutdown_stop_unverified'
+    return None
+
+
+def _rows(latest: Path, *, session_scope: str = 'current', tail_bytes: int = _TAIL_BYTES,
+          rotations: bool = True) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    # Lazy import avoids a logger/exporter import cycle.
+    from .logging import _privacy_safe_value, _read_snapshot_bytes
+
+    rows: list[dict[str, Any]] = []
+    coverage: list[dict[str, Any]] = []
+    for channel in _CHANNELS:
+        channel_rows: list[dict[str, Any]] = []
+        bounded = False
+        for suffix in (('.3', '.2', '.1', '') if rotations else ('',)):
+            source = latest / f'{channel}.log{suffix}'
+            payload = _read_snapshot_bytes(source, tail_bytes=tail_bytes)
+            if payload is None:
+                continue
+            try:
+                bounded = bounded or source.stat().st_size > tail_bytes
+            except OSError:
+                pass
+            for line in payload.decode('utf-8', errors='replace').splitlines():
+                parts = line.split(' ', 3)
+                if len(parts) != 4 or parts[2] not in {'INFO', 'WARNING', 'ERROR', 'DEBUG', 'CRITICAL'}:
+                    continue
+                try:
+                    stamp = f'{parts[0]} {parts[1]}'
+                    datetime.strptime(stamp, '%Y-%m-%d %H:%M:%S,%f')
+                    body = json.loads(parts[3])
+                except (ValueError, TypeError, RecursionError):
+                    continue
+                if not isinstance(body, dict):
+                    continue
+                try:
+                    safe = _privacy_safe_value(body)
+                except (ValueError, TypeError, RecursionError):
+                    continue
+                if not isinstance(safe, dict):
+                    continue
+                channel_rows.append({
+                    **safe, 'timestamp': stamp, 'channel': channel, 'level': parts[2], 'session_scope': session_scope,
+                })
+        if channel_rows:
+            channel_rows.sort(key=lambda row: row['timestamp'])
+            coverage.append({
+                'channel': channel, 'session_scope': session_scope, 'first_timestamp': channel_rows[0]['timestamp'],
+                'last_timestamp': channel_rows[-1]['timestamp'],
+                'records_examined': len(channel_rows), 'log_tail_limited': bounded,
+            })
+        rows.extend(channel_rows)
+    rows.sort(key=lambda row: row['timestamp'])
+    return rows[-_MAX_ROWS:], coverage
+
+
+def _seconds(left: str, right: str) -> float:
+    return (datetime.strptime(left, '%Y-%m-%d %H:%M:%S,%f') -
+            datetime.strptime(right, '%Y-%m-%d %H:%M:%S,%f')).total_seconds()
+
+
+def _same_scope(candidate: dict[str, Any], incident: dict[str, Any]) -> bool:
+    for key in ('session_scope', 'workspace_id', 'chat_id', 'run_id'):
+        if incident.get(key) and candidate.get(key) and incident[key] != candidate[key]:
+            return False
+    return True
+
+
+def _is_lock(row: dict[str, Any]) -> bool:
+    if type(row.get('sqlite_errorcode')) is int and (row['sqlite_errorcode'] & 255) in {5, 6}:
+        return True
+    name = row.get('sqlite_errorname')
+    if isinstance(name, str) and name.startswith(('SQLITE_BUSY', 'SQLITE_LOCKED')):
+        return True
+    for key in ('error', 'detail', 'fault', 'exception_evidence'):
+        value = row.get(key)
+        if isinstance(value, dict):
+            if value.get('error_code') == 'sqlite_database_locked':
+                return True
+            code = value.get('sqlite_errorcode')
+            if isinstance(code, int) and (code & 255) in {5, 6}:
+                return True
+            name = value.get('sqlite_errorname')
+            if isinstance(name, str) and name.startswith(('SQLITE_BUSY', 'SQLITE_LOCKED')):
+                return True
+    return False
+
+
+def _evidence(row: dict[str, Any]) -> dict[str, Any]:
+    # Keep identifiers and reviewed diagnostic structures, never error bodies.
+    keys = (
+        'timestamp', 'channel', 'event', 'workspace_id', 'chat_id', 'run_id',
+        'call_id', 'step', 'tool', 'returncode', 'command_ok', 'drift_seconds',
+        'elapsed_ms', 'busy_timeout_ms', 'db_id', 'db_role', 'connection_id',
+        'transaction_id', 'transaction_age_ms', 'operation', 'statement_kind',
+        'operation_origin', 'sqlite_errorcode', 'sqlite_errorname', 'fault',
+        'exception_evidence', 'candidate_holders', 'candidate_holders_truncated',
+        'candidate_scope', 'external_holder_unknown', 'journal_mode',
+        'pid', 'thread_id', 'task_id', 'monotonic_ns', 'frames',
+        'thread_frames', 'sample_age_seconds', 'blocked_seconds',
+        'last_stage', 'last_event',
+        'session_scope', 'ok', 'execution_status', 'duration_seconds',
+        'command_id', 'parent_start_command_id', 'controller_action', 'outcome',
+        'controller_returncode', 'controller_signal', 'elapsed_seconds', 'timeout_seconds',
+        'app_limit_seconds', 'native_limit_seconds', 'last_boot_milestone', 'controller_failure_kind',
+        'controller_status', 'status_probe_error',
+    )
+    return {key: row[key] for key in keys if key in row}
+
+
+def _has_frames(value: Any) -> bool:
+    if isinstance(value, dict):
+        return bool(value.get('frames')) or any(_has_frames(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_has_frames(child) for child in value)
+    return False
+
+
+def _vm_log_coverage(report: dict[str, Any] | None) -> tuple[dict[str, Any] | None, list[str]]:
+    if report is None:
+        return None, ['VM boot logs were not collected by this standalone summary. A diagnostics export includes VM_LOGS.json when collection runs.', '']
+    try:
+        from .vm_logs import validate_vm_report
+        safe = validate_vm_report(report)
+        if not isinstance(safe, dict):
+            raise ValueError('Invalid VM coverage')
+    except Exception:
+        safe = {'schema_version': 1, 'status': 'unavailable', 'reason': 'collector_failed', 'workspaces': []}
+    lines = ['VM boot evidence: VM_LOGS.json lists source coverage; retained logs are under vm-logs/.']
+    if safe.get('status') == 'unavailable':
+        lines.extend(['  VM log collection was unavailable; other diagnostics remain included.', ''])
+        return safe, lines
+    workspaces = safe.get('workspaces', [])
+    if not workspaces:
+        lines.append('  No workspace runtime was discovered from the bounded registry/app logs. This does not establish that no VM exists.')
+    counts = Counter(source.get('status') for workspace in workspaces for source in workspace.get('sources', []))
+    lines.append('  Sources: ' + '; '.join(f'{label} {counts[label]}' for label in ('included', 'missing', 'unsafe', 'unreadable', 'limited')) + '.')
+    bounded = sum(bool(source.get('truncated') or source.get('signals_limited'))
+                  for workspace in workspaces for source in workspace.get('sources', []))
+    lines.append(f'  Sources with bounded/truncated evidence: {bounded}. Counts are retained tails, not complete boot histories.')
+    discovery = safe.get('discovery', {})
+    if discovery.get('workspaces_limited') or discovery.get('discovery_limited'):
+        lines.append('  Workspace discovery reached a configured bound; additional workspace/log sources may be absent.')
+    if discovery.get('unsafe_app_sources'):
+        lines.append(f'  Unsafe app-log discovery sources excluded: {discovery["unsafe_app_sources"]}.')
+    for workspace in workspaces:
+        codes = workspace.get('evidence_codes', [])
+        if codes:
+            lines.append(f'  VM {workspace.get("workspace_id", "unknown")[:12]} / recognized log signals: ' + ', '.join(codes) + '.')
+        for source in workspace.get('sources', []):
+            if source.get('status') in {'missing', 'unsafe', 'unreadable', 'limited'} or source.get('truncated') or source.get('signals_limited'):
+                lines.append(f'  VM {workspace.get("workspace_id", "unknown")[:12]} / {source.get("filename", "unknown")}: '
+                             f'{source.get("status", "unavailable")}' + ('; bounded tail' if source.get('truncated') or source.get('signals_limited') else '') + '.')
+    lines.extend(['  VM log signals are observations from retained tails, not proof of the cause of a particular controller failure.',
+                  '  VM log tails may include earlier boots; match timestamps and command identities before attributing a cause.', ''])
+    return safe, lines
+
+
+def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = None) -> tuple[dict[str, Any], str]:
+    rows, coverage = _rows(Path(latest))
+    # After a restart, the previous process may contain the failure the user
+    # wants to report. Examine only the same bounded previous tail the ZIP keeps.
+    from .logging import _session_is_launcher_only, _read_snapshot_bytes
+    current_name = (_read_snapshot_bytes(Path(latest) / 'CURRENT_SESSION.txt') or b'').decode('utf-8', errors='ignore').strip()
+    sessions = Path(latest).parent / 'sessions'
+    try:
+        candidates = sorted((path for path in sessions.iterdir()
+                             if path.is_dir() and not path.is_symlink() and path.name != current_name),
+                            key=lambda path: path.stat().st_mtime, reverse=True)
+        previous = next((path for path in candidates if not _session_is_launcher_only(path)), None)
+    except OSError:
+        previous = None
+    if previous is not None:
+        older_rows, older_coverage = _rows(previous, session_scope='previous', tail_bytes=512 * 1024, rotations=False)
+        rows = sorted(rows + older_rows, key=lambda row: row['timestamp'])[-_MAX_ROWS:]
+        coverage.extend(older_coverage)
+    observation_keys = {(row.get('session_scope'), row.get('command_id')) for row in rows
+                        if row.get('event') == 'vm_startup_observation' and isinstance(row.get('command_id'), str)
+                        and _vm_failure_classification(row)}
+    failures = [row for row in rows if (row.get('event') in _ERROR_EVENTS or _vm_failure_classification(row))
+                and not (row.get('event') in {'environment_command_finished', 'environment_command_timeout'}
+                         and isinstance(row.get('command_id'), str)
+                         and (row.get('session_scope'), row.get('command_id')) in observation_keys)]
+    incidents: list[dict[str, Any]] = []
+    for failure in failures[-_MAX_INCIDENTS:]:
+        before = [row for row in rows if row['session_scope'] == failure['session_scope']
+                  and 0 <= _seconds(failure['timestamp'], row['timestamp']) <= _CONTEXT_SECONDS]
+        related = [row for row in before if _same_scope(row, failure)]
+        lock = _is_lock(failure)
+        vm_classification = _vm_failure_classification(failure)
+        if vm_classification == 'vm_controller_interrupted' and not isinstance(failure.get('controller_signal'), str):
+            code = failure.get('controller_returncode', failure.get('returncode'))
+            failure = {**failure, 'controller_signal': {-2: 'SIGINT', -9: 'SIGKILL', -15: 'SIGTERM'}.get(code, 'other')}
+        controller_id = failure.get('command_id')
+        controller_id = controller_id if isinstance(controller_id, str) else None
+        controller_evidence = [_evidence(row) for row in rows if controller_id and
+                               row['session_scope'] == failure['session_scope'] and
+                               (row.get('command_id') == controller_id or row.get('parent_start_command_id') == controller_id)
+                               and row.get('event') in {'environment_command_started', 'environment_command_finished',
+                                                       'environment_command_timeout', 'vm_startup_observation',
+                                                       'vm_startup_post_failure_state'}]
+        # A database event immediately before the run error is a correlation,
+        # unless both events carry the same connection/transaction identity.
+        database_errors = [row for row in related if row.get('event') == 'sqlite_operation_error'
+                           and _seconds(failure['timestamp'], row['timestamp']) <= 2.0]
+        starts = [row for row in related if row.get('event') == 'tool_execution_start'
+                  and row.get('workspace_id') == failure.get('workspace_id')
+                  and row.get('chat_id') == failure.get('chat_id')]
+        last_start = starts[-1] if starts else None
+        successful_tool = None
+        if last_start:
+            completions = [row for row in before
+                           if row.get('call_id') == last_start.get('call_id')
+                           and row.get('event') in {'vm_tool_exec_complete', 'tool_execution_complete', 'tool_execution_result_ready'}
+                           and (row.get('command_ok') is True or row.get('returncode') == 0 or row.get('ok') is True)]
+            if completions:
+                successful_tool = _evidence(completions[-1])
+        stalls = [row for row in before if row.get('event') in {'event_loop_stall', 'event_loop_stall_sample'}]
+        transcript_deferrals = [row for row in related if row.get('event') == 'transcript_refresh_deferred']
+        missing: list[str] = []
+        if not _has_frames(failure) and not any(_has_frames(row) for row in database_errors):
+            missing.append('exception_traceback_unavailable')
+        if lock and not database_errors:
+            missing.append('database_operation_not_recorded')
+        if lock:
+            missing.append('lock_holder_not_identified')
+        identity = json.dumps(_evidence(failure), sort_keys=True)
+        incidents.append({
+            'incident_id': hashlib.sha256(identity.encode()).hexdigest()[:24],
+            'classification': 'sqlite_lock_contention' if lock else vm_classification or 'operation_error',
+            'failure': _evidence(failure),
+            'nearby_database_errors': [_evidence(row) for row in database_errors[-3:]],
+            'last_successful_tool': successful_tool,
+            'nearby_stalls': [_evidence(row) for row in stalls[-4:]],
+            'transcript_refresh_deferred_count': len(transcript_deferrals),
+            'missing_evidence': missing,
+            'correlation_is_not_proof_of_lock_ownership': True,
+            'controller_evidence': controller_evidence[-8:],
+        })
+    counts = Counter(str(row.get('event', '')) for row in rows)
+    durations = [row['drift_seconds'] for row in rows
+                 if row.get('event') == 'event_loop_stall' and isinstance(row.get('drift_seconds'), (int, float))]
+    index: dict[str, Any] = {
+        'schema_version': 1, 'scope': 'bounded_current_and_previous_session_log_tails',
+        'records_examined': len(rows), 'coverage': coverage,
+        'incidents_available': len(failures), 'incidents_retained': len(incidents),
+        'event_loop_stalls': counts['event_loop_stall'],
+        'event_loop_stall_samples': counts['event_loop_stall_sample'],
+        'maximum_recorded_stall_seconds': max(durations, default=0),
+        'transcript_refresh_deferrals': counts['transcript_refresh_deferred'],
+        'database_errors': counts['sqlite_operation_error'], 'incidents': incidents,
+    }
+    safe_vm_report, vm_lines = _vm_log_coverage(vm_report)
+    if safe_vm_report is not None:
+        index['vm_log_evidence'] = safe_vm_report
+    lines = [
+        'HarnessyXO support summary', '==========================', '',
+        'Start here; machine-readable evidence is in INCIDENTS.json.',
+        'This summary examines bounded current/previous-session log tails. Counts are not whole-session totals.',
+        'Nearby events and tracked transactions are evidence for investigation, not proven lock ownership.', '',
+        f'Recorded failures in examined logs: {len(failures)} (latest {len(incidents)} shown)',
+        f'Event-loop stalls: {counts["event_loop_stall"]}; maximum recorded delay: {max(durations, default=0):.3f}s',
+        f'During-stall stack samples: {counts["event_loop_stall_sample"]}',
+        f'Transcript refresh deferrals: {counts["transcript_refresh_deferred"]}', '',
+        *vm_lines,
+    ]
+    if not incidents:
+        lines.append('No recorded failure event was found in the examined logs; this does not establish that no failure occurred.')
+    for incident in reversed(incidents):
+        failure = incident['failure']
+        lines.append(f'{failure["timestamp"]}  {failure.get("event", "operation_error")}  [{incident["classification"]}; {failure["session_scope"]} session]')
+        for key in ('run_id', 'call_id', 'workspace_id', 'chat_id'):
+            if failure.get(key):
+                lines.append(f'  {key}: {failure[key]}')
+        classification = incident['classification']
+        if classification.startswith('vm_'):
+            if classification == 'vm_controller_timeout':
+                lines.append('  HarnessyXO reached its controller wait deadline; this does not by itself establish an SSH failure.')
+            elif classification == 'vm_ssh_requirement_failed':
+                lines.append('  Lima explicitly reported failure to satisfy its SSH boot requirement. The underlying guest cause is not established.')
+                lines.append('  A longer controller watch does not by itself repair a guest SSH requirement failure.')
+            elif classification == 'vm_controller_interrupted':
+                lines.append('  The controller exited after a termination signal. The sender and resulting VM state are not established by this return code.')
+            elif classification == 'vm_shutdown_stop_unverified':
+                lines.append('  Application shutdown did not record a successful VM stop; inspect the controller receipts and retained VM logs.')
+            else:
+                lines.append('  The VM controller reported failure; the underlying cause is not established by its exit code or duration.')
+            for key, label in (('controller_action', 'Controller action'), ('controller_returncode', 'Observed controller return code'),
+                               ('returncode', 'Return code'), ('controller_signal', 'Observed termination signal'),
+                               ('elapsed_seconds', 'Elapsed seconds'), ('app_limit_seconds', 'App deadline seconds'),
+                               ('native_limit_seconds', 'Lima watch limit seconds'), ('last_boot_milestone', 'Last observed boot milestone')):
+                value = failure.get(key)
+                if value is not None and not isinstance(value, (dict, list)):
+                    lines.append(f'  {label}: {value}')
+            states = [row for row in incident['controller_evidence'] if row.get('event') == 'vm_startup_post_failure_state']
+            if states:
+                value = states[-1].get('controller_status')
+                if isinstance(value, str):
+                    lines.append(f'  Bounded controller status after failure: {value}; this is not proof of guest SSH readiness.')
+        fault = failure.get('fault') or failure.get('exception_evidence') or {}
+        if isinstance(fault, dict):
+            if fault.get('exception_type') or fault.get('exception_class'):
+                lines.append(f'  Exception: {fault.get("exception_type") or fault.get("exception_class")}')
+            for frame in fault.get('frames', [])[-6:]:
+                if isinstance(frame, dict):
+                    lines.append(f'  Frame: {frame.get("module", "external")}:{frame.get("line", "?")} {frame.get("function", "unknown")}')
+        for db in incident['nearby_database_errors']:
+            lines.append(f'  Database: {db.get("db_role", "unknown")} (identity {db.get("db_id", "unrecorded")})')
+            lines.append(f'  Operation: {db.get("operation", "unknown")} / {db.get("statement_kind", "unknown")}; '
+                         f'elapsed {db.get("elapsed_ms", "unknown")}ms; configured busy timeout {db.get("busy_timeout_ms", "unknown")}ms')
+            origin = db.get('operation_origin')
+            if isinstance(origin, dict):
+                lines.append(f'  Called from: {origin.get("module", "external")}:{origin.get("line", "?")} {origin.get("function", "unknown")}')
+            candidates = db.get('candidate_holders', [])
+            lines.append(f'  Tracked transaction/cursor/operation candidates: {len(candidates)}; external lock holder is not identified by this registry.')
+            for candidate in candidates[:4]:
+                kind = candidate.get('candidate_kind', 'transaction')
+                if kind == 'open_result_cursor':
+                    origin = candidate.get('oldest_result_cursor_origin') or {}
+                    age = candidate.get('oldest_result_cursor_age_ms', 'unknown')
+                elif kind == 'active_operation':
+                    origin = candidate.get('last_operation_origin') or {}
+                    age = candidate.get('current_operation_elapsed_ms', 'unknown')
+                else:
+                    origin = candidate.get('transaction_origin') or {}
+                    age = candidate.get('transaction_age_ms', 'unknown')
+                lines.append(f'    Connection {candidate.get("connection_id", "unknown")}, {kind}, age {age}ms, '
+                             f'{origin.get("module", "external")}:{origin.get("line", "?")} {origin.get("function", "unknown")}')
+        success = incident['last_successful_tool']
+        if success:
+            boundary = 'command succeeded' if success.get('event') == 'vm_tool_exec_complete' else 'result returned successfully'
+            lines.append(f'  Last tool {boundary} at {success["timestamp"]}; call_id {success.get("call_id", "unknown")}.')
+        if incident['nearby_stalls']:
+            lines.append(f'  Nearby event-loop stall records/samples: {len(incident["nearby_stalls"])}.')
+        for missing in incident['missing_evidence']:
+            lines.append('  Missing: ' + missing.replace('_', ' ') + '.')
+        lines.append('')
+    return index, '\n'.join(lines) + '\n'

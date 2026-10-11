@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.vendor/
+.settings/
+.logs/
+.harnessy/
+.harnessy-update.lock
+.harnessy-update-pending.json
+.harnessy-update-pending-*
+.harnessy-update-stage-*/
+RELEASE_MANIFEST.json
+dist/
+.DS_Store

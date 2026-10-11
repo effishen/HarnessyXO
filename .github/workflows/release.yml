@@ -1,0 +1,82 @@
+name: Publish HarnessyXO release
+
+on:
+  push:
+    branches: [main]
+    paths: [VERSION]
+  workflow_dispatch:
+
+concurrency:
+  group: harnessyxo-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.repository == 'effishen/HarnessyXO' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      statuses: write
+    steps:
+      - name: Report the release workflow location
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ github.sha }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          gh api --silent --method POST "repos/$RELEASE_REPOSITORY/statuses/$RELEASE_COMMIT" \
+            -f context='HarnessyXO release' -f state=pending \
+            -f target_url="https://github.com/$RELEASE_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            -f description='Release verification is running'
+      - name: Check out the exact source commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Build and verify the committed application package
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: python scripts/package_release.py build --expected-commit "$RELEASE_COMMIT"
+      - name: Publish matching notes and verify the actual downloads
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ github.sha }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: python scripts/package_release.py publish --expected-commit "$RELEASE_COMMIT" --repository "$RELEASE_REPOSITORY"
+      - name: Keep publication evidence with this workflow run
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: harnessyxo-publication-${{ github.run_id }}
+          path: |
+            dist/build-metadata.json
+            dist/release-notes.md
+            dist/publication-proof.json
+            dist/HarnessyXO_v*.zip
+            dist/HarnessyXO_v*.zip.sha256
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+      - name: Report the release workflow result
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ github.sha }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_JOB_STATUS: ${{ job.status }}
+        run: |
+          release_state=failure
+          if [ "$RELEASE_JOB_STATUS" = success ]; then
+            release_state=success
+          fi
+          gh api --silent --method POST "repos/$RELEASE_REPOSITORY/statuses/$RELEASE_COMMIT" \
+            -f context='HarnessyXO release' -f state="$release_state" \
+            -f target_url="https://github.com/$RELEASE_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            -f description='Release workflow finished'
