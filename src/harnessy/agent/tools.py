@@ -635,17 +635,17 @@ class WorkspaceToolbox:
                     'timeout_seconds': {'type': 'integer', 'minimum': 1, 'maximum': 7200},
                 }, 'required': ['command']
             }, 'shell', 'shell'),
-            ToolDefinition('list_external_targets', 'List configured external devices and managed Ubuntu/Windows test VMs for this workspace. Credentials are never exposed to the model.', {
+            ToolDefinition('list_external_targets', 'List external devices and managed test VMs for this workspace. OpenWrt hardware_emulation labels requested and last-observed software radios separately; use target_status for a live check. Emulated radios have no physical RF or USB dongle/chipset behavior. Credentials stay on the host.', {
                 'type': 'object', 'properties': {}
             }, 'external_targets', 'external_targets', read_only=True, approve_when_ask=False),
-            ToolDefinition('test_vm_control', 'Start/stop a configured Ubuntu or Windows test VM, or take/restore a named snapshot while stopped. Starts an asynchronous operation; poll target_status. These guests are separate from the working VM, have internet access, and allow software installation. Creation/deletion are in External/Test Targets.', {
+            ToolDefinition('test_vm_control', 'Start/stop a configured test VM, or take/restore a named snapshot while stopped. Starts an asynchronous operation; poll target_status. These guests are separate from the working VM, have internet access, and allow software installation. Creation/deletion and emulation settings are in Workspace Environment → Test targets.', {
                 'type': 'object', 'properties': {
                     'target': {'type': 'string'},
                     'action': {'type': 'string', 'enum': ['start', 'stop', 'snapshot', 'restore']},
                     'tag': {'type': 'string', 'description': 'Snapshot name for snapshot/restore.'},
                 }, 'required': ['target', 'action']
             }, 'external_targets', 'external_targets'),
-            ToolDefinition('target_status', 'Check one configured external SSH target and report basic identity plus whether its HarnessyXO remote test root exists and is writable. This is a fixed diagnostic command, not a raw shell.', {
+            ToolDefinition('target_status', 'Check a target, identity and test-root access. For a running OpenWrt VM, also probe live virtual Wi-Fi/Bluetooth capabilities and report hardware_emulation provenance, verification and limitations. Requested setup is not proof of active hardware; emulation cannot validate physical RF, nearby devices or USB chipsets. This is a fixed diagnostic command.', {
                 'type': 'object', 'properties': {
                     'target': {'type': 'string', 'description': 'Configured target id or exact target name.'},
                 }, 'required': ['target']
@@ -658,7 +658,7 @@ class WorkspaceToolbox:
                     'max_entries': {'type': 'integer', 'minimum': 1, 'maximum': 2000, 'default': 300},
                 }, 'required': ['target']
             }, 'external_targets', 'external_targets', read_only=True, approve_when_ask=False),
-            ToolDefinition('target_exec', 'Run bash on Linux or PowerShell on Windows in a configured test target. Managed test VMs allow installing software, updates and privileged guest commands (sudo on Ubuntu). External SSH devices keep their existing command filter; root is not confined by that filter. Credentials remain on the host.', {
+            ToolDefinition('target_exec', 'Run the configured guest shell (ash on OpenWrt, bash on other Linux, PowerShell on Windows). Managed test VMs allow software installation and privileged guest commands. External SSH devices keep their existing command filter; root is not confined by that filter. Check target_status hardware_emulation before hardware claims: software radios do not prove real RF or USB dongle support. Credentials remain on the host.', {
                 'type': 'object', 'properties': {
                     'target': {'type': 'string'},
                     'command': {'type': 'string'},

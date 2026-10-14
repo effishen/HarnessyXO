@@ -1,0 +1,7 @@
+noVNC 1.6.0
+Source: https://github.com/novnc/noVNC/tree/v1.6.0
+Source archive: https://codeload.github.com/novnc/noVNC/tar.gz/refs/tags/v1.6.0
+Archive SHA-256: 5066103959ef4e9b10f37e5a148627360dd8414e4cf8a7db92bdbd022e728aaa
+Unmodified core/ and vendor/ JavaScript modules; pako README.md renamed README.txt.
+Preserved upstream authors and license texts. See LICENSE.txt and vendor/pako/LICENSE.
+Used by HarnessyXO's bundled browser VNC viewer. Source remains available at the URL above.

@@ -1,4 +1,8 @@
-# HarnessyXO v0.6.82
+# HarnessyXO v0.6.83
+
+**Test targets in Environment:** open **Workspace Environment → Test targets** to connect a device or create/manage a VM. **Shell**, **Web UI** and **Desktop** now open tabs in the main area. OpenWrt can set up emulated Wi-Fi radios; Bluetooth emulation requires a custom guest with the necessary kernel and BlueZ support. The model receives requested versus verified capabilities and their emulation limits.
+
+**OpenWrt startup and diagnostics:** readiness works with minimal images that lack `hostname`. SSH success, shell readiness and optional radio setup are separate stages, and readiness retries have a four-minute wall-clock limit after VM launch. Support downloads now include `TARGET_LOGS.json`, `TARGET_TIMELINE.json` and separately retained target events, with bounded boot/host-agent evidence. An SSH post-quantum warning alone does not make a successful readiness check fail.
 
 **Updates from your private GitHub repo:** `python3 run.py` now checks [effishen/HarnessyXO](https://github.com/effishen/HarnessyXO) before starting the app. On macOS and Linux, a clean installation on `main` receives fast-forward updates and restarts the launcher before importing the updated code. Your settings, cached dependencies and workspaces stay in place. See [Startup updates](#startup-updates) for the one-time GitHub login and ZIP upgrade instructions.
 
@@ -14,7 +18,7 @@ Lima's native startup wait now follows HarnessyXO's 20-minute startup allowance,
 
 The default export retains traceback module/function/line, SQLite codes, generated connection/transaction identities, and stack samples collected during event-loop freezes. Database paths are represented by a stable identity hash; SQL, bound values, conversation content, source lines, frame locals and credentials remain excluded. Nearby operations and tracked candidates are explicitly distinguished from proven lock ownership. This release improves evidence collection; it does not change lock recovery or retry policy.
 
-**OpenWrt 23.05.2** is available in **External/Test Targets → Create VM → Operating system**, alongside OpenWrt 25.12.5. ARM64 and x86-64 targets use release-specific official kernel/rootfs downloads and pinned checksums.
+**OpenWrt 23.05.2** is available in **Workspace Environment → Test targets → Create VM → Operating system**, alongside OpenWrt 25.12.5. ARM64 and x86-64 targets use release-specific official kernel/rootfs downloads and pinned checksums.
 
 Built-in model instructions now separate reasoning from factual recall: use logic to analyze evidence, assume facts recalled from training are outdated until verified, and check relevant external facts with web search and page reading before substantive work, including familiar facts. Sources must match the actual target versions, and fresh local observations guide environment claims. Web permission still controls access.
 
@@ -180,7 +184,7 @@ cd HarnessyXO
 python3 run.py
 ```
 
-For a ZIP installation, install the v0.6.82 package once. Close the old app, extract the new package into its own folder, and bring across your retained `.settings`; keep existing workspaces where they are. Earlier launchers cannot update themselves. The new launcher verifies the installed files and executable modes against the matching `v0.6.82` Git tag before adding Git metadata to that folder. A modified or incomplete ZIP stays unchanged. Keep the package's `.github`, `scripts` and functional `skills` folders when extracting.
+For a ZIP installation, install the v0.6.83 package once. Close the old app, extract the new package into its own folder, and bring across your retained `.settings`; keep existing workspaces where they are. Launchers earlier than v0.6.82 cannot update themselves. The new launcher verifies the installed files and executable modes against the matching version tag before adding Git metadata to that folder. A modified or incomplete ZIP stays unchanged. Keep the package's `.github`, `scripts` and functional `skills` folders when extracting.
 
 Later starts check the repository's `main` branch automatically. An applied update restarts `run.py`, then the normal dependency and REA checks run. If GitHub is unavailable, authentication has expired, tracked code has local edits, the checkout is on another branch, or history has diverged, the current installed app starts with an explanation. The updater preserves local changes and does not reset Git history. It will stop if an interrupted update leaves an incomplete source tree.
 
@@ -509,9 +513,9 @@ Test targets are separate from the LLM's primary working VM. They receive copied
 
 ### Create and find a target
 
-Open the workspace menu → **External/Test Targets** → **Create VM**. Search the **Operating system** selector, name the target and adjust CPU, RAM and disk. Each OS supplies its own defaults and limits. **Architecture and model access** contains the less frequently changed options. Creation does not replace an existing VM or change the workspace environment.
+Open **Workspace Environment → Test targets → Create VM**. The workspace menu's **External/Test Targets** shortcut opens that same tab. Search the **Operating system** selector, name the target and adjust CPU, RAM and disk. Each OS supplies its own defaults and limits. **Architecture and model access** contains the less frequently changed options. Creation does not replace an existing VM or change the workspace environment.
 
-The target list has name/OS/host search and a target-type filter. Start, Stop, Shell and the graphical interface are on each card. Model access and activity details expand when needed. **Activity and setup output** shows downloads and startup errors. Closing the targets dialog stops UI polling; a VM operation already started continues in the background.
+The target list has name/OS/host search and a target-type filter. Start, Stop, Shell and the graphical interface are on each card. Model access, radio settings and activity details expand when needed. **Activity and setup output** shows downloads and startup errors. Changing tabs leaves an operation running in the background.
 
 | Guest | Shell / graphical interface | Host requirements | Image source |
 | --- | --- | --- | --- |
@@ -532,11 +536,27 @@ OpenWrt checks host tools before preparing its image. On macOS, missing packages
 
 ### Shells, GUI and updates
 
-**Shell** opens an interactive terminal in the guest. Model command/file tools use the same target. Managed guests allow package installation and guest system changes, including privileged commands; the external-device command filter still applies to connected physical/remote devices. Internet connectivity depends on the host's network and firewall.
+**Shell** opens an interactive terminal in a main-area tab, labelled with the target. Model command/file tools use the same target. Switching tabs or reloading the browser keeps the backend session; explicitly closing the tab closes its shell. Managed guests allow package installation and guest system changes, including privileged commands; the external-device command filter still applies to connected physical/remote devices. Internet connectivity depends on the host's network and firewall.
 
-**Desktop** shows a localhost VNC address and connection password. The button launches the host's registered VNC viewer. This release does not embed a viewer in the web page. For a browser on another computer, use the provided SSH tunnel command with a local VNC viewer. Windows also offers a control to set the `harnessy` desktop sign-in password; that is separate from the VNC password.
+**Desktop** opens the bundled noVNC viewer in a main-area tab. HarnessyXO forwards its selected guest display through your signed-in session, so the browser can be on another computer. Windows also offers a control to set the `harnessy` desktop sign-in password; that is separate from the VNC password. The bundled noVNC 1.6.0 source retains its upstream authorship and licence files.
 
-OpenWrt uses **Web UI** for LuCI. It shows the localhost URL and generated root password. Use a browser on the HarnessyXO host or the displayed SSH tunnel from another computer. The ash shell authenticates with a dedicated private key; SSH password login is disabled. Two private QEMU networks separate LAN management from WAN internet. Only SSH and, when selected, LuCI are forwarded to host loopback. No TAP/bridge configuration is required.
+OpenWrt uses **Web UI** for LuCI in a main-area tab, with the generated root password available in its connection controls. The guest page runs in an isolated iframe and its requests go through a session-bound proxy; guest scripts do not share HarnessyXO's browser origin. Closing the tab, signing out, stopping the VM or changing its display revokes the view. The ash shell authenticates with a dedicated private key; SSH password login is disabled. Two private QEMU networks separate LAN management from WAN internet. Only SSH and, when selected, LuCI are forwarded to host loopback. No TAP/bridge configuration is required.
+
+### Emulated Wi-Fi and Bluetooth
+
+OpenWrt's **Emulated radios** settings are available when creating a target and on its card. Stop an existing guest before changing the requested setup, then Start it. Optional setup failures leave its shell available and show the failed capability separately.
+
+Wi-Fi setup installs `kmod-mac80211-hwsim` and `iw` from signed official feeds matching the installed OpenWrt release, then requests two virtual radios. It verifies the hwsim PHYs with sysfs and `iw` before reporting them active. Feed access, kernel ABI or package failures remain visible. Existing wireless, LAN/WAN and firewall configuration is retained; configure an AP/station test yourself using the guest tools you need. The [Linux hwsim documentation](https://wireless.docs.kernel.org/en/latest/en/users/drivers/mac80211_hwsim.html) describes supported software tests.
+
+Bluetooth setup checks for BlueZ `btvirt` and Linux VHCI support. Stock OpenWrt 23.05.2 and 25.12.5 images do not supply the required combination, so they report unavailable. A custom image providing those prerequisites can start a dedicated guest service and verify virtual HCI controllers. HarnessyXO does not replace a stock guest kernel to enable this.
+
+These are guest software radios. They cannot communicate over physical RF, discover nearby real networks/devices or test a particular USB dongle chipset/driver. `list_external_targets` labels requested setup and last observations; `target_status` performs a live probe. The model is instructed to carry these limits into its conclusions. Turning off requested setup leaves previously installed or user-created radios intact; live inspection still reports any emulated radios found.
+
+### Startup evidence
+
+OpenWrt readiness checks the first-boot marker, a working shell and a writable test root in one bounded SSH command. Hostname display uses a kernel fallback when the optional utility is missing. Permanent shell/root failures stop polling immediately. Ordinary boot retries have a 240-second wall-clock deadline after launch; image downloads, disk preparation and optional radio setup are separate timed stages.
+
+Download diagnostics and open `SUMMARY.txt`. Target events have a dedicated bounded `targets.log` history and `TARGET_TIMELINE.json`, with operation IDs, stages, attempts, elapsed time and fixed failure codes. `TARGET_LOGS.json` reports which QEMU serial or Lima guest/host-agent files were included, missing, unsafe or limited. Collection reads existing files without contacting or starting a guest or opening its database. Default exports retain fixed technical signals; bounded raw tails require the existing content option. Credentials and view-capability URLs are redacted in both modes. Old diagnostic exports cannot gain evidence that their installed version never recorded.
 
 OpenWrt package changes and configuration persist in an expanded writable ext4 disk. Its kernel is a pinned, separately booted file: a firmware `sysupgrade` or replacing the kernel from inside the guest is not supported by this controller. Choose OpenWrt 23.05.2 or 25.12.5 in Create VM to test either available release. The selected release determines the downloaded kernel/rootfs pair; create a separate target when changing releases. Other firmware releases require their verified kernel/rootfs pair in the catalog. Package installation and ordinary userspace updates are available in the existing VM. Kali's official base disk is 25 GiB, so the creator requires at least 30 GiB; its normal default is 40 GiB.
 
@@ -552,15 +572,15 @@ Guest images, credentials, controller state and snapshots live in private worksp
 
 Stop requests guest shutdown, then powers off the VM if shutdown does not finish. During first boot, Stop can cancel startup once the VM instance exists. Normal application shutdown also stops managed test VMs.
 
-Close the shell, finish target commands, and stop the guest before taking/restoring a snapshot or deleting it. Snapshots copy the full stopped instance, including the disk and Windows firmware/TPM state or OpenWrt boot kernel and keys. Copy-on-write is used where supported. Restore replaces the guest's current state; project files and the working VM are separate. Removing an external device connection does not delete anything on that device.
+Close the shell and graphical tabs, finish target commands, and stop the guest before taking/restoring a snapshot or deleting it. Snapshots copy the full stopped instance, including the disk and Windows firmware/TPM state or OpenWrt boot kernel and keys. Copy-on-write is used where supported. Restore replaces the guest's current state; project files and the working VM are separate. Removing an external device connection does not delete anything on that device. Removing a workspace first closes its target views and stops its guests; an unconfirmed stop keeps the workspace available.
 
 ### Source checks and validation
 
 Catalog sources checked on 2026-09-25: [Lima templates](https://lima-vm.io/docs/templates/), [Kali cloud release](https://kali.download/cloud-images/kali-2026.2/), [Kali SHA256 sums](https://kali.download/cloud-images/kali-2026.2/SHA256SUMS), [OpenWrt ARM64](https://downloads.openwrt.org/releases/25.12.5/targets/armsr/armv8/), [OpenWrt x86-64](https://downloads.openwrt.org/releases/25.12.5/targets/x86/64/), [OpenWrt QEMU startup source](https://github.com/openwrt/openwrt/blob/openwrt-25.12/scripts/qemustart), and [Fedora Xfce installation](https://fedoraproject.org/wiki/Xfce). Pinned source versions/checksums live in `environment/test_catalog.py`; existing disks are never replaced by catalog updates.
 
-This release verifies native NiceGUI control events, persistence, broker/lifecycle boundaries, pinned ARM64 downloads, Kali disk extraction, and real OpenWrt filesystem preparation. It could not boot a guest in this runtime or render the updated UI in Chromium because required browser IPC is blocked. Full guest boot, package updates, GUI access and desktop layout checks still require a supported macOS/Linux host. See the current verification report for exact coverage.
+Current checks include a real OpenWrt 23.05.2 x86-64 QEMU boot, shell readiness with `hostname` absent, LuCI HTTP access, graceful stop and default serial-log diagnostics. The isolated test runtime required a test-only loopback TCP QMP adapter because it blocks Unix monitor sockets. Production uses the existing Unix monitor transport. Chromium checks cover the Environment/target tabs and isolated guest-page login, navigation and HTTP requests. Native macOS acceleration and the user's existing guest were not run here. See [Verification](#verification) for scope.
 
-OpenWrt 23.05.2 sources and SHA256 pins checked on 2026-10-10: [ARM64 sums](https://downloads.openwrt.org/releases/23.05.2/targets/armsr/armv8/sha256sums) and [x86-64 sums](https://downloads.openwrt.org/releases/23.05.2/targets/x86/64/sha256sums). See the current verification report for this release’s executed creation and filesystem checks.
+OpenWrt 23.05.2 sources and SHA256 pins checked on 2026-10-10: [ARM64 sums](https://downloads.openwrt.org/releases/23.05.2/targets/armsr/armv8/sha256sums) and [x86-64 sums](https://downloads.openwrt.org/releases/23.05.2/targets/x86/64/sha256sums). Current boot checks downloaded and verified the pinned x86-64 pair again.
 
 ## Target environment checks
 
@@ -672,6 +692,10 @@ Tool events now include workspace/chat/run identifiers. A result-ready record is
 This release builds on v0.6.78 and retains its WAL/connection-lifetime fixes, reduced transcript reads and UI workers, as well as OpenWrt 23.05.2, workspace upgrades, history-lock protection, grouped checkpoints and existing retry/recovery policies. Existing database tables and saved data are retained. See [Verification](#verification) for actual checks and limits. Historical diagnostic ZIPs cannot retrospectively gain traceback or lock ownership information that was never recorded.
 
 ## Verification
+
+The v0.6.83 focused gate completed with **128 passing checks** covering real-shell hostname fallback, bounded readiness and cancellation, radio setup/provenance, retained diagnostic evidence and privacy, target-tab persistence and lifecycle, and session-scoped HTTP/VNC transports. Chromium 155 checks exercised the rendered Environment controls, terminal/display tabs, reload persistence, isolated guest-page login/navigation/HTTP requests, and a noVNC RFB handshake with canvas rendering and logout disconnect. UI layout checks use controlled target fixtures. Separate real-guest browser checks passed OpenWrt LuCI login, populated dashboard data, System/Timezone navigation and session revocation.
+
+A fresh pinned OpenWrt 23.05.2 x86-64 guest booted in 28.8 seconds under QEMU TCG, passed actual SSH readiness with `hostname` absent, reached LuCI and shut down gracefully. Its real serial log was collected in default technical-signal mode. The test runtime required a loopback TCP adapter for QMP; native macOS/ARM acceleration and production Unix-monitor behavior were not exercised here. Automatic Wi-Fi package setup failed because guest HTTPS was blocked by that runtime; the working shell was preserved. Separately provisioned, signed, ABI-matched official packages allowed the unchanged setup/probe to verify two real guest hwsim PHYs and interfaces, including after reboot. No real physical RF, native Bluetooth controller, or user's existing guest was tested.
 
 This release retains the reader-versus-commit fix for the contention observed in the v0.6.77 diagnostics. Real SQLite tests hold a reader open while the workspace persists a tool result; the write completes in WAL mode. Separate writer-contention tests preserve SQLite's normal busy failures and diagnostic evidence. Store contexts commit/roll back and close on all tested paths; the generic diagnostics connection keeps native SQLite context semantics.
 

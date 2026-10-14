@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.6.83
+
+- Move test-target management into **Workspace Environment → Test targets**. Open guest Shell, LuCI Web UI and VNC Desktop views in main-area tabs; retain workspace/target selections through browser reloads.
+- Embed guest displays through session-bound transports and isolated browser frames. Close their access on tab closure, logout or VM lifecycle changes, and keep guest pages separate from HarnessyXO's browser origin.
+- Fix OpenWrt readiness on minimal images without `hostname`. Check the bootstrap marker, shell and writable test root together; stop immediately on permanent failures and bound boot readiness retries to 240 seconds after launch.
+- Add optional OpenWrt Wi-Fi simulation using matching signed packages and verified mac80211_hwsim radios. Check Bluetooth prerequisites for custom VHCI/btvirt images; stock images report unavailable. Tell the LLM which capabilities are requested or verified and their software-only limits.
+- Add separately retained target lifecycle events, stage/attempt/timing evidence, `TARGET_TIMELINE.json` and bounded QEMU/Lima logs in `TARGET_LOGS.json`. Include display transport errors and previously missed SQLite lock events in support summaries, while redacting credentials in every export mode.
+- Preserve settings, workspaces, existing guests, REA setup and private GitHub startup updates. Keep 11 Markdown files and exclude QA material from the app package.
+
 ## v0.6.82
 
 - Check the private `effishen/HarnessyXO` repository when `python3 run.py` starts on macOS or Linux. Apply clean `main` fast-forward updates before importing the app and restart the launcher after a change.

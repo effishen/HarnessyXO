@@ -395,6 +395,8 @@ body.body--dark .q-dialog__backdrop { background:rgba(0,0,0,.68) !important; }
 .hy-tab { position: relative; border-radius: 9px 9px 0 0; border: 1px solid transparent; border-bottom: 0; width:auto; min-width:140px; max-width:310px; opacity: .78; overflow:hidden; transition:transform .16s cubic-bezier(.2,.8,.2,1), opacity .12s ease, box-shadow .12s ease, border-color .12s ease, background-color .12s ease; }
 .hy-tab::after { content:""; position:absolute; left:7px; right:7px; bottom:-1px; height:3px; border-radius:3px 3px 0 0; background:transparent; }
 .hy-tab-chat { --hy-tab-rgb:16,163,127; --hy-tab-accent:#078b6c; }
+.hy-tab-target_terminal { --hy-tab-rgb:60,147,117; --hy-tab-accent:#3c9375; }
+.hy-tab-target_desktop { --hy-tab-rgb:60,147,117; --hy-tab-accent:#3c9375; }
 .hy-tab-environment { --hy-tab-rgb:133,92,201; --hy-tab-accent:#8052c6; }
 .hy-tab-files, .hy-tab-file { --hy-tab-rgb:42,126,211; --hy-tab-accent:#2478ce; }
 .hy-tab-terminal { --hy-tab-rgb:206,120,26; --hy-tab-accent:#bc6d13; }
@@ -1169,6 +1171,7 @@ class OpenTab:
     chat_id: str | None
     title: str
     file_path: str | None = None
+    target_id: str | None = None
 
 
 @dataclass
@@ -1369,7 +1372,7 @@ class HarnessyPage:
             return
         regs = {r.id: r for r in self.machine.list_workspaces()}
         restored: list[OpenTab] = []
-        allowed_kinds = {'chat', 'memory', 'files', 'file', 'terminal', 'artifacts', 'environment'}
+        allowed_kinds = {'chat', 'memory', 'files', 'file', 'terminal', 'artifacts', 'environment', 'target_terminal', 'target_desktop'}
         for item in raw.get('open_tabs') or []:
             if not isinstance(item, dict):
                 continue
@@ -1383,6 +1386,18 @@ class HarnessyPage:
             if workspace_id != HOME_SCOPE_ID and workspace_id not in regs:
                 continue
             file_path = str(item.get('file_path') or '') or None
+            target_id = None
+            if kind in {'target_terminal', 'target_desktop'}:
+                if workspace_id == HOME_SCOPE_ID:
+                    continue
+                target_id = str(item.get('target_id') or '')
+                from harnessy.ui.test_targets import target_tab_key
+                try:
+                    target = self._load_workspace(regs[workspace_id]).get_external_target(target_id)
+                    if not target or not target.managed_vm or key != target_tab_key(workspace_id, target_id, kind):
+                        continue
+                except (ValueError, OSError, KeyError):
+                    continue
             if kind == 'chat' or (kind in {'files', 'file'} and chat_id):
                 if not chat_id or workspace_id == HOME_SCOPE_ID:
                     continue
@@ -1408,7 +1423,7 @@ class HarnessyPage:
                 except Exception:
                     continue
             restored.append(OpenTab(
-                key, kind, workspace_id, str(chat_id) if chat_id else None, title or kind.title(), file_path=file_path,
+                key, kind, workspace_id, str(chat_id) if chat_id else None, title or kind.title(), file_path=file_path, target_id=target_id,
             ))
         self.open_tabs = restored
         active = str(raw.get('active_tab_key') or '')
@@ -1436,7 +1451,7 @@ class HarnessyPage:
         subtabs = raw.get('environment_subtabs')
         if isinstance(subtabs, dict):
             self.environment_subtabs = {
-                str(k): (str(v) if str(v) in {'Details', 'Snapshots'} else 'Details')
+                str(k): (str(v) if str(v) in {'Details', 'Snapshots', 'Test targets'} else 'Details')
                 for k, v in subtabs.items()
             }
 
@@ -1450,6 +1465,7 @@ class HarnessyPage:
                     'chat_id': tab.chat_id,
                     'title': tab.title,
                     'file_path': tab.file_path,
+                    'target_id': tab.target_id,
                 }
                 for tab in self.open_tabs
             ],
@@ -1958,7 +1974,7 @@ class HarnessyPage:
         if tab.kind == 'environment' and tab.workspace_id != HOME_SCOPE_ID:
             reg = self._find_reg(tab.workspace_id)
             return self._workspace_is_busy(tab.workspace_id) or bool(reg and PROCESS_JOBS.has_running(workspace_key=str(Path(reg.path).resolve())))
-        if tab.kind == 'terminal':
+        if tab.kind in {'terminal', 'target_terminal'}:
             task = self.terminal_start_tasks.get(tab.key)
             session = self.terminal_sessions.get(tab.key)
             if task and not task.done() or session and session.busy:
@@ -2649,204 +2665,197 @@ class HarnessyPage:
         dialog.open()
 
     def open_external_targets(self, reg: WorkspaceRegistration) -> None:
-        """Manage host-brokered SSH targets for one workspace.
+        """Open this workspace's Environment → Test targets tab."""
+        self.environment_subtabs[reg.id] = 'Test targets'
+        self.open_tool_tab('environment', reg)
 
-        Credentials remain host-side. The model receives only the brokered
-        target tools and never an SSH key/raw SSH command channel.
-        """
+    def _render_test_targets(self, ws: WorkspaceStore) -> None:
+        """Render independent targets inside Environment, never a separate window."""
         from harnessy.ui.test_targets import open_vm_creator, render_managed_target
-        ws = self._load_workspace(reg)
-        with ui.dialog() as dialog, ui.card().classes('hy-targets-dialog'):
-            with ui.row().classes('hy-dialog-header w-full items-start no-wrap gap-3'):
-                with ui.column().classes('grow min-w-0 gap-1'):
-                    ui.label('External/Test Targets').classes('text-lg font-semibold')
-                    ui.label(reg.name).classes('text-sm hy-muted hy-wrap-anywhere')
-                ui.button(icon='close', on_click=dialog.close).props('flat round dense aria-label="Close targets"')
-            with ui.column().classes('hy-targets-toolbar w-full gap-3'):
-                ui.label('Connect a device or create a VM for testing. Each target has its own files and system.').classes('text-sm hy-muted')
-                with ui.row().classes('w-full items-center gap-2'):
-                    count_label = ui.label('Targets').classes('font-semibold grow')
-                    ui.button('Connect device', icon='add_link', on_click=lambda: open_editor()).props('outline no-caps')
-                    ui.button('Create VM', icon='add', on_click=lambda: open_vm_creator(ws, render_targets)).props('unelevated no-caps color=primary')
-                with ui.row().classes('hy-target-filters w-full gap-2'):
-                    search = ui.input('Search targets', placeholder='Name, OS or host').props('outlined dense clearable debounce=200').classes('grow min-w-0')
-                    kind = ui.select({'all': 'All targets', 'vm': 'Test VMs', 'device': 'External devices'}, value='all', label='Show').props('outlined dense').classes('w-44')
-            target_list = ui.column().classes('hy-dialog-body w-full gap-3')
-            disposers = []
-            def stop_polling():
-                for dispose in disposers:
-                    dispose()
-                disposers.clear()
-            dialog.on('hide', stop_polling)
+        with ui.column().classes('hy-targets-toolbar w-full gap-3'):
+            ui.label('Connect a device or create a VM for testing. Each target has its own files and system.').classes('text-sm hy-muted')
+            with ui.row().classes('w-full items-center gap-2'):
+                count_label = ui.label('Targets').classes('font-semibold grow')
+                ui.button('Connect device', icon='add_link', on_click=lambda: open_editor()).props('outline no-caps')
+                ui.button('Create VM', icon='add', on_click=lambda: open_vm_creator(ws, render_targets)).props('unelevated no-caps color=primary')
+            with ui.row().classes('hy-target-filters w-full gap-2'):
+                search = ui.input('Search targets', placeholder='Name, OS or host').props('outlined dense clearable debounce=200').classes('grow min-w-0')
+                kind = ui.select({'all': 'All targets', 'vm': 'Test VMs', 'device': 'External devices'}, value='all', label='Show').props('outlined dense').classes('w-44')
+        target_list = ui.column().classes('w-full gap-3 px-4 pb-4')
+        disposers = []
+        def stop_polling():
+            for dispose in disposers:
+                dispose()
+            disposers.clear()
+        target_list.client.on_disconnect(stop_polling)
 
-            def open_editor(target_id: str | None = None) -> None:
-                target = ws.get_external_target(target_id or '') if target_id else None
-                with ui.dialog() as editor, ui.card().classes('hy-simple-dialog w-[680px] max-w-[95vw]'):
-                    ui.label('Edit External Target' if target else 'Add External Target').classes('text-lg font-semibold')
-                    ui.label('Choose an identity file/host SSH agent, or save an SSH password for unattended connections. Credentials stay on the HarnessyXO host.').classes('text-xs hy-muted')
-                    with ui.expansion('About device access', icon='info_outline').classes('w-full'):
-                        ui.label('A dedicated non-root account provides the strongest remote boundary. Commands run with the SSH account’s privileges. Root commands have full access to the device; command filtering cannot confine root code or symlinks.').classes('text-xs hy-muted')
-                    name = ui.input('Target name', value=target.name if target else '').classes('w-full')
-                    with ui.row().classes('w-full gap-2'):
-                        host = ui.input('Host / IP', value=target.host if target else '').classes('grow')
-                        port = ui.number('SSH port', value=target.port if target else 22, min=1, max=65535, step=1).classes('w-32')
-                    username = ui.input('SSH user', value=target.username if target else '').classes('w-full')
-                    ui.label(
-                        'Root login runs target commands with root privileges. “Allow autonomously” also permits the agent to run '
-                        'these commands without a separate approval; the command filter cannot confine root code.'
-                    ).classes('text-xs text-negative').bind_visibility_from(
-                        username, 'value', lambda value: str(value or '').strip().lower() == 'root'
-                    )
-                    authentication = ui.select(
-                        {'key': 'Identity file / SSH agent', 'password': 'SSH password'},
-                        value=target.auth_method if target else 'key', label='Authentication',
-                    ).classes('w-full')
-                    identity = ui.input(
-                        'Identity file on HarnessyXO host (optional)',
-                        value=target.identity_file if target else '',
-                        placeholder='~/.ssh/id_ed25519',
-                    ).classes('w-full').bind_visibility_from(authentication, 'value', lambda value: value == 'key')
-                    password = ui.input(
-                        'SSH password' + (' (leave blank to keep saved password)' if target and target.auth_method == 'password' else ''),
-                        password=True, password_toggle_button=True,
-                    ).props('autocomplete=new-password').classes('w-full').bind_visibility_from(
-                        authentication, 'value', lambda value: value == 'password'
-                    )
-                    ui.label(
-                        'Passwords are stored as plaintext in the private host .settings directory (mode 0700; file 0600), '
-                        'outside workspace data and the model context. Protect host backups and use HTTPS when connecting over untrusted networks.'
-                    ).classes('text-xs hy-muted').bind_visibility_from(
-                        authentication, 'value', lambda value: value == 'password'
-                    )
-                    remote_root = ui.input(
-                        'Remote test root', value=target.remote_root if target else '/home/harnessy/hx-test'
-                    ).classes('w-full')
-                    enabled = ui.switch('Enable target for this workspace', value=target.enabled if target else True)
-                    approval = ui.select(
-                        options={'ask': 'Ask before protected target actions', 'on': 'Allow autonomous target tools'},
-                        value=target.approval_mode if target else 'ask',
-                        label='Model access',
-                    ).classes('w-full')
-                    ui.label(
-                        '“Allow autonomously” skips individual approval for brokered target tools. The remote SSH account’s existing OS privileges still apply.'
-                    ).classes('text-xs hy-muted')
-                    with ui.row().classes('w-full justify-end gap-2'):
-                        ui.button('Cancel', on_click=editor.close).props('flat no-caps')
+        def open_editor(target_id: str | None = None) -> None:
+            target = ws.get_external_target(target_id or '') if target_id else None
+            with ui.dialog() as editor, ui.card().classes('hy-simple-dialog w-[680px] max-w-[95vw]'):
+                ui.label('Edit External Target' if target else 'Add External Target').classes('text-lg font-semibold')
+                ui.label('Choose an identity file/host SSH agent, or save an SSH password for unattended connections. Credentials stay on the HarnessyXO host.').classes('text-xs hy-muted')
+                with ui.expansion('About device access', icon='info_outline').classes('w-full'):
+                    ui.label('A dedicated non-root account provides the strongest remote boundary. Commands run with the SSH account’s privileges. Root commands have full access to the device; command filtering cannot confine root code or symlinks.').classes('text-xs hy-muted')
+                name = ui.input('Target name', value=target.name if target else '').classes('w-full')
+                with ui.row().classes('w-full gap-2'):
+                    host = ui.input('Host / IP', value=target.host if target else '').classes('grow')
+                    port = ui.number('SSH port', value=target.port if target else 22, min=1, max=65535, step=1).classes('w-32')
+                username = ui.input('SSH user', value=target.username if target else '').classes('w-full')
+                ui.label(
+                    'Root login runs target commands with root privileges. “Allow autonomously” also permits the agent to run '
+                    'these commands without a separate approval; the command filter cannot confine root code.'
+                ).classes('text-xs text-negative').bind_visibility_from(
+                    username, 'value', lambda value: str(value or '').strip().lower() == 'root'
+                )
+                authentication = ui.select(
+                    {'key': 'Identity file / SSH agent', 'password': 'SSH password'},
+                    value=target.auth_method if target else 'key', label='Authentication',
+                ).classes('w-full')
+                identity = ui.input(
+                    'Identity file on HarnessyXO host (optional)',
+                    value=target.identity_file if target else '',
+                    placeholder='~/.ssh/id_ed25519',
+                ).classes('w-full').bind_visibility_from(authentication, 'value', lambda value: value == 'key')
+                password = ui.input(
+                    'SSH password' + (' (leave blank to keep saved password)' if target and target.auth_method == 'password' else ''),
+                    password=True, password_toggle_button=True,
+                ).props('autocomplete=new-password').classes('w-full').bind_visibility_from(
+                    authentication, 'value', lambda value: value == 'password'
+                )
+                ui.label(
+                    'Passwords are stored as plaintext in the private host .settings directory (mode 0700; file 0600), '
+                    'outside workspace data and the model context. Protect host backups and use HTTPS when connecting over untrusted networks.'
+                ).classes('text-xs hy-muted').bind_visibility_from(
+                    authentication, 'value', lambda value: value == 'password'
+                )
+                remote_root = ui.input(
+                    'Remote test root', value=target.remote_root if target else '/home/harnessy/hx-test'
+                ).classes('w-full')
+                enabled = ui.switch('Enable target for this workspace', value=target.enabled if target else True)
+                approval = ui.select(
+                    options={'ask': 'Ask before protected target actions', 'on': 'Allow autonomous target tools'},
+                    value=target.approval_mode if target else 'ask',
+                    label='Model access',
+                ).classes('w-full')
+                ui.label(
+                    '“Allow autonomously” skips individual approval for brokered target tools. The remote SSH account’s existing OS privileges still apply.'
+                ).classes('text-xs hy-muted')
+                with ui.row().classes('w-full justify-end gap-2'):
+                    ui.button('Cancel', on_click=editor.close).props('flat no-caps')
 
-                        def save_target() -> None:
-                            try:
-                                ws.upsert_external_target(
-                                    target_id=target.id if target else None,
-                                    name=str(name.value or ''), host=str(host.value or ''),
-                                    port=int(port.value or 22), username=str(username.value or ''),
-                                    identity_file=str(identity.value or '') if authentication.value == 'key' else '',
-                                    auth_method=str(authentication.value or 'key'),
-                                    password=str(password.value) if authentication.value == 'password' and password.value else None,
-                                    remote_root=str(remote_root.value or ''),
-                                    enabled=bool(enabled.value), approval_mode=str(approval.value or 'ask'),
-                                )
-                            except ValueError as exc:
-                                ui.notify(str(exc), type='warning')
-                                return
-                            password.value = ''
-                            editor.close()
-                            render_targets()
-                            ui.notify('External target saved.', type='positive', timeout=1800)
+                    def save_target() -> None:
+                        try:
+                            ws.upsert_external_target(
+                                target_id=target.id if target else None,
+                                name=str(name.value or ''), host=str(host.value or ''),
+                                port=int(port.value or 22), username=str(username.value or ''),
+                                identity_file=str(identity.value or '') if authentication.value == 'key' else '',
+                                auth_method=str(authentication.value or 'key'),
+                                password=str(password.value) if authentication.value == 'password' and password.value else None,
+                                remote_root=str(remote_root.value or ''),
+                                enabled=bool(enabled.value), approval_mode=str(approval.value or 'ask'),
+                            )
+                        except ValueError as exc:
+                            ui.notify(str(exc), type='warning')
+                            return
+                        password.value = ''
+                        editor.close()
+                        render_targets()
+                        ui.notify('External target saved.', type='positive', timeout=1800)
 
-                        ui.button('Save', icon='check', on_click=save_target).props('unelevated no-caps color=primary')
-                editor.open()
+                    ui.button('Save', icon='check', on_click=save_target).props('unelevated no-caps color=primary')
+            editor.open()
 
-            async def test_target(target_id: str) -> None:
-                target = ws.get_external_target(target_id)
-                if target is None:
-                    return
-                ui.notify(f'Connecting to {target.name}…', type='info', timeout=1800)
-                try:
-                    broker = ExternalTargetBroker(ws)
-                    result = await broker.test_connection(target, initialize_root=True)
-                    if result.get('ok'):
-                        ui.notify(f'{target.name}: connected; remote test root is ready.', type='positive', timeout=3000)
-                    else:
-                        detail = str(result.get('stderr') or result.get('stdout') or 'Connection failed').strip()
-                        ui.notify(f'{target.name}: {detail[:500]}', type='negative', timeout=7000)
-                except Exception as exc:
-                    ui.notify(f'{target.name}: {exc}', type='negative', timeout=7000)
-                finally:
-                    render_targets()
+        async def test_target(target_id: str) -> None:
+            target = ws.get_external_target(target_id)
+            if target is None:
+                return
+            ui.notify(f'Connecting to {target.name}…', type='info', timeout=1800)
+            try:
+                broker = ExternalTargetBroker(ws)
+                result = await broker.test_connection(target, initialize_root=True)
+                if result.get('ok'):
+                    ui.notify(f'{target.name}: connected; remote test root is ready.', type='positive', timeout=3000)
+                else:
+                    detail = str(result.get('stderr') or result.get('stdout') or 'Connection failed').strip()
+                    ui.notify(f'{target.name}: {detail[:500]}', type='negative', timeout=7000)
+            except Exception as exc:
+                ui.notify(f'{target.name}: {exc}', type='negative', timeout=7000)
+            finally:
+                render_targets()
 
-            def delete_target(target_id: str) -> None:
-                target = ws.get_external_target(target_id)
-                if target is None:
-                    return
-                with ui.dialog() as confirm, ui.card().classes('w-[470px] max-w-[92vw]'):
-                    ui.label('Remove External Target?').classes('text-lg font-semibold')
-                    ui.label(
-                        f'Removes “{target.name}” from HarnessyXO only. Nothing is deleted or changed on the external device.'
-                    ).classes('text-sm hy-muted')
-                    with ui.row().classes('w-full justify-end gap-2'):
-                        ui.button('Cancel', on_click=confirm.close).props('flat no-caps')
-                        def remove() -> None:
-                            ws.delete_external_target(target.id)
-                            confirm.close()
-                            render_targets()
-                        ui.button('Remove', icon='delete_outline', on_click=remove).props('unelevated no-caps color=negative')
-                confirm.open()
+        def delete_target(target_id: str) -> None:
+            target = ws.get_external_target(target_id)
+            if target is None:
+                return
+            with ui.dialog() as confirm, ui.card().classes('w-[470px] max-w-[92vw]'):
+                ui.label('Remove External Target?').classes('text-lg font-semibold')
+                ui.label(
+                    f'Removes “{target.name}” from HarnessyXO only. Nothing is deleted or changed on the external device.'
+                ).classes('text-sm hy-muted')
+                with ui.row().classes('w-full justify-end gap-2'):
+                    ui.button('Cancel', on_click=confirm.close).props('flat no-caps')
+                    def remove() -> None:
+                        ws.delete_external_target(target.id)
+                        confirm.close()
+                        render_targets()
+                    ui.button('Remove', icon='delete_outline', on_click=remove).props('unelevated no-caps color=negative')
+            confirm.open()
 
-            def render_targets() -> None:
-                from harnessy.environment.test_catalog import guest_os
-                stop_polling()
-                target_list.clear()
-                all_targets = ws.list_external_targets()
-                count_label.set_text(f'{len(all_targets)} target' + ('' if len(all_targets) == 1 else 's'))
-                query = str(search.value or '').strip().casefold()
-                targets = [target for target in all_targets
-                           if (kind.value == 'all' or bool(target.managed_vm) == (kind.value == 'vm'))
-                           and query in ' '.join((target.name, target.host,
-                               guest_os(target.managed_vm['os']).label if target.managed_vm else 'External device')).casefold()]
-                with target_list:
-                    if not targets:
-                        with ui.column().classes('hy-empty-state w-full items-center gap-2'):
-                            ui.icon('search_off' if all_targets else 'devices', size='32px').classes('hy-muted')
-                            ui.label('No matching targets' if all_targets else 'Your test targets will appear here').classes('font-semibold')
-                            ui.label('Try another name or show all target types.' if all_targets else 'Create a VM or connect an existing device using the buttons above.').classes('text-sm hy-muted text-center')
-                    for target in targets:
-                        if target.managed_vm:
-                            disposers.append(render_managed_target(self, ws, target, render_targets))
-                            continue
-                        with ui.card().classes('w-full hy-target-card'):
-                            with ui.row().classes('w-full items-start justify-between gap-3'):
-                                with ui.column().classes('gap-0 min-w-0'):
-                                    with ui.row().classes('items-center gap-2'):
-                                        ui.label(target.name).classes('font-semibold hy-target-name')
-                                        ui.badge('Enabled' if target.enabled else 'Disabled').props(
-                                            'color=positive' if target.enabled else 'color=grey'
-                                        )
-                                    ui.label(f'{target.username}@{target.host}:{target.port}  →  {target.remote_root}').classes('text-xs hy-muted break-all')
+        def render_targets() -> None:
+            from harnessy.environment.test_catalog import guest_os
+            stop_polling()
+            target_list.clear()
+            all_targets = ws.list_external_targets()
+            count_label.set_text(f'{len(all_targets)} target' + ('' if len(all_targets) == 1 else 's'))
+            query = str(search.value or '').strip().casefold()
+            targets = [target for target in all_targets
+                       if (kind.value == 'all' or bool(target.managed_vm) == (kind.value == 'vm'))
+                       and query in ' '.join((target.name, target.host,
+                           guest_os(target.managed_vm['os']).label if target.managed_vm else 'External device')).casefold()]
+            with target_list:
+                if not targets:
+                    with ui.column().classes('hy-empty-state w-full items-center gap-2'):
+                        ui.icon('search_off' if all_targets else 'devices', size='32px').classes('hy-muted')
+                        ui.label('No matching targets' if all_targets else 'Your test targets will appear here').classes('font-semibold')
+                        ui.label('Try another name or show all target types.' if all_targets else 'Create a VM or connect an existing device using the buttons above.').classes('text-sm hy-muted text-center')
+                for target in targets:
+                    if target.managed_vm:
+                        disposers.append(render_managed_target(self, ws, target, render_targets))
+                        continue
+                    with ui.card().classes('w-full hy-target-card'):
+                        with ui.row().classes('w-full items-start justify-between gap-3'):
+                            with ui.column().classes('gap-0 min-w-0'):
+                                with ui.row().classes('items-center gap-2'):
+                                    ui.label(target.name).classes('font-semibold hy-target-name')
+                                    ui.badge('Enabled' if target.enabled else 'Disabled').props(
+                                        'color=positive' if target.enabled else 'color=grey'
+                                    )
+                                ui.label(f'{target.username}@{target.host}:{target.port}  →  {target.remote_root}').classes('text-xs hy-muted break-all')
+                                ui.label(
+                                    'SSH password' if target.auth_method == 'password' else (
+                                        'Identity file' if target.identity_file else 'SSH agent / default key'
+                                    )
+                                ).classes('text-xs hy-muted')
+                                ui.label(
+                                    'Autonomous target tools' if target.approval_mode == 'on' else 'Ask before protected target actions'
+                                ).classes('text-xs hy-muted')
+                            with ui.row().classes('gap-1'):
+                                ui.button('Test connection', icon='cable', on_click=lambda _=None, tid=target.id: test_target(tid)).props('flat no-caps dense')
+                                ui.button('Edit', icon='edit', on_click=lambda _=None, tid=target.id: open_editor(tid)).props('flat no-caps dense')
+                                ui.button(icon='delete_outline', on_click=lambda _=None, tid=target.id: delete_target(tid)).props('flat round dense color=negative aria-label="Remove external device"').tooltip('Remove connection')
+                        events = ws.external_target_events(target.id, limit=3)
+                        if events:
+                            with ui.expansion('Recent activity', icon='history').classes('w-full hy-target-details'):
+                                for event in events:
+                                    outcome = '✓' if event.get('ok') == 1 else ('✕' if event.get('ok') == 0 else '·')
                                     ui.label(
-                                        'SSH password' if target.auth_method == 'password' else (
-                                            'Identity file' if target.identity_file else 'SSH agent / default key'
-                                        )
-                                    ).classes('text-xs hy-muted')
-                                    ui.label(
-                                        'Autonomous target tools' if target.approval_mode == 'on' else 'Ask before protected target actions'
-                                    ).classes('text-xs hy-muted')
-                                with ui.row().classes('gap-1'):
-                                    ui.button('Test connection', icon='cable', on_click=lambda _=None, tid=target.id: test_target(tid)).props('flat no-caps dense')
-                                    ui.button('Edit', icon='edit', on_click=lambda _=None, tid=target.id: open_editor(tid)).props('flat no-caps dense')
-                                    ui.button(icon='delete_outline', on_click=lambda _=None, tid=target.id: delete_target(tid)).props('flat round dense color=negative aria-label="Remove external device"').tooltip('Remove connection')
-                            events = ws.external_target_events(target.id, limit=3)
-                            if events:
-                                with ui.expansion('Recent activity', icon='history').classes('w-full hy-target-details'):
-                                    for event in events:
-                                        outcome = '✓' if event.get('ok') == 1 else ('✕' if event.get('ok') == 0 else '·')
-                                        ui.label(
-                                            f"{outcome} {event.get('created_at', '')} · {event.get('action', '')} · {str(event.get('detail') or '')[:180]}"
-                                        ).classes('text-[11px] hy-muted break-all')
+                                        f"{outcome} {event.get('created_at', '')} · {event.get('action', '')} · {str(event.get('detail') or '')[:180]}"
+                                    ).classes('text-[11px] hy-muted break-all')
 
-            search.on_value_change(lambda _: render_targets())
-            kind.on_value_change(lambda _: render_targets())
-            render_targets()
-        dialog.open()
+        search.on_value_change(lambda _: render_targets())
+        kind.on_value_change(lambda _: render_targets())
+        render_targets()
 
     def _rename_chat_dialog(self, ws: WorkspaceStore, chat_id: str) -> None:
         chat = ws.get_chat(chat_id)
@@ -3944,17 +3953,33 @@ class HarnessyPage:
                             )
                         else:
                             self.chat_composer_drafts.pop((reg.id, removed_tab.chat_id), None)
+                    pending_terminal_starts = []
                     for tab in list(self.open_tabs):
-                        if tab.workspace_id == reg.id and tab.kind == 'terminal':
+                        if tab.workspace_id != reg.id:
+                            continue
+                        if tab.kind in {'terminal', 'target_terminal'}:
+                            task = self.terminal_start_tasks.pop(tab.key, None)
+                            if task is not None and not task.done():
+                                task.cancel()
+                                pending_terminal_starts.append(task)
+                            self.terminal_errors.pop(tab.key, None)
                             session = self.terminal_sessions.pop(tab.key, None)
                             if session:
                                 session.close()
+                        elif tab.kind == 'target_desktop':
+                            from harnessy.ui.test_targets import close_target_desktop
+                            close_target_desktop(self, tab.key)
+                    if pending_terminal_starts:
+                        await asyncio.gather(*pending_terminal_starts, return_exceptions=True)
                     self.open_tabs = [tab for tab in self.open_tabs if tab.workspace_id != reg.id]
                     for removed_key in removed_keys:
                         self.file_editor_states.pop(removed_key, None)
                     if self.active_tab_key in removed_keys:
                         self.active_tab_key = self.open_tabs[-1].key if self.open_tabs else None
 
+                    if removed_ws is not None:
+                        from harnessy.environment.test_targets import stop_workspace_test_targets
+                        await stop_workspace_test_targets(removed_ws)
                     if workspace_path.is_dir():
                         manager = EnvironmentManager(workspace_path)
                         if manager.config is not None:
@@ -4194,6 +4219,20 @@ class HarnessyPage:
                 self.open_tabs.append(OpenTab(key, kind, reg.id, None, labels[kind]))
         self.activate_tab(key)
 
+    def open_target_tab(self, ws: WorkspaceStore, target_id: str, kind: str) -> None:
+        from harnessy.ui.test_targets import target_tab_key
+        if kind not in {'target_terminal', 'target_desktop'}:
+            raise ValueError('Unsupported target view.')
+        target = ws.get_external_target(target_id)
+        if not target or not target.managed_vm:
+            ui.notify('This managed test target no longer exists.', type='warning')
+            return
+        key = target_tab_key(ws.id, target.id, kind)
+        label = 'Shell' if kind == 'target_terminal' else 'Web UI' if target.managed_vm.get('os', '').startswith('openwrt') else 'Desktop'
+        if not any(tab.key == key for tab in self.open_tabs):
+            self.open_tabs.append(OpenTab(key, kind, ws.id, None, f'{target.name} · {label}', target_id=target.id))
+        self.activate_tab(key)
+
     def open_home_tool_tab(self, kind: str) -> None:
         if kind not in {'files', 'terminal'}:
             return
@@ -4318,7 +4357,7 @@ class HarnessyPage:
                 self.chat_composer_drafts.pop((tab.workspace_id, tab.chat_id), None)
             if self._composer_owner == (tab.workspace_id, tab.chat_id):
                 self._composer_owner = None
-        if tab.kind == 'terminal':
+        if tab.kind in {'terminal', 'target_terminal'}:
             task = self.terminal_start_tasks.pop(tab.key, None)
             if task and not task.done():
                 task.cancel()
@@ -4326,6 +4365,9 @@ class HarnessyPage:
             session = self.terminal_sessions.pop(tab.key, None)
             if session:
                 session.close()
+        if tab.kind == 'target_desktop':
+            from harnessy.ui.test_targets import close_target_desktop
+            close_target_desktop(self, key)
         self.file_editor_states.pop(key, None)
         self.file_history_states.pop(key, None)
         self.open_tabs.pop(idx)
@@ -4353,7 +4395,7 @@ class HarnessyPage:
             for tab in self.open_tabs:
                 active = tab.key == self.active_tab_key
                 kind_class = tab.kind if tab.kind in {
-                    'chat', 'environment', 'files', 'file', 'terminal', 'memory', 'artifacts', 'history'
+                    'chat', 'environment', 'files', 'file', 'terminal', 'memory', 'artifacts', 'history', 'target_terminal', 'target_desktop'
                 } else 'tool'
                 cls = f'hy-tab hy-tab-{kind_class}' + (' hy-tab-active' if active else '')
                 with ui.row().classes(cls + ' items-center no-wrap gap-0 px-1').props(f'draggable=true data-hy-tab-key={tab.key}'):
@@ -4365,7 +4407,7 @@ class HarnessyPage:
                     else:
                         icon = 'chat_bubble_outline' if tab.kind == 'chat' else {
                             'memory':'memory', 'files':'folder_special', 'file':'description', 'history':'history',
-                            'terminal':'terminal', 'artifacts':'archive', 'environment':'shield'
+                            'terminal':'terminal', 'target_terminal':'terminal', 'target_desktop':'desktop_windows', 'artifacts':'archive', 'environment':'shield'
                         }.get(tab.kind, 'tab')
                     workspace_label = self._tab_workspace_label(tab)
                     item_label = self._tab_item_label(tab)
@@ -4454,6 +4496,9 @@ class HarnessyPage:
                     )
             elif tab.kind == 'terminal':
                 self._render_terminal_tab(tab, ws)
+            elif tab.kind in {'target_terminal', 'target_desktop'}:
+                from harnessy.ui.test_targets import render_target_tab
+                render_target_tab(self, tab, ws)
             elif tab.kind == 'artifacts':
                 self._render_artifacts_tab(tab, ws)
             elif tab.kind == 'environment':
@@ -15507,6 +15552,11 @@ window.harnessyTerminalFocus = function(terminalId) {
     def _terminal_input(self, e) -> None:
         data = e.args if isinstance(e.args, dict) else {}
         terminal_id = str(data.get('terminal_id') or '')
+        if terminal_id.startswith('test-target:') and not any(
+            tab.key == terminal_id and tab.kind == 'target_terminal' and tab.workspace_id == str(data.get('workspace_id') or '')
+            for tab in self.open_tabs
+        ):
+            return
         session = self.terminal_sessions.get(terminal_id)
         if session:
             session.send(str(data.get('data') or ''))
@@ -15514,6 +15564,11 @@ window.harnessyTerminalFocus = function(terminalId) {
     def _terminal_resize(self, e) -> None:
         data = e.args if isinstance(e.args, dict) else {}
         terminal_id = str(data.get('terminal_id') or '')
+        if terminal_id.startswith('test-target:') and not any(
+            tab.key == terminal_id and tab.kind == 'target_terminal' and tab.workspace_id == str(data.get('workspace_id') or '')
+            for tab in self.open_tabs
+        ):
+            return
         session = self.terminal_sessions.get(terminal_id)
         if session:
             try:
@@ -17928,9 +17983,22 @@ window.harnessyTerminalFocus = function(terminalId) {
                 ui.label(f'{ws.name} · Environment').classes('font-semibold')
             with ui.column().classes('w-full overflow-y-auto').style('flex:1'):
                 if not config:
-                    with ui.column().classes('w-full p-5 gap-2'):
-                        ui.label('This workspace has no VM environment definition.').classes('text-negative font-semibold')
-                        ui.label('Create a new workspace to use the VM-first execution model.').classes('text-sm hy-muted')
+                    selected_subtab = self.environment_subtabs.get(ws.id, 'Details')
+                    if selected_subtab not in {'Details', 'Test targets'}:
+                        selected_subtab = 'Details'
+                    with ui.tabs(value=selected_subtab).classes('w-full px-3').props('dense no-caps align=left') as tabs:
+                        details = ui.tab('Details')
+                        targets = ui.tab('Test targets')
+                    def remember_missing_environment(e):
+                        self.environment_subtabs[ws.id] = str(e.value or 'Details')
+                        self._save_ui_session()
+                    tabs.on_value_change(remember_missing_environment)
+                    with ui.tab_panels(tabs, value=selected_subtab).classes('w-full bg-transparent'):
+                        with ui.tab_panel(details):
+                            ui.label('This workspace has no VM environment definition.').classes('text-negative font-semibold')
+                            ui.label('Create a new workspace to use the VM-first execution model.').classes('text-sm hy-muted')
+                        with ui.tab_panel(targets).classes('p-0'):
+                            self._render_test_targets(ws)
                     return
 
                 preset = get_preset(config.preset)
@@ -17943,6 +18011,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                 with ui.tabs(value=selected_subtab).classes('hy-env-width px-3').props('dense no-caps align=left indicator-color=primary') as env_tabs:
                     details_tab = ui.tab('Details')
                     snapshots_tab = ui.tab('Snapshots')
+                    targets_tab = ui.tab('Test targets')
                 if not hasattr(self, 'environment_subtabs'):
                     self.environment_subtabs = {}
 
@@ -17953,7 +18022,7 @@ window.harnessyTerminalFocus = function(terminalId) {
 
                 env_tabs.on_value_change(remember_subtab)
 
-                with ui.tab_panels(env_tabs, value=selected_subtab).classes('w-full bg-transparent'):
+                with ui.tab_panels(env_tabs, value=selected_subtab).classes('w-full bg-transparent') as environment_panels:
                     with ui.tab_panel(details_tab).classes('p-0'):
                         with ui.column().classes('hy-env-width p-4 gap-4'):
                             with ui.row().classes('w-full gap-3 flex-wrap items-stretch'):
@@ -18050,6 +18119,9 @@ window.harnessyTerminalFocus = function(terminalId) {
                                 take_snapshot_button = ui.button('Take Snapshot', icon='camera').props('unelevated no-caps')
                             snapshot_operation_label = ui.label('').classes('text-sm hy-muted').style('white-space:pre-wrap')
                             snapshot_list_area = ui.column().classes('w-full gap-2')
+
+                with environment_panels, ui.tab_panel(targets_tab).classes('p-0'):
+                    self._render_test_targets(ws)
 
                 def queue_action(kind: str, **payload: Any) -> None:
                     try:
@@ -21818,6 +21890,8 @@ def run_app() -> None:
     machine = MachineStore(settings_root)
     settings = machine.load_settings()
     _register_attachment_api(machine)
+    from harnessy.ui.target_views import register_target_view_routes
+    register_target_view_routes(app, machine, user_store)
 
     @ui.page('/')
     def index(settings: str = '') -> None:
@@ -21933,6 +22007,8 @@ def run_app() -> None:
         if notification_tasks:
             await asyncio.gather(*notification_tasks, return_exceptions=True)
         _NOTIFICATION_TASKS.clear()
+        from harnessy.ui.test_targets import close_target_tab_views
+        await close_target_tab_views()
         from harnessy.environment.test_targets import close_test_targets
         target_workspaces = []
         for reg in machine.list_workspaces():

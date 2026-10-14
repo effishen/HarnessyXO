@@ -15,6 +15,7 @@ import secrets
 import shlex
 import shutil
 import socket
+import time
 import uuid
 from pathlib import Path
 
@@ -22,7 +23,10 @@ from .host_prerequisites import discover_binary, repaired_path
 from .presets import canonical_arch
 from .test_catalog import OPENWRT_RELEASE_IMAGES
 from .test_images import download_verified, expand_gzip, finish_thread
-from .test_targets import TestTargetManager
+from .test_targets import TestTargetManager, TestTargetFailure
+
+OPENWRT_READINESS_SECONDS = 240.0
+OPENWRT_POLL_SECONDS = 2.0
 
 
 def e2fs_binary(name: str) -> str | None:
@@ -126,6 +130,7 @@ class OpenWrtTargetManager(TestTargetManager):
 
     async def _prepare(self):
         note = self.operation.note if self.operation else lambda _: None
+        self.stage('download')
         try:
             folder, target, root_hash, kernel_hash = OPENWRT_RELEASE_IMAGES[self.config['os']][self.config['architecture']]
         except KeyError:
@@ -135,6 +140,7 @@ class OpenWrtTargetManager(TestTargetManager):
         images = self.root / 'images'
         root_archive = await download_verified(base + 'ext4-rootfs.img.gz', root_hash, images / 'rootfs.img.gz', note)
         kernel = await download_verified(base + 'kernel.bin', kernel_hash, images / 'kernel.bin', note)
+        self.stage('prepare_disk')
         stage = self.home / '.create-new'
         if stage.exists():
             await finish_thread(shutil.rmtree, stage)
@@ -225,15 +231,18 @@ class OpenWrtTargetManager(TestTargetManager):
 
     async def status(self):
         if not self.instance_dir.exists():
-            return {'state': 'not_created', 'running': False, 'created': False}
+            return {'state': 'not_created', 'running': False, 'created': False,
+                    'hardware_emulation': self.radio_state()}
         try:
             result = await self.qmp('query-status')
         except (FileNotFoundError, ConnectionRefusedError):
             if self._pid_alive():
                 raise RuntimeError('OpenWrt process exists but its monitor is unavailable; its state is unknown.')
-            return {'state': 'stopped', 'running': False, 'created': True}
+            return {'state': 'stopped', 'running': False, 'created': True,
+                    'hardware_emulation': self.radio_state()}
         return {'state': 'running' if result.get('running') else result.get('status', 'paused'),
-                'running': True, 'created': True, 'internet': True}
+                'running': True, 'created': True, 'internet': True,
+                'hardware_emulation': self.radio_state()}
 
     @staticmethod
     def _port():
@@ -266,11 +275,14 @@ class OpenWrtTargetManager(TestTargetManager):
             '-pidfile', str(runtime / 'qemu.pid'), '-daemonize']
 
     async def start(self):
+        self.invalidate_views()
+        self.stage('prerequisites')
         self._env()
         await self.prerequisites()
         if not self.instance_dir.exists():
             await self._prepare()
         if not (await self.status())['running']:
+            self.forget_radios()
             runtime = self.runtime_dir()
             for filename in ('qmp.sock', 'qemu.pid'):
                 (runtime / filename).unlink(missing_ok=True)
@@ -280,29 +292,77 @@ class OpenWrtTargetManager(TestTargetManager):
             state = self.instance_dir / 'ports.json'
             state.write_text(json.dumps({'ssh': ssh_port, 'web': web_port}))
             state.chmod(0o600)
+            self.stage('launch', timeout_seconds=30)
             await self.host_command(self.qemu_argv(ssh_port, web_port), timeout=30)
         from harnessy.agent.external_targets import ExternalTargetBroker
+        from harnessy.diagnostics.test_target_logs import classify_target_failure
         broker = ExternalTargetBroker(self.workspace)
-        detail = ''
-        for _ in range(120):
+        deadline = time.monotonic() + OPENWRT_READINESS_SECONDS
+        attempt, last_code = 0, 'ssh_unavailable'
+        while time.monotonic() < deadline:
+            attempt += 1
+            remaining = deadline - time.monotonic()
+            self.stage('wait_ssh', attempt=attempt, timeout_seconds=remaining)
             try:
-                await self.host_command(self.command('test -f /etc/harnessy-test-ready')[0], timeout=10)
-                result = await broker.test_connection(self.target, initialize_root=True)
-                if result['ok']:
+                # One bounded SSH invocation checks bootstrap, writable test
+                # root and shell together. Metadata utilities are optional.
+                result = await broker.test_connection(
+                    self.target, initialize_root=True, timeout=min(10, remaining),
+                    require_bootstrap=True, audit=False,
+                )
+                if result['ok'] and 'HX_OK' in result['stdout'].splitlines():
+                    self.stage('probe_shell', attempt=attempt, returncode=0)
                     if self.operation:
                         self.operation.note('OpenWrt ready. Shell and package installation are available.\n')
+                    await self.configure_radios()
+                    self.stage('ready', attempt=attempt)
                     return
-                detail = result.get('stderr', '')
+                rc = result.get('returncode')
+                last_code = classify_target_failure(result.get('stderr', '')) if rc == 255 else 'readiness_probe_failed'
+                if rc in (126, 127, 72, 73):
+                    code = 'shell_command_missing' if rc in (126, 127) else 'readiness_probe_failed'
+                    self.stage('probe_shell', attempt=attempt, failure_code=code, returncode=rc)
+                    raise TestTargetFailure(
+                        'OpenWrt answered SSH, but its shell or writable test root check failed. '
+                        'Open Shell to inspect it; download diagnostics for the failure stage and boot log.',
+                        code, returncode=rc,
+                    )
+                self.stage('probe_shell', attempt=attempt, failure_code=last_code, returncode=rc)
+            except TestTargetFailure:
+                raise
             except (RuntimeError, asyncio.TimeoutError) as exc:
-                detail = str(exc)
-            if not (await self.status())['running']:
+                last_code = 'shell_probe_timeout' if isinstance(exc, asyncio.TimeoutError) else classify_target_failure(exc)
+                self.stage('probe_shell', attempt=attempt, failure_code=last_code)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 break
-            await asyncio.sleep(2)
-        raise RuntimeError('OpenWrt shell did not become ready. ' + detail[-600:] + ' Check the private VM serial.log on the host.')
+            try:
+                running = (await asyncio.wait_for(self.status(), timeout=min(5, remaining)))['running']
+            except asyncio.TimeoutError:
+                running = True  # Unknown monitor state is not proof of exit.
+                last_code = 'monitor_unavailable'
+            if not running:
+                raise TestTargetFailure('OpenWrt exited before its shell became ready. Download diagnostics for the boot log.', 'guest_exited')
+            await asyncio.sleep(min(OPENWRT_POLL_SECONDS, max(0, deadline - time.monotonic())))
+        self.stage('probe_shell', attempt=attempt, failure_code=last_code,
+                   timeout_seconds=OPENWRT_READINESS_SECONDS)
+        raise TestTargetFailure(
+            f'OpenWrt shell was not ready after {OPENWRT_READINESS_SECONDS:g} seconds '
+            f'({last_code}). Download diagnostics for the startup stages and VM boot log. '
+            'The VM has been left available for inspection.', 'boot_timeout',
+        )
 
     async def stop(self):
+        self.invalidate_views()
+        self.forget_radios()
         if not (await self.status())['running']:
             return
+        if self.config['emulation']['bluetooth']:
+            from .test_radios import stop_radios
+            try:
+                await stop_radios(self._radio_command)
+            except (OSError, RuntimeError, asyncio.TimeoutError):
+                pass  # Optional emulation cleanup cannot prevent guest shutdown.
         try:
             await self.host_command(self.command('sync; poweroff')[0], timeout=10)
         except (RuntimeError, asyncio.TimeoutError):
@@ -345,6 +405,7 @@ class OpenWrtTargetManager(TestTargetManager):
                 'username': 'root', 'password': access['web_password'], 'kind': 'web'}
 
     async def delete(self):
+        self.forget_radios()
         if self.instance_dir.exists():
             await self._require_stopped()
         if self.root.exists():

@@ -68,6 +68,8 @@ EVIDENCE_CODES = frozenset({
     'ssh_kex_failed', 'kernel_panic', 'guest_out_of_memory', 'storage_full',
     'storage_io_error', 'service_failed', 'cloud_init_stage', 'cloud_init_complete',
     'network_device_ready', 'network_online', 'dhcp_lease_lost', 'dns_failure',
+    'shell_hostname_unavailable', 'ssh_legacy_kex_warning', 'openwrt_preinit_started',
+    'openwrt_boot_complete',
 })
 
 
@@ -400,6 +402,17 @@ def _signals(line: str, kind: str, line_number: int) -> list[dict[str, Any]]:
 
     def add(code: str, **fields: Any) -> None:
         projected.setdefault(code, {**metadata, 'code': code, **fields})
+
+    if 'hostname: not found' in lower:
+        add('shell_hostname_unavailable')
+    if 'connection is not using a post-quantum key exchange algorithm' in lower:
+        add('ssh_legacy_kex_warning')
+    if 'init: - preinit -' in lower or 'procd: - early -' in lower:
+        add('openwrt_preinit_started')
+    if 'procd: - init complete -' in lower:
+        add('openwrt_boot_complete')
+    if 'dropbear' in lower and ('running in background' in lower or 'not forking' in lower):
+        add('ssh_daemon_started')
 
     if kind == 'hostagent' and metadata.get('level') in {'warning', 'error', 'fatal', 'panic'}:
         add('hostagent_' + ('fatal' if metadata['level'] == 'panic' else metadata['level']))

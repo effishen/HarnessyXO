@@ -488,6 +488,17 @@ class HarnessyLoginMiddleware:
             return
         path = str(scope.get('path') or '')
         method = str(scope.get('method') or 'GET').upper()
+        # Target displays run in an opaque-origin sandbox, which deliberately
+        # cannot carry this controller's login cookie. Only this exact scoped
+        # route delegates authentication to its captured AccountSession. It
+        # validates the session, registered workspace and enabled target on
+        # every HTTP request and throughout the display websocket lifetime.
+        # No other HarnessyXO API accepts opaque/null-origin requests.
+        if path.startswith('/api/harnessy/target-view/'):
+            from ..ui.target_views import delegated_target_view_path
+            if delegated_target_view_path(path):
+                await self.app(scope, receive, send)
+                return
         if kind == 'http' and path == '/setup':
             await self._setup(scope, receive, send)
             return

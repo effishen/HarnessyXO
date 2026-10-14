@@ -5,7 +5,8 @@ import asyncio
 import json
 import platform
 import re
-import shutil
+import time
+import uuid
 from datetime import datetime
 
 from nicegui import ui
@@ -48,6 +49,11 @@ def open_vm_creator(ws, refresh, os_name='ubuntu-24.04'):
                 approval = ui.select({'ask': 'Ask before protected target actions', 'on': 'Allow autonomous target tools'},
                     value='on', label='Model access').classes('w-full')
                 ui.label('The model can install software and make system changes in this test VM.').classes('text-xs hy-muted')
+            with ui.column().classes('w-full gap-2') as radio_options:
+                ui.label('Guest radio emulation').classes('font-semibold text-sm')
+                wifi = ui.checkbox('Emulated Wi-Fi radios (mac80211_hwsim)', value=False)
+                bluetooth = ui.checkbox('Emulated Bluetooth controllers (requires custom image support)', value=False)
+                ui.label('Software radios only: no real RF, USB dongle identity or access to nearby devices. Wi-Fi modules download on Start; stock OpenWrt images cannot provide a Bluetooth controller. The model is told what is requested and what actually becomes active.').classes('text-xs hy-muted')
             prerequisite_hint = ui.label('').classes('text-xs hy-muted')
             start_now = ui.switch('Start after creating', value=True)
             error = ui.label('').classes('text-sm text-negative whitespace-pre-wrap').props('role=alert')
@@ -66,6 +72,7 @@ def open_vm_creator(ws, refresh, os_name='ubuntu-24.04'):
                 selection['id'] = guest.id
                 description.set_text(guest.description)
                 windows_options.set_visibility(guest.family == 'windows')
+                radio_options.set_visibility(guest.family == 'openwrt')
                 interface_hint.set_text('LuCI web interface; the shell uses ash.' if guest.interface == 'web' else
                     ('Windows desktop over VNC.' if guest.family == 'windows' else 'Xfce desktop over VNC; turn off for a smaller shell-only VM.'))
                 prerequisite_hint.set_text('Host requirements: QEMU and e2fsprogs. Official images download on first Start.' if guest.family == 'openwrt' else
@@ -86,7 +93,9 @@ def open_vm_creator(ws, refresh, os_name='ubuntu-24.04'):
                         approval_mode=approval.value,
                         managed_vm={'os': guest.id, 'architecture': arch.value, 'cpu': int(cpu.value),
                                     'memory_mb': int(memory.value), 'disk_gb': int(disk.value),
-                                    'desktop': bool(desktop.value), 'iso_path': str(iso.value or '')})
+                                    'desktop': bool(desktop.value), 'iso_path': str(iso.value or ''),
+                                    'emulation': {'wifi': bool(wifi.value) if guest.family == 'openwrt' else False,
+                                                  'bluetooth': bool(bluetooth.value) if guest.family == 'openwrt' else False}})
                     if start_now.value:
                         TestTargetManager(ws, target).begin('start')
                     dialog.close()
@@ -96,108 +105,276 @@ def open_vm_creator(ws, refresh, os_name='ubuntu-24.04'):
             ui.button('Create test VM', icon='add', on_click=create).props('unelevated no-caps color=primary')
     dialog.open()
 
-async def open_target_shell(page, manager):
-    try:
-        if manager.busy or not (await manager.status())['running']:
-            raise RuntimeError('Start this test VM and wait until it is ready before opening its shell.')
-        argv, env, cwd = manager.terminal_command()
-        key = f'test-target:{manager.workspace.id}:{manager.target.id}'
-        if key in page.terminal_sessions:
-            raise RuntimeError('This test target already has an open shell.')
-        release = manager.acquire()
+def target_tab_key(workspace_id, target_id, kind):
+    """Canonical, workspace-scoped identities; reject restored cross-target aliases."""
+    if kind not in {'target_terminal', 'target_desktop'} or not re.fullmatch(r'[a-f0-9]{32}', str(target_id)):
+        raise ValueError('Invalid managed target view.')
+    return ('test-target:' if kind == 'target_terminal' else 'target-desktop:') + str(workspace_id) + ':' + target_id
+
+
+class _LeasedTargetSession:
+    """A backend-owned PTY whose target lease ends on explicit close/shutdown."""
+    def __init__(self, session, release):
+        self._session, self._release = session, release
+
+    def __getattr__(self, name):
+        return getattr(self._session, name)
+
+    def close(self):
+        release, self._release = self._release, None
         try:
-            session = await asyncio.to_thread(TerminalSession, cwd, command_argv=argv, env=env)
-        except BaseException:
+            self._session.close()
+        finally:
+            if release is not None:
+                release()
+
+
+def _record_view_result(manager, action, operation_id, started, error=None):
+    from harnessy.diagnostics import log_event
+    from harnessy.diagnostics.test_target_logs import classify_target_failure
+    log_event('runtime', 'test_target_operation_finished', target_id=manager.target.id,
+        target_backend=manager.backend, target_action=action,
+        target_stage='probe_shell' if action == 'shell' else 'connection_test',
+        target_outcome='failed' if error is not None else 'completed',
+        target_failure_code=classify_target_failure(error) if error is not None else 'none',
+        operation_id=operation_id, elapsed_seconds=max(0, time.monotonic() - started))
+
+
+async def _create_target_session(manager):
+    if manager.busy or not (await manager.status())['running'] or manager.busy:
+        raise RuntimeError('Start this test VM and wait until it is ready before opening its shell.')
+    argv, env, cwd = manager.terminal_command()
+    release = manager.acquire()
+    task = asyncio.create_task(asyncio.to_thread(TerminalSession, cwd, command_argv=argv, env=env))
+    try:
+        session = await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Closing a tab during PTY construction must close the eventual child too.
+        try:
+            orphan = await task
+            orphan.close()
+        finally:
             release()
-            raise
-        page.terminal_sessions[key] = session
-    except Exception as exc:
-        ui.notify(str(exc), type='negative', timeout=6000)
+        raise
+    except BaseException:
+        release()
+        raise
+    return _LeasedTargetSession(session, release)
+
+
+async def open_target_shell(page, manager):
+    page.open_target_tab(manager.workspace, manager.target.id, 'target_terminal')
+
+
+async def open_target_desktop(page, manager):
+    page.open_target_tab(manager.workspace, manager.target.id, 'target_desktop')
+
+
+def render_target_tab(page, tab, ws):
+    target = ws.get_external_target(tab.target_id or '')
+    if not target or not target.managed_vm or tab.key != target_tab_key(ws.id, target.id, tab.kind):
+        ui.label('This managed test target no longer exists.').classes('text-negative p-4')
         return
-    with ui.dialog().props('maximized') as dialog, ui.card().classes('w-full h-full no-wrap gap-1'):
-        with ui.row().classes('w-full items-center'):
-            ui.label(f'{manager.target.name} · ' + manager.guest.shell).classes('font-semibold')
-            ui.label('Test VM shell · internet and system updates available').classes('text-xs hy-muted')
+    manager = TestTargetManager(ws, target)
+    if tab.kind == 'target_terminal':
+        _render_target_shell(page, tab, manager)
+    else:
+        _render_target_desktop(page, tab, manager)
+
+
+def _render_target_shell(page, tab, manager):
+    session = page.terminal_sessions.get(tab.key)
+    with ui.column().classes('hy-tool-panel hy-terminal-panel w-full no-wrap gap-0') as panel:
+        with ui.row().classes('hy-tool-toolbar w-full items-center py-2 no-wrap gap-2'):
+            ui.label(manager.target.name + ' · Shell').classes('font-semibold')
+            ui.label('Independent test VM · ' + manager.guest.shell).classes('text-xs hy-muted')
             ui.space()
-            ui.button('Ctrl+C', on_click=session.interrupt).props('flat no-caps')
-            ui.button('Close shell', on_click=dialog.close).props('flat no-caps')
-        dom = 'hy-target-' + manager.target.id
-        element = ui.element('div').props(f'id={dom}').classes('hy-terminal-shell hy-xterm w-full').style('flex:1;min-height:300px')
+            if session is not None:
+                ui.button('Ctrl+C', on_click=session.interrupt).props('flat dense no-caps')
+                clear = ui.button('Clear').props('flat dense no-caps')
+        if session is None:
+            error = page.terminal_errors.get(tab.key)
+            with ui.column().classes('w-full grow items-center justify-center gap-3'):
+                if error:
+                    ui.icon('error_outline', size='34px').classes('text-negative')
+                    ui.label('Test VM shell could not open').classes('font-semibold text-negative')
+                    ui.label(error).classes('text-sm hy-muted whitespace-pre-wrap').style('max-width:760px')
+                    def retry():
+                        page.terminal_errors.pop(tab.key, None)
+                        page.refresh_tabs()
+                    ui.button('Retry', icon='refresh', on_click=retry).props('unelevated no-caps')
+                else:
+                    ui.spinner(size='34px')
+                    ui.label('Connecting to test VM…').classes('font-semibold')
+            if not error and tab.key not in page.terminal_start_tasks:
+                async def start():
+                    operation_id, started = uuid.uuid4().hex, time.monotonic()
+                    try:
+                        page.terminal_sessions[tab.key] = await _create_target_session(manager)
+                        page.terminal_errors.pop(tab.key, None)
+                        _record_view_result(manager, 'shell', operation_id, started)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        page.terminal_errors[tab.key] = str(exc)
+                        _record_view_result(manager, 'shell', operation_id, started, exc)
+                    finally:
+                        if page.terminal_start_tasks.get(tab.key) is asyncio.current_task():
+                            page.terminal_start_tasks.pop(tab.key, None)
+                page.terminal_start_tasks[tab.key] = asyncio.create_task(start(), name='harnessy-target-shell-' + manager.target.id)
+            if not error:
+                async def watch():
+                    if panel.is_deleted:
+                        timer.deactivate()
+                        return
+                    task = page.terminal_start_tasks.get(tab.key)
+                    if task is None or task.done():
+                        timer.deactivate()
+                        page.refresh_tabs()
+                timer = ui.timer(0.25, watch)
+            return
+        dom = 'hy-target-' + re.sub(r'[^A-Za-z0-9_-]', '-', tab.key)
+        element = ui.element('div').props(f'id={dom}').classes('hy-terminal-shell hy-xterm')
+        clear.on('click', js_handler=f'() => window.harnessyTerminalClear && window.harnessyTerminalClear({json.dumps(tab.key)})')
         client = element.client
-        cursor = {'value': 0, 'mounted': False}
-        async def mount():
-            await client.run_javascript(f'window.harnessyCreateTerminal({json.dumps(dom)}, {json.dumps(key)}, {json.dumps(manager.workspace.id)});')
-            cursor['mounted'] = True
-        ui.timer(0.15, mount, once=True)
+        client.run_javascript(f'window.harnessyCreateTerminal && window.harnessyCreateTerminal({json.dumps(dom)}, {json.dumps(tab.key)}, {json.dumps(manager.workspace.id)});', timeout=2)
+        cursor, history = session.history_snapshot()
+        cursor_state = {'value': cursor}
+        if history:
+            client.run_javascript(f'window.harnessyTerminalWrite && window.harnessyTerminalWrite({json.dumps(tab.key)}, {json.dumps(history)});', timeout=2)
         async def poll():
-            if not cursor['mounted']:
+            if panel.is_deleted:
+                timer.deactivate()
                 return
-            next_cursor, chunk = session.read_since(cursor['value'])
+            next_cursor, chunk = session.read_since(cursor_state['value'])
             if chunk:
                 try:
-                    await client.run_javascript(f'window.harnessyTerminalWrite({json.dumps(key)}, {json.dumps(chunk)});', timeout=2)
-                    cursor['value'] = next_cursor
+                    await client.run_javascript(f'window.harnessyTerminalWrite && window.harnessyTerminalWrite({json.dumps(tab.key)}, {json.dumps(chunk)});', timeout=2)
+                    cursor_state['value'] = next_cursor
                 except Exception:
                     pass
-        timer = ui.timer(0.1, poll)
-        def close():
-            timer.deactivate()
-            session.close()
-            release()
-            page.terminal_sessions.pop(key, None)
-        dialog.on('hide', close)
-        client.on_disconnect(close)
-    dialog.open()
+        timer = ui.timer(0.08, poll)
 
 
-async def open_target_desktop(manager):
-    try:
-        if not (await manager.status())['running']:
-            raise RuntimeError('Start this test VM before opening its graphical interface.')
-        info = manager.desktop_info()
-    except Exception as exc:
-        ui.notify(str(exc), type='warning', timeout=6000)
-        return
-    web = info.get('kind') == 'web'
-    with ui.dialog() as dialog, ui.card().classes('hy-simple-dialog w-[680px] max-w-[95vw]'):
-        ui.label(f'{manager.target.name} · ' + ('Web interface' if web else 'Desktop')).classes('text-lg font-semibold')
-        ui.label('Open this address on the computer running HarnessyXO.' if web else 'Open this VNC address on the computer running HarnessyXO.').classes('text-sm hy-muted')
-        ui.input('Web address' if web else 'VNC address', value=info['url']).props('readonly').classes('w-full')
-        ui.input('Root password' if web else 'VNC connection password', value=info['password'], password=True, password_toggle_button=True).props('readonly').classes('w-full')
-        ui.label('On another computer, run this SSH tunnel, then open the address in your ' + ('browser. Sign in as root.' if web else 'VNC viewer.')).classes('text-xs hy-muted')
-        ui.code(f"ssh -N -L {info['port']}:127.0.0.1:{info['port']} YOUR_USER@HARNESSY_HOST", language='bash').classes('w-full')
-        async def launch():
-            opener = shutil.which('open' if platform.system() == 'Darwin' else 'xdg-open')
-            if not opener:
-                ui.notify('Open the address in a browser on the HarnessyXO host.' if web else 'Open the address in a VNC viewer on the HarnessyXO host.', type='info')
-                return
-            proc = await asyncio.create_subprocess_exec(opener, info['url'], stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-            _, err = await proc.communicate()
-            if proc.returncode:
-                ui.notify('Could not open the graphical interface: ' + err.decode(errors='replace')[-300:], type='warning')
-        ui.button('Open web interface on HarnessyXO host' if web else 'Open desktop on HarnessyXO host', icon='open_in_new', on_click=launch).props('unelevated no-caps')
+# View handles remain server-side. Only workspace/target IDs enter UI-session settings.
+_TARGET_DESKTOP_VIEWS = {}
+_TARGET_DESKTOP_TASKS = {}
+_TARGET_DESKTOP_ERRORS = {}
+
+
+def _desktop_key(page, key):
+    # Distinct logins for the same username must never share a captured session
+    # capability. The server-only session token also survives a browser reload.
+    accounts = getattr(page, '_accounts', None)
+    session = str(getattr(accounts, '_token', '') or getattr(page, '_page_id', ''))
+    return str(getattr(page, '_username', '') or ''), session, key
+
+
+def close_target_desktop(page, key):
+    identity = _desktop_key(page, key)
+    task = _TARGET_DESKTOP_TASKS.pop(identity, None)
+    if task is not None and not task.done():
+        task.cancel()
+    view = _TARGET_DESKTOP_VIEWS.pop(identity, None)
+    if view is not None:
+        view.close()
+    _TARGET_DESKTOP_ERRORS.pop(identity, None)
+
+
+async def close_target_tab_views():
+    tasks = tuple(_TARGET_DESKTOP_TASKS.values())
+    _TARGET_DESKTOP_TASKS.clear()
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    handles = tuple(_TARGET_DESKTOP_VIEWS.values())
+    _TARGET_DESKTOP_VIEWS.clear()
+    _TARGET_DESKTOP_ERRORS.clear()
+    if handles:
+        await asyncio.gather(*(view.aclose() for view in handles), return_exceptions=True)
+
+
+def _render_target_desktop(page, tab, manager):
+    identity = _desktop_key(page, tab.key)
+    view = _TARGET_DESKTOP_VIEWS.get(identity)
+    if view is not None and not view.active:
+        close_target_desktop(page, tab.key)
+        view = None
+    with ui.column().classes('hy-tool-panel w-full no-wrap gap-0') as panel:
+        with ui.row().classes('hy-tool-toolbar w-full items-center py-2 gap-2'):
+            ui.label(manager.target.name + ' · ' + ('Web UI' if manager.guest.interface == 'web' else 'Desktop')).classes('font-semibold')
+            ui.label('Independent test VM').classes('text-xs hy-muted')
+            ui.space()
+            if view is not None:
+                def reconnect():
+                    close_target_desktop(page, tab.key)
+                    page.refresh_tabs()
+                ui.button('Reconnect', icon='refresh', on_click=reconnect).props('flat dense no-caps')
         if manager.windows:
-            ui.separator()
-            ui.label('Windows desktop sign-in user: harnessy. After first Start finishes, you can set its sign-in password here.').classes('text-sm')
-            password = ui.input('New Windows sign-in password', password=True, password_toggle_button=True).classes('w-full')
-            async def set_password():
-                value = str(password.value or '')
-                if not value or any(c in value for c in ('\x00', '\r', '\n')):
-                    ui.notify('Enter a non-empty password without line breaks.', type='warning')
-                    return
+            with ui.expansion('Windows sign-in', icon='account_circle').classes('w-full px-3'):
+                ui.label('Desktop sign-in user: harnessy. Set its Windows password after first Start has finished.').classes('text-sm hy-muted')
+                password = ui.input('New Windows sign-in password', password=True, password_toggle_button=True).classes('w-full max-w-lg')
+                async def set_password():
+                    value = str(password.value or '')
+                    if not value or any(c in value for c in ('\x00', '\r', '\n')):
+                        ui.notify('Enter a non-empty password without line breaks.', type='warning')
+                        return
+                    try:
+                        broker = ExternalTargetBroker(manager.workspace)
+                        command = "Set-LocalUser -Name 'harnessy' -Password (ConvertTo-SecureString " + broker._ps_literal(value) + ' -AsPlainText -Force)'
+                        result = await broker.exec(manager.target, command)
+                        if not result['ok']:
+                            raise RuntimeError(result.get('stderr') or 'Could not set the Windows password.')
+                        password.value = ''
+                        ui.notify('Windows sign-in password updated.', type='positive')
+                    except Exception as exc:
+                        ui.notify(str(exc), type='negative', timeout=6000)
+                ui.button('Set Windows sign-in password', on_click=set_password).props('flat no-caps')
+        if view is not None:
+            ui.element('iframe').props(f'src={view.iframe_url} sandbox="{view.sandbox}" title="Test target graphical interface" referrerpolicy=no-referrer').classes('w-full grow border-0').style('min-height:0;flex:1')
+            return
+        error = _TARGET_DESKTOP_ERRORS.get(identity)
+        with ui.column().classes('w-full grow items-center justify-center gap-3'):
+            if error:
+                ui.icon('error_outline', size='34px').classes('text-negative')
+                ui.label('Test VM interface could not open').classes('font-semibold text-negative')
+                ui.label(error).classes('text-sm hy-muted whitespace-pre-wrap').style('max-width:760px')
+                def retry():
+                    _TARGET_DESKTOP_ERRORS.pop(identity, None)
+                    page.refresh_tabs()
+                ui.button('Reconnect', icon='refresh', on_click=retry).props('unelevated no-caps')
+            else:
+                ui.spinner(size='34px')
+                ui.label('Connecting to test VM interface…').classes('font-semibold')
+        if not error and identity not in _TARGET_DESKTOP_TASKS:
+            async def start():
+                operation_id, started = uuid.uuid4().hex, time.monotonic()
                 try:
-                    broker = ExternalTargetBroker(manager.workspace)
-                    command = "Set-LocalUser -Name 'harnessy' -Password (ConvertTo-SecureString " + broker._ps_literal(value) + ' -AsPlainText -Force)'
-                    result = await broker.exec(manager.target, command)
-                    if not result['ok']:
-                        raise RuntimeError(result.get('stderr') or 'Could not set the Windows password.')
-                    password.value = ''
-                    ui.notify('Windows sign-in password updated.', type='positive')
+                    if manager.busy or not (await manager.status())['running'] or manager.busy:
+                        raise RuntimeError('Start this test VM and wait until it is ready before opening its interface.')
+                    from harnessy.ui.target_views import create_target_view
+                    _TARGET_DESKTOP_VIEWS[identity] = await create_target_view(manager, identity[0], getattr(page, '_accounts', None))
+                    _record_view_result(manager, 'web', operation_id, started)
+                except asyncio.CancelledError:
+                    raise
                 except Exception as exc:
-                    ui.notify(str(exc), type='negative', timeout=6000)
-            ui.button('Set Windows sign-in password', on_click=set_password).props('flat no-caps')
-        ui.button('Close', on_click=dialog.close).props('flat no-caps')
-    dialog.open()
+                    _TARGET_DESKTOP_ERRORS[identity] = str(exc)
+                    _record_view_result(manager, 'web', operation_id, started, exc)
+                finally:
+                    if _TARGET_DESKTOP_TASKS.get(identity) is asyncio.current_task():
+                        _TARGET_DESKTOP_TASKS.pop(identity, None)
+            _TARGET_DESKTOP_TASKS[identity] = asyncio.create_task(start(), name='harnessy-target-view-' + manager.target.id)
+        if not error:
+            async def watch():
+                if panel.is_deleted:
+                    timer.deactivate()
+                    return
+                task = _TARGET_DESKTOP_TASKS.get(identity)
+                if task is None or task.done():
+                    timer.deactivate()
+                    page.refresh_tabs()
+            timer = ui.timer(0.25, watch)
 
 
 def render_managed_target(page, ws, target, refresh):
@@ -210,16 +387,44 @@ def render_managed_target(page, ws, target, refresh):
             ui.space()
             state_label = ui.label('Checking status…').classes('text-xs hy-muted').props('role=status aria-live=polite')
         c = manager.config
+        radio_status = ui.label('').classes('text-xs hy-muted whitespace-pre-wrap') if manager.guest.family == 'openwrt' else None
         ui.label(f"{c['architecture']} · {c['cpu']} CPUs · {c['memory_mb']} MiB RAM · {c['disk_gb']} GiB disk · Internet enabled").classes('text-xs hy-muted')
         with ui.expansion('Model access and test files', icon='tune').classes('w-full hy-target-details'):
             ui.label(f'Test files: {target.remote_root}').classes('text-xs hy-muted break-all')
             enabled = ui.switch('Available to the model', value=target.enabled)
             approval = ui.select({'ask': 'Ask before protected actions', 'on': 'Allow autonomous target tools'}, value=target.approval_mode, label='Model access').classes('grow')
             def save_access(_=None):
+                current = ws.get_external_target(target.id)
+                if current is None:
+                    return
                 ws.upsert_external_target(target_id=target.id, name=target.name, host=target.host, username=target.username,
-                    remote_root=target.remote_root, enabled=bool(enabled.value), approval_mode=approval.value, managed_vm=target.managed_vm)
+                    remote_root=target.remote_root, enabled=bool(enabled.value), approval_mode=approval.value, managed_vm=current.managed_vm)
             enabled.on_value_change(save_access)
             approval.on_value_change(save_access)
+        if manager.guest.family == 'openwrt':
+            with ui.expansion('Emulated radios', icon='wifi').classes('w-full hy-target-details'):
+                requested = c.get('emulation') or {}
+                wifi = ui.checkbox('Emulated Wi-Fi radios (mac80211_hwsim)', value=bool(requested.get('wifi')))
+                bluetooth = ui.checkbox('Emulated Bluetooth controllers (requires custom image support)', value=bool(requested.get('bluetooth')))
+                ui.label('Guest software radios, with no real RF or USB dongle identity. Stock OpenWrt supports the Wi-Fi simulator; Bluetooth needs a custom image providing VHCI and btvirt. The model sees requested and verified active states separately.').classes('text-xs hy-muted')
+                ui.label('Stop this VM before applying. The saved selection is applied on its next Start; existing network and wireless configuration is kept.').classes('text-xs hy-muted')
+                radio_error = ui.label('').classes('text-negative text-sm whitespace-pre-wrap').props('role=alert')
+                async def save_radios():
+                    try:
+                        if manager.busy or (await manager.status())['state'] != 'stopped' or manager.busy:
+                            raise RuntimeError('Stop this test VM and wait for its operation to finish before changing emulated radios.')
+                        current = ws.get_external_target(target.id)
+                        if current is None:
+                            raise RuntimeError('This test VM no longer exists.')
+                        config = dict(current.managed_vm)
+                        config['emulation'] = {'wifi': bool(wifi.value), 'bluetooth': bool(bluetooth.value)}
+                        ws.upsert_external_target(target_id=current.id, name=current.name, host=current.host,
+                            username=current.username, remote_root=current.remote_root, enabled=current.enabled,
+                            approval_mode=current.approval_mode, managed_vm=config)
+                        refresh()
+                    except Exception as exc:
+                        radio_error.set_text(str(exc))
+                ui.button('Apply for next Start', icon='save', on_click=save_radios).props('outline no-caps')
 
         async def start_action(action, tag=''):
             try:
@@ -235,7 +440,7 @@ def render_managed_target(page, ws, target, refresh):
         def snapshot_dialog():
             with ui.dialog() as dialog, ui.card().classes('w-[470px] max-w-[95vw]'):
                 ui.label('Create test VM snapshot').classes('font-semibold')
-                ui.label('Stop the VM and close its shell first. The snapshot includes the VM disk and firmware/TPM state.').classes('text-sm hy-muted')
+                ui.label('Stop the VM and close its shell and graphical interface tabs first. The snapshot includes the VM disk and firmware/TPM state.').classes('text-sm hy-muted')
                 name = ui.input('Snapshot name', value=datetime.now().strftime('test-%Y%m%d-%H%M%S')).classes('w-full')
                 async def save():
                     await start_action('snapshot', str(name.value or ''))
@@ -263,7 +468,7 @@ def render_managed_target(page, ws, target, refresh):
         def delete_dialog():
             with ui.dialog() as dialog, ui.card().classes('w-[470px] max-w-[95vw]'):
                 ui.label('Delete test VM and its snapshots?').classes('font-semibold')
-                ui.label(f'Deletes {target.name} and all data inside this test VM. Stop it and close its shell first.').classes('text-sm')
+                ui.label(f'Deletes {target.name} and all data inside this test VM. Stop it and close its shell and graphical interface tabs first.').classes('text-sm')
                 async def remove():
                     await start_action('delete')
                     dialog.close()
@@ -274,7 +479,7 @@ def render_managed_target(page, ws, target, refresh):
             start_button = ui.button('Start', icon='play_arrow', on_click=lambda: start_action('start')).props('flat no-caps')
             stop_button = ui.button('Stop', icon='stop', on_click=lambda: start_action('stop')).props('flat no-caps')
             shell_button = ui.button('Shell', icon='terminal', on_click=lambda: open_target_shell(page, manager)).props('flat no-caps')
-            desktop_button = ui.button('Web UI' if manager.guest.interface == 'web' else 'Desktop', icon='language' if manager.guest.interface == 'web' else 'desktop_windows', on_click=lambda: open_target_desktop(manager)).props('flat no-caps')
+            desktop_button = ui.button('Web UI' if manager.guest.interface == 'web' else 'Desktop', icon='language' if manager.guest.interface == 'web' else 'desktop_windows', on_click=lambda: open_target_desktop(page, manager)).props('flat no-caps')
             desktop_button.set_visibility(bool(c['desktop']))
             snapshot_button = ui.button('Snapshot', icon='save', on_click=snapshot_dialog).props('flat no-caps')
             restore_button = ui.button('Restore', icon='restore', on_click=restore_dialog).props('flat no-caps')
@@ -301,6 +506,15 @@ def render_managed_target(page, ws, target, refresh):
                     return
                 state_label.set_text(f'{op.action} in progress' if busy else status['state'].replace('_', ' ').title())
                 running = status['running']
+                if radio_status is not None:
+                    from harnessy.environment.test_radios import radio_summary
+                    snapshot = status.get('hardware_emulation')
+                    if snapshot and snapshot.get('observation') == 'last_guest_probe':
+                        age = snapshot.get('probe_age_seconds')
+                        when = f' ({int(age)} seconds ago)' if isinstance(age, (int, float)) and age >= 0 else ''
+                        radio_status.set_text('Last guest probe' + when + ': ' + radio_summary(snapshot))
+                    else:
+                        radio_status.set_text('Emulated radios: not yet probed inside this guest.')
                 start_button.set_enabled(not busy and (not running or bool(op and op.state == 'failed')))
                 stop_button.set_enabled(running and (not busy or bool(op and op.action == 'start')))
                 shell_button.set_enabled(not busy and running)

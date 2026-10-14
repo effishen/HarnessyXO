@@ -90,12 +90,35 @@ class ExternalTargetBroker:
                           internet=True, software_installation=True, authentication='host-managed Lima',
                           role='Separate test target. Develop in the workspace; copy files here to install, run and test.')
             result['policy'].update(mode='managed_test_vm', allow_privileged=True)
+            if str(target.managed_vm.get('os')).startswith('openwrt-'):
+                from harnessy.environment.test_radios import public_radio_snapshot
+                requested = target.managed_vm.get('emulation', {})
+                requested = requested if isinstance(requested, dict) else {}
+                result['hardware_emulation'] = public_radio_snapshot({
+                    kind: {'requested': requested.get(kind) is True,
+                           'status': 'unverified' if requested.get(kind) is True else 'disabled',
+                           'reason': 'not_detected' if requested.get(kind) is True else 'not_requested'}
+                    for kind in ('wifi', 'bluetooth')
+                })
+                result['hardware_emulation'].update(
+                    current_state_verified=False,
+                    verify_with='target_status',
+                    scope='Guest software radios only. No physical RF, nearby devices, USB dongle or chipset emulation.',
+                )
+                result['authentication'] = 'host-managed OpenSSH'
         else:
             result['kind'] = 'external_ssh'
         return result
 
     def list_public(self) -> list[dict[str, Any]]:
-        return [self.public_target(t) for t in self.workspace.list_external_targets(enabled_only=True)]
+        results = []
+        for target in self.workspace.list_external_targets(enabled_only=True):
+            item = self.public_target(target)
+            if str(target.managed_vm.get('os')).startswith('openwrt-'):
+                from harnessy.environment.test_targets import TestTargetManager
+                item['hardware_emulation'].update(TestTargetManager(self.workspace, target).radio_state())
+            results.append(item)
+        return results
 
     def _ssh_argv(self, target: ExternalTarget) -> list[str]:
         password_auth = target.auth_method == 'password'
@@ -308,15 +331,27 @@ class ExternalTargetBroker:
             raise ExternalTargetError('Windows command is too long. Copy a .ps1 script with target_copy_to and run that file.')
         return 'powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ' + encoded
 
-    async def test_connection(self, target: ExternalTarget, *, initialize_root: bool = False) -> dict[str, Any]:
+    @staticmethod
+    def _hostname_probe() -> str:
+        # OpenWrt's minimal BusyBox build need not ship a hostname applet.
+        # Host identity is descriptive metadata, not a readiness dependency.
+        return ('if command -v hostname >/dev/null 2>&1; then hostname 2>/dev/null || printf "unknown\\n"; '
+                'elif IFS= read -r hx_host < /proc/sys/kernel/hostname; then printf "%s\\n" "$hx_host"; '
+                'else printf "unknown\\n"; fi')
+
+    async def test_connection(self, target: ExternalTarget, *, initialize_root: bool = False,
+                              timeout: float = 20, require_bootstrap: bool = False,
+                              audit: bool = True) -> dict[str, Any]:
         root_q = shlex.quote(target.remote_root)
         action = 'mkdir -p -- ' + root_q if initialize_root else 'test -d ' + root_q
         command = (
-            f'{action} && '
+            ('test -f /etc/harnessy-test-ready || exit 74; ' if require_bootstrap else '') +
+            f'{action} || exit 72; '
+            f'test -w {root_q} || {{ printf "HX_ROOT_NOT_WRITABLE\\n" >&2; exit 73; }}; '
             f'printf "HX_OK\\n" && '
-            f'printf "USER=" && id -un && '
-            f'printf "HOST=" && hostname && '
-            f'printf "ROOT_WRITABLE=" && if test -w {root_q}; then echo yes; else echo no; fi'
+            f'printf "USER="; id -un 2>/dev/null || printf "unknown\\n"; '
+            f'printf "HOST="; {self._hostname_probe()}; '
+            f'printf "ROOT_WRITABLE=yes\\n"'
         )
         if self._windows(target):
             root = self._ps_literal(target.remote_root)
@@ -325,12 +360,13 @@ class ExternalTargetBroker:
                 f"if (!(Test-Path -LiteralPath {root} -PathType Container)) {{ throw 'Test root does not exist' }}; "
                 "Write-Output 'HX_OK'; Write-Output ('USER=' + $env:USERNAME); Write-Output ('HOST=' + $env:COMPUTERNAME)"
             )
-        result = await self._run_ssh(target, command, timeout=20)
-        self.workspace.record_external_target_event(
-            target.id, chat_id=self.chat_id, action='connection_test',
-            detail='initialize_root=true' if initialize_root else 'initialize_root=false',
-            ok=result.ok, returncode=result.returncode, duration_seconds=result.duration_seconds,
-        )
+        result = await self._run_ssh(target, command, timeout=timeout)
+        if audit:
+            self.workspace.record_external_target_event(
+                target.id, chat_id=self.chat_id, action='connection_test',
+                detail='initialize_root=true' if initialize_root else 'initialize_root=false',
+                ok=result.ok, returncode=result.returncode, duration_seconds=result.duration_seconds,
+            )
         return {
             'ok': result.ok,
             'target': self.public_target(target),
@@ -349,12 +385,14 @@ class ExternalTargetBroker:
             operation = manager.operation
             vm_status['operation'] = {'action': operation.action, 'state': operation.state, 'error': operation.error} if operation else None
             vm_status['snapshots'] = manager.snapshots()
+            if manager.guest.family == 'openwrt':
+                vm_status['hardware_emulation'] = manager.radio_state()
             if not vm_status['running'] or manager.busy:
                 return {'ok': True, 'target': self.public_target(target), 'vm': vm_status}
         root_q = shlex.quote(target.remote_root)
         command = (
             'printf "USER="; id -un; '
-            'printf "HOST="; hostname; '
+            f'printf "HOST="; {self._hostname_probe()}; '
             'printf "KERNEL="; uname -sr; '
             f'printf "ROOT_EXISTS="; if test -d {root_q}; then echo yes; else echo no; fi; '
             f'printf "ROOT_WRITABLE="; if test -w {root_q}; then echo yes; else echo no; fi'
@@ -367,8 +405,13 @@ class ExternalTargetBroker:
             target.id, chat_id=self.chat_id, action='status', ok=result.ok,
             returncode=result.returncode, duration_seconds=result.duration_seconds,
         )
+        target_public = self.public_target(target)
+        if vm_status is not None and manager.guest.family == 'openwrt' and result.ok:
+            snapshot = await manager.inspect_radios()
+            vm_status['hardware_emulation'] = snapshot
+            target_public['hardware_emulation'].update(snapshot)
         return {
-            'ok': result.ok, 'target': self.public_target(target), 'stdout': result.stdout,
+            'ok': result.ok, 'target': target_public, 'stdout': result.stdout,
             'stderr': result.stderr, 'returncode': result.returncode,
             'duration_seconds': result.duration_seconds,
             'vm': vm_status,

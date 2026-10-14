@@ -26,7 +26,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
-_LOG_NAMES = ('harnessy', 'backend', 'tools', 'runtime', 'system', 'context_tuning', 'database')
+_LOG_NAMES = ('harnessy', 'backend', 'tools', 'runtime', 'system', 'context_tuning', 'database', 'targets')
 _MAX_LOG_BYTES = 25 * 1024 * 1024
 _BACKUPS = 2
 _SESSION_KEEP = 20
@@ -43,6 +43,25 @@ _CONTEXT_HISTORY_BACKUPS = 15
 # Database instrumentation is a separate bounded, content-free channel.
 _DATABASE_LOG_MAX_BYTES = 2 * 1024 * 1024
 _DATABASE_LOG_BACKUPS = 3
+_TARGET_LOG_MAX_BYTES = 1024 * 1024
+_TARGET_LOG_BACKUPS = 3
+_TARGET_VIEW_CAPABILITY = re.compile(
+    # Read sizes are bounded by the exporter. Disjoint escape/plain branches
+    # consume the complete URI tail in linear time, while preserving enclosing
+    # unescaped JSON/log quotes and whitespace. Guest paths and queries can
+    # themselves contain LuCI session tokens or passwords.
+    rb'((?:\\*/|%2f)api(?:\\*/|%2f)harnessy(?:\\*/|%2f)target-view(?:\\*/|%2f))[0-9a-f]{64}(?:\\[^\r\n]|[^\s\x22\x27<>\\])*',
+    re.IGNORECASE,
+)
+
+
+class _DiagnosticsZipFile(zipfile.ZipFile):
+    """A target-view URL is a credential in every diagnostics export mode."""
+    def writestr(self, zinfo_or_arcname, data, compress_type=None, compresslevel=None):
+        encoded = data.encode('utf-8') if isinstance(data, str) else data
+        if isinstance(encoded, (bytes, bytearray)):
+            data = _TARGET_VIEW_CAPABILITY.sub(lambda match: match.group(1) + b'<redacted>', encoded)
+        return super().writestr(zinfo_or_arcname, data, compress_type=compress_type, compresslevel=compresslevel)
 _FILE_OPERATION_TIMELINE_MAX_EVENTS = 1000
 _FILE_OPERATION_TIMELINE_LOG_TAIL_BYTES = 8 * 1024 * 1024
 _PRIVACY_SAFE_BUNDLE = 'HarnessyXO-Diagnostics-Latest.zip'
@@ -686,6 +705,8 @@ class DiagnosticsManager:
         for path in paths:
             if name == 'database':
                 max_bytes, backups = _DATABASE_LOG_MAX_BYTES, _DATABASE_LOG_BACKUPS
+            elif name == 'targets':
+                max_bytes, backups = _TARGET_LOG_MAX_BYTES, _TARGET_LOG_BACKUPS
             elif name != 'context_tuning':
                 max_bytes, backups = _MAX_LOG_BYTES, _BACKUPS
             elif path.parent == self.root / 'context-history':
@@ -765,6 +786,10 @@ class DiagnosticsManager:
         return DiagnosticsManager._safe(str(value), depth=depth + 1)
 
     def event(self, channel: str, event: str, *, level: int = logging.INFO, **fields: Any) -> None:
+        if event.startswith('test_target_'):
+            # Preserve sparse boot/lifecycle evidence independently of verbose
+            # model and workspace command traffic in runtime.log.
+            channel = 'targets'
         if channel == 'context_tuning':
             self.record_context_tuning(event, **fields)
             return
@@ -1182,6 +1207,12 @@ def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
     lowered = key.lower()
     if _is_sensitive_log_key(lowered):
         return '<redacted>'
+    if lowered.startswith('target_'):
+        from .test_target_logs import TARGET_ENUMS
+        if lowered in TARGET_ENUMS:
+            return value if isinstance(value, str) and value in TARGET_ENUMS[lowered] else _privacy_marker(value, label=lowered)
+        if lowered == 'target_id':
+            return value if isinstance(value, str) and re.fullmatch(r'[0-9a-f]{32}', value) else _privacy_marker(value, label=lowered)
     if isinstance(value, dict) and value.get('event') in {
         'vm_controller_command', 'environment_command_started', 'environment_command_finished',
         'environment_command_timeout', 'environment_command_cancelled',
@@ -1449,7 +1480,7 @@ def _sanitize_stream_tail_bytes(payload: bytes) -> bytes:
 
 
 _ENVIRONMENT_TIMELINE_PREFIXES = (
-    'vm_', 'environment_operation_', 'environment_command_', 'workspace_mapping_',
+    'vm_', 'environment_operation_', 'environment_command_', 'workspace_mapping_', 'test_target_',
 )
 _ENVIRONMENT_TIMELINE_EVENTS = {
     'vm_tool_exec_start', 'vm_tool_exec_complete', 'vm_tool_exec_timeout',
@@ -1460,7 +1491,7 @@ _ENVIRONMENT_TIMELINE_EVENTS = {
 def _privacy_environment_timeline(latest: Path) -> list[dict[str, Any]]:
     """Build a bounded semantic VM/tool timeline from structured logs only."""
     rows: list[dict[str, Any]] = []
-    for channel in ('runtime', 'tools'):
+    for channel in ('runtime', 'tools', 'targets'):
         source = latest / f'{channel}.log'
         payload = _read_snapshot_bytes(source)
         if payload is None:
@@ -1496,6 +1527,28 @@ def _privacy_environment_timeline(latest: Path) -> list[dict[str, Any]]:
                 **safe,
             })
     rows.sort(key=lambda row: str(row.get('timestamp') or ''))
+    return rows[-600:]
+
+
+def _privacy_test_target_timeline(latest: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for suffix in ('.3', '.2', '.1', ''):
+        payload = _read_snapshot_bytes(latest / f'targets.log{suffix}', tail_bytes=512 * 1024)
+        for line in (payload.decode('utf-8', errors='replace').splitlines() if payload else []):
+            parts = line.split(' ', 3)
+            if len(parts) != 4 or parts[2] not in {'INFO', 'WARNING', 'ERROR', 'DEBUG', 'CRITICAL'}:
+                continue
+            try:
+                stamp = f'{parts[0]} {parts[1]}'
+                datetime.strptime(stamp, '%Y-%m-%d %H:%M:%S,%f')
+                decoded = json.loads(parts[3])
+                if not isinstance(decoded, dict) or not isinstance(decoded.get('event'), str) or not decoded['event'].startswith('test_target_'):
+                    continue
+                safe = _privacy_safe_value(decoded)
+            except (ValueError, TypeError, RecursionError):
+                continue
+            rows.append({**safe, 'timestamp': stamp, 'channel': 'targets', 'level': parts[2]})
+    rows.sort(key=lambda row: row['timestamp'])
     return rows[-600:]
 
 
@@ -1609,6 +1662,18 @@ def _privacy_manifest(*, include_content: bool = False) -> str:
         'arbitrary guest lines, paths, names and message bodies are omitted. These tails can contain observations '
         'from earlier boots and do not establish an underlying cause by themselves. VM collection reads existing '
         'files only: it opens no database and runs no VM/controller commands.\n\n'
+        'TARGET_LOGS.json records separately bounded managed test-target QEMU serial and Lima log coverage, '
+        'including unavailable/unsafe sources. target-logs/ contains fixed technical signals; raw tails require '
+        'content-rich export. Test-target operation stages, elapsed time, probe attempts, and fixed failure '
+        'codes remain in ENVIRONMENT_TIMELINE.json and INCIDENTS.json. Collection never opens target '
+        'databases, SSH keys, ports/access metadata, or starts a target. No registered target observations '
+        'means missing evidence, not proof that a test target did not exist.\n\n'
+        'targets.log has independent bounded retention (four 1 MiB files per current/session channel); '
+        'TARGET_TIMELINE.json preserves up to 600 recent target lifecycle records separately from busy '
+        'workspace/model traffic. Counts and timelines still describe retained evidence, not lifetime totals.\n\n'
+        'Target-view capability URLs are credentials and their entire scoped path/query tails are redacted from '
+        'every archive member, including raw content-rich logs. Credential redaction may reduce exported '
+        'member byte counts relative to the bounded source measurements.\n\n'
         + ('Raw bounded serial/hostagent tails are also included under vm-logs/ because content-rich mode was '
            'explicitly selected. They may contain guest/project text. Unsafe or symlinked sources remain excluded; '
            'VM_LOGS.json metadata and incident summaries remain content-free.\n\n' if include_content else '') +
@@ -1688,6 +1753,36 @@ def _collect_vm_export(latest: Path, *, include_content: bool) -> tuple[dict[str
                 'mode': 'raw_bounded_tails' if include_content else 'signals_only', 'workspaces': []}, {}
 
 
+def _collect_test_target_export(latest: Path, *, include_content: bool) -> tuple[dict[str, Any], dict[str, bytes]]:
+    try:
+        from .test_target_logs import (MAX_EXPORT_BYTES, MAX_TARGET_FILES,
+                                      collect_test_target_diagnostics, validate_test_target_report)
+        from .vm_logs import PER_FILE_TAIL_BYTES
+        collected = collect_test_target_diagnostics(latest, include_content=include_content)
+        report = validate_test_target_report(collected['report'])
+        members = collected['members']
+        if not isinstance(members, dict) or len(members) > MAX_TARGET_FILES * (2 if include_content else 1):
+            raise ValueError('Invalid target collection')
+        if report['mode'] != ('raw_bounded_tails' if include_content else 'signals_only'):
+            raise ValueError('Invalid target privacy mode')
+        declared = {source[key] for target in report['targets'] for source in target['sources']
+                    if source['status'] == 'included' for key in ('archive_member', 'raw_archive_member') if key in source}
+        if set(members) != declared:
+            raise ValueError('Invalid target archive coverage')
+        total = 0
+        for name, payload in members.items():
+            if not isinstance(payload, bytes) or len(payload) > (PER_FILE_TAIL_BYTES if name.endswith('.raw.log') else MAX_EXPORT_BYTES):
+                raise ValueError('Invalid target member bounds')
+            total += len(payload)
+            if total > MAX_EXPORT_BYTES:
+                raise ValueError('Invalid target collection bounds')
+        json.dumps(report, ensure_ascii=False, allow_nan=False)
+        return report, members
+    except Exception:
+        return {'schema_version': 1, 'status': 'unavailable', 'reason': 'collector_failed',
+                'mode': 'raw_bounded_tails' if include_content else 'signals_only', 'targets': []}, {}
+
+
 def collect_existing_diagnostics(app_root: Path, *, include_content: bool = False) -> Path | None:
     """Build a fresh diagnostics ZIP from current logs.
 
@@ -1703,13 +1798,14 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
     target = root / bundle_name
     tmp = root / f'{bundle_name}.tmp'
     try:
-        with zipfile.ZipFile(tmp, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+        with _DiagnosticsZipFile(tmp, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
             from .sqlite import snapshot_database_connections, validate_database_snapshot
             from .support_summary import build_support_summary
 
             vm_report, vm_members = _collect_vm_export(latest, include_content=include_content)
+            target_report, target_members = _collect_test_target_export(latest, include_content=include_content)
             try:
-                incidents, summary = build_support_summary(latest, vm_report=vm_report)
+                incidents, summary = build_support_summary(latest, vm_report=vm_report, target_report=target_report)
             except Exception:
                 # Export is itself a recovery action. A corrupt log or summary
                 # bug must not prevent collection of the remaining evidence.
@@ -1723,6 +1819,10 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
             zf.writestr('VM_LOGS.json', json.dumps(vm_report, ensure_ascii=False, indent=2, allow_nan=False))
             for name, payload in vm_members.items():
                 zf.writestr(name, payload)
+            zf.writestr('TARGET_LOGS.json', json.dumps(target_report, ensure_ascii=False, indent=2, allow_nan=False))
+            for name, payload in target_members.items():
+                zf.writestr(name, payload)
+            zf.writestr('TARGET_TIMELINE.json', json.dumps(_privacy_test_target_timeline(latest), ensure_ascii=False, indent=2))
             zf.writestr('EXPORT_METADATA.json', json.dumps(_export_metadata(latest), ensure_ascii=False, indent=2))
             try:
                 database_state = validate_database_snapshot(snapshot_database_connections())

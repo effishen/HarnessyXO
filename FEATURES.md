@@ -1,4 +1,19 @@
-# HarnessyXO v0.6.82 Features
+# HarnessyXO v0.6.83 Features
+
+## Workspace test-target tabs
+
+- Manage external devices and test VMs in **Workspace Environment → Test targets**.
+- Open guest Shell, LuCI Web UI and noVNC Desktop views as separate main-area tabs, preserving selected targets across browser reloads.
+- Keep guest pages isolated from HarnessyXO's browser origin; scope display access to the signed-in session and selected target, and revoke it on close or VM changes.
+- Verify OpenWrt readiness without requiring a hostname utility. Separate boot, shell and optional radio setup stages, with a bounded readiness deadline.
+- Retain target lifecycle evidence separately from busy model logs and include bounded QEMU/Lima boot evidence in diagnostics.
+
+## OpenWrt radio emulation
+
+- Request two guest mac80211_hwsim Wi-Fi radios, installing matching signed official packages and verifying their actual PHYs before claiming activation.
+- Support Bluetooth simulation when a custom image provides Linux VHCI and BlueZ btvirt. Report stock-image prerequisites as unavailable.
+- Tell the model which capabilities are requested, last observed or currently verified, and label virtual radios as emulated with no physical RF or USB chipset coverage.
+- Keep existing guest network configuration intact. Optional setup failures leave the shell available.
 
 ## Private GitHub startup updates
 
@@ -199,8 +214,8 @@ Workspace and machine databases use WAL so background reads can coexist with mes
 ## Model defaults and test machines
 
 - Choose the default model for new projects/chats separately from the profile being edited. Set default thinking per model; new chats and model switches inherit it, while existing saved chat choices remain intact.
-- Use one **Create VM** flow under **External/Test Targets**, with Ubuntu 24.04/26.04, Debian 13, Fedora 44, Kali 2026.2, OpenWrt 25.12.5 and experimental Windows 11. Each test machine is separate from the workspace VM and has outbound internet for updates and software installation.
-- Use brokered model commands, binary file transfer, an in-app Bash/PowerShell/ash shell, optional localhost VNC desktops, or OpenWrt’s LuCI web UI. Manage start/stop and full stopped-VM snapshots, including Windows firmware/TPM state.
+- Use one **Create VM** flow under **Workspace Environment → Test targets**, with Ubuntu 24.04/26.04, Debian 13, Fedora 44, Kali 2026.2, OpenWrt 23.05.2/25.12.5 and experimental Windows 11. Each test machine is separate from the workspace VM and has outbound internet for updates and software installation.
+- Use brokered model commands, binary file transfer, and main-area Bash/PowerShell/ash, noVNC Desktop and LuCI Web UI tabs. Manage start/stop and full stopped-VM snapshots, including Windows firmware/TPM state.
 - Match ARM64 or x86-64 to the host for acceleration, or choose the other architecture for CPU emulation. Windows requires matching installation media, Lima 2.2+, QEMU and swtpm. OpenWrt requires QEMU and e2fsprogs; it uses private NAT, pinned official images and a dedicated guest SSH key. See [test-target instructions](README.md#externaltest-targets).
 
 ## Project files and chat attachments
@@ -600,7 +615,7 @@ Workspace and machine databases use WAL so background reads can coexist with mes
 
 ## Why HarnessyXO
 
-<!-- Current release: v0.6.82 -->
+<!-- Current release: v0.6.83 -->
 
 Capacity recovery follows backend feedback: a prompt rejection reduces the request view, while the observed model-loading memory rejection gets delayed retries with the same prompt. A rough token estimate does not prevent preserved input from reaching the backend, and the timeline identifies which recovery is active.
 
@@ -632,7 +647,7 @@ These are CPU-based Linux work environments. Windows as the primary working envi
 
 **External/Test Targets** brings existing SSH devices and managed Ubuntu, Debian, Fedora, Kali, OpenWrt or Windows test VMs into the same workflow. The model can copy a build into a test machine, install dependencies, run tests, and retrieve the results. These machines have internet access for updates and package downloads, while project files remain in their canonical workspace home.
 
-Choose the OS in one Create VM flow. Open a Bash, ash or PowerShell shell yourself, connect a VNC viewer to an optional desktop, or use OpenWrt’s LuCI web interface. Stop a test VM and save its full state before a disruptive experiment; restore that snapshot to repeat the test. Windows guest support uses Lima's experimental Windows integration and your installation media.
+Choose the OS in one Create VM flow under **Workspace Environment → Test targets**. Open a Bash, ash or PowerShell shell, embedded noVNC Desktop or OpenWrt LuCI Web UI in the main area. Stop a test VM and save its full state before a disruptive experiment; restore that snapshot to repeat the test. Windows guest support uses Lima's experimental Windows integration and your installation media.
 
 ### Projects that can depend on other projects
 

@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-_CHANNELS = ('harnessy', 'runtime', 'database', 'tools', 'backend')
+_CHANNELS = ('harnessy', 'runtime', 'database', 'tools', 'backend', 'targets')
 _TAIL_BYTES = 2 * 1024 * 1024
 _MAX_ROWS = 20000
 _MAX_INCIDENTS = 20
@@ -22,6 +22,17 @@ _ERROR_EVENTS = frozenset({
     'sqlite_operation_error', 'tool_execution_error', 'request_error',
     'environment_command_timeout', 'workspace_environment_shutdown_stop_failed',
 })
+
+
+def _bounded_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if len(rows) <= _MAX_ROWS:
+        return rows
+    # Reserve sparse target evidence when busy database/model traffic fills the
+    # common index. The separate TARGET_TIMELINE retains the same 600-row bound.
+    targets = [row for row in rows if str(row.get('event')).startswith('test_target_')][-600:]
+    recent = rows[-(_MAX_ROWS - len(targets)):]
+    retained = {id(row): row for row in targets + recent}
+    return sorted(retained.values(), key=lambda row: row['timestamp'])
 
 
 def _vm_failure_classification(row: dict[str, Any]) -> str | None:
@@ -44,6 +55,23 @@ def _vm_failure_classification(row: dict[str, Any]) -> str | None:
     if event == 'workspace_environment_shutdown_stop_failed':
         return 'vm_shutdown_stop_unverified'
     return None
+
+
+def _target_failure_classification(row: dict[str, Any]) -> str | None:
+    if row.get('event') == 'test_target_view_failed':
+        return 'test_target_view_unavailable'
+    if row.get('event') == 'test_target_shutdown_failed':
+        return 'test_target_shutdown_unverified'
+    if row.get('event') != 'test_target_operation_finished':
+        return None
+    if row.get('target_outcome') not in {'failed', 'timeout'}:
+        return None
+    code = row.get('target_failure_code')
+    if code in {'shell_hostname_unavailable', 'shell_command_missing', 'readiness_probe_failed', 'shell_probe_failed'}:
+        return 'test_target_readiness_failed'
+    if code in {'boot_timeout', 'shell_probe_timeout', 'controller_timeout'} or row.get('target_outcome') == 'timeout':
+        return 'test_target_startup_timeout'
+    return 'test_target_operation_failed'
 
 
 def _rows(latest: Path, *, session_scope: str = 'current', tail_bytes: int = _TAIL_BYTES,
@@ -95,7 +123,7 @@ def _rows(latest: Path, *, session_scope: str = 'current', tail_bytes: int = _TA
             })
         rows.extend(channel_rows)
     rows.sort(key=lambda row: row['timestamp'])
-    return rows[-_MAX_ROWS:], coverage
+    return _bounded_rows(rows), coverage
 
 
 def _seconds(left: str, right: str) -> float:
@@ -104,7 +132,7 @@ def _seconds(left: str, right: str) -> float:
 
 
 def _same_scope(candidate: dict[str, Any], incident: dict[str, Any]) -> bool:
-    for key in ('session_scope', 'workspace_id', 'chat_id', 'run_id'):
+    for key in ('session_scope', 'workspace_id', 'chat_id', 'run_id', 'target_id'):
         if incident.get(key) and candidate.get(key) and incident[key] != candidate[key]:
             return False
     return True
@@ -148,8 +176,14 @@ def _evidence(row: dict[str, Any]) -> dict[str, Any]:
         'controller_returncode', 'controller_signal', 'elapsed_seconds', 'timeout_seconds',
         'app_limit_seconds', 'native_limit_seconds', 'last_boot_milestone', 'controller_failure_kind',
         'controller_status', 'status_probe_error',
+        'target_id', 'target_backend', 'target_action', 'target_stage', 'target_outcome',
+        'target_failure_code', 'operation_id', 'attempt', 'attempts', 'probe_attempts',
+        'target_view_failure_code', 'target_interface',
     )
-    return {key: row[key] for key in keys if key in row}
+    evidence = {key: row[key] for key in keys if key in row}
+    if _is_lock(row):
+        evidence['error_code'] = 'sqlite_database_locked'
+    return evidence
 
 
 def _has_frames(value: Any) -> bool:
@@ -200,7 +234,8 @@ def _vm_log_coverage(report: dict[str, Any] | None) -> tuple[dict[str, Any] | No
     return safe, lines
 
 
-def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = None) -> tuple[dict[str, Any], str]:
+def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = None,
+                          target_report: dict[str, Any] | None = None) -> tuple[dict[str, Any], str]:
     rows, coverage = _rows(Path(latest))
     # After a restart, the previous process may contain the failure the user
     # wants to report. Examine only the same bounded previous tail the ZIP keeps.
@@ -216,12 +251,13 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         previous = None
     if previous is not None:
         older_rows, older_coverage = _rows(previous, session_scope='previous', tail_bytes=512 * 1024, rotations=False)
-        rows = sorted(rows + older_rows, key=lambda row: row['timestamp'])[-_MAX_ROWS:]
+        rows = _bounded_rows(sorted(rows + older_rows, key=lambda row: row['timestamp']))
         coverage.extend(older_coverage)
     observation_keys = {(row.get('session_scope'), row.get('command_id')) for row in rows
                         if row.get('event') == 'vm_startup_observation' and isinstance(row.get('command_id'), str)
                         and _vm_failure_classification(row)}
-    failures = [row for row in rows if (row.get('event') in _ERROR_EVENTS or _vm_failure_classification(row))
+    failures = [row for row in rows if (row.get('event') in _ERROR_EVENTS or _vm_failure_classification(row)
+                                       or _target_failure_classification(row) or _is_lock(row))
                 and not (row.get('event') in {'environment_command_finished', 'environment_command_timeout'}
                          and isinstance(row.get('command_id'), str)
                          and (row.get('session_scope'), row.get('command_id')) in observation_keys)]
@@ -232,6 +268,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         related = [row for row in before if _same_scope(row, failure)]
         lock = _is_lock(failure)
         vm_classification = _vm_failure_classification(failure)
+        target_classification = _target_failure_classification(failure)
         if vm_classification == 'vm_controller_interrupted' and not isinstance(failure.get('controller_signal'), str):
             code = failure.get('controller_returncode', failure.get('returncode'))
             failure = {**failure, 'controller_signal': {-2: 'SIGINT', -9: 'SIGKILL', -15: 'SIGTERM'}.get(code, 'other')}
@@ -271,7 +308,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         identity = json.dumps(_evidence(failure), sort_keys=True)
         incidents.append({
             'incident_id': hashlib.sha256(identity.encode()).hexdigest()[:24],
-            'classification': 'sqlite_lock_contention' if lock else vm_classification or 'operation_error',
+            'classification': 'sqlite_lock_contention' if lock else target_classification or vm_classification or 'operation_error',
             'failure': _evidence(failure),
             'nearby_database_errors': [_evidence(row) for row in database_errors[-3:]],
             'last_successful_tool': successful_tool,
@@ -280,6 +317,11 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
             'missing_evidence': missing,
             'correlation_is_not_proof_of_lock_ownership': True,
             'controller_evidence': controller_evidence[-8:],
+            'target_operation_evidence': [_evidence(row) for row in rows if target_classification
+                                         and row.get('session_scope') == failure.get('session_scope')
+                                         and row.get('target_id') == failure.get('target_id')
+                                         and row.get('operation_id') == failure.get('operation_id')
+                                         and str(row.get('event')).startswith('test_target_operation_')][-16:],
         })
     counts = Counter(str(row.get('event', '')) for row in rows)
     durations = [row['drift_seconds'] for row in rows
@@ -292,21 +334,48 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         'event_loop_stall_samples': counts['event_loop_stall_sample'],
         'maximum_recorded_stall_seconds': max(durations, default=0),
         'transcript_refresh_deferrals': counts['transcript_refresh_deferred'],
-        'database_errors': counts['sqlite_operation_error'], 'incidents': incidents,
+        'database_errors': sum(row.get('event') == 'sqlite_operation_error' or _is_lock(row) for row in rows),
+        'database_operation_errors': counts['sqlite_operation_error'], 'incidents': incidents,
     }
     safe_vm_report, vm_lines = _vm_log_coverage(vm_report)
     if safe_vm_report is not None:
         index['vm_log_evidence'] = safe_vm_report
+    target_rows = [row for row in rows if str(row.get('event')).startswith('test_target_')]
+    target_lines = ['Test-target evidence: TARGET_LOGS.json lists managed target runtime source coverage; TARGET_TIMELINE.json retains target lifecycle receipts separately.']
+    if target_report is not None:
+        from .test_target_logs import validate_test_target_report
+        safe_target_report = validate_test_target_report(target_report)
+        index['test_target_log_evidence'] = safe_target_report
+        target_lines.append('  Source counts: ' + '; '.join(f'{key} {safe_target_report["summary"][key]}'
+                            for key in ('included', 'missing', 'unsafe', 'unreadable', 'limited')) + '.')
+        if safe_target_report['status'] == 'unavailable':
+            target_lines.append('  Target boot-log collector unavailable; other diagnostics remain included.')
+        if safe_target_report['discovery'].get('discovery_limited') or safe_target_report['discovery'].get('targets_limited'):
+            target_lines.append('  Target discovery reached a bound; earlier targets or boot observations may be absent.')
+    if not target_rows:
+        target_lines.append('  No test-target lifecycle observations in examined logs. Target creation/startup timing and failures cannot be reconstructed from their absence.')
+    else:
+        target_lines.append(f'  Test-target lifecycle records examined: {len(target_rows)}; failure observations: {sum(bool(_target_failure_classification(row)) for row in target_rows)}.')
+    target_lines.extend(['  A running VM monitor does not establish that its guest shell or web service is ready.', ''])
+    from .logging import _export_metadata
+    metadata = _export_metadata(Path(latest))
+    session = metadata.get('session', {})
+    version = session.get('app_version', 'unrecorded')
+    index['session_app_version'] = version
     lines = [
         'HarnessyXO support summary', '==========================', '',
         'Start here; machine-readable evidence is in INCIDENTS.json.',
+        f'Session application version: {version}; capture time: {metadata.get("captured_at", "unrecorded")}.',
         'This summary examines bounded current/previous-session log tails. Counts are not whole-session totals.',
         'Nearby events and tracked transactions are evidence for investigation, not proven lock ownership.', '',
         f'Recorded failures in examined logs: {len(failures)} (latest {len(incidents)} shown)',
         f'Event-loop stalls: {counts["event_loop_stall"]}; maximum recorded delay: {max(durations, default=0):.3f}s',
         f'During-stall stack samples: {counts["event_loop_stall_sample"]}',
         f'Transcript refresh deferrals: {counts["transcript_refresh_deferred"]}', '',
+        f'Database failure observations: {index["database_errors"]}; instrumented SQLite operation errors: {counts["sqlite_operation_error"]}.',
+        'Zero instrumented SQLite operation errors does not exclude lock errors recorded by other application operations.', '',
         *vm_lines,
+        *target_lines,
     ]
     if not incidents:
         lines.append('No recorded failure event was found in the examined logs; this does not establish that no failure occurred.')
@@ -317,6 +386,15 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
             if failure.get(key):
                 lines.append(f'  {key}: {failure[key]}')
         classification = incident['classification']
+        if classification.startswith('test_target_'):
+            for key in ('target_id', 'target_backend', 'target_action', 'target_stage', 'target_failure_code',
+                        'target_interface', 'target_view_failure_code', 'elapsed_seconds', 'attempt', 'timeout_seconds'):
+                if key in failure:
+                    lines.append(f'  {key}: {failure[key]}')
+            if classification == 'test_target_view_unavailable':
+                lines.append('  The browser display transport failed or rejected a bounded request/response. Check the fixed failure code and target boot evidence; VM running state alone does not establish display readiness.')
+            else:
+                lines.append('  Inspect target_operation_evidence and TARGET_LOGS.json; a shell probe failure does not establish that the VM failed to boot.')
         if classification.startswith('vm_'):
             if classification == 'vm_controller_timeout':
                 lines.append('  HarnessyXO reached its controller wait deadline; this does not by itself establish an SSH failure.')
