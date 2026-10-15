@@ -1,7 +1,8 @@
-# HarnessyXO v0.6.96 Features
+# HarnessyXO v0.6.97 Features
 
 ## Model progress across backends
 
+- See the completed model call’s decode speed on each Thinking and answer card, including compact Thinking rows. **Call … tok/s** covers the originating model call; **~** before a speed marks an estimate. Keep each card’s observed duration separate, and retain saved rates across reloads and tab changes.
 - Use one current-request display for every backend. Show an animated wait with increasing elapsed time before output; show real prompt-processing counters, cache reuse and throughput when the backend exposes them. Explicitly report unavailable progress instead of estimating percentages or inventing live token rates.
 - Ask native llama.cpp for streamed prompt progress. Separate newly evaluated work from cached tokens, including zero-work and fully cached prompts. Preserve native generation timing and final usage. Generic OpenAI-compatible servers receive only their supported common request options.
 - Keep previous completed-call speed and time to first output on a separately labelled line while the next request waits. Reset current-request clocks and counters between calls and keep chat/profile state distinct.

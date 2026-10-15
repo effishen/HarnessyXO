@@ -5003,7 +5003,10 @@ class HarnessyPage:
             except (TypeError, ValueError):
                 last_visible = 0.0
             silent_for = max(0.0, time.perf_counter() - last_visible) if last_visible else 0.0
-            if isinstance(state.get('tool_building'), dict):
+            if view.copy_state.get('model_step_finished'):
+                view.waiting_label.set_text(phase_text)
+                view.waiting_row.set_visibility(True)
+            elif isinstance(state.get('tool_building'), dict):
                 view.reasoning_status_label.set_visibility(False)
                 view.answer_status_label.set_visibility(False)
                 view.waiting_label.set_text(phase_text)
@@ -6512,6 +6515,40 @@ class HarnessyPage:
         return '~<0.1s' if value < 0.1 else f'~{value:.1f}s'
 
     @staticmethod
+    def _completed_call_rate_text(metric: dict[str, Any] | None) -> str:
+        """A saved decode rate belongs to its model call, across output phases."""
+        metric = metric if isinstance(metric, dict) else {}
+        rate = number(metric.get('tps'))
+        if rate is None or rate <= 0:
+            return ''
+        source = str(metric.get('throughput_source') or '')
+        native = source in {
+            'llama.cpp timings', 'oMLX usage metadata', 'oMLX timing counters',
+            'Ollama timing counters', 'backend timing counters',
+        }
+        return f'Call {"" if native else "~"}{rate:.1f} tok/s'
+
+    @classmethod
+    def _card_performance_text(
+        cls, metric: dict[str, Any] | None, phase: str,
+        model_call_metric: dict[str, Any] | None,
+    ) -> str:
+        timing = cls._phase_performance_text(metric, phase)
+        rate = cls._completed_call_rate_text(model_call_metric)
+        return ' · '.join(part for part in (timing, rate) if part)
+
+    @classmethod
+    def _compact_thinking_text(
+        cls, metric: dict[str, Any] | None,
+        model_call_metric: dict[str, Any] | None = None,
+    ) -> str:
+        timing = cls._phase_performance_text(metric, 'reasoning')
+        rate = cls._completed_call_rate_text(model_call_metric)
+        return ' · '.join(part for part in (
+            'Thinking', timing if timing != 'Timing unavailable' else '', rate,
+        ) if part)
+
+    @staticmethod
     def _timed_live_groups(state: dict[str, Any]) -> list[dict[str, Any]]:
         segments = timed_stream_segments(state.get('stream_segments') or [], state.get('phase_timings') or [])
         metadata = {
@@ -6687,17 +6724,26 @@ class HarnessyPage:
             output=output,
         )
 
-    def _apply_group_timing(self, view: AssistantView, group: dict[str, Any], *, finished: bool = False) -> None:
+    def _apply_group_timing(
+        self, view: AssistantView, group: dict[str, Any], *, finished: bool = False,
+        model_call_metric: dict[str, Any] | None = None,
+    ) -> None:
         if not self._ui_elements_alive(view.root):
             return
+        # A continuation can tick the next request's phase clock before its
+        # new views exist. Keep the previous model step's final summary intact.
+        if not finished and view.copy_state.get('model_step_finished'):
+            return
+        if finished:
+            view.copy_state['model_step_finished'] = True
         for phase, label in (('reasoning', view.reasoning_status_label), ('answer', view.answer_status_label)):
             if str(group.get(phase) or '').strip() and (finished or group.get(f'{phase}_timing_complete')):
-                label.set_text(self._phase_performance_text(group, phase))
+                label.set_text(self._card_performance_text(
+                    group, phase, model_call_metric if finished else None,
+                ))
                 label.set_visibility(True)
         if finished:
-            duration = number(group.get('reasoning_duration_seconds'))
-            suffix = f' · {self._compact_elapsed_text(duration)}' if duration is not None else ''
-            view.reasoning_compact_label.set_text(f'Thinking{suffix}')
+            view.reasoning_compact_label.set_text(self._compact_thinking_text(group, model_call_metric))
             view.reasoning_compact_dots.set_visibility(False)
             view.reasoning_container.classes(remove='hy-activity-running')
 
@@ -8149,6 +8195,7 @@ class HarnessyPage:
                     reasoning_created_at=group['reasoning_started_at'] or group['created_at'] or msg.created_at,
                     answer_created_at=group['answer_started_at'] or group['created_at'] or msg.created_at,
                     generation_metric=group if group.get('timing_source') else (metadata.get('generation_metric') if len(groups) == 1 else None),
+                    model_call_metric=metadata.get('generation_metric'),
                     reasoning_provenance=group.get('reasoning_provenance'),
                     answer_provenance=group.get('answer_provenance'),
                     output_provenance=group.get('output_provenance'),
@@ -8341,6 +8388,7 @@ class HarnessyPage:
         reasoning_created_at: str | None = None,
         answer_created_at: str | None = None,
         generation_metric: dict[str, Any] | None = None,
+        model_call_metric: dict[str, Any] | None = None,
         reasoning_provenance: dict[str, Any] | None = None,
         answer_provenance: dict[str, Any] | None = None,
         output_provenance: dict[str, Any] | None = None,
@@ -8477,14 +8525,14 @@ class HarnessyPage:
                 f'data-hy-bubble-id={reasoning_bubble_id} data-hy-bubble-kind=thinking '
                 f'{reasoning_bookmark_props}'
             ) as reasoning_container:
-                reasoning_duration = number((generation_metric or {}).get('reasoning_duration_seconds'))
-                reasoning_suffix = self._compact_elapsed_text(reasoning_duration)
                 with ui.row().classes('hy-compact-summary items-center no-wrap gap-2').props(
                     'role=button tabindex=0 data-hy-compact-toggle=1 aria-label="Temporarily expand Thinking"'
                 ):
                     reasoning_compact_label = ui.label(
-                        'Thinking' + (f' · {reasoning_suffix}' if reasoning_suffix and not pending else '')
+                        self._compact_thinking_text(generation_metric, model_call_metric or generation_metric)
+                        if not pending else 'Thinking'
                     ).classes('hy-compact-summary-label')
+                    reasoning_compact_label.tooltip('Call speed covers this model call, including its Thinking, answer and generated tool arguments. ~ before a speed means an estimate; ~ before a duration means an observed stream interval.')
                     reasoning_compact_saved = ui.label('State saved').classes('hy-state-saved')
                     self._message_settings_badge(settings_tip)
                     reasoning_compact_dots = ui.element('span').classes('hy-running-dots')
@@ -8507,7 +8555,7 @@ class HarnessyPage:
                     reasoning_copy_button.set_visibility(not pending)
                     ui.space()
                     reasoning_status_label = ui.label('').classes('hy-model-status')
-                    reasoning_status_label.tooltip('~ = observed stream interval, not backend compute time. Call TPS covers the whole model call. Full totals and timing method are in Stats; old/buffered phase timings may be unavailable.')
+                    reasoning_status_label.tooltip('Call speed covers this model call, including its Thinking, answer and generated tool arguments. ~ before a speed means an estimate; ~ before a duration means an observed stream interval. Full measurements are in Stats.')
                     reasoning_time_label = ui.label(reasoning_short).classes('hy-message-time')
                     with reasoning_time_label:
                         reasoning_time_tooltip = ui.tooltip(reasoning_full)
@@ -8553,7 +8601,7 @@ class HarnessyPage:
                     answer_copy_button.set_visibility(not pending)
                     ui.space()
                     answer_status_label = ui.label('').classes('hy-model-status')
-                    answer_status_label.tooltip('~ = observed stream interval, not backend compute time. Call TPS covers the whole model call. Full totals and timing method are in Stats; old/buffered phase timings may be unavailable.')
+                    answer_status_label.tooltip('Call speed covers this model call, including its Thinking, answer and generated tool arguments. ~ before a speed means an estimate; ~ before a duration means an observed stream interval. Full measurements are in Stats.')
                     if turn_elapsed_text and ws is not None and chat_id:
                         answer_total_label = ui.button(
                             turn_elapsed_text,
@@ -8584,11 +8632,11 @@ class HarnessyPage:
                 answer_container.set_visibility(has_answer)
                 reasoning_status_label.set_visibility(False)
                 answer_status_label.set_visibility(False)
-                reasoning_performance = self._phase_performance_text(
-                    generation_metric, 'reasoning', has_other_output=has_answer,
+                reasoning_performance = self._card_performance_text(
+                    generation_metric, 'reasoning', None if pending else (model_call_metric or generation_metric),
                 )
-                answer_performance = self._phase_performance_text(
-                    generation_metric, 'answer', has_other_output=has_reasoning,
+                answer_performance = self._card_performance_text(
+                    generation_metric, 'answer', None if pending else (model_call_metric or generation_metric),
                 )
                 if has_reasoning and reasoning_performance:
                     reasoning_status_label.set_text(reasoning_performance)
@@ -10152,6 +10200,10 @@ class HarnessyPage:
             if not phase_state.get('active'):
                 return
             text_value = live_phase_text()
+            if view.copy_state.get('model_step_finished'):
+                view.waiting_label.set_text(text_value)
+                view.waiting_row.set_visibility(True)
+                return
             target = str(current.get('active_output') or '')
             silent_for = max(
                 0.0,
@@ -10785,7 +10837,10 @@ class HarnessyPage:
                 for segment_view, group in zip(current.get('step_views') or [], groups):
                     if live_render_available(segment_view.root):
                         segment_view.waiting_row.set_visibility(False)
-                        self._apply_group_timing(segment_view, group, finished=True)
+                        self._apply_group_timing(
+                            segment_view, group, finished=True,
+                            model_call_metric=event.get('performance'),
+                        )
                         self._apply_output_provenance(segment_view, group)
                         self._set_assistant_copy_ready(segment_view, ready=True)
                 if isinstance(view, AssistantView) and live_render_available(view.root) and not bool(event.get('has_visible_output')):
@@ -10810,7 +10865,8 @@ class HarnessyPage:
                 view = current.get('view')
                 if isinstance(view, AssistantView) and live_render_available(view.root):
                     view.root.set_visibility(True)
-                    view.answer_container.set_visibility(False)
+                    if not view.copy_state.get('model_step_finished'):
+                        view.answer_container.set_visibility(False)
                     view.waiting_label.set_text(message)
                     view.waiting_row.set_visibility(True)
                 return

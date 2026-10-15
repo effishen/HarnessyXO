@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.6.97
+
+- Restore the saved tokens/s summary on completed Thinking and HarnessyXO answer cards, including compact Thinking rows. Keep each card's observed duration beside its originating model call's decode speed.
+- Show the final speed as soon as each model step completes and retain it after reload, tab changes and alternating Thinking/answer segments. Older cards reuse their own saved rate when available.
+- Label whole-call speed as **Call … tok/s**. Mark estimated or legacy rates with **~**; omit unavailable or invalid rates. Do not turn a whole-call token count into a separate Thinking or answer speed. Live request progress and full Run Stats remain available.
+- Preserve existing model requests, workspace data, VMs and automatic updates. Leave README unchanged and keep the same 11 Markdown resources; private QA stays outside the application package.
+
 ## v0.6.96
 
 - Fix the launch lock surviving Ctrl+C on Linux. The final app now makes its lock private before starting native tools, so uvloop-launched Lima and QEMU processes cannot inherit it. Forked workers close only their own copy; the running parent stays locked.
