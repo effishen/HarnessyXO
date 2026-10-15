@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build committed application files and verify a matching private GitHub release."""
+"""Build committed application files and verify a matching public GitHub release."""
 
 from __future__ import annotations
 
@@ -258,8 +258,9 @@ def publish(output: Path, repository: str, expected_commit: str) -> dict:
         if filename == 'release-notes.md':
             notes = payload.decode('utf-8')
     repo = gh_json(f'repos/{repository}')
-    if repo['id'] != REPOSITORY_ID or repo['full_name'] != repository or repo['private'] is not True:
-        raise ReleaseError('The intended private repository identity was not verified.')
+    if (repo['id'] != REPOSITORY_ID or repo['full_name'] != repository
+            or repo.get('private') is not False or repo.get('visibility') != 'public'):
+        raise ReleaseError('The intended public repository identity was not verified.')
     commit = metadata['commit']
     tag = metadata['tag']
     target = tag_target(repository, tag)
@@ -316,11 +317,12 @@ def publish(output: Path, repository: str, expected_commit: str) -> dict:
         raise ReleaseError('Release metadata changed during publication verification.')
     final_repo = gh_json(f'repos/{repository}')
     if (final_repo['id'] != REPOSITORY_ID or final_repo['full_name'] != repository
-            or final_repo['private'] is not True):
-        raise ReleaseError('Private repository identity changed during publication verification.')
+            or final_repo.get('private') is not False or final_repo.get('visibility') != 'public'):
+        raise ReleaseError('Public repository identity changed during publication verification.')
     proof = {
         'schema': 'harnessyxo-release-proof-v1', 'verified': True,
-        'repository': repository, 'repository_id': repo['id'], 'private': True,
+        'repository': repository, 'repository_id': repo['id'],
+        'private': repo['private'], 'visibility': repo['visibility'],
         'version': metadata['version'], 'tag': tag, 'tag_target_commit': commit,
         'release': {'id': release['id'], 'url': release['html_url'],
                     'name': release['name'], 'body': release['body'],
@@ -351,7 +353,7 @@ def main() -> int:
             if not arguments.expected_commit:
                 raise ReleaseError('Publication requires --expected-commit.')
             result = publish(arguments.output.resolve(), arguments.repository, arguments.expected_commit)
-            print(f'Verified private release: {result["release"]["url"]}')
+            print(f'Verified public release: {result["release"]["url"]}')
     except (ReleaseError, OSError, ValueError, KeyError, SyntaxError,
             subprocess.SubprocessError) as error:
         parser.exit(1, f'Release stopped: {error}\n')

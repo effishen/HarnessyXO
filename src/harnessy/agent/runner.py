@@ -17,7 +17,7 @@ from contextlib import aclosing
 from typing import Any
 
 from harnessy.environment.activity import activity
-from harnessy.core.machine import DEFAULT_MODEL_PROFILE, GLOBAL_INSTRUCTIONS_NAME
+from harnessy.core.machine import DEFAULT_MODEL_PROFILE, DEFAULT_TOOL_PERMISSIONS, GLOBAL_INSTRUCTIONS_NAME
 from harnessy.core.paths import settings_path
 from harnessy.core.workspace import WorkspaceStore
 from harnessy.diagnostics import environment_claim_diagnostics, log_event, log_stream_event
@@ -410,6 +410,7 @@ class AgentRunner:
         run_id: str | None = None,
         agent_slot_lease: Any | None = None,
         live_profile_loader: Callable[[], dict[str, Any] | None] | None = None,
+        live_permission_loader: Callable[[], dict[str, Any]] | None = None,
         backend_recovery_callback: Callable[[str, dict[str, Any]], None] | None = None,
         completion_gate_callback: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
@@ -451,6 +452,7 @@ class AgentRunner:
             workspace, chat_id, settings, profile=self.profile,
             sticky_mutation_lease=True, agent_slot_lease=agent_slot_lease,
             thinking=self.thinking_selection,
+            live_permission_loader=live_permission_loader,
         )
         if run_id:
             self.toolbox.run_id = str(run_id)
@@ -1063,6 +1065,7 @@ class AgentRunner:
         code_intelligence_permission = self.toolbox.permission_for('code_intelligence')
         diagnostics_permission = self.toolbox.permission_for('diagnostics')
         memory_permission = self.toolbox.permission_for('memory')
+        external_targets_permission = self.toolbox.permission_for('external_targets')
         tool_catalogue = self.toolbox.catalogue_summary()
         skill_block = self.toolbox.skill_prompt_block()
         workspace_telemetry = json.dumps(self.toolbox.prompt_workspace_state(), ensure_ascii=False, separators=(',', ':'))
@@ -1133,6 +1136,7 @@ Rules:
 - Reusable skills are instructions/playbooks, not tools. Use list_skills/read_skill for skill discovery; do not confuse skills with callable capabilities.
 - Global Agent Slots ceiling: {global_agent_slots}. This is a maximum, not a target. When useful, delegate_task can run a bounded ephemeral read-only analysis worker; verbally requested delegation never creates a sidebar project and the coordinator remains responsible for all file changes, durable memory, and the final answer.
 - Shell permission: {shell_permission}. If it is Ask, HarnessyXO will request user approval before execution. For VM workspaces, shell cwd is the guest active root and execution is sandboxed inside that workspace VM; it never silently falls back to the host shell.
+- External/Test Targets permission: {external_targets_permission}. Use target_exec, target_status and target_copy tools for a configured test target; always pass its explicit id or exact name. Global On allows target tools without confirmation and global Off blocks them. Global Ask requests approval for protected actions unless the enabled target's Model access is On; target listing and fixed read-only checks run directly. Saved tool-permission changes apply to active runs. HarnessyXO enforces approval; call the appropriate tool instead of asking for permission in conversational text. Workspace shell/process permissions remain separate.
 - Long-running process permission: {process_permission}. Prefer start_process/poll_process for builds, servers, watchers, monitors, or interactive commands that should not block the agent loop. If permission is Ask, approval is requested when starting the job; later polling/input/stop calls for that HarnessyXO-owned job do not repeatedly prompt.
 - Git permissions: read={git_read_permission}, write={git_write_permission}. Prefer the structured Git tools (git_status, git_diff, git_log, git_branch, git_show, git_commit, git_restore) over shelling out to git. Discover their schemas when needed. Git tools only operate when the active working root is the repository root.
 - Browser automation permission: {browser_permission}. Browser tools use isolated Playwright sessions restricted to public-network http/https destinations; host/local/private networks and host file URLs are blocked. Discover browser_open/browser_dom/browser_click/browser_type/browser_screenshot/browser_wait/browser_back/browser_reload/browser_close when UI/browser interaction is needed. With Ask, creating a new browser session requires approval; navigation and follow-up actions inside that HarnessyXO-owned session do not repeatedly prompt. Use browser_dom for structured inspection and browser_screenshot when a visual record is useful.
@@ -2222,6 +2226,7 @@ Rules:
             result.append(item)
             self._request_sources[id(item)] = msg
 
+        self._append_live_permission_context(result)
         report = self._budget_request(result, self.toolbox.schemas)
         initial_changed = self._budget_changed_request(report)
         runway = 0
@@ -2244,6 +2249,7 @@ Rules:
 
     def _api_messages(self) -> list[dict[str, Any]]:
         """Build a cache-stable request view for the current autonomous run."""
+        self.toolbox._refresh_permission_policy()
         # Activity cards share the durable timeline but are presentation-only:
         # they must never consume context, disturb cache epochs, or reach a model.
         messages = [
@@ -2318,6 +2324,7 @@ Rules:
         })
         self._context_strategy = strategy
 
+        self._append_live_permission_context(result)
         report = self._budget_request(result, self.toolbox.schemas)
         if self._budget_changed_request(report):
             rebase_target, runway = self._epoch_runway_target(report)
@@ -2330,6 +2337,25 @@ Rules:
                 result, messages, reason='budget_pressure', runway_tokens=runway,
             )
         return result
+
+    def _append_live_permission_context(self, messages: list[dict[str, Any]]) -> None:
+        if getattr(self.toolbox, '_live_permission_loader', None) is None:
+            return
+        states = {key: self.toolbox.permission_for(key) for key in DEFAULT_TOOL_PERMISSIONS}
+        row = {
+            'role': 'user', '_harnessy_ephemeral': True, '_harnessy_region': 'tool_policy',
+            'content': (
+                '[HarnessyXO current saved tool permissions — application state]\n'
+                + json.dumps(states, sort_keys=True, separators=(',', ':'))
+                + '\nUse these current values for this request. Saved changes apply during active runs. '
+                  'Global External/Test Targets On allows configured enabled target tools without a dialog; '
+                  'Off blocks them. With Ask, an enabled target whose Model access is On can run autonomously. '
+                  'Pass an explicit target id or exact name. Workspace shell/process permissions remain separate. '
+                  'Call tools directly and let HarnessyXO enforce approval.'
+            ),
+        }
+        messages.append(row)
+        self._request_ephemeral_row_ids.add(id(row))
 
     def _budget_request(
         self, messages, tools, runtime: int = 0, context_source: str | None = None,
@@ -5637,6 +5663,8 @@ Rules:
                         if len(self.toolbox.execution_history) > execution_history_start and self.toolbox.execution_history[-1].get('tool') == name
                         else {}
                     )
+                    if execution_record and execution_record.get('execution_duration_seconds') is None:
+                        tool_execution_started = False
                     if infrastructure_failure is not None:
                         execution_record = {'status': 'skipped', 'execution_duration_seconds': 0.0}
                     tool_duration = max(0.0, time.perf_counter() - tool_started)
@@ -5695,6 +5723,7 @@ Rules:
                             'started_at': tool_started_at,
                             'category': execution_record.get('category'),
                             'permission': execution_record.get('permission'),
+                            'permission_decision': execution_record.get('permission_decision'),
                             'execution_status': execution_record.get('status'),
                             'requested_by_model': getattr(self.client, 'model', self.profile.get('model')),
                             'thinking': self.thinking,
@@ -5732,8 +5761,13 @@ Rules:
                         'tools', 'tool_execution_complete', step=step + 1, call_id=call.get('id'),
                         workspace_id=getattr(self.workspace, 'id', None), chat_id=self.chat_id, run_id=self.run_id,
                         tool=name, ok=tool_ok, duration_seconds=tool_duration,
+                        execution_duration_seconds=execution_record.get('execution_duration_seconds'),
+                        approval_wait_seconds=execution_record.get('approval_wait_seconds', 0.0),
+                        coordination_wait_seconds=execution_record.get('coordination_wait_seconds', 0.0),
+                        permission_decision=execution_record.get('permission_decision'),
                         result_chars=len(str(result or '')), execution_status=execution_record.get('status'),
                         error_code=(parsed_result or {}).get('error_code') if isinstance(parsed_result, dict) else None,
+                        target_validation=(parsed_result or {}).get('target_validation') if isinstance(parsed_result, dict) else None,
                         error=(str((parsed_result or {}).get('error') or '')[:1600] if (not tool_ok and isinstance(parsed_result, dict)) else ''),
                     )
                     await emit_event(
@@ -5752,6 +5786,7 @@ Rules:
                         coordination_wait_seconds=execution_record.get('coordination_wait_seconds', 0.0),
                         category=execution_record.get('category'),
                         permission=execution_record.get('permission'),
+                        permission_decision=execution_record.get('permission_decision'),
                         execution_status=execution_record.get('status'),
                         created_at=tool_message.created_at,
                         requested_by_model=getattr(self.client, 'model', self.profile.get('model')),

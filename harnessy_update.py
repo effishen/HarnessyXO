@@ -156,7 +156,7 @@ def acquire_install_lock(app_dir: Path) -> InstallLock:
         raise StartupLockUnsafe("HarnessyXO's installation lock could not be opened.") from None
 
 
-def _git_env() -> dict[str, str]:
+def _git_env(*, anonymous: bool = False) -> dict[str, str]:
     env = dict(os.environ)
     for name in list(env):
         if (name in {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
@@ -164,20 +164,31 @@ def _git_env() -> dict[str, str]:
                      "GIT_CONFIG_COUNT", "GIT_QUARANTINE_PATH"}
                 or name.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_", "GIT_TRACE"))):
             env.pop(name, None)
+    if anonymous:
+        for name in ('GIT_ASKPASS', 'SSH_ASKPASS', 'SSH_ASKPASS_REQUIRE'):
+            env.pop(name, None)
     env.update({"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "Never",
                 "GIT_SSH_COMMAND": "ssh -o BatchMode=yes -o ConnectTimeout=8",
                 "LC_ALL": "C"})
     return env
 
 
-def _git(root: Path, *args: str, timeout: float = GIT_TIMEOUT_SECONDS) -> bytes:
+def _git(root: Path, *args: str, timeout: float = GIT_TIMEOUT_SECONDS,
+         anonymous: bool = False) -> bytes:
     command = ["git", "-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false",
                "-c", "fetch.recurseSubmodules=false", "-c", "maintenance.auto=false",
-               "-c", "gc.auto=0", "-C", str(root), *args]
+               "-c", "gc.auto=0"]
+    if anonymous:
+        # Public downloads need no account or credential helper. Keep trusted
+        # proxy/CA configuration while avoiding stale saved authorization.
+        command += ["-c", "credential.helper=", "-c", "credential.interactive=false",
+                    "-c", "core.askPass=", "-c", "http.extraHeader=",
+                    "-c", f"http.{REPOSITORY_URL}.extraHeader="]
+    command += ["-C", str(root), *args]
     try:
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                   env=_git_env(), start_new_session=os.name != "nt")
+                                   env=_git_env(anonymous=anonymous), start_new_session=os.name != "nt")
         try:
             output, _ = process.communicate(timeout=timeout)
         except (subprocess.TimeoutExpired, KeyboardInterrupt):
@@ -389,7 +400,13 @@ def _updates_supported() -> bool:
     return os.name != "nt"
 
 
-def _bootstrap(root: Path, version: str, repository: str) -> dict | None:
+def _public_transport_url(repository: str) -> str:
+    # Git's explicit helper syntax passes the canonical URL directly to HTTPS,
+    # including when the user's insteadOf rules normally rewrite GitHub to SSH.
+    return f"https::{repository}"
+
+
+def _bootstrap(root: Path, version: str, repository: str, *, anonymous: bool = True) -> dict | None:
     if not _VERSION.fullmatch(version):
         return _result("zip_version_unrecognized")
     tag = f"v{version}"
@@ -397,7 +414,13 @@ def _bootstrap(root: Path, version: str, repository: str) -> dict | None:
         with tempfile.TemporaryDirectory(prefix=".harnessy-update-stage-", dir=root) as temp:
             staged = Path(temp) / "repository"
             _git(root, "clone", "--no-checkout", "--no-hardlinks", "--single-branch",
-                 "--branch", tag, "--", repository, str(staged))
+                 "--branch", tag, "--",
+                 _public_transport_url(repository) if anonymous else repository,
+                 str(staged), anonymous=anonymous)
+            if anonymous:
+                # This is newly created metadata. Existing checkout remotes are
+                # left intact; only network operations use the helper syntax.
+                _git(staged, "config", "remote.origin.url", repository)
             baseline = _head(staged)
             entries = _tree(staged, baseline)
             if not _matches_installed(root, entries):
@@ -420,9 +443,8 @@ def _bootstrap(root: Path, version: str, repository: str) -> dict | None:
 
 
 def check_for_updates(app_dir: Path, release_version: str) -> dict:
-    """Check the configured private GitHub main branch; preserve local state.
+    """Check the public GitHub main branch without login; preserve local state.
 
-    Authentication is supplied by existing Git credential helpers/SSH agents.
     Failure before source mutation is a safe skip; a mixed tree is fatal.
     """
     return _check_for_updates(app_dir, release_version, repository_url=REPOSITORY_URL)
@@ -464,7 +486,8 @@ def _check_for_updates(app_dir: Path, release_version: str, *, repository_url: s
     if not marker.exists():
         if pending is not None:
             return _result("update_state_unsafe", fatal=True)
-        result = _bootstrap(root, release_version, repository_url)
+        result = _bootstrap(root, release_version, repository_url,
+                            anonymous=not allow_local_transport)
         if result is not None:
             return result
     try:
@@ -472,7 +495,7 @@ def _check_for_updates(app_dir: Path, release_version: str, *, repository_url: s
             return _result("repository_root_mismatch", fatal=pending is not None)
         if _git_text(root, "symbolic-ref", "--quiet", "--short", "HEAD") != UPDATE_BRANCH:
             return _result("branch_not_managed", fatal=pending is not None)
-        if not _remote_matches(_git_text(root, "remote", "get-url", "origin"),
+        if not _remote_matches(_git_text(root, "config", "--get", "remote.origin.url"),
                                repository_url, allow_local_transport):
             return _result("repository_remote_mismatch", fatal=pending is not None)
         if pending is not None:
@@ -491,8 +514,13 @@ def _check_for_updates(app_dir: Path, release_version: str, *, repository_url: s
         if not _clean(root):
             return _result("local_changes", old=old)
         target_ref = f"refs/remotes/origin/{UPDATE_BRANCH}"
-        _git(root, "fetch", "--no-tags", "--no-recurse-submodules", "origin",
-             f"+refs/heads/{UPDATE_BRANCH}:{target_ref}")
+        # Validate the saved origin above, then use HTTPS directly even for an
+        # SSH checkout. Never rewrite the user's stored origin or require login
+        # to download the public repository.
+        _git(root, "fetch", "--no-tags", "--no-recurse-submodules",
+             repository_url if allow_local_transport else _public_transport_url(repository_url),
+             f"+refs/heads/{UPDATE_BRANCH}:{target_ref}",
+             anonymous=not allow_local_transport)
         target = _git_text(root, "rev-parse", "--verify", target_ref)
         if not _SHA.fullmatch(target):
             raise _GitFailure()

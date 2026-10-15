@@ -13,7 +13,7 @@ import json
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,7 +49,7 @@ def _task_stopping(task: asyncio.Task[Any]) -> bool:
 
 
 class ToolApprovalBroker:
-    """Wait for an explicit decision without a timeout or automatic allowance."""
+    """Wait for a decision or an explicit change to the saved tool policy."""
 
     def __init__(self) -> None:
         self._pending: dict[str, _PendingApproval] = {}
@@ -84,6 +84,7 @@ class ToolApprovalBroker:
         run_id: str,
         request: Mapping[str, Any],
         owner_task: asyncio.Task[Any] | None = None,
+        live_policy_decision: Callable[[], bool | None] | None = None,
     ) -> bool:
         """Register one tool call and suspend it until allowed, denied or stopped."""
         self._identity(workspace_id, chat_id, run_id)
@@ -118,10 +119,25 @@ class ToolApprovalBroker:
         self._pending[snapshot.request_id] = entry
         owner.add_done_callback(owner_finished)
         try:
+            if live_policy_decision is None:
+                return await decision
+            while not decision.done():
+                # A completed explicit decision always wins. The policy check
+                # and decide are synchronous on the owning event loop.
+                policy_decision = live_policy_decision()
+                if policy_decision is not None:
+                    self.decide(
+                        snapshot.request_id, workspace_id=workspace_id,
+                        chat_id=chat_id, run_id=run_id, allow=policy_decision,
+                    )
+                    break
+                await asyncio.wait({decision}, timeout=0.25)
             return await decision
         finally:
             self._pending.pop(snapshot.request_id, None)
             owner.remove_done_callback(owner_finished)
+            if not decision.done():
+                decision.cancel()
 
     def pending(
         self,

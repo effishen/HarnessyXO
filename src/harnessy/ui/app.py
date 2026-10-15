@@ -50,6 +50,7 @@ from harnessy.agent.queue_retries import retry_queued_run, queued_retry_continue
 from harnessy.agent.saved_retries import retry_saved_run, saved_run_retry_payload
 from harnessy.agent.prompt_references import resolve_run_prompt_reference, resolve_run_origin_message
 from harnessy.agent.tool_approvals import TOOL_APPROVALS, ToolApprovalSnapshot
+from harnessy.agent.tools import ToolApprovalDecision, tool_permission_reason
 from harnessy.agent.external_targets import ExternalTargetBroker  # noqa: E402
 from harnessy.core.archive import is_archive, make_zip, safe_extract_archive  # noqa: E402
 from harnessy.core.access import HarnessyLoginMiddleware  # noqa: E402
@@ -1456,7 +1457,7 @@ class HarnessyPage:
             }
 
     def _save_ui_session(self) -> None:
-        self.settings['ui_session'] = {
+        session = {
             'open_tabs': [
                 {
                     'key': tab.key,
@@ -1478,7 +1479,7 @@ class HarnessyPage:
             'file_paths': {key: str(value) for key, value in self.file_paths.items()},
             'environment_subtabs': dict(self.environment_subtabs),
         }
-        self.machine.save_settings(self.settings)
+        self.settings = self.machine.update_settings({'ui_session': session}, replace_sections=('ui_session',))
 
     # ------------------------------------------------------------------ layout
     def build(self) -> None:
@@ -1882,8 +1883,7 @@ class HarnessyPage:
             self.sidebar_section_collapsed['archives'] = True
             self._apply_sidebar_section_state('archives')
         self.machine.touch_workspace(reg.id)
-        self.settings['last_workspace_id'] = reg.id
-        self.machine.save_settings(self.settings)
+        self.settings = self.machine.update_settings({'last_workspace_id': reg.id})
         if preserve_workspace_rows:
             # The clicked button must survive the second click and native dblclick
             # event. Repaint its highlight in place; only the chat lists need rebuilding.
@@ -2404,13 +2404,8 @@ class HarnessyPage:
         return normalize_prompt_navigator_options(general.get('prompt_navigator_options'))
 
     def _toggle_prompt_navigator(self) -> None:
-        general = self.settings.setdefault('general', {})
-        if not isinstance(general, dict):
-            general = {}
-            self.settings['general'] = general
         enabled = not self._prompt_navigator_enabled()
-        general['prompt_navigator'] = enabled
-        self.machine.save_settings(self.settings)
+        self.settings = self.machine.update_settings({'general': {'prompt_navigator': enabled}})
         if self.message_area is not None and self._ui_elements_alive(self.message_area):
             try:
                 self.message_area.client.run_javascript(
@@ -4007,8 +4002,7 @@ class HarnessyPage:
                         if remaining:
                             self.select_workspace(remaining[0])
                         else:
-                            self.settings['last_workspace_id'] = None
-                            self.machine.save_settings(self.settings)
+                            self.settings = self.machine.update_settings({'last_workspace_id': None})
                             self.refresh_sidebar()
                             self.refresh_tabs()
                     else:
@@ -4729,7 +4723,7 @@ class HarnessyPage:
             return False
         stored.update(deepcopy(changes))
         current.update(deepcopy(changes))
-        self.machine.save_settings(saved)
+        self.settings = self.machine.update_settings({'models': {'profiles': saved['models']['profiles']}})
         owner = getattr(self, '_thinking_owner', None)
         if owner:
             self._refresh_thinking_selector(*owner)
@@ -10888,9 +10882,9 @@ class HarnessyPage:
                     self._render_memory_notice(tool_view.root, ws, durable_id)
                 await compact_durable_live_tail()
 
-        async def approve_tool_once(request: dict[str, Any]) -> bool:
+        async def approve_tool_once(request: dict[str, Any]) -> ToolApprovalDecision:
             return await _await_tool_approval(ws, chat_id, process_live_state, request,
-                                             owner_task=_AGENT_TASKS.get(live_state_key))
+                                             machine=self.machine, owner_task=_AGENT_TASKS.get(live_state_key))
 
         async def tolerate_stale_ui(callback_name: str, callback, *args) -> None:
             try:
@@ -10984,6 +10978,7 @@ class HarnessyPage:
                 thinking=requested_thinking, skill=selected_skill,
                 run_id=str(process_live_state["run_id"]),
                 agent_slot_lease=agent_slot_lease,
+                live_permission_loader=self.machine.load_tool_permission_settings,
                 completion_gate_callback=_completion_gate_callback(self.machine, completion_details, completion_gate),
                 backend_recovery_callback=lambda state, details: _record_backend_recovery(
                     self.machine, state, details,
@@ -16724,10 +16719,10 @@ window.harnessyTerminalFocus = function(terminalId) {
         if owner_tab_key is not None and self.active_tab_key != owner_tab_key:
             return
         current_key, current_desc = self._file_sort_state()
-        general = self.settings.setdefault('general', {})
-        general['file_sort_key'] = key if key in {'name', 'modified', 'size', 'type'} else current_key
-        general['file_sort_descending'] = current_desc if descending is None else bool(descending)
-        self.machine.save_settings(self.settings)
+        self.settings = self.machine.update_settings({'general': {
+            'file_sort_key': key if key in {'name', 'modified', 'size', 'type'} else current_key,
+            'file_sort_descending': current_desc if descending is None else bool(descending),
+        }})
         self.refresh_tabs()
 
     def _render_files_tab(self, tab: OpenTab, ws: WorkspaceStore | ToolScope) -> None:
@@ -18668,7 +18663,9 @@ window.harnessyTerminalFocus = function(terminalId) {
 
     # --------------------------------------------------------------- settings
     def open_settings(self, initial_tab: str = 'General') -> None:
-        draft = deepcopy(self.settings)
+        self.settings = self.machine.load_settings()
+        original_settings = deepcopy(self.settings)
+        draft = deepcopy(original_settings)
         collectors: list[Any] = []
         instruction_writers: list[Any] = []
         settings_cleanups: list[Any] = []
@@ -18932,7 +18929,9 @@ window.harnessyTerminalFocus = function(terminalId) {
                                     'Off hides and blocks the tool family. Ask requests approval for protected actions. '
                                     'Long-running processes ask when the job starts, and browser automation asks when browser_open creates a new session; '
                                     'navigation and follow-up actions inside that HarnessyXO-owned session do not repeatedly prompt. '
-                                    'On allows actions without a confirmation dialog.'
+                                    'On allows actions without a confirmation dialog. Saved permission changes apply to active runs. '
+                                    'External Test Targets On also allows targets whose own mode is Ask; global Off always blocks. '
+                                    'Other required tool permissions still apply.'
                                 ).classes('text-xs hy-muted mb-2')
                                 with ui.grid(columns=2).classes('w-full gap-x-3 gap-y-1'):
                                     for permission_key, permission_label in permission_labels.items():
@@ -19258,14 +19257,12 @@ window.harnessyTerminalFocus = function(terminalId) {
                         )
                         old_dark = bool(self.settings.get('general', {}).get('dark', False))
                         new_dark = bool(draft.get('general', {}).get('dark', False))
-                        # Settings may stay open while the user opens/closes work
-                        # tabs or changes the selected workspace. Those live UI
-                        # session fields are not editable settings and must never
-                        # be rolled back by saving an older Settings-dialog draft.
+                        # Only edited preference fields belong to this dialog.
+                        # Other pages may have changed permissions or UI state
+                        # since it opened; preserve those current saved values.
                         for volatile_key in ('ui_session', 'last_workspace_id'):
-                            if volatile_key in self.settings:
-                                draft[volatile_key] = deepcopy(self.settings[volatile_key])
-                        self.machine.save_settings(draft)
+                            draft[volatile_key] = deepcopy(original_settings.get(volatile_key))
+                        self.settings = self.machine.save_settings_changes(original_settings, draft)
                         for write_instructions in instruction_writers:
                             write_instructions()
                         self.settings = self.machine.load_settings()
@@ -20388,11 +20385,45 @@ def _new_remote_live_state(
     }
 
 
+def _pending_tool_permission_reason(
+    machine: MachineStore, ws: WorkspaceStore, request: dict[str, Any],
+) -> tuple[str, dict[str, str]]:
+    """Reconcile only this request's required families with current saved policy."""
+    settings = machine.load_tool_permission_settings()
+    configured = settings['agent']['tool_permissions']
+    required = request.get('required_permissions')
+    if not isinstance(required, list) or not required:
+        primary = request.get('permission')
+        required = [primary] if isinstance(primary, str) and primary else []
+    if not required:
+        return 'ask', {}
+    states = {
+        str(key): str(configured.get(str(key), DEFAULT_TOOL_PERMISSIONS.get(str(key), 'off')))
+        for key in required
+    }
+    if any(value not in {'off', 'ask', 'on'} for value in states.values()):
+        raise ValueError('Invalid tool permission policy.')
+    target_state = target_mode = 'not_applicable'
+    if 'external_targets' in states:
+        arguments = request.get('arguments')
+        target_ref = arguments.get('target') if isinstance(arguments, dict) else None
+        if target_ref:
+            target = ws.get_external_target(str(target_ref))
+            if target is None or not target.enabled:
+                return 'target_unavailable', states
+            target_state, target_mode = 'enabled', target.approval_mode
+    return tool_permission_reason(
+        states, approve_when_ask=bool(request.get('approve_when_ask', True)),
+        target_state=target_state, target_mode=target_mode,
+    ), states
+
+
 async def _await_tool_approval(
     ws: WorkspaceStore, chat_id: str, state: dict[str, Any], request: dict[str, Any], *,
+    machine: MachineStore,
     owner_task: asyncio.Task[Any] | None = None,
-) -> bool:
-    """Keep Ask decisions with the running task, independent of any page DOM."""
+) -> ToolApprovalDecision:
+    """Keep pending decisions with the run and react to current saved permissions."""
     key = (ws.id, chat_id)
     run_id = str(state.get('run_id') or '')
     if _AGENT_LIVE_STATES.get(key) is not state or state.get('stopping') or not state.get('active'):
@@ -20400,10 +20431,33 @@ async def _await_tool_approval(
     state.update(awaiting_approval=True, status=f'Waiting for approval · {request.get("name") or "tool"}')
     state['revision'] = int(state.get('revision') or 0) + 1
     allowed = False
+    policy_reason = ''
+
+    def current_policy_decision() -> bool | None:
+        nonlocal policy_reason
+        if (_AGENT_LIVE_STATES.get(key) is not state or state.get('stopping')
+                or not state.get('active') or state.get('finished')
+                or str(state.get('run_id') or '') != run_id):
+            raise asyncio.CancelledError()
+        try:
+            reason, permission_states = _pending_tool_permission_reason(machine, ws, request)
+        except Exception:
+            reason, permission_states = 'policy_unavailable', {}
+        if reason == 'ask':
+            return None
+        policy_reason = reason
+        log_event(
+            'tools', 'tool_approval_policy_resolved', workspace_id=ws.id,
+            chat_id=chat_id, run_id=run_id, tool=request.get('name'),
+            permission_states=permission_states, reason=reason,
+        )
+        return reason not in {'blocked_off', 'target_unavailable', 'policy_unavailable'}
+
     try:
         allowed = await TOOL_APPROVALS.request(workspace_id=ws.id, chat_id=chat_id, run_id=run_id,
-                                             request=request, owner_task=owner_task)
-        return allowed
+                                             request=request, owner_task=owner_task,
+                                             live_policy_decision=current_policy_decision)
+        return ToolApprovalDecision(allowed, source='policy' if policy_reason else 'user')
     finally:
         if _AGENT_LIVE_STATES.get(key) is state:
             remaining = TOOL_APPROVALS.pending(workspace_id=ws.id, chat_id=chat_id, run_id=run_id)
@@ -20411,7 +20465,11 @@ async def _await_tool_approval(
             if state.get('stopping'):
                 state['status'] = 'Stopping generation…'
             elif not remaining:
-                state['status'] = ('Tool allowed once' if allowed else 'Tool request not approved')
+                state['status'] = (
+                    'Tool allowed by saved permissions' if allowed and policy_reason else
+                    'Tool blocked by saved permissions' if policy_reason else
+                    'Tool allowed once' if allowed else 'Tool request not approved'
+                )
             state['revision'] = int(state.get('revision') or 0) + 1
 
 
@@ -20522,8 +20580,9 @@ async def _run_headless_turn(
         async def on_status(status: str) -> None:
             publish(status=str(status or ''))
 
-        async def approve_tool_once(request: dict[str, Any]) -> bool:
-            return await _await_tool_approval(ws, chat_id, state, request, owner_task=current_task)
+        async def approve_tool_once(request: dict[str, Any]) -> ToolApprovalDecision:
+            return await _await_tool_approval(ws, chat_id, state, request,
+                                             machine=machine, owner_task=current_task)
 
         async def on_event(event: dict[str, Any]) -> None:
             nonlocal diagnostic_last_event
@@ -20697,6 +20756,7 @@ async def _run_headless_turn(
             ws, chat_id, settings, profile=profile, thinking=requested_thinking,
             skill='auto', run_id=str(state['run_id']),
             agent_slot_lease=agent_slot_lease,
+            live_permission_loader=machine.load_tool_permission_settings,
             completion_gate_callback=_completion_gate_callback(machine, completion_details, completion_gate),
             backend_recovery_callback=lambda recovery_state, details: _record_backend_recovery(
                 machine, recovery_state, details, project_label=f'{ws.name} / {chat.title}',

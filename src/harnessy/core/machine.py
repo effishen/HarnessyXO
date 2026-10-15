@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
+import tempfile
+import threading
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass
@@ -19,6 +21,11 @@ from .thinking import model_family
 from .rea_settings import DEFAULT_REA_SETTINGS, normalize_rea_settings
 
 GLOBAL_INSTRUCTIONS_NAME = 'GLOBAL_INSTRUCTIONS.md'
+
+# Pages and background workers may use separate stores for the same machine.
+# Keep their read/modify/write settings updates in one critical section.
+_SETTINGS_LOCKS: dict[str, Any] = {}
+_SETTINGS_LOCKS_GUARD = threading.Lock()
 
 
 def completion_hold_label(state: str) -> str:
@@ -202,6 +209,10 @@ class MachineStore:
         self.root = Path(root or settings_dir()).expanduser().absolute()
         self.root.mkdir(parents=True, exist_ok=True)
         self.settings_path = self.root / 'settings.json'
+        with _SETTINGS_LOCKS_GUARD:
+            self._settings_lock = _SETTINGS_LOCKS.setdefault(
+                str(self.settings_path.resolve()), threading.RLock(),
+            )
         self.global_instructions_path = self.root / GLOBAL_INSTRUCTIONS_NAME
         self.db_path = self.root / 'machine.db'
         self.skills_dir = self.root / 'skills'
@@ -847,25 +858,72 @@ class MachineStore:
         return result
 
     def load_settings(self) -> dict[str, Any]:
-        try:
-            data = json.loads(self.settings_path.read_text('utf-8'))
-        except (FileNotFoundError, json.JSONDecodeError):
-            data = {}
-        migrated, changed = _migrate_settings(data)
-        merged = _deep_merge(deepcopy(DEFAULT_SETTINGS), migrated)
-        merged = _normalize_settings(merged)
-        merged.setdefault('agent', {})['completion_check_enabled'] = True
-        if changed or merged != data:
-            self.save_settings(merged)
-        return merged
+        with self._settings_lock:
+            try:
+                data = json.loads(self.settings_path.read_text('utf-8'))
+            except (FileNotFoundError, json.JSONDecodeError):
+                data = {}
+            migrated, changed = _migrate_settings(data)
+            merged = _deep_merge(deepcopy(DEFAULT_SETTINGS), migrated)
+            merged = _normalize_settings(merged)
+            merged.setdefault('agent', {})['completion_check_enabled'] = True
+            if changed or merged != data:
+                self.save_settings(merged)
+            return merged
 
     def save_settings(self, data: dict[str, Any]) -> None:
-        migrated, _ = _migrate_settings(data)
-        merged = _normalize_settings(_deep_merge(deepcopy(DEFAULT_SETTINGS), migrated))
-        merged.setdefault('agent', {})['completion_check_enabled'] = True
-        tmp = self.settings_path.with_suffix('.tmp')
-        tmp.write_text(json.dumps(merged, indent=2), encoding='utf-8')
-        tmp.replace(self.settings_path)
+        with self._settings_lock:
+            migrated, _ = _migrate_settings(data)
+            merged = _normalize_settings(_deep_merge(deepcopy(DEFAULT_SETTINGS), migrated))
+            merged.setdefault('agent', {})['completion_check_enabled'] = True
+            with tempfile.NamedTemporaryFile(
+                mode='w', encoding='utf-8', prefix='.settings-', suffix='.tmp',
+                dir=self.root, delete=False,
+            ) as stream:
+                tmp = Path(stream.name)
+                json.dump(merged, stream, indent=2)
+            try:
+                tmp.replace(self.settings_path)
+            finally:
+                tmp.unlink(missing_ok=True)
+
+    def load_tool_permission_settings(self) -> dict[str, Any]:
+        """Read live grants strictly; missing/corrupt policy never restores defaults.
+
+        Unlike the preferences editor's migration path, this read must neither
+        repair the file nor synthesize an On grant for an executing tool.
+        """
+        with self._settings_lock:
+            data = json.loads(self.settings_path.read_text('utf-8'))
+            agent = data.get('agent') if isinstance(data, dict) else None
+            permissions = agent.get('tool_permissions') if isinstance(agent, dict) else None
+            if not isinstance(permissions, dict) or any(
+                permissions.get(key) not in {'off', 'ask', 'on'}
+                for key in DEFAULT_TOOL_PERMISSIONS
+            ):
+                raise ValueError('Saved tool permission policy is unavailable.')
+            return data
+
+    def update_settings(
+        self, changes: dict[str, Any], *, replace_sections: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        """Apply only the caller-owned fields to the latest saved preferences."""
+        with self._settings_lock:
+            current = self.load_settings()
+            if changes:
+                updated = _deep_merge(current, changes)
+                for key in replace_sections:
+                    if key in changes:
+                        updated[key] = deepcopy(changes[key])
+                self.save_settings(updated)
+                current = self.load_settings()
+            return current
+
+    def save_settings_changes(
+        self, original: dict[str, Any], updated: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Save edited draft fields without reverting another page's changes."""
+        return self.update_settings(_settings_changes(original, updated))
 
     def login_session_timeout_seconds(self) -> int:
         """Live authentication preference without reparsing settings per frame."""
@@ -999,6 +1057,18 @@ class MachineStore:
                     raise ValueError('Pinned workspaces must stay in their exact sidebar position.')
             con.executemany('UPDATE workspaces SET position=? WHERE id=?', list(enumerate(final)))
             con.commit()
+
+
+def _settings_changes(original: dict[str, Any], updated: dict[str, Any]) -> dict[str, Any]:
+    changes: dict[str, Any] = {}
+    for key, value in updated.items():
+        if isinstance(value, dict) and isinstance(original.get(key), dict):
+            nested = _settings_changes(original[key], value)
+            if nested:
+                changes[key] = nested
+        elif key not in original or original[key] != value:
+            changes[key] = deepcopy(value)
+    return changes
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

@@ -1,4 +1,4 @@
-# HarnessyXO v0.6.83 Features
+# HarnessyXO v0.6.84 Features
 
 ## Workspace test-target tabs
 
@@ -15,12 +15,12 @@
 - Tell the model which capabilities are requested, last observed or currently verified, and label virtual radios as emulated with no physical RF or USB chipset coverage.
 - Keep existing guest network configuration intact. Optional setup failures leave the shell available.
 
-## Private GitHub startup updates
+## Public GitHub startup updates
 
 - Check `effishen/HarnessyXO` before application imports when starting `python3 run.py` on macOS or Linux.
 - Apply clean `main` updates through fast-forward Git history and restart the launcher before setup.
-- Verify a ZIP installation against its matching version tag before adding Git metadata.
-- Use your computer's GitHub credential helper or SSH agent. Keep credentials out of source and remote URLs.
+- Verify a ZIP installation against its matching version tag before adding Git metadata. The first public check needs Git and internet access, without a GitHub account.
+- Download updates from the public repository over HTTPS without GitHub login. Existing SSH checkouts keep their saved remote; the updater reads the matching public HTTPS source.
 - Preserve settings, dependencies, runtime caches, workspaces and local code edits. Keep the current app available when a check fails.
 - Hold an installation lock for the lifetime of the app and detect incomplete source updates across restarts.
 - Publish versioned GitHub Release notes and verified downloads from committed application files, with the same 11 Markdown resources and no QA payload.
@@ -103,7 +103,10 @@ Workspace and machine databases use WAL so background reads can coexist with mes
 
 - With a permission set to Ask, queued/retried and direct runs wait for Allow once, Deny or Stop run. The card shows the original prompt, actual held slot and exact tool arguments; the sidebar also says Needs approval.
 - Reloading, switching projects, closing a tab or signing out does not silently decide the request. Reopen the chat or Run queue to act from a valid signed-in session.
-- Allow once applies to one request; an identical later command needs its own approval. Stale controls cannot decide or stop a newer run. New direct runs reload saved settings, and an Off permission blocks a pending Allow.
+- Allow once applies to one request; an identical later command needs its own approval. Stale controls cannot decide or stop a newer run. Saved permission changes apply during active runs and pending approvals. Off blocks execution even after an earlier Allow; explicit Deny and Stop remain final for that request.
+- External / Test Targets On skips confirmation for an enabled target; global Off blocks it. With global Ask, a target set to On can run without a dialog. Validate the required target before asking, and preserve other required tool permissions.
+- Opening tabs and changing workspace or navigator preferences preserve permission changes saved from another page.
+- Export reviewed permission decisions and separate approval/tool execution timings in `PERMISSIONS.json`; show missing historical measurements as unrecorded.
 - Waiting tools show Waiting for approval and accrue no execution time. Other queued work waits for the retained slot. A server restart interrupts the run; pending approvals are never replayed automatically.
 
 

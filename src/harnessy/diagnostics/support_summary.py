@@ -11,12 +11,14 @@ import hashlib
 import json
 from pathlib import Path
 from typing import Any
+from .permissions import PERMISSION_EVENTS
 
 _CHANNELS = ('harnessy', 'runtime', 'database', 'tools', 'backend', 'targets')
 _TAIL_BYTES = 2 * 1024 * 1024
 _MAX_ROWS = 20000
 _MAX_INCIDENTS = 20
 _CONTEXT_SECONDS = 30.0
+_PERMISSION_RECEIPTS = 120
 _ERROR_EVENTS = frozenset({
     'agent_run_error', 'headless_run_error', 'uncaught_exception',
     'sqlite_operation_error', 'tool_execution_error', 'request_error',
@@ -30,8 +32,11 @@ def _bounded_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     # Reserve sparse target evidence when busy database/model traffic fills the
     # common index. The separate TARGET_TIMELINE retains the same 600-row bound.
     targets = [row for row in rows if str(row.get('event')).startswith('test_target_')][-600:]
-    recent = rows[-(_MAX_ROWS - len(targets)):]
-    retained = {id(row): row for row in targets + recent}
+    permissions = [row for row in rows if row.get('event') in PERMISSION_EVENTS
+                   or (row.get('event') == 'tool_execution_complete'
+                       and ('permission_decision' in row or 'target_validation' in row))][-600:]
+    recent = rows[-(_MAX_ROWS - len(targets) - len(permissions)):]
+    retained = {id(row): row for row in targets + permissions + recent}
     return sorted(retained.values(), key=lambda row: row['timestamp'])
 
 
@@ -72,6 +77,16 @@ def _target_failure_classification(row: dict[str, Any]) -> str | None:
     if code in {'boot_timeout', 'shell_probe_timeout', 'controller_timeout'} or row.get('target_outcome') == 'timeout':
         return 'test_target_startup_timeout'
     return 'test_target_operation_failed'
+
+
+def _permission_failure_classification(row: dict[str, Any]) -> str | None:
+    if row.get('event') != 'tool_execution_complete':
+        return None
+    if row.get('target_validation') in {'missing', 'invalid', 'not_found', 'disabled'}:
+        return 'tool_target_validation_failed'
+    if row.get('error_code') == 'PERMISSION_POLICY_UNAVAILABLE':
+        return 'tool_permission_policy_unavailable'
+    return None
 
 
 def _rows(latest: Path, *, session_scope: str = 'current', tail_bytes: int = _TAIL_BYTES,
@@ -179,11 +194,137 @@ def _evidence(row: dict[str, Any]) -> dict[str, Any]:
         'target_id', 'target_backend', 'target_action', 'target_stage', 'target_outcome',
         'target_failure_code', 'operation_id', 'attempt', 'attempts', 'probe_attempts',
         'target_view_failure_code', 'target_interface',
+        'error_code', 'target_validation', 'permission', 'permission_decision',
+        'permission_source', 'permission_reason', 'permission_target_mode',
+        'permission_target_state', 'permission_changed', 'permission_states',
+        'required_permissions', 'phase', 'approval_required', 'approved',
+        'approval_wait_seconds', 'execution_duration_seconds', 'coordination_wait_seconds',
     )
     evidence = {key: row[key] for key in keys if key in row}
     if _is_lock(row):
         evidence['error_code'] = 'sqlite_database_locked'
     return evidence
+
+
+def _permission_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
+    """Summarize recorded boundaries; absence never establishes zero prompting."""
+    from .permissions import safe_timing, validate_permission_event
+
+    decisions = [row for row in rows if row.get('event') == 'tool_permission_decision']
+    resolutions = [row for row in rows if row.get('event') == 'tool_approval_policy_resolved']
+    completions = [row for row in rows if row.get('event') == 'tool_execution_complete']
+    request_ids: set[tuple[Any, ...]] = set()
+    approved_ids: set[tuple[Any, ...]] = set()
+    denied_ids: set[tuple[Any, ...]] = set()
+    validation_ids: set[tuple[Any, ...]] = set()
+    changed_ids: set[tuple[Any, ...]] = set()
+    sources: Counter[str] = Counter()
+    reasons: Counter[str] = Counter()
+    receipts: list[dict[str, Any]] = []
+
+    def identity(row: dict[str, Any]) -> tuple[Any, ...]:
+        safe = validate_permission_event('tool_permission_decision', row) or {}
+        return (row.get('session_scope'),) + tuple(safe.get(key) for key in ('workspace_id', 'chat_id', 'run_id')) + (
+            safe.get('call_id') or row['timestamp'],)
+
+    for row in decisions:
+        key = identity(row)
+        reason = row.get('permission_reason')
+        if isinstance(reason, str):
+            reasons[reason] += 1
+        source = row.get('permission_source')
+        if isinstance(source, str):
+            sources[source] += 1
+        if reason == 'ask':
+            request_ids.add(key)
+        if reason == 'approved_once' or row.get('approved') is True:
+            approved_ids.add(key)
+        if row.get('execution_status') == 'denied' or row.get('approved') is False:
+            denied_ids.add(key)
+        if row.get('permission_changed') is True:
+            changed_ids.add(key)
+        if row.get('permission_target_state') in {'missing', 'invalid', 'not_found', 'disabled'}:
+            validation_ids.add(key)
+
+    timed = []
+    for row in completions:
+        if row.get('target_validation') in {'missing', 'invalid', 'not_found', 'disabled'}:
+            validation_ids.add(identity(row))
+        if row.get('execution_status') == 'denied':
+            denied_ids.add(identity(row))
+        if any(safe_timing(row.get(key)) is not None for key in (
+            'approval_wait_seconds', 'execution_duration_seconds', 'coordination_wait_seconds',
+        )):
+            timed.append(row)
+
+    evidence_rows = [row for row in rows if row.get('event') in PERMISSION_EVENTS
+                     or (row.get('event') == 'tool_execution_complete'
+                         and ('permission_decision' in row or 'target_validation' in row
+                              or 'approval_wait_seconds' in row))]
+    for row in evidence_rows[-_PERMISSION_RECEIPTS:]:
+        # Reuse the reviewed permission projection, including its fixed tool
+        # names and identity validation. Completion bodies never enter this file.
+        safe = validate_permission_event(row['event'] if row['event'] in PERMISSION_EVENTS else 'tool_permission_decision', row) or {}
+        safe['event'] = row['event']
+        for key in ('timestamp', 'session_scope', 'channel'):
+            safe[key] = row[key]
+        if row.get('error_code') in {'TARGET_POLICY', 'PERMISSION_POLICY_UNAVAILABLE'}:
+            safe['error_code'] = row['error_code']
+        receipts.append(safe)
+    waits = [safe_timing(row.get('approval_wait_seconds')) for row in timed]
+    waits = [value for value in waits if value is not None]
+    executions = [safe_timing(row.get('execution_duration_seconds')) for row in timed]
+    executions = [value for value in executions if value is not None]
+    coordination = [safe_timing(row.get('coordination_wait_seconds')) for row in timed]
+    coordination = [value for value in coordination if value is not None]
+    unlabelled_policy = sum(row.get('error_code') == 'TARGET_POLICY'
+                           and row.get('target_validation') not in {'missing', 'invalid', 'not_found', 'disabled'}
+                           for row in completions)
+    audit: dict[str, Any] = {
+        'schema_version': 1, 'status': 'recorded' if decisions or resolutions or timed or validation_ids else 'unrecorded',
+        'scope': 'bounded_current_and_previous_session_log_tails',
+        'approval_count_unit': 'unique_tool_calls',
+        'decision_records': len(decisions), 'tool_calls_requiring_approval': len(request_ids) if decisions else None,
+        'approvals_granted': len(approved_ids) if decisions else None,
+        'approvals_denied': len(denied_ids) if decisions else None,
+        'permission_changes_observed': len(changed_ids) if decisions else None,
+        'target_validation_failures': len(validation_ids) if decisions or validation_ids else None,
+        'target_policy_failures_without_validation_label': unlabelled_policy,
+        'timed_tool_completions': len(timed), 'approval_wait_records': len(waits),
+        'approval_wait_seconds': round(sum(waits), 6) if waits else None,
+        'maximum_approval_wait_seconds': max(waits, default=None),
+        'execution_duration_seconds': round(sum(executions), 6) if executions else None,
+        'coordination_wait_seconds': round(sum(coordination), 6) if coordination else None,
+        'decision_source_record_counts': dict(sources), 'decision_reason_record_counts': dict(reasons),
+        'automatic_policy_resolution_records': len(resolutions) if decisions or resolutions else None,
+        'automatic_policy_resolution_reasons': dict(Counter(row.get('reason') for row in resolutions if isinstance(row.get('reason'), str))),
+        'receipts_available': len(evidence_rows), 'receipts_retained': len(receipts),
+        'recent_receipts': receipts,
+    }
+    lines = ['Tool permissions: PERMISSIONS.json contains reviewed decision receipts and separate timing boundaries.']
+    if not decisions:
+        lines.append('  No permission decision receipts were recorded; effective settings and the reason for a dialog cannot be reconstructed.')
+    else:
+        lines.append(f'  Tool calls requiring approval: {len(request_ids)}; granted: {len(approved_ids)}; denied: {len(denied_ids)}; '
+                     f'permission changes observed: {len(changed_ids)}.')
+        lines.append('  Decision source records: ' + '; '.join(f'{key} {value}' for key, value in sorted(sources.items())) + '.')
+    if resolutions:
+        lines.append(f'  Pending approval resolutions by current policy: {len(resolutions)}; reason records: '
+                     + '; '.join(f'{key} {value}' for key, value in sorted(audit['automatic_policy_resolution_reasons'].items())) + '.')
+    if waits:
+        execution_label = f'{sum(executions):.3f}s' if executions else 'unrecorded'
+        coordination_label = f'{sum(coordination):.3f}s' if coordination else 'unrecorded'
+        lines.append(f'  Recorded approval wait: {sum(waits):.3f}s across {len(waits)} completed tool records; '
+                     f'guest/tool execution: {execution_label}; coordination wait: {coordination_label}.')
+    else:
+        lines.append('  Approval wait timing was not recorded; total tool duration does not establish time spent waiting for permission.')
+    if validation_ids:
+        lines.append(f'  Target argument validation failures observed: {len(validation_ids)}; fixed labels distinguish missing/invalid/not-found/disabled targets without target names.')
+    if unlabelled_policy:
+        lines.append(f'  Target policy failures without a recorded validation label: {unlabelled_policy}; their cause and any approval wait remain unverified.')
+    lines.extend(['  Approval counts are unique tool calls, not the number of displayed dialogs; an unavailable approval handler may prevent a dialog from opening.',
+                  '  Counts describe retained receipts; pending or older approvals may be absent. No saved settings, commands or target names are collected.', ''])
+    return audit, lines
 
 
 def _has_frames(value: Any) -> bool:
@@ -257,7 +398,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
                         if row.get('event') == 'vm_startup_observation' and isinstance(row.get('command_id'), str)
                         and _vm_failure_classification(row)}
     failures = [row for row in rows if (row.get('event') in _ERROR_EVENTS or _vm_failure_classification(row)
-                                       or _target_failure_classification(row) or _is_lock(row))
+                                       or _target_failure_classification(row) or _permission_failure_classification(row) or _is_lock(row))
                 and not (row.get('event') in {'environment_command_finished', 'environment_command_timeout'}
                          and isinstance(row.get('command_id'), str)
                          and (row.get('session_scope'), row.get('command_id')) in observation_keys)]
@@ -269,6 +410,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         lock = _is_lock(failure)
         vm_classification = _vm_failure_classification(failure)
         target_classification = _target_failure_classification(failure)
+        permission_classification = _permission_failure_classification(failure)
         if vm_classification == 'vm_controller_interrupted' and not isinstance(failure.get('controller_signal'), str):
             code = failure.get('controller_returncode', failure.get('returncode'))
             failure = {**failure, 'controller_signal': {-2: 'SIGINT', -9: 'SIGKILL', -15: 'SIGTERM'}.get(code, 'other')}
@@ -299,7 +441,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         stalls = [row for row in before if row.get('event') in {'event_loop_stall', 'event_loop_stall_sample'}]
         transcript_deferrals = [row for row in related if row.get('event') == 'transcript_refresh_deferred']
         missing: list[str] = []
-        if not _has_frames(failure) and not any(_has_frames(row) for row in database_errors):
+        if not permission_classification and not _has_frames(failure) and not any(_has_frames(row) for row in database_errors):
             missing.append('exception_traceback_unavailable')
         if lock and not database_errors:
             missing.append('database_operation_not_recorded')
@@ -308,7 +450,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         identity = json.dumps(_evidence(failure), sort_keys=True)
         incidents.append({
             'incident_id': hashlib.sha256(identity.encode()).hexdigest()[:24],
-            'classification': 'sqlite_lock_contention' if lock else target_classification or vm_classification or 'operation_error',
+            'classification': 'sqlite_lock_contention' if lock else permission_classification or target_classification or vm_classification or 'operation_error',
             'failure': _evidence(failure),
             'nearby_database_errors': [_evidence(row) for row in database_errors[-3:]],
             'last_successful_tool': successful_tool,
@@ -337,6 +479,8 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         'database_errors': sum(row.get('event') == 'sqlite_operation_error' or _is_lock(row) for row in rows),
         'database_operation_errors': counts['sqlite_operation_error'], 'incidents': incidents,
     }
+    permission_audit, permission_lines = _permission_audit(rows)
+    index['permission_audit'] = permission_audit
     safe_vm_report, vm_lines = _vm_log_coverage(vm_report)
     if safe_vm_report is not None:
         index['vm_log_evidence'] = safe_vm_report
@@ -376,6 +520,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         'Zero instrumented SQLite operation errors does not exclude lock errors recorded by other application operations.', '',
         *vm_lines,
         *target_lines,
+        *permission_lines,
     ]
     if not incidents:
         lines.append('No recorded failure event was found in the examined logs; this does not establish that no failure occurred.')
@@ -386,6 +531,10 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
             if failure.get(key):
                 lines.append(f'  {key}: {failure[key]}')
         classification = incident['classification']
+        if classification == 'tool_target_validation_failed':
+            lines.append(f'  Target argument validation: {failure.get("target_validation", "unrecorded")}; no target name or command is included.')
+        if classification == 'tool_permission_policy_unavailable':
+            lines.append('  The saved permission policy was unavailable; execution was blocked rather than using a stale policy.')
         if classification.startswith('test_target_'):
             for key in ('target_id', 'target_backend', 'target_action', 'target_stage', 'target_failure_code',
                         'target_interface', 'target_view_failure_code', 'elapsed_seconds', 'attempt', 'timeout_seconds'):

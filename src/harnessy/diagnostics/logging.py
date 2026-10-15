@@ -279,6 +279,13 @@ def _safe_event_field(key: str, value: Any) -> Any:
     """Keep reviewed structured evidence intact, without widening raw limits."""
     if _is_sensitive_log_key(key):
         return '<redacted>'
+    if key in {
+        'permission_decision', 'permission_states', 'required_permissions',
+        'permission_source', 'permission_reason', 'permission_target_mode',
+        'permission_target_state', 'target_validation', 'approval_wait_seconds',
+        'execution_duration_seconds', 'coordination_wait_seconds',
+    }:
+        return _privacy_safe_value(value, key=key)
     if key in {'fault', 'exception_evidence'}:
         from .faults import validate_fault_evidence
 
@@ -808,6 +815,13 @@ class DiagnosticsManager:
             # hot path. The precise operation evidence has already been stored.
             return
         logger = self.logger(channel)
+        if event in {'tool_permission_decision', 'tool_approval_policy_resolved'}:
+            from .permissions import validate_permission_event
+
+            payload = validate_permission_event(event, fields)
+            if payload is not None:
+                logger.log(level, json.dumps(payload, ensure_ascii=False, separators=(',', ':')))
+            return
         # Process the field names too: passing only each value bypassed the
         # secret-key checks for top-level password/token fields.
         payload = {
@@ -1207,6 +1221,29 @@ def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
     lowered = key.lower()
     if _is_sensitive_log_key(lowered):
         return '<redacted>'
+    if isinstance(value, dict) and isinstance(value.get('event'), str) and value['event'] in {'tool_permission_decision', 'tool_approval_policy_resolved'}:
+        from .permissions import validate_permission_event
+
+        return validate_permission_event(value['event'], value) or {'event': 'tool_permission_decision'}
+    if lowered in {'permission_decision', 'permission_states', 'required_permissions'}:
+        from .permissions import PERMISSION_FAMILIES, validate_permission_decision, validate_permission_states
+
+        if lowered == 'permission_decision':
+            return validate_permission_decision(value)
+        if lowered == 'permission_states':
+            return validate_permission_states(value)
+        return [item for item in value[:len(PERMISSION_FAMILIES)]
+                if isinstance(item, str) and item in PERMISSION_FAMILIES] if isinstance(value, (list, tuple)) else []
+    if lowered in {'approval_wait_seconds', 'execution_duration_seconds', 'coordination_wait_seconds'}:
+        from .permissions import safe_timing
+
+        return safe_timing(value)
+    if lowered in {'permission_source', 'permission_reason', 'permission_target_mode', 'permission_target_state', 'target_validation'}:
+        from .permissions import PERMISSION_ENUMS
+
+        if value is None:
+            return None
+        return value if isinstance(value, str) and value in PERMISSION_ENUMS[lowered] else _privacy_marker(value, label=lowered)
     if lowered.startswith('target_'):
         from .test_target_logs import TARGET_ENUMS
         if lowered in TARGET_ENUMS:
@@ -1657,6 +1694,10 @@ def _privacy_manifest(*, include_content: bool = False) -> str:
         'SUMMARY.txt and INCIDENTS.json describe recent failures, relevant tool completion, '\
         'nearby event-loop stalls, and missing evidence. EXPORT_METADATA.json identifies '\
         'the session, application/runtime versions when recorded, and capture time with its timezone.\n\n'
+        'PERMISSIONS.json contains bounded, content-free tool permission receipts: reviewed permission '
+        'families/states, decision source and reason, argument-validation labels, and approval wait '
+        'separately from execution and coordination time. It never reads saved settings or exports '
+        'commands, target names or credentials. Missing receipts leave the reason for a dialog unverified.\n\n'
         'VM_LOGS.json records bounded Lima serial/hostagent source coverage, missing/unsafe/unreadable sources, '
         'and truncation limits. The default vm-logs/ members contain reviewed technical signal records only; '
         'arbitrary guest lines, paths, names and message bodies are omitted. These tails can contain observations '
@@ -1816,6 +1857,9 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
                            'VM_LOGS.json records VM log source coverage; available retained VM evidence is under vm-logs/.\n')
             zf.writestr('SUMMARY.txt', summary)
             zf.writestr('INCIDENTS.json', json.dumps(incidents, ensure_ascii=False, indent=2))
+            zf.writestr('PERMISSIONS.json', json.dumps(incidents.get('permission_audit', {
+                'schema_version': 1, 'status': 'unavailable', 'reason': 'summary_generation_failed',
+            }), ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('VM_LOGS.json', json.dumps(vm_report, ensure_ascii=False, indent=2, allow_nan=False))
             for name, payload in vm_members.items():
                 zf.writestr(name, payload)

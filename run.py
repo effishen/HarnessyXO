@@ -306,8 +306,8 @@ def main() -> None:
             "history_not_fast_forward": "Source update skipped: local Git history needs review. Starting the installed version.",
             "windows_updates_unsupported": "Automatic source updates currently support macOS and Linux. Starting the installed version.",
             "branch_not_managed": "Source update skipped: this checkout is not on main. Starting the installed version.",
-            "check_unavailable": "Source update unavailable. Check internet access and GitHub authentication; starting the installed version.",
-            "zip_bootstrap_unavailable": "Source update unavailable. Check Git, internet access and GitHub authentication; starting the installed version.",
+            "check_unavailable": "Source update unavailable. Check internet access to the public GitHub repository; starting the installed version.",
+            "zip_bootstrap_unavailable": "Source update unavailable. Check Git and internet access to the public GitHub repository; starting the installed version.",
         }
         print(messages.get(outcome, f"Source update skipped ({outcome}). Starting the installed version."), flush=True)
     app_entry = app_dir / "harnessy_app.py"

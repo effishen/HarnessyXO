@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.6.84
+
+- Fetch startup updates on macOS and Linux from the now-public `effishen/HarnessyXO` repository over HTTPS without GitHub login, including existing installations whose saved origin uses SSH. Keep local edits, settings and workspace data intact.
+- Apply saved tool permissions to active runs and pending approvals. External / Test Targets **On** allows tools for enabled targets without repeated confirmation; **Off**, explicit Deny and Stop still block execution. Other required permissions continue to apply.
+- Keep newly saved permissions when another page opens tabs, selects a workspace or changes navigator/file-list preferences. Save only the settings owned by that action.
+- Check missing, unknown and disabled targets before asking for approval. Return a target-selection error instead of showing a dialog for a call that cannot run.
+- Add `PERMISSIONS.json` with content-free permission decisions and separate approval-wait timing, so support can distinguish a permission wait from slow guest execution.
+- Preserve existing VMs, workspace data, radio capability reporting and REA. Leave README unchanged. Keep the same 11 Markdown files and exclude QA material from the app package.
+
 ## v0.6.83
 
 - Move test-target management into **Workspace Environment → Test targets**. Open guest Shell, LuCI Web UI and VNC Desktop views in main-area tabs; retain workspace/target selections through browser reloads.

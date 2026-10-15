@@ -43,11 +43,45 @@ from .external_targets import ExternalTargetBroker, ExternalTargetError
 from .rea import ReaClient, ReaError, rea_status as local_rea_status
 
 ToolHandler = Callable[[dict[str, Any]], Awaitable[str]]
-ToolApprovalCallback = Callable[[dict[str, Any]], Awaitable[bool]]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolApprovalDecision:
+    allowed: bool
+    source: str = 'user'
+
+    def __bool__(self) -> bool:
+        return self.allowed
+
+
+ToolApprovalCallback = Callable[[dict[str, Any]], Awaitable[bool | ToolApprovalDecision]]
 ToolStatusCallback = Callable[[str], Awaitable[None]]
 
 
 VALID_TOOL_PERMISSIONS = {'off', 'ask', 'on'}
+
+
+def tool_permission_reason(
+    states: dict[str, str], *, approve_when_ask: bool = True,
+    target_state: str = 'not_applicable', target_mode: str = 'not_applicable',
+    approved_permissions: set[str] | frozenset[str] = frozenset(),
+    owned_session: bool = False,
+) -> str:
+    """Shared policy precedence for execution and pending-request reconciliation."""
+    if 'off' in states.values():
+        return 'blocked_off'
+    ask = {key for key, value in states.items() if value == 'ask'}
+    if not ask:
+        return 'global_on'
+    if not approve_when_ask:
+        return 'owned_session' if owned_session else 'read_only'
+    if target_state == 'enabled' and target_mode == 'on':
+        ask.discard('external_targets')
+        if not ask:
+            return 'target_on'
+    if ask <= approved_permissions:
+        return 'approved_once'
+    return 'ask'
 
 # Reviewed REA 6.4.0 static reads only. Discovery never expands this boundary.
 REA_NATIVE_QUERY_KEYS = {
@@ -337,12 +371,16 @@ class WorkspaceToolbox:
         self, workspace: WorkspaceStore, chat_id: str, settings: dict[str, Any], *,
         profile: dict[str, Any] | None = None, sticky_mutation_lease: bool = False,
         agent_slot_lease: Any | None = None, thinking: str | None = None,
+        live_permission_loader: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self.workspace = workspace
         self.chat_id = chat_id
         self.run_id = uuid.uuid4().hex
         self.tool_call_id = ''
         self.settings = settings
+        self._live_permission_loader = live_permission_loader
+        self._live_tool_permissions: dict[str, str] | None = None
+        self._permission_source = 'run_start'
         self.profile = dict(profile) if isinstance(profile, dict) else None
         self.root = workspace.active_root_path(chat_id).resolve()
         self.environment = EnvironmentManager(workspace.root).provider() if workspace.is_vm_workspace else None
@@ -1053,6 +1091,9 @@ class WorkspaceToolbox:
     def permission_for(self, permission: str | None) -> str:
         if permission is None:
             return 'on'
+        live = getattr(self, '_live_tool_permissions', None)
+        if live is not None:
+            return live.get(permission, 'off')
         agent = self.settings.get('agent', {}) if isinstance(self.settings.get('agent'), dict) else {}
         configured = agent.get('tool_permissions') if isinstance(agent.get('tool_permissions'), dict) else {}
         value = str(configured.get(permission, '') or '').strip().lower()
@@ -1064,6 +1105,59 @@ class WorkspaceToolbox:
         if permission == 'shell' and 'shell_enabled' in agent:
             return 'on' if bool(agent.get('shell_enabled', False)) else 'off'
         return DEFAULT_TOOL_PERMISSIONS.get(permission, 'off')
+
+    def _refresh_permission_policy(self) -> bool:
+        """Refresh only tool policy; the model/profile remain a run snapshot.
+
+        The loader must return normalized saved settings, as MachineStore does.
+        Never fall back to an older grant when a live policy cannot be read.
+        """
+        loader = getattr(self, '_live_permission_loader', None)
+        if loader is None:
+            self._permission_source = 'run_start'
+            return True
+        try:
+            saved = loader()
+            agent = saved.get('agent') if isinstance(saved, dict) else None
+            permissions = agent.get('tool_permissions') if isinstance(agent, dict) else None
+            if not isinstance(permissions, dict) or any(
+                permissions.get(key) not in VALID_TOOL_PERMISSIONS
+                for key in DEFAULT_TOOL_PERMISSIONS
+            ):
+                raise ValueError('Invalid saved tool policy.')
+            self._live_tool_permissions = {
+                key: permissions[key] for key in DEFAULT_TOOL_PERMISSIONS
+            }
+            self._permission_source = 'saved_settings'
+            return True
+        except Exception:
+            self._live_tool_permissions = {key: 'off' for key in DEFAULT_TOOL_PERMISSIONS}
+            self._permission_source = 'unavailable'
+            return False
+
+    def _permission_target_context(
+        self, definition: ToolDefinition, arguments: dict[str, Any],
+    ) -> tuple[str, str, dict[str, Any] | None]:
+        if definition.permission != 'external_targets' or 'target' not in definition.parameters.get('required', []):
+            return 'not_applicable', 'not_applicable', None
+        raw = arguments.get('target')
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            state, error = 'missing', 'Specify a configured target id or exact target name. No target was selected.'
+        elif not isinstance(raw, str) or any(char in raw for char in ('\x00', '\r', '\n')):
+            state, error = 'invalid', 'The target must be a configured target id or exact target name.'
+        else:
+            target = self.workspace.get_external_target(raw.strip())
+            if target is None:
+                state, error = 'not_found', 'The selected external target no longer exists.'
+            elif not target.enabled:
+                state, error = 'disabled', 'The selected external target is disabled.'
+            else:
+                return 'enabled', 'on' if target.approval_mode == 'on' else 'ask', None
+        return state, 'not_applicable', {
+            'ok': False, 'error_code': 'TARGET_POLICY', 'target_validation': state,
+            'error': error, 'write_applied': False,
+            'next_model_action': 'Use list_external_targets and pass an explicit enabled target. Do not infer a target.',
+        }
 
     def permission_states_for(self, definition: ToolDefinition) -> dict[str, str]:
         return {
@@ -1081,6 +1175,7 @@ class WorkspaceToolbox:
 
     @property
     def schemas(self) -> list[dict[str, Any]]:
+        self._refresh_permission_policy()
         schemas: list[dict[str, Any]] = []
         for definition in self.registry.values():
             if not self._definition_available(definition):
@@ -1288,6 +1383,127 @@ class WorkspaceToolbox:
         self.execution_history.append(record)
         acquired_mutation_lease_this_call = False
         execution_started: float | None = None
+        approved_permissions: set[str] = set()
+        previous_permission_states = dict(permission_states)
+        policy_changed = False
+
+        async def authorize(phase: str, *, allow_prompt: bool = True) -> str | None:
+            nonlocal permission_states, permission_state, previous_permission_states, policy_changed
+            while True:
+                available = self._refresh_permission_policy()
+                permission_states = self.permission_states_for(definition)
+                permission_state = self.effective_permission_for(definition)
+                policy_changed = policy_changed or permission_states != previous_permission_states
+                previous_permission_states = dict(permission_states)
+                target_state, target_mode, target_error = (
+                    self._permission_target_context(definition, arguments)
+                    if available and permission_state != 'off'
+                    else ('not_applicable', 'not_applicable', None)
+                )
+                approval_required = definition.approve_when_ask
+                owned_session = False
+                if name == 'browser_open' and str(arguments.get('session_id') or '').strip():
+                    owned_session = BROWSER_SESSIONS.owns(
+                        workspace_key=self._browser_workspace_key(),
+                        session_id=str(arguments.get('session_id') or '').strip(),
+                    )
+                    approval_required = not owned_session
+                reason = tool_permission_reason(
+                    permission_states, approve_when_ask=approval_required,
+                    target_state=target_state, target_mode=target_mode,
+                    approved_permissions=approved_permissions, owned_session=owned_session,
+                )
+                if not available:
+                    reason = 'policy_unavailable'
+                elif reason != 'blocked_off' and target_error:
+                    reason = 'target_invalid'
+                decision = {
+                    'source': self._permission_source, 'effective': permission_state,
+                    'states': dict(permission_states), 'target_mode': target_mode,
+                    'target_state': target_state, 'reason': reason, 'changed': policy_changed,
+                }
+                record.update(permission=permission_state, permission_decision=decision)
+                log_event(
+                    'tools', 'tool_permission_decision', workspace_id=self.workspace.id,
+                    chat_id=self.chat_id, run_id=self.run_id, call_id=self.tool_call_id,
+                    tool=name, category=definition.category, permission=permission_state,
+                    phase=phase, permission_source=self._permission_source,
+                    permission_reason=reason, permission_target_mode=target_mode,
+                    permission_target_state=target_state, permission_changed=policy_changed,
+                    permission_states=dict(permission_states),
+                    required_permissions=list(definition.required_permissions),
+                    permission_decision=decision,
+                )
+                if not available:
+                    record['status'] = 'blocked'
+                    return json.dumps({
+                        'ok': False, 'error_code': 'PERMISSION_POLICY_UNAVAILABLE',
+                        'error': 'Saved tool permissions could not be read. The tool did not run. Save Settings and retry.',
+                        'write_applied': False,
+                    })
+                if reason == 'blocked_off':
+                    disabled = [key for key, state in permission_states.items() if state == 'off']
+                    record['status'] = 'blocked'
+                    return json.dumps({
+                        'ok': False, 'error_code': 'TOOL_PERMISSION_OFF',
+                        'error': (f'Tool {name} is Off in Settings → Agent / Tools because the required '
+                                  f'permission {", ".join(disabled)} is Off.'),
+                        'required_permissions': list(definition.required_permissions),
+                        'permission_states': permission_states,
+                    })
+                if target_error:
+                    record['status'] = 'blocked'
+                    return json.dumps(target_error)
+                if reason != 'ask':
+                    return None
+                if not allow_prompt:
+                    record['status'] = 'blocked'
+                    return json.dumps({
+                        'ok': False, 'error_code': 'PERMISSION_POLICY_CHANGED',
+                        'error': 'Saved permissions changed while this tool was waiting. The tool did not run. Retry using the current permissions.',
+                        'write_applied': False,
+                    })
+                if approve is None:
+                    record['status'] = 'blocked'
+                    return json.dumps({
+                        'ok': False, 'error_code': 'APPROVAL_UNAVAILABLE',
+                        'error': (f'Tool {name} requires user approval, but this executor has no approval handler. '
+                                  'No user decision was received; the tool did not run.'),
+                        'required_permissions': list(definition.required_permissions),
+                        'permission_states': permission_states,
+                    })
+                ask_permissions = {key for key, state in permission_states.items() if state == 'ask'}
+                if target_state == 'enabled' and target_mode == 'on':
+                    ask_permissions.discard('external_targets')
+                request = {
+                    'name': name, 'category': definition.category,
+                    'permission': ','.join(sorted(ask_permissions)),
+                    'required_permissions': list(definition.required_permissions),
+                    'permission_states': dict(permission_states),
+                    'permission_decision': decision, 'approve_when_ask': approval_required,
+                    'read_only': definition.read_only, 'destructive': definition.destructive,
+                    'arguments': arguments,
+                }
+                wait_started = time.perf_counter()
+                try:
+                    response = await approve(request)
+                    allowed = bool(response)
+                finally:
+                    record['approval_wait_seconds'] += max(0.0, time.perf_counter() - wait_started)
+                if not allowed:
+                    if isinstance(response, ToolApprovalDecision) and response.source != 'user':
+                        blocked = await authorize('after_approval', allow_prompt=False)
+                        record['status'] = 'blocked'
+                        return blocked or json.dumps({
+                            'ok': False, 'error_code': 'PERMISSION_POLICY_CHANGED',
+                            'error': 'Saved permissions changed while this tool was waiting. The tool did not run. Retry using the current permissions.',
+                            'write_applied': False,
+                        })
+                    record['status'] = 'denied'
+                    return json.dumps({'ok': False, 'error': f'User approval was required and not granted for tool {name}.'})
+                if not isinstance(response, ToolApprovalDecision) or response.source == 'user':
+                    approved_permissions.update(ask_permissions)
+                phase = 'after_approval'
         try:
             self.output_policy = self.workspace.output_policy(self.chat_id)
             self._refresh_project_namespace()
@@ -1313,18 +1529,6 @@ class WorkspaceToolbox:
                 })
                 record['result'] = result
                 return result
-            if permission_state == 'off':
-                disabled = [name for name, state in permission_states.items() if state == 'off']
-                record['status'] = 'blocked'
-                return json.dumps({
-                    'ok': False,
-                    'error': (
-                        f'Tool {name} is Off in Settings → Agent / Tools because the required '
-                        f'permission {", ".join(disabled)} is Off.'
-                    ),
-                    'required_permissions': list(definition.required_permissions),
-                    'permission_states': permission_states,
-                })
             if definition.category in {'filesystem', 'shell', 'processes', 'git', 'code_intelligence', 'rea'}:
                 try:
                     root_selection_current = self.workspace.active_root_path(self.chat_id).resolve() == self.root
@@ -1346,47 +1550,10 @@ class WorkspaceToolbox:
                     })
                     record.update(status='failed', result=result)
                     return result
-            approval_required = definition.approve_when_ask
-            if name == 'browser_open' and str(arguments.get('session_id') or '').strip():
-                approval_required = not BROWSER_SESSIONS.owns(
-                    workspace_key=self._browser_workspace_key(),
-                    session_id=str(arguments.get('session_id') or '').strip(),
-                )
-            if definition.permission == 'external_targets' and str(arguments.get('target') or '').strip():
-                target = self.workspace.get_external_target(str(arguments.get('target') or '').strip())
-                if target is not None and target.enabled and target.approval_mode == 'on':
-                    approval_required = False
-            if permission_state == 'ask' and approval_required:
-                if approve is None:
-                    result = json.dumps({
-                        'ok': False,
-                        'error_code': 'APPROVAL_UNAVAILABLE',
-                        'error': (
-                            f'Tool {name} requires user approval, but this executor has no approval handler. '
-                            'No user decision was received; the tool did not run.'
-                        ),
-                        'required_permissions': list(definition.required_permissions),
-                        'permission_states': permission_states,
-                    })
-                    record.update(status='blocked', result=result)
-                    return result
-                ask_permissions = [name for name, state in permission_states.items() if state == 'ask']
-                request = {
-                    'name': name, 'category': definition.category,
-                    'permission': ask_permissions[0] if len(ask_permissions) == 1 else ','.join(ask_permissions),
-                    'required_permissions': list(definition.required_permissions),
-                    'permission_states': permission_states,
-                    'read_only': definition.read_only, 'destructive': definition.destructive,
-                    'arguments': arguments,
-                }
-                wait_started = time.perf_counter()
-                try:
-                    allowed = bool(await approve(request))
-                finally:
-                    record['approval_wait_seconds'] = max(0.0, time.perf_counter() - wait_started)
-                if not allowed:
-                    record['status'] = 'denied'
-                    return json.dumps({'ok': False, 'error': f'User approval was required and not granted for tool {name}.'})
+            blocked = await authorize('before_approval')
+            if blocked is not None:
+                record['result'] = blocked
+                return blocked
             if self._requires_mutation_lease(definition) and not self._mutation_lease_held:
                 wait_started = time.perf_counter()
                 try:
@@ -1394,10 +1561,18 @@ class WorkspaceToolbox:
                 finally:
                     record['coordination_wait_seconds'] = max(0.0, time.perf_counter() - wait_started)
                 acquired_mutation_lease_this_call = True
+                blocked = await authorize('after_coordination')
+                if blocked is not None:
+                    record['result'] = blocked
+                    return blocked
             if on_execution_start is not None:
                 await on_execution_start(time.perf_counter())
             if name == 'package_working_copy' and on_status is not None:
                 await on_status('Packaging canonical project…')
+            blocked = await authorize('before_execution')
+            if blocked is not None:
+                record['result'] = blocked
+                return blocked
             execution_started = time.perf_counter()
             try:
                 with activity(self.workspace.root, f'Tool · {name}'), memory_origin(
@@ -3203,9 +3378,21 @@ class WorkspaceToolbox:
 
     async def list_external_targets(self, a: dict[str, Any]) -> str:
         broker = self._external_target_broker()
+        targets = broker.list_public()
+        global_permission = self.permission_for('external_targets')
+        for target in targets:
+            reason = tool_permission_reason(
+                {'external_targets': global_permission}, target_state='enabled',
+                target_mode='on' if target.get('approval_mode') == 'on' else 'ask',
+            )
+            target['model_access'] = {
+                'global_permission': global_permission,
+                'effective': 'off' if reason == 'blocked_off' else 'ask' if reason == 'ask' else 'on',
+                'permission_source': self._permission_source,
+            }
         return json.dumps({
             'ok': True,
-            'targets': broker.list_public(),
+            'targets': targets,
             'security_note': (
                 'SSH credentials stay on the HarnessyXO host and are not exposed to the model or workspace VM. '
                 'A root SSH target executes with remote root privileges; the HarnessyXO command filter is not an OS sandbox.'
