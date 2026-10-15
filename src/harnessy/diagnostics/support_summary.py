@@ -46,8 +46,10 @@ def _bounded_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     models = [row for row in rows if row.get('event') in MODEL_EVENTS][-600:]
     from .controller_observations import CONTROLLER_OBSERVATION_EVENTS
     controllers = [row for row in rows if row.get('event') in CONTROLLER_OBSERVATION_EVENTS][-120:]
-    recent = rows[-(_MAX_ROWS - len(targets) - len(permissions) - len(startup) - len(models) - len(controllers)):]
-    retained = {id(row): row for row in targets + permissions + startup + models + controllers + recent}
+    from .queue_observations import QUEUE_EVENTS
+    queues = [row for row in rows if row.get('event') in QUEUE_EVENTS][-160:]
+    recent = rows[-(_MAX_ROWS - len(targets) - len(permissions) - len(startup) - len(models) - len(controllers) - len(queues)):]
+    retained = {id(row): row for row in targets + permissions + startup + models + controllers + queues + recent}
     return sorted(retained.values(), key=lambda row: row['timestamp'])
 
 
@@ -390,6 +392,7 @@ def _launcher_startup_rows(path: Path) -> tuple[list[dict[str, Any]], list[dict[
     """Recover reviewed startup receipts discarded by the launcher's exec."""
     from .logging import _read_snapshot_bytes
     from .startup import is_kvm_refresh_handoff, validate_startup_event
+    from .queue_observations import QUEUE_EVENTS, validate_queue_event
 
     limit = 512 * 1024
     payload = _read_snapshot_bytes(path / 'harnessy.log', tail_bytes=limit)
@@ -411,22 +414,49 @@ def _launcher_startup_rows(path: Path) -> tuple[list[dict[str, Any]], list[dict[
                 }
             safe = validate_startup_event(body.get('event'), body) if isinstance(body, dict) else None
             launcher_handoff = launcher_handoff or bool(safe and is_kvm_refresh_handoff(safe))
+            if safe is None and isinstance(body, dict) and isinstance(body.get('event'), str) and body['event'] in QUEUE_EVENTS:
+                safe = validate_queue_event(body['event'], body)
         except (ValueError, TypeError, RecursionError):
             continue
         if safe is not None:
             rows.append({**safe, 'timestamp': stamp, 'channel': 'harnessy',
                          'level': parts[2], 'session_scope': 'launcher'})
-    rows = sorted(rows, key=lambda row: row['timestamp'])[-120:]
-    if not rows or not launcher_handoff or application_started:
+    if not launcher_handoff or application_started:
         return [], []
-    try:
-        limited = (path / 'harnessy.log').stat().st_size > limit
-    except OSError:
-        limited = True
-    return rows, [{'channel': 'harnessy', 'session_scope': 'launcher',
-                   'first_timestamp': rows[0]['timestamp'], 'last_timestamp': rows[-1]['timestamp'],
-                   'records_examined': len(rows), 'log_tail_limited': limited,
-                   'startup_receipts_only': True}]
+    # MachineStore initialization can retire settled orphan holds in run.py,
+    # before the application exec. Its fixed receipt uses runtime.log.
+    runtime = _read_snapshot_bytes(path / 'runtime.log', tail_bytes=limit)
+    for line in (runtime.decode('utf-8', errors='replace').splitlines() if runtime else []):
+        parts = line.split(' ', 3)
+        if len(parts) != 4 or parts[2] not in {'INFO', 'WARNING', 'ERROR', 'DEBUG', 'CRITICAL'}:
+            continue
+        try:
+            stamp = f'{parts[0]} {parts[1]}'
+            datetime.strptime(stamp, '%Y-%m-%d %H:%M:%S,%f')
+            body = json.loads(parts[3])
+            if not isinstance(body, dict) or body.get('event') != 'run_queue_holds_retired':
+                continue
+            safe = validate_queue_event('run_queue_holds_retired', body)
+        except (ValueError, TypeError, RecursionError):
+            continue
+        if safe is not None:
+            rows.append({**safe, 'timestamp': stamp, 'channel': 'runtime',
+                         'level': parts[2], 'session_scope': 'launcher'})
+    rows = sorted(rows, key=lambda row: row['timestamp'])[-120:]
+    coverage = []
+    for channel in ('harnessy', 'runtime'):
+        channel_rows = [row for row in rows if row['channel'] == channel]
+        if not channel_rows:
+            continue
+        try:
+            limited = (path / (channel + '.log')).stat().st_size > limit
+        except OSError:
+            limited = True
+        coverage.append({'channel': channel, 'session_scope': 'launcher',
+                         'first_timestamp': channel_rows[0]['timestamp'], 'last_timestamp': channel_rows[-1]['timestamp'],
+                         'records_examined': len(channel_rows), 'log_tail_limited': limited,
+                         'startup_receipts_only': True})
+    return rows, coverage
 
 
 def _seconds(left: str, right: str) -> float:
@@ -1017,8 +1047,12 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
     index['model_request_audit'] = model_audit
     controller_audit, controller_lines = _controller_observation_audit(rows)
     index['controller_observation_audit'] = controller_audit
+    from .queue_observations import QUEUE_EVENTS, build_queue_audit
+    queue_audit, queue_lines = build_queue_audit(rows)
+    index['queue_audit'] = queue_audit
     control_rows = [row for row in rows if row.get('level') in {'WARNING', 'ERROR', 'CRITICAL'}
                     or str(row.get('event')).startswith(('vm_', 'environment_', 'workspace_mapping_', 'test_target_'))
+                    or row.get('event') in QUEUE_EVENTS
                     or row.get('event') in {'headless_run_error', 'agent_run_error', 'run_blocked_by_infrastructure'}]
     index['control_plane_timeline'] = control_rows[-1200:]
     index['control_plane_coverage'] = {'rows_available': len(control_rows), 'rows_retained': min(len(control_rows), 1200),
@@ -1041,6 +1075,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         'This summary examines bounded current/previous-session log tails and startup receipts from up to two recent launcher sessions. Counts are not whole-session totals.',
         'Nearby events and tracked transactions are evidence for investigation, not proven lock ownership.', '',
         *primary_setup, *primary_cause,
+        *queue_lines,
         *model_lines,
         *controller_lines,
         f'Recorded failures in examined logs: {len(failures)} (latest {len(incidents)} shown)',

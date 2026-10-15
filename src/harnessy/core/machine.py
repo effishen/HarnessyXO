@@ -371,7 +371,32 @@ class MachineStore:
                     PRIMARY KEY(workspace_id,chat_id)
                 )
             ''')
+            retired = self._prune_settled_orphan_completion_holds(con)
             con.commit()
+        self._log_retired_completion_holds(retired, cleanup_scope='startup')
+
+    @staticmethod
+    def _prune_settled_orphan_completion_holds(con: sqlite3.Connection) -> int:
+        # Registration absence is authoritative here. A registered workspace's
+        # disk may only be temporarily unavailable, so never inspect its path.
+        # Active completion checks and all backend recoveries remain protected.
+        changed = con.execute(
+            "DELETE FROM completion_holds WHERE state IN ('unconfirmed','interrupted') "
+            "AND NOT EXISTS (SELECT 1 FROM workspaces WHERE workspaces.id=completion_holds.workspace_id)"
+        ).rowcount
+        return int(changed or 0)
+
+    @staticmethod
+    def _log_retired_completion_holds(count: int, *, cleanup_scope: str) -> None:
+        if count:
+            try:
+                from ..diagnostics import log_event
+                log_event('runtime', 'run_queue_holds_retired', reason_code='owner_unregistered',
+                          count=count, cleanup_scope=cleanup_scope)
+            except Exception:
+                # A failed receipt must not report failure after the database
+                # cleanup and explicit workspace removal have already committed.
+                pass
 
     def list_completion_holds(
         self, *, include_generating: bool = False, include_released: bool = False,
@@ -500,7 +525,12 @@ class MachineStore:
                 "reason='HarnessyXO restarted before completion was confirmed. Continue this project or explicitly resume the queue.',"
                 "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE state IN ('generating','checking','continuing','running')"
             ).rowcount
+            # Startup has now settled the previous process's active markers.
+            # Retire orphaned ones in this same startup, rather than requiring
+            # another restart before unrelated work can be admitted.
+            retired = self._prune_settled_orphan_completion_holds(con)
             con.commit()
+        self._log_retired_completion_holds(retired, cleanup_scope='after_interrupted_recovery')
         return int(changed or 0)
 
     def record_backend_recovery(self, state: str, details: dict[str, Any]) -> None:
@@ -1026,10 +1056,43 @@ class MachineStore:
             raise ValueError('Workspace is no longer registered.')
         return registration
 
+    @staticmethod
+    def _check_workspace_removal_allowed(con: sqlite3.Connection, workspace_id: str) -> None:
+        if (con.execute(
+            "SELECT 1 FROM completion_holds WHERE workspace_id=? "
+            "AND state IN ('generating','checking','continuing','running') LIMIT 1",
+            (workspace_id,),
+        ).fetchone() is not None or con.execute(
+            "SELECT 1 FROM run_queue_jobs WHERE workspace_id=? AND status='running' LIMIT 1",
+            (workspace_id,),
+        ).fetchone() is not None):
+            raise ValueError('Stop the active workspace run before removing this workspace.')
+
+    def check_workspace_removal_allowed(self, workspace_id: str) -> None:
+        """Check persisted run ownership before any UI/VM/disk removal effects."""
+        with self._connect() as con:
+            self._check_workspace_removal_allowed(con, workspace_id)
+
     def unregister_workspace(self, workspace_id: str) -> None:
         with self._connect() as con:
+            con.execute('BEGIN IMMEDIATE')
+            self._check_workspace_removal_allowed(con, workspace_id)
+            # A worker may already have read the registration while waiting
+            # for a model slot. Its pending-only claim must lose to removal.
+            con.execute(
+                "UPDATE run_queue_jobs SET status='cancelled',outcome='workspace_removed',"
+                "error='Workspace removed before this queued run started.',"
+                "finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                "WHERE workspace_id=? AND status='pending'",
+                (workspace_id,),
+            )
+            retired = con.execute(
+                "DELETE FROM completion_holds WHERE workspace_id=? AND state IN ('unconfirmed','interrupted')",
+                (workspace_id,),
+            ).rowcount
             con.execute('DELETE FROM workspaces WHERE id=?', (workspace_id,))
             con.commit()
+        self._log_retired_completion_holds(int(retired or 0), cleanup_scope='workspace_unregister')
 
     def touch_workspace(self, workspace_id: str) -> None:
         with self._connect() as con:

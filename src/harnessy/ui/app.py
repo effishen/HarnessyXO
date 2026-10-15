@@ -218,6 +218,8 @@ _RUN_QUEUE_TASK_JOB_IDS: dict[asyncio.Task[Any], str] = {}
 _USER_STOPPED_TASKS: set[asyncio.Task[Any]] = set()
 _RUN_QUEUE_RETRY_TASKS: dict[str, asyncio.Task[Any]] = {}
 _RUN_QUEUE_WAKE = asyncio.Event()
+_RUN_QUEUE_SNAPSHOT_OBSERVATIONS: dict[str, str] = {}
+_RUN_QUEUE_ADMISSION_OBSERVATIONS: dict[tuple[str, str], str] = {}
 # A process-owned rewind keeps other pages from submitting into the same chat
 # until restoration and the intended queued-send handoff have finished.
 _TIMELINE_REPLACEMENTS: dict[tuple[str, str], str] = {}
@@ -1565,6 +1567,7 @@ class HarnessyPage:
             # contains the event which caused it to be collected. The default
             # export is privacy-safe; raw content requires explicit opt-in.
             log_event('harnessy', 'diagnostics_download_requested', include_content=bool(include_content))
+            _observe_run_queue_snapshot(self.machine, source='diagnostics_download', force=True)
             path = await asyncio.to_thread(refresh_diagnostics_bundle, include_content=bool(include_content))
             if path is None or not Path(path).is_file():
                 ui.notify('Could not create the diagnostics bundle.', type='negative')
@@ -3953,6 +3956,7 @@ class HarnessyPage:
                     ui.notify('Stop the active workspace agent job before removing this workspace.', type='warning')
                     return
                 try:
+                    self.machine.check_workspace_removal_allowed(reg.id)
                     # Close only this workspace's tabs/PTYs before touching its
                     # registration or directory; other workspaces stay intact.
                     removed_tabs = [tab for tab in self.open_tabs if tab.workspace_id == reg.id]
@@ -4013,6 +4017,8 @@ class HarnessyPage:
                     if destructive:
                         shutil.rmtree(workspace_path)
                     self.machine.unregister_workspace(reg.id)
+                    _wake_run_queue()
+                    _observe_run_queue_snapshot(self.machine, source='state_change')
                     self.workspace_cache.pop(reg.id, None)
                     self.file_paths.pop(reg.id, None)
                     self.file_clipboard.pop(reg.id, None)
@@ -9114,6 +9120,7 @@ class HarnessyPage:
                 ws.release_queued_attachments(chat_id, attachment_ids)
             raise
         _wake_run_queue()
+        _observe_run_queue_snapshot(self.machine, source='state_change')
         return job
 
     async def queue_run_message(self, ws: WorkspaceStore, chat_id: str, *, preferred_slot: int = 0) -> None:
@@ -9514,6 +9521,7 @@ class HarnessyPage:
                                 if not self.machine.resume_run_queue():
                                     ui.notify('Wait for the current check or recovery to finish, or stop that run first.', type='warning')
                                     return
+                                _observe_run_queue_snapshot(self.machine, source='resume')
                                 _wake_run_queue()
                                 ui.notify('Run queue resumed.', type='positive')
                                 refresh_recovery_panel()
@@ -20833,6 +20841,119 @@ def _run_queue_limit(machine: MachineStore) -> int:
         return 1
 
 
+def _run_queue_observation_data(machine: MachineStore) -> dict[str, Any]:
+    """Project existing machine state; never construct a store during export."""
+    holds = machine.list_completion_holds(include_generating=True, include_released=True)
+    recoveries = machine.list_backend_recoveries()
+    jobs = machine.list_run_jobs(active_only=True, limit=5000)
+    blocking = [row for row in holds if row.get('state') not in {'generating', 'unconfirmed_released'}]
+    paused = bool(blocking or recoveries)
+    resume_allowed = paused and not any(row.get('state') in {'checking', 'continuing', 'running'} for row in blocking)
+    resume_allowed = resume_allowed and not any(row.get('state') == 'retrying' for row in recoveries)
+    owner_fields = ('workspace_id', 'chat_id', 'run_id', 'state', 'updated_at')
+    def project(row, names):
+        return {name: row[name] for name in names if name in row}
+    runtime = GLOBAL_AGENT_SLOTS.snapshot()
+    return {
+        'schema_version': 1, 'status': 'observed', 'queue_paused': paused, 'resume_allowed': resume_allowed,
+        'completion_holds': [project(row, owner_fields) for row in holds[:64]],
+        'backend_recoveries': [project(row, (*owner_fields, 'attempt')) for row in recoveries[:64]],
+        'jobs': [project(row, ('id', 'workspace_id', 'chat_id', 'status', 'lane', 'preferred_slot',
+                               'created_at', 'started_at')) for row in jobs[:64]],
+        'counts': {'completion_holds': len(holds), 'blocking_completion_holds': len(blocking),
+                   'backend_recoveries': len(recoveries), 'jobs': len(jobs),
+                   'pending_jobs': sum(row.get('status') == 'pending' for row in jobs),
+                   'running_jobs': sum(row.get('status') == 'running' for row in jobs)},
+        'completion_holds_limited': len(holds) > 64, 'backend_recoveries_limited': len(recoveries) > 64,
+        'jobs_limited': len(jobs) > 64,
+        'slot_limit': runtime['limit'] if type(runtime.get('limit')) is int else _run_queue_limit(machine),
+        'active_slots': int(runtime.get('active_count') or 0),
+        'pending_slots': len(runtime.get('queued') or []),
+    }
+
+
+def _observe_run_queue_snapshot(
+    machine: MachineStore, *, source: str = 'state_change', force: bool = False,
+) -> dict[str, Any] | None:
+    """Emit only changed, content-free facts from a live MachineStore."""
+    try:
+        from harnessy.diagnostics.queue_observations import validate_queue_event
+        data = _run_queue_observation_data(machine)
+        clean = validate_queue_event('run_queue_snapshot', {**data, 'source': source})
+        if not clean:
+            return None
+        clean.pop('event', None)
+        key = str(machine.db_path)
+        signature = json.dumps({name: value for name, value in clean.items() if name != 'source'}, sort_keys=True)
+        if force or _RUN_QUEUE_SNAPSHOT_OBSERVATIONS.get(key) != signature:
+            log_event('runtime', 'run_queue_snapshot', **clean,
+                      observed_at=datetime.now().astimezone().isoformat(timespec='milliseconds'))
+            _RUN_QUEUE_SNAPSHOT_OBSERVATIONS[key] = signature
+            if len(_RUN_QUEUE_SNAPSHOT_OBSERVATIONS) > 16:
+                _RUN_QUEUE_SNAPSHOT_OBSERVATIONS.pop(next(iter(_RUN_QUEUE_SNAPSHOT_OBSERVATIONS)))
+        return clean
+    except Exception as exc:
+        # Observation cannot change admission or expose exception text/paths.
+        try:
+            from harnessy.diagnostics.technical import technical_error_evidence
+            evidence = technical_error_evidence(exc)
+            key = str(machine.db_path)
+            signature = json.dumps({'status': 'unavailable', 'technical_error': evidence}, sort_keys=True)
+            if force or _RUN_QUEUE_SNAPSHOT_OBSERVATIONS.get(key) != signature:
+                log_event('runtime', 'run_queue_snapshot', schema_version=1, status='unavailable', source=source,
+                          technical_error=evidence,
+                          observed_at=datetime.now().astimezone().isoformat(timespec='milliseconds'))
+                _RUN_QUEUE_SNAPSHOT_OBSERVATIONS[key] = signature
+        except Exception:
+            pass
+        return None
+
+
+def _observe_run_queue_admission(
+    machine: MachineStore, *, workspace_id: str, chat_id: str, request_id: str,
+    phase: str, include_backend: bool, job_id: str = '', gate_kind: str = '', queue_position: int = 0,
+) -> None:
+    try:
+        from harnessy.diagnostics.queue_observations import validate_queue_event
+        data = _observe_run_queue_snapshot(machine, source='admission')
+        fields: dict[str, Any] = {'workspace_id': workspace_id, 'chat_id': chat_id,
+            'request_id': request_id, 'phase': phase, 'include_backend': include_backend,
+            'same_owner_exempt': False, 'queue_position': queue_position}
+        if job_id:
+            fields['job_id'] = job_id
+        if data is None:
+            fields['gate_kind'] = 'unavailable'
+        else:
+            fields.update(resume_allowed=data.get('resume_allowed', False), slot_limit=data.get('slot_limit', 1),
+                          active_slots=data.get('active_slots', 0))
+            # Admission uses every current owner, independently of the bounded
+            # rows retained in a diagnostic snapshot.
+            holds = machine.list_completion_holds()
+            fields['same_owner_exempt'] = any(row.get('workspace_id') == workspace_id and row.get('chat_id') == chat_id for row in holds)
+            recoveries = machine.list_backend_recoveries()
+            blocker = completion_blocking_hold(holds, workspace_id, chat_id)
+            if phase == 'waiting' and gate_kind in {'', 'unavailable'} and include_backend and recoveries:
+                fields.update(gate_kind='backend_recovery', blocker=recoveries[0])
+            elif phase == 'waiting' and gate_kind in {'', 'unavailable'} and blocker:
+                fields.update(gate_kind='completion_hold', blocker=blocker)
+            else:
+                fields['gate_kind'] = gate_kind or ('capacity' if phase == 'waiting' else 'none')
+        clean = validate_queue_event('run_queue_admission', fields)
+        if not clean:
+            return
+        clean.pop('event', None)
+        key = (str(machine.db_path), request_id)
+        signature = json.dumps(clean, sort_keys=True)
+        if _RUN_QUEUE_ADMISSION_OBSERVATIONS.get(key) != signature:
+            log_event('runtime', 'run_queue_admission', **clean,
+                      observed_at=datetime.now().astimezone().isoformat(timespec='milliseconds'))
+            _RUN_QUEUE_ADMISSION_OBSERVATIONS[key] = signature
+            if len(_RUN_QUEUE_ADMISSION_OBSERVATIONS) > 512:
+                _RUN_QUEUE_ADMISSION_OBSERVATIONS.pop(next(iter(_RUN_QUEUE_ADMISSION_OBSERVATIONS)))
+    except Exception:
+        pass
+
+
 def _run_queue_jobs_with_positions(machine: MachineStore) -> list[dict[str, Any]]:
     """Return active persisted jobs with one stable global waiting position."""
     jobs = machine.list_run_jobs(active_only=True)
@@ -20881,6 +21002,7 @@ def _record_backend_recovery(
     machine: MachineStore, state: str, details: dict[str, Any], *, project_label: str = '',
 ) -> None:
     machine.record_backend_recovery(state, {**details, 'project_label': project_label})
+    _observe_run_queue_snapshot(machine, source='state_change')
     # Remove already-waiting queue workers from slot admission immediately.
     # Their persisted jobs remain pending, cancellable and in their old order.
     if state != 'succeeded':
@@ -20902,24 +21024,44 @@ async def _acquire_verified_agent_slot(
     workspace_id, chat_id = str(kwargs.get('workspace_id') or ''), str(kwargs.get('project_chat_id') or '')
     on_wait = kwargs.get('on_wait')
     last_reason = ''
-    while True:
-        reason = machine.run_admission_reason(workspace_id, chat_id, include_backend=include_backend)
-        if reason:
-            if include_backend:
-                # Persisted queue jobs remain pending and are restarted by the
-                # supervisor when their owner is eligible; no idle task needed.
-                return None
-            if on_wait is not None and reason != last_reason:
-                await on_wait({'reason': 'completion_gate', 'gate_reason': reason, 'position': 0, 'owner': ''})
-            last_reason = reason
-            await asyncio.sleep(0.25)
-            continue
-        lease = await GLOBAL_AGENT_SLOTS.acquire(**kwargs)
-        if not machine.run_admission_reason(workspace_id, chat_id, include_backend=include_backend):
-            return lease
-        # A may have failed while B was already waiting inside the scheduler.
-        # Release immediately; never occupy capacity while waiting for A's retry.
-        await GLOBAL_AGENT_SLOTS.release(lease)
+    request_id = uuid.uuid4().hex
+    job_id = _RUN_QUEUE_TASK_JOB_IDS.get(asyncio.current_task(), '')
+    async def observed_wait(wait: dict[str, Any]) -> None:
+        _observe_run_queue_admission(machine, workspace_id=workspace_id, chat_id=chat_id,
+            request_id=request_id, job_id=job_id, phase='waiting', include_backend=include_backend,
+            gate_kind='related_project' if wait.get('reason') == 'related_project' else 'capacity',
+            queue_position=int(wait.get('position') or 0))
+        if on_wait is not None:
+            await on_wait(wait)
+    kwargs['on_wait'] = observed_wait
+    try:
+        while True:
+            reason = machine.run_admission_reason(workspace_id, chat_id, include_backend=include_backend)
+            if reason:
+                if reason != last_reason:
+                    _observe_run_queue_admission(machine, workspace_id=workspace_id, chat_id=chat_id,
+                        request_id=request_id, job_id=job_id, phase='waiting', include_backend=include_backend,
+                        gate_kind='unavailable')
+                if include_backend:
+                    # Persisted jobs stay pending; supervisor retries admission.
+                    return None
+                if on_wait is not None and reason != last_reason:
+                    await on_wait({'reason': 'completion_gate', 'gate_reason': reason, 'position': 0, 'owner': ''})
+                last_reason = reason
+                await asyncio.sleep(0.25)
+                continue
+            lease = await GLOBAL_AGENT_SLOTS.acquire(**kwargs)
+            if not machine.run_admission_reason(workspace_id, chat_id, include_backend=include_backend):
+                _observe_run_queue_admission(machine, workspace_id=workspace_id, chat_id=chat_id,
+                    request_id=request_id, job_id=job_id, phase='admitted', include_backend=include_backend)
+                return lease
+            # A may have failed while B waited in the scheduler. Release the
+            # slot before observing/waiting for its durable recovery hold.
+            await GLOBAL_AGENT_SLOTS.release(lease)
+    except asyncio.CancelledError:
+        _observe_run_queue_admission(machine, workspace_id=workspace_id, chat_id=chat_id,
+            request_id=request_id, job_id=job_id, phase='cancelled', include_backend=include_backend)
+        raise
 
 
 def _completion_gate_callback(machine: MachineStore, base: dict[str, Any], outcome: dict[str, Any]):
@@ -20935,6 +21077,7 @@ def _completion_gate_callback(machine: MachineStore, base: dict[str, Any], outco
         accepted = machine.record_completion_gate(state, {**details, **base})
         if accepted:
             outcome['verified'] = state in {'complete', 'needs_input'}
+        _observe_run_queue_snapshot(machine, source='state_change')
         _wake_run_queue()
     return record
 
@@ -20973,6 +21116,7 @@ def _settle_completion_gate(
             details = {**details, 'reason': 'The model reported completion, but the run failed while finishing. '
                        'Inspect the project error before continuing or resuming the queue.'}
         machine.record_completion_gate('interrupted' if interrupted else 'unconfirmed', details)
+    _observe_run_queue_snapshot(machine, source='state_change')
     _wake_run_queue()
 
 
@@ -21220,14 +21364,29 @@ async def _run_queue_supervisor(machine: MachineStore) -> None:
     machine.recover_interrupted_completion_holds()
     _migrate_finished_completion_holds(machine)
     interrupted = machine.recover_interrupted_run_jobs()
+    _observe_run_queue_snapshot(machine, source='startup', force=True)
     if interrupted:
         log_event('harnessy', 'run_queue_recovered_interrupted', count=interrupted)
     last_limit: int | None = None
+    last_diagnostic_signature = ''
     try:
         while True:
             limit = _run_queue_limit(machine)
             await GLOBAL_AGENT_SLOTS.set_limit(limit)
             changed = machine.rebalance_run_queue_lanes(limit)
+            snapshot = _observe_run_queue_snapshot(machine, source='state_change')
+            diagnostic_signature = json.dumps(snapshot, sort_keys=True) if snapshot else ''
+            if snapshot and diagnostic_signature != last_diagnostic_signature and snapshot.get('queue_paused'):
+                for job in snapshot.get('jobs') or []:
+                    if job.get('status') == 'pending':
+                        reason = machine.run_admission_reason(str(job.get('workspace_id') or ''),
+                            str(job.get('chat_id') or ''), include_backend=True)
+                        if reason:
+                            _observe_run_queue_admission(machine, workspace_id=str(job.get('workspace_id') or ''),
+                                chat_id=str(job.get('chat_id') or ''), request_id=str(job.get('id') or ''),
+                                job_id=str(job.get('id') or ''), phase='waiting', include_backend=True,
+                                gate_kind='unavailable')
+            last_diagnostic_signature = diagnostic_signature
             paused = machine.run_queue_paused()
             if paused or changed or (last_limit is not None and last_limit != limit):
                 # A waiting worker captured its old preference and ceiling.

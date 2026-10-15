@@ -1,4 +1,4 @@
-# HarnessyXO v0.6.94 Features
+# HarnessyXO v0.6.95 Features
 
 ## Model progress across backends
 
@@ -58,12 +58,18 @@
 - Preserve existing host REA settings and cache files for rollback. They are inactive and are not copied into a guest or deleted.
 - Retain the lean package: three living documents and eight functional skill files.
 
+## Run queue recovery
+
+- New chats use the same global run queue. Interrupted completion work and backend recovery can pause waiting prompts across chats and restarts. Click **Agents** at the bottom to inspect the owner and use **Resume queue** after active checks or retries settle.
+- Removing a workspace retires its settled blocking completion holds and cancels its pending queued runs atomically. Startup also clears settled completion holds whose workspace registration was removed by an older version. Registered workspaces remain protected even when their folder is temporarily unavailable; backend-recovery holds keep their existing explicit recovery controls.
+
 ## Storage concurrency
 
 Workspace and machine databases use WAL so background reads can coexist with message writes. Store connections close promptly. Attachment authorization avoids transcript bodies; checkpoint badges retain full signed recovery checks while reading only relevant boundaries. Recurring transcript/navigation reads are offloaded from the UI event loop.
 
 ## Actionable support diagnostics
 
+- Include QUEUE_STATE.json with bounded technical queue and hold state, observed admission gates, slot capacity and Resume availability. Correlate blocking owners by IDs without exporting project names, model names, prompts, replies, attachment metadata or arbitrary reason text. Snapshot the existing live queue at startup, on state changes and before a diagnostics download.
 - Highlight a recorded QEMU KVM permission denial and corroborating host device/process-access facts near the start of the support summary. Distinguish the launch cause from QMP cleanup errors; a process's active groups do not establish the account's saved group membership.
 - Include scrubbed host-agent and QEMU control-plane errors in the default download, rather than only recognized signal codes. Keep unfamiliar technical wording while excluding credentials, private paths, command payloads and guest console content. Guest serial logs still contribute fixed boot/error signals without guest output.
 - Preserve bounded failure receipts before Start, Factory Reset or rebuild replaces the current VM logs. Retain controller command and lifecycle correlation, requested VM configuration and resource snapshots with their capture time; identify stale or prior-attempt sources explicitly. Capture test-target QEMU launcher output separately from guest serial output.

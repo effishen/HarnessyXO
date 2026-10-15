@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.95
+
+- Stop removed workspaces from leaving settled completion holds that pause new chats. Clean up those orphaned holds during startup, and remove the workspace registration and its settled blocking completion holds together. Cancel that workspace's pending queued runs in the same transaction, so a late worker cannot recreate the hold after removal. Keep registered projects, active work and backend-recovery holds protected.
+- Include QUEUE_STATE.json and a queue section in the diagnostic summary. Record bounded, content-free job and hold IDs, states, timestamps, slot capacity and Resume availability. Record actual admission waits separately so a queued prompt can be traced to the hold that blocks it.
+- Refresh the queue evidence at startup, when queue state changes, after Resume queue and before downloading diagnostics. Keep project names, prompts, replies, attachments, model names and arbitrary reason text out of these receipts.
+- Keep the existing recovery control: click Agents at the bottom, then Resume queue to release settled holds and continue waiting work. Active completion checks or backend retries must settle first.
+- Preserve existing VMs, workspace files, model requests and public startup updates. Leave README unchanged and keep the same 11 Markdown resources; private QA stays outside the application package.
+
 ## v0.6.94
 
 - Fix numeric bounds in the test-VM creator. Keep CPU, memory and disk limits numeric when changing operating system or architecture, so editing or leaving a field no longer raises NiceGUI string-versus-number errors. Restore each operating system's defaults after applying its limits and preserve valid values during architecture changes.

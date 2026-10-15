@@ -877,6 +877,12 @@ class DiagnosticsManager:
             # hot path. The precise operation evidence has already been stored.
             return
         logger = self.logger(channel)
+        from .queue_observations import QUEUE_EVENTS, validate_queue_event
+        if event in QUEUE_EVENTS:
+            payload = validate_queue_event(event, fields)
+            if payload is not None:
+                logger.log(level, json.dumps(payload, ensure_ascii=False, separators=(',', ':')))
+            return
         from .controller_observations import CONTROLLER_OBSERVATION_EVENTS, validate_controller_observation
         if event in CONTROLLER_OBSERVATION_EVENTS:
             payload = validate_controller_observation(event, fields)
@@ -1356,6 +1362,9 @@ def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
     if _is_sensitive_log_key(lowered):
         return '<redacted>'
     if not key and isinstance(value, dict):
+        from .queue_observations import QUEUE_EVENTS, validate_queue_event
+        if isinstance(value.get('event'), str) and value['event'] in QUEUE_EVENTS:
+            return validate_queue_event(value['event'], value)
         from .controller_observations import CONTROLLER_OBSERVATION_EVENTS, validate_controller_observation
         if isinstance(value.get('event'), str) and value['event'] in CONTROLLER_OBSERVATION_EVENTS:
             return validate_controller_observation(value['event'], value)
@@ -2049,6 +2058,11 @@ def _privacy_manifest(*, include_content: bool = False) -> str:
         'outside known runtime components use fixed parent labels. File contents, home paths, raw errors '
         'and credentials are excluded from these receipts in both export modes. The collector reads logs '
         'only and does not check Git, run an installer, or open an application database.\n\n'
+        'QUEUE_STATE.json projects bounded queue snapshots and admission transitions recorded by the live app: '
+        'typed owner/request IDs, fixed hold/gate states, counts, resume eligibility, and settled orphan-hold '
+        'retirements. Project labels, prompts, models, raw reasons, attachments and saved row bodies are excluded. '
+        'Export reads these receipts only and never opens a queue database. A global pause snapshot is not '
+        'a per-chat admission verdict; owner exemptions and backend inclusion remain separate facts.\n\n'
         'VM_LOGS.json records bounded Lima serial/hostagent source coverage, missing/unsafe/unreadable sources, '
         'and truncation limits. The default vm-logs/ members contain reviewed technical signal records only; '
         'arbitrary guest lines, paths, names and message bodies are omitted. These tails can contain observations '
@@ -2232,6 +2246,9 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
                 'schema_version': 1, 'status': 'unavailable', 'reason': 'summary_generation_failed',
             }), ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('STARTUP.json', json.dumps(incidents.get('startup_audit', {
+                'schema_version': 1, 'status': 'unavailable', 'reason': 'summary_generation_failed',
+            }), ensure_ascii=False, indent=2, allow_nan=False))
+            zf.writestr('QUEUE_STATE.json', json.dumps(incidents.get('queue_audit', {
                 'schema_version': 1, 'status': 'unavailable', 'reason': 'summary_generation_failed',
             }), ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('MODEL_REQUESTS.json', json.dumps(incidents.get('model_request_audit', {
