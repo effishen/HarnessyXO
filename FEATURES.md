@@ -1,4 +1,4 @@
-# HarnessyXO v0.6.93 Features
+# HarnessyXO v0.6.94 Features
 
 ## Model progress across backends
 
@@ -11,6 +11,7 @@
 ## Workspace test-target tabs
 
 - Manage external devices and test VMs in **Workspace Environment → Test targets**.
+- Keep numeric CPU, memory and disk bounds valid while switching guest OS or architecture. Apply OS defaults under the new bounds and preserve in-range values for architecture-only changes.
 - Spot a ready test VM by its bold green Ready badge and check icon beside the name, green card outline and subtle tint. Other states have distinct icons and colours; the status wraps on smaller screens and stays readable in light and dark themes. A stopped, paused or unavailable current state clears an earlier Ready result.
 - Open guest Shell, LuCI Web UI and noVNC Desktop views as separate main-area tabs, preserving selected targets across browser reloads.
 - Keep guest pages isolated from HarnessyXO's browser origin; scope display access to the signed-in session and selected target, and revoke it on close or VM changes.
@@ -73,6 +74,8 @@ Workspace and machine databases use WAL so background reads can coexist with mes
 - Retain timestamped, locally correlated numeric prompt progress, usage and native timings without copying model text, tool arguments or token-ID arrays. Use explicit correlation for new requests and label legacy timestamp candidates and missing evidence. A local request ID does not establish provider-side inference activity.
 - Include bounded Lima guest boot and host-agent evidence in the normal download. `VM_LOGS.json` reports available, missing and limited sources; raw tails use the existing content option.
 - Record fixed boot/SSH milestones and distinguish native controller failure, HarnessyXO timeout and cancellation. Observe status after startup failure without retrying a blocked model command.
+- Capture trusted lifecycle progress without making controller completion depend on inherited output pipes. Report controller process state, elapsed wait and output activity while a command is pending; keep VM readiness dependent on the normal guest, provisioning and isolation checks.
+- Preserve the original controller or setup timeout and failed stage. Use the total-deadline message only when the overall environment deadline actually expires.
 - Give Lima's readiness-event wait the same 20-minute allowance as HarnessyXO; retain guest-requirement limits and the existing isolation/readiness guard.
 - Open `SUMMARY.txt` first for recent failures and their code/database/tool context; inspect `INCIDENTS.json` for structured evidence.
 - Include previous-session incidents after restarting, with session scope and bounded coverage stated explicitly.

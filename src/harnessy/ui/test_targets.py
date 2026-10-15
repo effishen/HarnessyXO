@@ -60,13 +60,27 @@ def open_vm_creator(ws, refresh, os_name='ubuntu-24.04'):
             error = ui.label('').classes('text-sm text-negative whitespace-pre-wrap').props('role=alert')
 
             selection = {'id': initial.id}
-            def select_architecture(_=None):
+            def set_number_limits(field, minimum, maximum, value):
+                # Number's public setters sanitize immediately. Widen the old
+                # interval first, then apply the new limits and intended value.
+                # String .props bounds break NiceGUI's numeric blur handling.
+                field.min = min(field.min, minimum)
+                field.max = max(field.max, maximum)
+                field.min = minimum
+                field.max = maximum
+                field.value = value
+                field.sanitize()
+
+            def select_architecture(_=None, *, reset_defaults=False):
                 guest = guest_os(operating_system.value)
                 mips = str(arch.value).startswith('mips')
-                cpu.props(f'min={2 if guest.family == "windows" else 1} max={1 if mips else 32}')
-                memory.props(f'min={guest.min_memory} max={2048 if mips else 131072}')
+                values = ((guest.cpu, guest.memory, guest.disk) if reset_defaults
+                          else (cpu.value, memory.value, disk.value))
+                set_number_limits(cpu, 2 if guest.family == 'windows' else 1, 1 if mips else 32,
+                                  1 if mips else values[0])
+                set_number_limits(memory, guest.min_memory, 2048 if mips else 131072, values[1])
+                set_number_limits(disk, guest.min_disk, 64 if guest.family == 'openwrt' else 2048, values[2])
                 if mips:
-                    cpu.value = 1
                     memory.value = min(int(memory.value or guest.memory), 2048)
                 architecture_hint.set_text(
                     'MIPS uses a Malta development board with software CPU emulation, one CPU and up to 2048 MiB RAM. It does not emulate a particular router model. Only official images available for this release are listed.' if mips else
@@ -77,16 +91,11 @@ def open_vm_creator(ws, refresh, os_name='ubuntu-24.04'):
                 previous = guest_os(selection['id'])
                 if name.value == previous.label + ' test':
                     name.value = guest.label + ' test'
-                if guest.id != previous.id:
-                    cpu.value, memory.value, disk.value = guest.cpu, guest.memory, guest.disk
-                cpu.props(f'min={2 if guest.family == "windows" else 1}')
-                memory.props(f'min={guest.min_memory}')
-                disk.props(f'min={guest.min_disk} max={64 if guest.family == "openwrt" else 2048}')
                 selection['id'] = guest.id
                 options = target_architectures(guest.id)
                 current_arch = arch.value if arch.value in options else canonical_arch(platform.machine())
                 arch.set_options(options, value=current_arch if current_arch in options else next(iter(options)))
-                select_architecture()
+                select_architecture(reset_defaults=guest.id != previous.id)
                 description.set_text(guest.description)
                 windows_options.set_visibility(guest.family == 'windows')
                 radio_options.set_visibility(guest.family == 'openwrt')

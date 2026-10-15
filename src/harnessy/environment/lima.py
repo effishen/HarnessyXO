@@ -205,6 +205,7 @@ class LimaVMEnvironment(WorkspaceEnvironment):
     TIMEOUT_CONTROLLER_STOP_GRACE = 1.5
     TIMEOUT_DIAGNOSTIC_RESOURCES = 2.0
     TIMEOUT_DIAGNOSTIC_PRESERVE = 3.0
+    CONTROLLER_HEARTBEAT_SECONDS = 15.0
 
 
     def __init__(self, workspace_root: Path, config: EnvironmentConfig) -> None:
@@ -2344,6 +2345,68 @@ exit $rc
         stdout_buffer = bytearray()
         stderr_buffer = bytearray()
         buffer_limit = 512 * 1024
+        capture_files: dict[str, Any] = {}
+        capture_sizes = {'stdout': 0, 'stderr': 0}
+        final_capture_sizes: dict[str, int] | None = None
+        pending_progress = {'stdout': False, 'stderr': False}
+        last_output_at: float | None = None
+
+        def captured_sizes() -> dict[str, int]:
+            nonlocal last_output_at
+            sizes = final_capture_sizes if final_capture_sizes is not None else {
+                name: os.fstat(handle.fileno()).st_size for name, handle in capture_files.items()}
+            for name, size in sizes.items():
+                if size > capture_sizes[name]:
+                    last_output_at = time.monotonic()
+                capture_sizes[name] = size
+            return sizes
+
+        def freeze_capture() -> None:
+            nonlocal final_capture_sizes
+            if final_capture_sizes is None:
+                final_capture_sizes = dict(captured_sizes())
+
+        def capture_observation(event: str, *, phase: str) -> None:
+            captured_sizes()
+            now = time.monotonic()
+            log_event('runtime', event, workspace=str(self.workspace_root), provider='lima',
+                      command_id=command_id, controller_action=controller_action,
+                      controller_returncode=process.returncode,
+                      controller_state='running' if process.returncode is None else 'exited',
+                      completion_phase=phase, elapsed_seconds=max(0.0, now - started),
+                      stdout_bytes=capture_sizes['stdout'], stderr_bytes=capture_sizes['stderr'],
+                      last_output_age_seconds=None if last_output_at is None else max(0.0, now - last_output_at),
+                      pending_progress=any(pending_progress.values()),
+                      output_capture='anonymous_files', capture_scope='direct_controller_lifetime',
+                      **({'post_exit_output_not_collected': True} if event == 'environment_command_output_handoff' else {}),
+                      **diagnostic_fields)
+
+        class CapturedReader:
+            """Read an anonymous capture without changing its inherited write offset."""
+            def __init__(reader, name: str) -> None:
+                reader.name, reader.offset, reader.skipped_bytes = name, 0, 0
+
+            async def read(reader, count: int) -> bytes:
+                # Yield even with continuous output, so child-exit/timeout and
+                # progress callbacks cannot be starved by a file backlog.
+                await asyncio.sleep(0)
+                while True:
+                    if process.returncode is not None:
+                        freeze_capture()
+                    size = captured_sizes()[reader.name]
+                    if size - reader.offset > buffer_limit:
+                        skipped = size - reader.offset - buffer_limit
+                        reader.offset += skipped
+                        reader.skipped_bytes += skipped
+                    if reader.offset < size:
+                        chunk = os.pread(capture_files[reader.name].fileno(),
+                                         min(count, size - reader.offset), reader.offset)
+                        if chunk:
+                            reader.offset += len(chunk)
+                            return chunk
+                    if final_capture_sizes is not None:
+                        return b''
+                    await asyncio.sleep(0.05)
 
         def controller_evidence() -> dict[str, Any]:
             if not trusted_control_plane:
@@ -2404,14 +2467,28 @@ exit $rc
             host_resources=launch_resources, **diagnostic_fields,
         )
         try:
+            if trusted_control_plane:
+                # A background hostagent can inherit the controller's handles.
+                # Anonymous regular files let wait() observe the direct child
+                # independently, and closing our handles cannot send SIGPIPE to
+                # that descendant. Only a bounded in-memory tail is retained.
+                for name in ('stdout', 'stderr'):
+                    capture_files[name] = tempfile.TemporaryFile(mode='w+b')
+                    os.fchmod(capture_files[name].fileno(), 0o600)
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdin=asyncio.subprocess.PIPE if input_text is not None else None,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stdout=capture_files.get('stdout', asyncio.subprocess.PIPE),
+                stderr=capture_files.get('stderr', asyncio.subprocess.PIPE),
                 env=self._host_env(),
             )
+        except asyncio.CancelledError:
+            for handle in capture_files.values():
+                handle.close()
+            raise
         except Exception as exc:
+            for handle in capture_files.values():
+                handle.close()
             elapsed = max(0.0, time.monotonic() - started)
             failure_resources = await self._collect_host_resources() if trusted_control_plane else {}
             log_event('runtime', 'environment_command_spawn_failed', workspace=str(self.workspace_root),
@@ -2467,6 +2544,7 @@ exit $rc
                     pending = ''
                     discarding_line = False
                     logical_line_limit = 16 * 1024
+                    observed_skipped = 0
 
                     async def publish(text: str) -> None:
                         if not text.strip():
@@ -2488,10 +2566,18 @@ exit $rc
 
                     while True:
                         chunk = await stream.read(4096)
+                        skipped = stream.skipped_bytes if isinstance(stream, CapturedReader) else 0
+                        if skipped > observed_skipped:
+                            # A bounded tail may start in a UTF-8 sequence or
+                            # logical line; never classify that partial line.
+                            decoder.reset()
+                            pending, discarding_line = '', True
+                            observed_skipped = skipped
                         if not chunk:
                             pending += decoder.decode(b'', final=True)
                             if pending and not discarding_line:
                                 await publish(pending)
+                            pending_progress[stream_name] = False
                             return
                         buffer.extend(chunk)
                         if len(buffer) > buffer_limit:
@@ -2510,13 +2596,37 @@ exit $rc
                         if len(pending) > logical_line_limit:
                             pending = ''
                             discarding_line = True
+                        pending_progress[stream_name] = bool(pending or decoder.getstate()[0])
 
                 async def stream_command() -> tuple[bytes, bytes]:
-                    await asyncio.gather(
-                        drain(process.stdout, 'stdout', stdout_buffer),
-                        drain(process.stderr, 'stderr', stderr_buffer),
-                        process.wait(),
-                    )
+                    async def parent_exit() -> None:
+                        await process.wait()
+                        if trusted_control_plane:
+                            freeze_capture()
+                            capture_observation('environment_command_parent_exited', phase='collecting_output')
+
+                    async def heartbeat() -> None:
+                        while True:
+                            await asyncio.sleep(self.CONTROLLER_HEARTBEAT_SECONDS)
+                            capture_observation('environment_command_heartbeat',
+                                phase='running_controller' if process.returncode is None else 'collecting_output')
+
+                    readers = {name: CapturedReader(name) if trusted_control_plane else getattr(process, name)
+                               for name in ('stdout', 'stderr')}
+                    tasks = [asyncio.create_task(drain(readers['stdout'], 'stdout', stdout_buffer)),
+                             asyncio.create_task(drain(readers['stderr'], 'stderr', stderr_buffer)),
+                             asyncio.create_task(parent_exit())]
+                    heartbeat_task = asyncio.create_task(heartbeat()) if trusted_control_plane else None
+                    try:
+                        await asyncio.gather(*tasks)
+                        if trusted_control_plane:
+                            capture_observation('environment_command_output_handoff', phase='collecting_output')
+                    finally:
+                        for task in (*tasks, heartbeat_task):
+                            if task is not None and not task.done():
+                                task.cancel()
+                        await asyncio.gather(*(task for task in (*tasks, heartbeat_task) if task is not None),
+                                             return_exceptions=True)
                     return bytes(stdout_buffer), bytes(stderr_buffer)
 
                 streamed = stream_command()
@@ -2552,6 +2662,9 @@ exit $rc
             record_startup('cancelled', observed_returncode, elapsed)
             await asyncio.shield(preserve_failure('controller_cancelled', failure_resources))
             raise
+        finally:
+            for handle in capture_files.values():
+                handle.close()
         stdout = stdout_b.decode(errors='replace')
         stderr = stderr_b.decode(errors='replace')
         elapsed = max(0.0, time.monotonic() - started)

@@ -28,6 +28,7 @@ _ERROR_EVENTS = frozenset({
     'sqlite_operation_error', 'tool_execution_error', 'request_error',
     'environment_command_timeout', 'workspace_environment_shutdown_stop_failed',
     'environment_command_spawn_failed', 'vm_failure_evidence_unavailable', 'run_blocked_by_infrastructure',
+    'environment_operation_failed', 'environment_operation_timed_out',
 })
 
 
@@ -43,8 +44,10 @@ def _bounded_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     startup = [row for row in rows if row.get('event') in STARTUP_EVENTS][-120:]
     from .model_requests import MODEL_EVENTS
     models = [row for row in rows if row.get('event') in MODEL_EVENTS][-600:]
-    recent = rows[-(_MAX_ROWS - len(targets) - len(permissions) - len(startup) - len(models)):]
-    retained = {id(row): row for row in targets + permissions + startup + models + recent}
+    from .controller_observations import CONTROLLER_OBSERVATION_EVENTS
+    controllers = [row for row in rows if row.get('event') in CONTROLLER_OBSERVATION_EVENTS][-120:]
+    recent = rows[-(_MAX_ROWS - len(targets) - len(permissions) - len(startup) - len(models) - len(controllers)):]
+    retained = {id(row): row for row in targets + permissions + startup + models + controllers + recent}
     return sorted(retained.values(), key=lambda row: row['timestamp'])
 
 
@@ -207,6 +210,15 @@ def _target_failure_classification(row: dict[str, Any]) -> str | None:
     if code in {'boot_timeout', 'shell_probe_timeout', 'controller_timeout'} or row.get('target_outcome') == 'timeout':
         return 'test_target_startup_timeout'
     return 'test_target_operation_failed'
+
+
+def _timeout_failure_classification(row: dict[str, Any]) -> str | None:
+    if row.get('event') == 'environment_operation_timed_out':
+        return ('environment_operation_deadline' if row.get('timeout_scope') == 'operation'
+                else 'environment_timeout_unscoped')
+    if row.get('event') == 'environment_operation_failed' and row.get('timeout_scope') == 'provider':
+        return 'environment_provider_timeout'
+    return None
 
 
 def _target_operation_rows(rows: list[dict[str, Any]], failure: dict[str, Any]) -> list[dict[str, Any]]:
@@ -484,11 +496,61 @@ def _evidence(row: dict[str, Any]) -> dict[str, Any]:
         'source', 'technical_error', 'controller_evidence', 'requested_vm_config',
         'environment_action', 'lifecycle_action', 'preservation_reason', 'failure_receipt', 'host_resources',
         'kvm_present', 'kvm_accessible',
+        'timeout_scope', 'failed_stage', 'controller_state', 'completion_phase',
+        'stdout_bytes', 'stderr_bytes', 'last_output_age_seconds', 'output_capture',
+        'capture_scope', 'pending_progress', 'post_exit_output_not_collected',
     )
     evidence = {key: row[key] for key in keys if key in row}
     if _is_lock(row):
         evidence['error_code'] = 'sqlite_database_locked'
     return evidence
+
+
+def _controller_observation_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
+    from .controller_observations import CONTROLLER_OBSERVATION_EVENTS
+    observations = [row for row in rows if row.get('event') in CONTROLLER_OBSERVATION_EVENTS
+                    and row.get('provider') == 'lima' and isinstance(row.get('command_id'), str)]
+    retained = observations[-120:]
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in retained:
+        groups.setdefault((row['session_scope'], row['command_id']), []).append(row)
+    commands: list[dict[str, Any]] = []
+    lines = ['Lima controller observations: parent process state and captured output are separate from guest readiness.']
+    for (scope, command), items in sorted(groups.items(), key=lambda item: item[1][-1]['timestamp'])[-4:]:
+        latest = items[-1]
+        parent = next((row for row in reversed(items) if row['event'] == 'environment_command_parent_exited'), None)
+        handoff = next((row for row in reversed(items) if row['event'] == 'environment_command_output_handoff'), None)
+        terminal = any(row.get('command_id') == command and row.get('session_scope') == scope
+                       and row.get('event') in {'environment_command_finished', 'environment_command_timeout',
+                                               'environment_command_cancelled', 'environment_command_spawn_failed'}
+                       for row in rows)
+        commands.append({'command_id': command, 'session_scope': scope,
+                         'latest_observation': _evidence(latest),
+                         'parent_exit': _evidence(parent) if parent else None,
+                         'output_handoff': _evidence(handoff) if handoff else None,
+                         'terminal_receipt_recorded': terminal})
+        action = latest.get('controller_action', 'unknown')
+        elapsed = latest.get('elapsed_seconds')
+        duration = f' after {elapsed:g}s' if type(elapsed) in {int, float} else ''
+        if parent:
+            lines.append(f'  {parent["timestamp"]} [{scope}]: the spawned {action} controller exited with return code {parent.get("controller_returncode", "unrecorded")}; this records the parent, not descendant completion.')
+        else:
+            lines.append(f'  {latest["timestamp"]} [{scope}]: {action} controller state was {latest.get("controller_state", "unrecorded")}{duration}; phase {latest.get("completion_phase", "unrecorded")}. This is a timestamped observation, not a current liveness probe.')
+        facts = {key: latest[key] for key in ('stdout_bytes', 'stderr_bytes', 'last_output_age_seconds', 'pending_progress') if key in latest}
+        if facts:
+            lines.append('    Recorded capture facts: ' + json.dumps(facts, sort_keys=True) + '.')
+        if handoff and handoff.get('post_exit_output_not_collected') is True:
+            lines.append('    Anonymous output files were snapshotted for the direct controller lifetime; later descendant output is not collected. No pipe-EOF or descendant-exit claim is made.')
+        if not terminal:
+            lines.append('    No terminal controller receipt was retained for this command; its final result is not established by this observation.')
+    if not retained:
+        lines.append('  No parent-exit, heartbeat or capture-handoff receipts were recorded in the examined logs; native-controller versus output-collection waits cannot be distinguished from their absence.')
+    lines.append('  These receipts do not establish Environment Ready; guest provisioning and isolation verification remain separate checks.')
+    lines.append('')
+    return {'scope': 'bounded_controller_observations', 'records_available': len(observations),
+            'records_retained': len(retained), 'record_limit': 120,
+            'record_limit_reached': len(observations) > len(retained),
+            'commands': commands, 'recent_receipts': [_evidence(row) for row in retained]}, lines
 
 
 _KVM_SETUP_DESCRIPTIONS = {
@@ -827,6 +889,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         target_classification = _target_failure_classification(failure)
         permission_classification = _permission_failure_classification(failure)
         startup_classification = _startup_failure_classification(failure)
+        timeout_classification = _timeout_failure_classification(failure)
         vm_cause = _kvm_permission_cause(failure, rows, safe_vm_report, host_kvm_facts)
         if vm_cause:
             vm_classification = 'vm_host_kvm_access_denied'
@@ -862,7 +925,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         stalls = [row for row in before if row.get('event') in {'event_loop_stall', 'event_loop_stall_sample'}]
         transcript_deferrals = [row for row in related if row.get('event') == 'transcript_refresh_deferred']
         missing: list[str] = []
-        if not vm_classification and not target_classification and not permission_classification and not startup_classification and not _has_frames(failure) and not any(_has_frames(row) for row in database_errors):
+        if not vm_classification and not target_classification and not permission_classification and not startup_classification and not timeout_classification and not _has_frames(failure) and not any(_has_frames(row) for row in database_errors):
             missing.append('exception_traceback_unavailable')
         if vm_classification and not vm_cause and not any(
                 isinstance(row.get('controller_evidence'), dict) and any(
@@ -878,10 +941,12 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
             missing.append('database_operation_not_recorded')
         if lock:
             missing.append('lock_holder_not_identified')
+        if timeout_classification == 'environment_timeout_unscoped':
+            missing.append('timeout_scope_not_recorded')
         identity = json.dumps(_evidence(failure), sort_keys=True)
         incidents.append({
             'incident_id': hashlib.sha256(identity.encode()).hexdigest()[:24],
-            'classification': 'sqlite_lock_contention' if lock else startup_classification or permission_classification or target_classification or vm_classification or 'operation_error',
+            'classification': 'sqlite_lock_contention' if lock else startup_classification or permission_classification or target_classification or vm_classification or timeout_classification or 'operation_error',
             'failure': _evidence(failure),
             'nearby_database_errors': [_evidence(row) for row in database_errors[-3:]],
             'last_successful_tool': successful_tool,
@@ -950,6 +1015,8 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
     from .model_requests import build_model_audit
     model_audit, model_lines = build_model_audit(rows, coverage, Path(latest), metadata.get('captured_at'))
     index['model_request_audit'] = model_audit
+    controller_audit, controller_lines = _controller_observation_audit(rows)
+    index['controller_observation_audit'] = controller_audit
     control_rows = [row for row in rows if row.get('level') in {'WARNING', 'ERROR', 'CRITICAL'}
                     or str(row.get('event')).startswith(('vm_', 'environment_', 'workspace_mapping_', 'test_target_'))
                     or row.get('event') in {'headless_run_error', 'agent_run_error', 'run_blocked_by_infrastructure'}]
@@ -975,6 +1042,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         'Nearby events and tracked transactions are evidence for investigation, not proven lock ownership.', '',
         *primary_setup, *primary_cause,
         *model_lines,
+        *controller_lines,
         f'Recorded failures in examined logs: {len(failures)} (latest {len(incidents)} shown)',
         f'Event-loop stalls: {counts["event_loop_stall"]}; maximum recorded delay: {max(durations, default=0):.3f}s',
         f'During-stall stack samples: {counts["event_loop_stall_sample"]}',
@@ -995,6 +1063,15 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
             if failure.get(key):
                 lines.append(f'  {key}: {failure[key]}')
         classification = incident['classification']
+        if classification == 'environment_provider_timeout':
+            lines.append('  A provider/controller phase raised TimeoutError before the operation deadline was reached; this is not a recorded expiration of the overall operation budget.')
+        elif classification == 'environment_operation_deadline':
+            lines.append('  The registry reached the overall operation deadline.')
+        elif classification == 'environment_timeout_unscoped':
+            lines.append('  A timeout was recorded, but these older or incomplete receipts do not distinguish a provider timeout from the overall operation deadline.')
+        if classification in {'environment_provider_timeout', 'environment_operation_deadline', 'environment_timeout_unscoped'}:
+            if failure.get('failed_stage'):
+                lines.append('  Originating stage: ' + failure['failed_stage'] + '.')
         if classification == 'tool_target_validation_failed':
             lines.append(f'  Target argument validation: {failure.get("target_validation", "unrecorded")}; no target name or command is included.')
         if classification == 'tool_permission_policy_unavailable':

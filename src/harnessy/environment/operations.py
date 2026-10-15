@@ -16,6 +16,10 @@ from .manager import EnvironmentManager, environment_operation_context
 from .activity import reserve_policy_change, reserve_environment_change
 
 
+class _OperationDeadlineExpired(Exception):
+    """The registry's own timer expired, rather than a provider's timer."""
+
+
 @dataclass(slots=True)
 class EnvironmentOperationState:
     snapshot_tag: str = ''
@@ -430,6 +434,32 @@ class EnvironmentOperationRegistry:
             'environment_ready': data.get('ready'),
         }
 
+    @staticmethod
+    async def _wait_for_operation(awaitable, timeout: float):
+        # wait_for raises TimeoutError for both its own timer and a provider's
+        # timer. Wait for completion explicitly so the UI can distinguish them.
+        task = asyncio.create_task(awaitable)
+        try:
+            done, _ = await asyncio.wait({task}, timeout=timeout)
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+        if done:
+            return task.result()
+        task.cancel()
+        # A cancelled child becomes a result, while a cancellation of this
+        # registry task still propagates, including during deadline cleanup.
+        await asyncio.gather(task, return_exceptions=True)
+        raise _OperationDeadlineExpired
+
+    @classmethod
+    def _failure_stage(cls, stage: str) -> str:
+        known = {'queued', 'unknown', 'checking_host_dependencies',
+                 'installing_host_dependencies', 'host_dependencies_ready'}
+        known.update(item for stages in cls.WORKFLOW_STAGES.values() for item in stages)
+        return stage if isinstance(stage, str) and stage in known else 'unknown'
+
     async def _run(self, workspace_root: Path, action: str, payload: dict[str, Any]) -> None:
         key = self._key(workspace_root)
         initial = self.state(workspace_root)
@@ -553,7 +583,7 @@ class EnvironmentOperationRegistry:
             state = self.state(workspace_root)
             remaining = max(0.1, state.deadline - time.time()) if state.deadline else self._deadline_seconds(action)
             with environment_operation_context(operation_id, action):
-                result = await asyncio.wait_for(execute(provider), timeout=remaining)
+                result = await self._wait_for_operation(execute(provider), remaining)
             self._validate_result(action, result, snapshot_tag=str(payload.get('name') or ''))
             if action == 'snapshot':
                 from .status import ENVIRONMENT_STATUS
@@ -594,7 +624,8 @@ class EnvironmentOperationRegistry:
                 duration_seconds=duration_seconds, **fields,
             )
             log_event('harnessy', 'environment_action_complete', workspace=str(workspace_root), action=action)
-        except asyncio.TimeoutError:
+        except _OperationDeadlineExpired:
+            failed_stage = self._failure_stage(self.state(workspace_root).stage)
             state = self._update(
                 workspace_root, busy=False, status='timed_out', stage='timed_out',
                 message='Environment operation timed out.',
@@ -604,6 +635,7 @@ class EnvironmentOperationRegistry:
                 'runtime', 'environment_operation_timed_out', workspace=str(workspace_root),
                 workspace_id=state.workspace_id, operation_id=state.operation_id,
                 kind=action, stage=state.stage, deadline=state.deadline,
+                failed_stage=failed_stage, timeout_scope='operation',
             )
         except asyncio.CancelledError:
             state = self._update(
@@ -618,7 +650,12 @@ class EnvironmentOperationRegistry:
             log_event('harnessy', 'environment_action_cancelled', workspace=str(workspace_root), action=action)
             raise
         except Exception as exc:
-            error = str(exc) or f'{type(exc).__name__}'
+            failed_stage = self._failure_stage(self.state(workspace_root).stage)
+            provider_timeout = isinstance(exc, asyncio.TimeoutError)
+            stage_label = failed_stage.replace('_', ' ') if failed_stage != 'unknown' else 'environment provider'
+            error = str(exc) or type(exc).__name__
+            if provider_timeout:
+                error += f'\nFailed stage: {stage_label}.'
             state = self._update(
                 workspace_root,
                 busy=False,
@@ -627,11 +664,14 @@ class EnvironmentOperationRegistry:
                 message='Environment operation failed.',
                 error=error,
                 success='',
+                **({'detail': f'Timed out during {stage_label}.'} if provider_timeout else {}),
             )
             log_event(
                 'runtime', 'environment_operation_failed', workspace=str(workspace_root),
                 workspace_id=state.workspace_id, operation_id=state.operation_id,
                 kind=action, stage=state.stage, error=error, deadline=state.deadline,
+                failed_stage=failed_stage, error_type=type(exc).__name__,
+                **({'timeout_scope': 'provider'} if provider_timeout else {}),
             )
             log_event('harnessy', 'environment_action_failed', workspace=str(workspace_root), action=action, error=error)
         finally:

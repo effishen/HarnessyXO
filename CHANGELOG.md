@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.94
+
+- Fix numeric bounds in the test-VM creator. Keep CPU, memory and disk limits numeric when changing operating system or architecture, so editing or leaving a field no longer raises NiceGUI string-versus-number errors. Restore each operating system's defaults after applying its limits and preserve valid values during architecture changes.
+- Separate a lifecycle controller's process completion from its output handles. Capture trusted Lima lifecycle output in private anonymous files, stream available progress, and finish when the controller exits instead of waiting for a background process to close inherited output pipes. Continue the normal guest, provisioning and isolation checks before reporting Ready.
+- Distinguish a controller or setup timeout from the environment operation's overall deadline. Show the original timeout and failed stage instead of describing every timeout as a total-deadline failure.
+- Record content-free controller wait and process-exit evidence while a lifecycle command runs. Include the observed controller state and output activity in diagnostics so a slow guest boot can be distinguished from a stalled controller handoff without copying guest content.
+- Preserve existing VMs, workspace data, tools and public startup updates. Leave README unchanged and keep the same 11 Markdown resources; private QA stays outside the application package.
+
 ## v0.6.93
 
 - Make ready test VMs easy to spot: show a bold green Ready badge with a check icon beside the target name, plus a green card outline and subtle background tint. Keep the status visible in light and dark themes and let long names or status messages wrap on narrow screens.

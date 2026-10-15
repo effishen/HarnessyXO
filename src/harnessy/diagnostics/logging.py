@@ -306,6 +306,23 @@ _VM_DIAGNOSTIC_ENUMS = {
     'controller_signal': frozenset({'SIGINT', 'SIGTERM', 'SIGKILL', 'other'}),
     'controller_status': frozenset({'running', 'stopped', 'starting', 'stopping', 'broken', 'unknown',
                                   'not_created', 'unavailable', 'probe_failed', 'timeout'}),
+    'timeout_scope': frozenset({'operation', 'provider'}),
+    'failed_stage': frozenset({
+        'queued', 'starting', 'running', 'failed', 'timed_out', 'cancelled', 'unknown',
+        'checking_host_dependencies', 'installing_host_dependencies', 'host_dependencies_ready',
+        'creating_vm', 'reconciling_environment', 'starting_vm', 'waiting_for_guest',
+        'checking_provisioning', 'adopting_provisioning', 'provisioning_packages',
+        'provisioning_package_index', 'provisioning_required_packages', 'provisioning_optional_packages',
+        'provisioning_ghidra', 'provisioning_ghidra_arm64', 'provisioning_python_re', 'provisioning_rea',
+        'provisioning_skipped_offline', 'finalizing_provisioning', 'installing_isolation',
+        'applying_isolation', 'verifying_isolation', 'ready', 'stopping_vm',
+        'tools_saving', 'tools_removing', 'tools_pending', 'tools_installing', 'tools_complete',
+        'preparing_snapshot', 'stopping_snapshot_vm', 'cloning_snapshot', 'saving_snapshot',
+        'restarting_snapshot_vm', 'verifying_snapshot_restart', 'preparing_restore',
+        'stopping_restore_vm', 'replacing_restore_vm', 'reconciling_restore_files',
+        'restarting_restore_vm', 'verifying_restore_restart', 'factory_reset',
+        'restarting_reset_vm', 'rebuilding', 'network_stopping', 'network_applying', 'network_starting',
+    }),
 }
 _VM_COMMAND_ID_KEYS = frozenset({'command_id', 'parent_start_command_id', 'startup_attempt_id'})
 
@@ -860,6 +877,12 @@ class DiagnosticsManager:
             # hot path. The precise operation evidence has already been stored.
             return
         logger = self.logger(channel)
+        from .controller_observations import CONTROLLER_OBSERVATION_EVENTS, validate_controller_observation
+        if event in CONTROLLER_OBSERVATION_EVENTS:
+            payload = validate_controller_observation(event, fields)
+            if payload is not None:
+                logger.log(level, json.dumps(payload, ensure_ascii=False, separators=(',', ':')))
+            return
         from .startup import STARTUP_EVENTS, validate_startup_event
         if event in STARTUP_EVENTS:
             payload = validate_startup_event(event, fields)
@@ -1332,6 +1355,10 @@ def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
     lowered = key.lower()
     if _is_sensitive_log_key(lowered):
         return '<redacted>'
+    if not key and isinstance(value, dict):
+        from .controller_observations import CONTROLLER_OBSERVATION_EVENTS, validate_controller_observation
+        if isinstance(value.get('event'), str) and value['event'] in CONTROLLER_OBSERVATION_EVENTS:
+            return validate_controller_observation(value['event'], value)
     if not key and _trusted_controller_event(value):
         return {str(name): (_controller_evidence(item, trusted=True) if name == 'controller_evidence'
                            else _privacy_safe_value(item, key=str(name)))
