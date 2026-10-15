@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.86
+
+- Run REA as the ordinary `rea` CLI inside reverse-engineering workspace VMs. The LLM discovers installed commands through shell tools and CLI help; Shell commands and Long-running processes permissions apply. Remove the dedicated host MCP tools, permission and Settings panel, and stop host REA downloads in `python3 run.py`. Preserve inactive host settings and caches for rollback.
+- Install or update REA in an existing VM through **Workspace Environment → Manage Optional Tools → Apply / Retry Selected** with REA selected. Resolve the latest published stable npm version, verify a supported guest Node runtime and staged CLI before switching, and retain a working guest installation if an update fails. Normal REA invocations reuse the installed version. Downloads respect public-outbound settings.
+- Add **Set up / repair radios** for running OpenWrt targets and probe their current radio state after restarting HarnessyXO. Repair missing simulated Wi-Fi interfaces without overwriting guest network configuration. Show package, network, kernel and missing-prerequisite results in setup output and diagnostics; incomplete requested setup reports failure while keeping the shell available. Disable the Bluetooth checkbox for new stock images, which cannot supply VHCI/btvirt controllers; existing customized targets retain the option.
+- Add release-specific OpenWrt MIPS Malta targets using pinned official kernel and ext4 downloads. OpenWrt 23.05.2 offers MIPS32 big-endian; 25.12.5 offers MIPS32 and MIPS64 in both endian variants. These use slower software CPU emulation with one CPU and at most 2048 MiB RAM; they do not emulate a particular router board or radio chipset.
+- Preserve existing targets, workspace data and the public startup updater. Leave README unchanged and keep the existing 11 Markdown resources, with QA material outside the application package.
+
 ## v0.6.85
 
 - Verify ZIP contents before restoring executable metadata lost during extraction, so an unchanged archive can join startup updates. Also verify untouched current-main ZIPs against their exact main commit; leave genuine source edits intact.

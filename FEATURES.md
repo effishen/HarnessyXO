@@ -1,4 +1,4 @@
-# HarnessyXO v0.6.85 Features
+# HarnessyXO v0.6.86 Features
 
 ## Workspace test-target tabs
 
@@ -10,10 +10,10 @@
 
 ## OpenWrt radio emulation
 
-- Request two guest mac80211_hwsim Wi-Fi radios, installing matching signed official packages and verifying their actual PHYs before claiming activation.
-- Support Bluetooth simulation when a custom image provides Linux VHCI and BlueZ btvirt. Report stock-image prerequisites as unavailable.
+- Request two guest mac80211_hwsim Wi-Fi radios, installing matching signed official packages and verifying both PHYs and usable virtual interfaces before claiming activation. Create missing hwsim interfaces without replacing existing wireless or LAN configuration.
+- Support Bluetooth simulation when a custom image provides Linux VHCI and BlueZ btvirt. Disable Bluetooth selection when creating a stock OpenWrt image. Existing customized targets can request it, but missing prerequisites remain explicitly unavailable; a selected checkbox cannot supply them.
 - Tell the model which capabilities are requested, last observed or currently verified, and label virtual radios as emulated with no physical RF or USB chipset coverage.
-- Keep existing guest network configuration intact. Optional setup failures leave the shell available.
+- Use **Set up / repair radios** on a running target to retry its saved selection. Probe live capabilities after an application restart. Show setup progress, package/network/kernel failure categories, and per-radio results in the UI and support diagnostics. Incomplete requested setup reports failure while leaving the VM shell available.
 
 ## Public GitHub startup updates
 
@@ -21,18 +21,19 @@
 - Apply clean `main` updates through fast-forward Git history and restart the launcher before setup.
 - Verify every application byte before adding Git metadata to a ZIP installation. Restore executable metadata lost during extraction only after content matches; accept an untouched current-main ZIP against its exact current commit. Keep genuine source edits untouched and report the app-relative mismatch and reason. The first public check needs Git and internet access, without a GitHub account.
 - Download updates from the public repository over HTTPS without GitHub login. Existing SSH checkouts keep their saved remote; the updater reads the matching public HTTPS source.
-- Include reviewed source-check and REA storage evidence in `STARTUP.json` and the support summary, retaining bounded launcher receipts when the app starts.
+- Include reviewed source-check and historical host REA storage evidence in `STARTUP.json` and the support summary, retaining bounded launcher receipts when the app starts.
 - Preserve settings, dependencies, runtime caches, workspaces and local code edits. Keep the current app available when a check fails.
 - Hold an installation lock for the lifetime of the app and detect incomplete source updates across restarts.
 - Publish versioned GitHub Release notes and verified downloads from committed application files, with the same 11 Markdown resources and no QA payload.
 
-## REA reverse engineering
+## REA in the workspace VM
 
-- Use the local Reverse Engineer Anything server through the normal agent tool catalogue with any configured model backend.
-- Analyze native binaries with an existing Hopper, Ghidra or IDA engine; inspect JavaScript/Electron structure and static .NET metadata/CIL.
-- Trace functions, strings, calls and references, then follow retained evidence with bounded queries. Keep upstream coverage, limitations and actionable errors in the result.
-- First launch automatically sets up the REA version pinned by HarnessyXO (currently 6.4.0); it does not independently track the newest upstream REA release. A private supported Node.js runtime is installed when needed. Setup repairs installer-owned cache permissions under a private REA root and names the component and reason when storage cannot be used. Later launches reuse the local installation; Settings offers Repair REA, engine selection, timeout and an existing local command override.
-- Default to Ask, respect filesystem read permission, confine follow-up queries to the authorized target, and close run-owned sessions on Stop or completion.
+- Install Reverse Engineer Anything as the ordinary `rea` command inside a reverse-engineering workspace VM. The model discovers the installed version and commands using `command -v rea`, `rea --version` and `rea --help`, then uses the normal shell or long-running process tools.
+- Use **Workspace Environment → Manage Optional Tools → Apply / Retry Selected** with REA selected to install or check the latest published stable npm release. Existing VMs can install it in place. Normal command execution reuses the installed version; it does not download a new version for each analysis.
+- Stage and verify guest installation before switching versions. Keep a working guest installation if an update fails. Public outbound access is required for downloads; an offline selection stays pending.
+- Keep the supported Node runtime and npm package inside the VM. `python3 run.py` no longer installs a host REA server, and REA has no separate permission family or host MCP settings panel. Shell and long-running process permissions apply.
+- Native analysis engines must be available inside the same VM. The reverse preset already offers Ghidra; use REA's installed help and readiness checks for exact capabilities and missing engine requirements.
+- Preserve existing host REA settings and cache files for rollback. They are inactive and are not copied into a guest or deleted.
 - Retain the lean package: three living documents and eight functional skill files.
 
 ## Storage concurrency
@@ -55,7 +56,7 @@ Workspace and machine databases use WAL so background reads can coexist with mes
 ## OpenWrt test-target releases
 
 - Choose OpenWrt 23.05.2 or 25.12.5 in the existing Create VM operating-system selector.
-- ARM64 and x86-64 use the selected release’s pinned kernel and writable ext4 filesystem.
+- ARM64, x86-64 and release-specific MIPS Malta choices use the selected release’s pinned kernel and writable ext4 filesystem. OpenWrt 23.05.2 offers MIPS32 big-endian; 25.12.5 offers MIPS32 and MIPS64 in both endian variants. MIPS uses slower software CPU emulation, not vendor router board emulation.
 - Existing targets retain their configured release and disk.
 
 ## Reasoning grounded in verified facts

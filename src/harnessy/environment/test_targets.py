@@ -21,15 +21,16 @@ from typing import Any
 
 from .host_prerequisites import discover_binary, repaired_path
 from .presets import canonical_arch
-from .test_catalog import guest_os, KALI_IMAGES
+from .test_catalog import guest_os, KALI_IMAGES, target_architectures
 
 
 def normalize_vm_config(raw: dict[str, Any]) -> dict[str, Any]:
     os_name = str(raw.get('os') or 'ubuntu-24.04')
     guest = guest_os(os_name)
     arch = canonical_arch(str(raw.get('architecture') or platform.machine()))
-    if arch not in {'arm64', 'x86_64'}:
-        raise ValueError('Test VMs support ARM64 and x86-64.')
+    if arch not in target_architectures(os_name):
+        raise ValueError('Choose an architecture available for this operating system and release.')
+    mips = arch.startswith('mips')
     def number(key, default, low, high):
         value = int(raw.get(key, default))
         if not low <= value <= high:
@@ -50,8 +51,8 @@ def normalize_vm_config(raw: dict[str, Any]) -> dict[str, Any]:
         raise ValueError('Radio emulation is currently available only for OpenWrt test targets.')
     return {
         'os': os_name, 'architecture': arch,
-        'cpu': number('cpu', guest.cpu, 2 if os_name == 'windows-11' else 1, 32),
-        'memory_mb': number('memory_mb', guest.memory, guest.min_memory, 131072),
+        'cpu': number('cpu', 1 if mips else guest.cpu, 2 if os_name == 'windows-11' else 1, 1 if mips else 32),
+        'memory_mb': number('memory_mb', guest.memory, guest.min_memory, 2048 if mips else 131072),
         'disk_gb': number('disk_gb', guest.disk, guest.min_disk, 2048 if guest.family != 'openwrt' else 64),
         'desktop': bool(raw.get('desktop', True)), 'internet': True,
         'iso_path': iso if os_name == 'windows-11' else '',
@@ -170,6 +171,8 @@ class TestTargetManager:
                    'reason': 'not_detected' if requested[kind] else 'not_requested'}
             for kind in ('wifi', 'bluetooth')
         })
+        for kind in ('wifi', 'bluetooth'):
+            state[kind]['requested'] = requested[kind]
         state['observation'] = 'last_guest_probe' if cached else 'not_probed'
         state['probe_age_seconds'] = round(max(0, time.monotonic() - cached[0]), 3) if cached else None
         state['current_state_verified'] = False
@@ -186,6 +189,7 @@ class TestTargetManager:
         from .test_radios import probe_radios
         state = await probe_radios(self.config['emulation'], self._radio_command)
         _RADIOS[self.key] = (time.monotonic(), state)
+        self._record_radio_result(state, observation='probe')
         while len(_RADIOS) > 64:
             _RADIOS.pop(next(iter(_RADIOS)))
         return {**state, 'observation': 'live_guest_probe', 'probe_age_seconds': 0,
@@ -193,18 +197,47 @@ class TestTargetManager:
                     state[kind]['status'] not in {'unverified', 'error'}
                     for kind in ('wifi', 'bluetooth'))}
 
+    def _record_radio_result(self, state: dict[str, Any], *, observation: str) -> None:
+        from harnessy.diagnostics import log_event
+        for kind in ('wifi', 'bluetooth'):
+            item = state[kind]
+            op = self.operation
+            log_event('runtime', 'test_target_radio_result', target_id=self.target.id,
+                      target_backend=self.backend,
+                      operation_id=op.operation_id if op and self.busy else '',
+                      target_action=op.action if op and self.busy else 'status',
+                      target_stage='radio_setup', target_radio_kind=kind,
+                      target_radio_observation=observation,
+                      target_radio_status=item['status'], target_radio_reason=item['reason'],
+                      target_radio_detail=item.get('detail_code', 'none'),
+                      target_radio_requested=item['requested'], target_radio_verified=item['verified'],
+                      target_radio_count=item['radio_count'], target_radio_interface_count=item['interface_count'])
+
     async def configure_radios(self) -> None:
         if self.guest.family != 'openwrt' or not any(self.config['emulation'].values()):
             _RADIOS.pop(self.key, None)
             return
         from .test_radios import configure_radios, radio_summary
         self.stage('radio_setup', timeout_seconds=215)
+        if self.operation:
+            self.operation.note('Checking requested guest radios. Wi-Fi setup may download signed packages for this exact OpenWrt release (up to 180 seconds).\n')
         state = await configure_radios(self.config['emulation'], self._radio_command)
         _RADIOS[self.key] = (time.monotonic(), state)
+        self._record_radio_result(state, observation='setup')
         if self.operation:
             self.operation.note('\n' + radio_summary(state) + '\n')
-        if any(state[kind]['requested'] and not state[kind]['verified'] for kind in ('wifi', 'bluetooth')):
+        if any(state[kind]['requested'] and (not state[kind]['verified'] or state[kind]['reason'] in {
+            'interface_create_failed', 'insufficient_radios', 'insufficient_controllers',
+        }) for kind in ('wifi', 'bluetooth')):
             self.stage('radio_setup', failure_code='radio_setup_failed')
+            raise TestTargetFailure(
+                'The VM shell is running, but requested radio setup is incomplete. '
+                + radio_summary(state)
+                + ' Use Set up / repair radios on this running VM to retry. '
+                'Inspect Wi-Fi with iw dev and iw phy; AP/station configuration remains yours. '
+                'Stock OpenWrt cannot provide Bluetooth btvirt/VHCI controllers.',
+                'radio_setup_failed',
+            )
 
     def forget_radios(self) -> None:
         _RADIOS.pop(self.key, None)
@@ -371,13 +404,14 @@ systemctl restart lightdm
         return {'state': state, 'running': state == 'running', 'created': True, 'architecture': self.config['architecture'], 'internet': True}
 
     def begin(self, action: str, *, tag: str = '') -> TargetOperation:
-        if action not in {'start', 'stop', 'snapshot', 'restore', 'delete'}:
+        if action not in {'start', 'stop', 'snapshot', 'restore', 'delete', 'radios'}:
             raise ValueError('Unsupported test VM action.')
         if self.busy:
             raise RuntimeError('A test VM operation is already running. Wait for it to finish.')
         if action in {'snapshot', 'restore', 'delete'} and _ACTIVE.get(self.key, 0):
             raise RuntimeError('Close this target’s shell and graphical interface tabs, and finish its commands before changing VM data.')
-        op = TargetOperation(action, stage='prerequisites' if action == 'start' else ('stopped' if action == 'stop' else action))
+        op = TargetOperation(action, stage='prerequisites' if action == 'start' else
+                             'radio_setup' if action == 'radios' else ('stopped' if action == 'stop' else action))
         _OPERATIONS[self.key] = op
         async def work():
             from harnessy.diagnostics import log_event
@@ -391,6 +425,10 @@ systemctl restart lightdm
                 op.note(f'{action.capitalize()} · {self.target.name}\n')
                 if action == 'start':
                     await self.start()
+                elif action == 'radios':
+                    if self.guest.family != 'openwrt' or not (await self.status()).get('running'):
+                        raise TestTargetFailure('Start this OpenWrt VM before setting up its radios.', 'radio_setup_failed')
+                    await self.configure_radios()
                 elif action == 'stop':
                     await self.stop()
                 elif action == 'snapshot':
@@ -432,7 +470,7 @@ systemctl restart lightdm
     async def request_stop(self) -> TargetOperation:
         if self.busy:
             if self.operation.action != 'start':
-                raise RuntimeError('Wait for the current snapshot/restore/delete operation to finish.')
+                raise RuntimeError('Wait for the current test VM operation to finish.')
             if not self.instance_dir.exists():
                 raise RuntimeError('Host prerequisites are still being prepared. Retry Stop once the VM has been created.')
             task = self.operation.task

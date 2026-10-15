@@ -235,68 +235,6 @@ def show_source_update_details(result: dict) -> None:
     print('Keep this folder to preserve local edits; use a clean release folder for automatic updates.', flush=True)
 
 
-def ensure_rea_setup(diagnostic_event=None) -> bool:
-    """Prepare the optional local analysis service before opening the app.
-
-    The installer owns private, retained dependencies. Failure leaves the UI
-    available for Settings repair; Ctrl-C still cancels the launcher.
-    """
-    import asyncio
-    from harnessy.core.auth_users import UserStore
-    from harnessy.core.machine import MachineStore
-    from harnessy.core.paths import settings_dir
-    from harnessy.core.rea_settings import REA_VERSION, normalize_rea_settings
-    from harnessy.agent.rea import install_rea, rea_status
-
-    async def setup() -> bool:
-        # Validate the retained root before creating caches or reading settings.
-        # Constructing UserStore checks the directory; it creates no accounts.
-        UserStore(settings_dir())
-        settings = MachineStore().load_settings()
-        agent = settings.get('agent') if isinstance(settings.get('agent'), dict) else {}
-        permissions = agent.get('tool_permissions') if isinstance(agent.get('tool_permissions'), dict) else {}
-        if permissions.get('rea') == 'off':
-            print('REA: Off in Settings; automatic setup skipped.', flush=True)
-            return True
-        config = normalize_rea_settings(agent.get('rea'))
-        if config['command']:
-            print('REA: using your configured local command; it will be checked when analysis starts.', flush=True)
-            return True
-        status = await rea_status(config)
-        if status.get('ok') and status.get('status') == 'ready':
-            print(f'REA {REA_VERSION}: ready (cached local setup).', flush=True)
-            if diagnostic_event:
-                diagnostic_event('harnessy', 'launcher_rea_ready', cached=True, version=REA_VERSION)
-            return True
-        print(f'Setting up REA {REA_VERSION} (version pinned by HarnessyXO)…', flush=True)
-        print('The first setup downloads REA and, if needed, a private Node.js runtime. Later launches reuse them.', flush=True)
-        if diagnostic_event:
-            diagnostic_event('harnessy', 'launcher_rea_setup_start', version=REA_VERSION)
-        status = await install_rea()
-        if status.get('ok') and status.get('status') == 'ready':
-            print(f'REA {REA_VERSION}: setup complete.', flush=True)
-            if diagnostic_event:
-                diagnostic_event('harnessy', 'launcher_rea_ready', cached=False, version=REA_VERSION)
-            return True
-        print('REA setup did not complete. Open Settings → Agent / Tools → REA → Repair REA to retry.', file=sys.stderr, flush=True)
-        if status.get('remediation'):
-            print(str(status['remediation']), file=sys.stderr, flush=True)
-        if diagnostic_event:
-            diagnostic_event('harnessy', 'launcher_rea_setup_failed', version=REA_VERSION,
-                             error_code=status.get('code'), status=status.get('status'),
-                             storage_issue=status.get('storage_issue'))
-        return False
-
-    try:
-        return asyncio.run(setup())
-    except Exception as exc:
-        # Do not print arbitrary subprocess/server text, settings or secrets.
-        print('REA setup could not finish. The app will still open; use Settings → Agent / Tools → REA → Repair REA to retry.', file=sys.stderr, flush=True)
-        if diagnostic_event:
-            diagnostic_event('harnessy', 'launcher_rea_setup_failed', exception_class=type(exc).__name__)
-        return False
-
-
 def main() -> None:
     if sys.version_info < MIN_PYTHON:
         fail(
@@ -436,7 +374,6 @@ def main() -> None:
     # harnessy_app.py prepends .vendor. Make the dependencies which were just
     # verified or installed importable here as well.
     prepend_import_path(vendor_dir)
-    ensure_rea_setup(diagnostic_event)
     try:
         check_registered_host_prerequisites()
     except Exception as exc:

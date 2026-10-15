@@ -18,7 +18,7 @@ from harnessy.environment.test_targets import TestTargetManager
 
 
 def open_vm_creator(ws, refresh, os_name='ubuntu-24.04'):
-    from harnessy.environment.test_catalog import GUESTS, guest_os
+    from harnessy.environment.test_catalog import GUESTS, guest_os, target_architectures
     initial = guest_os(os_name)
     with ui.dialog() as dialog, ui.card().classes('hy-form-dialog hy-vm-creator'):
         with ui.row().classes('hy-dialog-header w-full no-wrap items-center'):
@@ -43,9 +43,9 @@ def open_vm_creator(ws, refresh, os_name='ubuntu-24.04'):
                     ui.link('Download ARM64 ISO', 'https://www.microsoft.com/software-download/windows11arm64', new_tab=True)
                     ui.link('Download x64 ISO', 'https://www.microsoft.com/software-download/windows11', new_tab=True)
             with ui.expansion('Architecture and model access', icon='tune').classes('w-full hy-target-details'):
-                arch = ui.select({'arm64': 'ARM64 (Apple Silicon / ARM hosts)', 'x86_64': 'x86-64 (Intel / AMD)'},
+                arch = ui.select(target_architectures(initial.id),
                     value=canonical_arch(platform.machine()), label='Architecture').classes('w-full')
-                ui.label('Matching the host enables acceleration. Other architectures use slower CPU emulation.').classes('text-xs hy-muted')
+                architecture_hint = ui.label('Matching the host enables acceleration. Other architectures use slower CPU emulation.').classes('text-xs hy-muted')
                 approval = ui.select({'ask': 'Ask before protected target actions', 'on': 'Allow autonomous target tools'},
                     value='on', label='Model access').classes('w-full')
                 ui.label('The model can install software and make system changes in this test VM.').classes('text-xs hy-muted')
@@ -53,12 +53,26 @@ def open_vm_creator(ws, refresh, os_name='ubuntu-24.04'):
                 ui.label('Guest radio emulation').classes('font-semibold text-sm')
                 wifi = ui.checkbox('Emulated Wi-Fi radios (mac80211_hwsim)', value=False)
                 bluetooth = ui.checkbox('Emulated Bluetooth controllers (requires custom image support)', value=False)
+                bluetooth.set_enabled(False)
+                ui.label('Bluetooth is unavailable in these stock OpenWrt images. After creating a VM, a manually customized guest with VHCI and btvirt can request it in Emulated radios.').classes('text-xs hy-muted')
                 ui.label('Software radios only: no real RF, USB dongle identity or access to nearby devices. Wi-Fi modules download on Start; stock OpenWrt images cannot provide a Bluetooth controller. The model is told what is requested and what actually becomes active.').classes('text-xs hy-muted')
             prerequisite_hint = ui.label('').classes('text-xs hy-muted')
             start_now = ui.switch('Start after creating', value=True)
             error = ui.label('').classes('text-sm text-negative whitespace-pre-wrap').props('role=alert')
 
             selection = {'id': initial.id}
+            def select_architecture(_=None):
+                guest = guest_os(operating_system.value)
+                mips = str(arch.value).startswith('mips')
+                cpu.props(f'min={2 if guest.family == "windows" else 1} max={1 if mips else 32}')
+                memory.props(f'min={guest.min_memory} max={2048 if mips else 131072}')
+                if mips:
+                    cpu.value = 1
+                    memory.value = min(int(memory.value or guest.memory), 2048)
+                architecture_hint.set_text(
+                    'MIPS uses a Malta development board with software CPU emulation, one CPU and up to 2048 MiB RAM. It does not emulate a particular router model. Only official images available for this release are listed.' if mips else
+                    'Matching the host enables acceleration. Other architectures use slower CPU emulation.')
+            arch.on_value_change(select_architecture)
             def select_os(_=None):
                 guest = guest_os(operating_system.value)
                 previous = guest_os(selection['id'])
@@ -70,6 +84,10 @@ def open_vm_creator(ws, refresh, os_name='ubuntu-24.04'):
                 memory.props(f'min={guest.min_memory}')
                 disk.props(f'min={guest.min_disk} max={64 if guest.family == "openwrt" else 2048}')
                 selection['id'] = guest.id
+                options = target_architectures(guest.id)
+                current_arch = arch.value if arch.value in options else canonical_arch(platform.machine())
+                arch.set_options(options, value=current_arch if current_arch in options else next(iter(options)))
+                select_architecture()
                 description.set_text(guest.description)
                 windows_options.set_visibility(guest.family == 'windows')
                 radio_options.set_visibility(guest.family == 'openwrt')
@@ -406,8 +424,8 @@ def render_managed_target(page, ws, target, refresh):
                 requested = c.get('emulation') or {}
                 wifi = ui.checkbox('Emulated Wi-Fi radios (mac80211_hwsim)', value=bool(requested.get('wifi')))
                 bluetooth = ui.checkbox('Emulated Bluetooth controllers (requires custom image support)', value=bool(requested.get('bluetooth')))
-                ui.label('Guest software radios, with no real RF or USB dongle identity. Stock OpenWrt supports the Wi-Fi simulator; Bluetooth needs a custom image providing VHCI and btvirt. The model sees requested and verified active states separately.').classes('text-xs hy-muted')
-                ui.label('Stop this VM before applying. The saved selection is applied on its next Start; existing network and wireless configuration is kept.').classes('text-xs hy-muted')
+                ui.label('Guest software radios, with no real RF or USB dongle identity. Wi-Fi setup downloads matching signed simulator packages. Bluetooth is unavailable in stock OpenWrt images; it needs a custom image providing VHCI and btvirt. The model sees requested and verified active states separately.').classes('text-xs hy-muted')
+                ui.label('Stop this VM before changing the saved selection. Retry its saved setup on a running VM with Set up / repair radios. Unticking skips future setup; it leaves installed guest packages and existing interfaces in place. Network and wireless configuration is kept.').classes('text-xs hy-muted')
                 radio_error = ui.label('').classes('text-negative text-sm whitespace-pre-wrap').props('role=alert')
                 async def save_radios():
                     try:
@@ -421,10 +439,14 @@ def render_managed_target(page, ws, target, refresh):
                         ws.upsert_external_target(target_id=current.id, name=current.name, host=current.host,
                             username=current.username, remote_root=current.remote_root, enabled=current.enabled,
                             approval_mode=current.approval_mode, managed_vm=config)
+                        manager.forget_radios()
                         refresh()
                     except Exception as exc:
                         radio_error.set_text(str(exc))
                 ui.button('Apply for next Start', icon='save', on_click=save_radios).props('outline no-caps')
+                radio_repair = ui.button('Set up / repair radios', icon='build',
+                    on_click=lambda: start_action('radios')).props('outline no-caps')
+                radio_guidance_label = ui.label('').classes('text-xs hy-muted whitespace-pre-wrap')
 
         async def start_action(action, tag=''):
             try:
@@ -487,6 +509,7 @@ def render_managed_target(page, ws, target, refresh):
         with ui.expansion('Activity and setup output', icon='receipt_long').classes('w-full'):
             output = ui.label('').classes('text-xs w-full font-mono').style('white-space:pre-wrap;max-height:260px;overflow:auto')
         error_label = ui.label('').classes('text-negative text-sm whitespace-pre-wrap')
+        radio_probe_busy = {'value': False}
         async def poll():
             if panel.is_deleted:
                 timer.deactivate()
@@ -509,12 +532,24 @@ def render_managed_target(page, ws, target, refresh):
                 if radio_status is not None:
                     from harnessy.environment.test_radios import radio_summary
                     snapshot = status.get('hardware_emulation')
-                    if snapshot and snapshot.get('observation') == 'last_guest_probe':
+                    if (snapshot and snapshot.get('observation') == 'not_probed' and running
+                            and not busy and any((c.get('emulation') or {}).values())
+                            and not radio_probe_busy['value']):
+                        radio_probe_busy['value'] = True
+                        radio_status.set_text('Checking emulated radios inside the running guest…')
+                        try:
+                            snapshot = await manager.inspect_radios()
+                        finally:
+                            radio_probe_busy['value'] = False
+                    if snapshot and snapshot.get('observation') in {'last_guest_probe', 'live_guest_probe'}:
                         age = snapshot.get('probe_age_seconds')
                         when = f' ({int(age)} seconds ago)' if isinstance(age, (int, float)) and age >= 0 else ''
                         radio_status.set_text('Last guest probe' + when + ': ' + radio_summary(snapshot))
+                        from harnessy.environment.test_radios import radio_guidance
+                        radio_guidance_label.set_text(radio_guidance(snapshot))
                     else:
                         radio_status.set_text('Emulated radios: not yet probed inside this guest.')
+                    radio_repair.set_enabled(running and not busy and any((c.get('emulation') or {}).values()))
                 start_button.set_enabled(not busy and (not running or bool(op and op.state == 'failed')))
                 stop_button.set_enabled(running and (not busy or bool(op and op.action == 'start')))
                 shell_button.set_enabled(not busy and running)

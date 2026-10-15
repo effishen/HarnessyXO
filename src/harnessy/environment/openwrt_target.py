@@ -29,6 +29,14 @@ OPENWRT_READINESS_SECONDS = 240.0
 OPENWRT_POLL_SECONDS = 2.0
 
 
+def qemu_binary(architecture: str) -> str:
+    return {
+        'arm64': 'qemu-system-aarch64', 'x86_64': 'qemu-system-x86_64',
+        'mips': 'qemu-system-mips', 'mipsel': 'qemu-system-mipsel',
+        'mips64': 'qemu-system-mips64', 'mips64el': 'qemu-system-mips64el',
+    }[architecture]
+
+
 def e2fs_binary(name: str) -> str | None:
     found = discover_binary(name)
     if found:
@@ -121,11 +129,12 @@ class OpenWrtTargetManager(TestTargetManager):
         return text
 
     async def prerequisites(self):
-        names = ['ssh', 'ssh-keygen', 'qemu-system-aarch64' if self.config['architecture'] == 'arm64' else 'qemu-system-x86_64']
+        names = ['ssh', 'ssh-keygen', qemu_binary(self.config['architecture'])]
         missing = [name for name in names if not discover_binary(name)]
         missing += [name for name in ('debugfs', 'e2fsck', 'resize2fs') if not e2fs_binary(name)]
         if missing:
-            command = 'brew install qemu e2fsprogs' if platform.system() == 'Darwin' else 'sudo apt-get install qemu-system-arm qemu-system-x86 e2fsprogs openssh-client'
+            qemu_package = 'qemu-system-mips' if self.config['architecture'].startswith('mips') else ('qemu-system-arm' if self.config['architecture'] == 'arm64' else 'qemu-system-x86')
+            command = 'brew install qemu e2fsprogs' if platform.system() == 'Darwin' else f'sudo apt-get install {qemu_package} e2fsprogs openssh-client'
             raise RuntimeError('OpenWrt needs ' + ', '.join(missing) + ' on the HarnessyXO host. Install the missing packages and retry Start. Example: ' + command)
 
     async def _prepare(self):
@@ -136,10 +145,11 @@ class OpenWrtTargetManager(TestTargetManager):
         except KeyError:
             raise ValueError('Unsupported OpenWrt test VM release or architecture.') from None
         release = self.config['os'].removeprefix('openwrt-')
-        base = f'https://downloads.openwrt.org/releases/{release}/targets/{folder}/openwrt-{release}-{target}-generic-'
+        mips = self.config['architecture'].startswith('mips')
+        base = f'https://downloads.openwrt.org/releases/{release}/targets/{folder}/openwrt-{release}-{target}-' + ('' if mips else 'generic-')
         images = self.root / 'images'
-        root_archive = await download_verified(base + 'ext4-rootfs.img.gz', root_hash, images / 'rootfs.img.gz', note)
-        kernel = await download_verified(base + 'kernel.bin', kernel_hash, images / 'kernel.bin', note)
+        root_archive = await download_verified(base + ('rootfs-ext4.img.gz' if mips else 'ext4-rootfs.img.gz'), root_hash, images / 'rootfs.img.gz', note)
+        kernel = await download_verified(base + ('vmlinux.elf' if mips else 'kernel.bin'), kernel_hash, images / 'kernel.bin', note)
         self.stage('prepare_disk')
         stage = self.home / '.create-new'
         if stage.exists():
@@ -252,24 +262,26 @@ class OpenWrtTargetManager(TestTargetManager):
 
     def qemu_argv(self, ssh_port: int, web_port: int):
         arm = self.config['architecture'] == 'arm64'
-        native = canonical_arch(platform.machine()) == self.config['architecture']
+        mips = self.config['architecture'].startswith('mips')
+        native = not mips and canonical_arch(platform.machine()) == self.config['architecture']
         accel = 'hvf' if native and platform.system() == 'Darwin' else ('kvm' if native and os.access('/dev/kvm', os.R_OK | os.W_OK) else 'tcg')
-        cpu = 'host' if accel != 'tcg' else ('cortex-a57' if arm else 'max')
+        cpu = ('MIPS64R2-generic' if '64' in self.config['architecture'] else '24Kc') if mips else ('host' if accel != 'tcg' else ('cortex-a57' if arm else 'max'))
         runtime = self.runtime_dir()
         # Escape QEMU key/value commas; host paths remain one fixed argv value.
         disk = str(self.instance_dir / 'rootfs.raw').replace(',', ',,')
         lan = f'user,id=lan,net=192.168.77.0/24,host=192.168.77.1,restrict=on,hostfwd=tcp:127.0.0.1:{ssh_port}-192.168.77.2:22'
         if self.config['desktop']:
             lan += f',hostfwd=tcp:127.0.0.1:{web_port}-192.168.77.2:80'
-        return [discover_binary('qemu-system-aarch64' if arm else 'qemu-system-x86_64'),
+        network = 'pcnet' if mips else 'virtio-net-pci'
+        return [discover_binary(qemu_binary(self.config['architecture'])),
             '-name', 'harnessy-test-' + self.target.id, '-uuid', str(uuid.UUID(self.target.id)),
-            '-machine', 'virt' if arm else 'pc', '-accel', accel, '-cpu', cpu,
+            '-machine', 'malta' if mips else ('virt' if arm else 'pc'), '-accel', accel, '-cpu', cpu,
             '-smp', str(self.config['cpu']), '-m', str(self.config['memory_mb']),
             '-kernel', str(self.instance_dir / 'kernel.bin'),
-            '-append', 'root=/dev/vda rootwait rw console=' + ('ttyAMA0' if arm else 'ttyS0'),
-            '-drive', f'file={disk},format=raw,if=virtio',
-            '-netdev', lan, '-device', 'virtio-net-pci,netdev=lan,mac=52:54:00:77:00:01',
-            '-netdev', 'user,id=wan', '-device', 'virtio-net-pci,netdev=wan,mac=52:54:00:77:00:02',
+            '-append', ('root=/dev/sda' if mips else 'root=/dev/vda') + ' rootwait rw console=' + ('ttyAMA0' if arm else 'ttyS0'),
+            '-drive', f'file={disk},format=raw,if=' + ('ide' if mips else 'virtio'),
+            '-netdev', lan, '-device', network + ',netdev=lan,mac=52:54:00:77:00:01',
+            '-netdev', 'user,id=wan', '-device', network + ',netdev=wan,mac=52:54:00:77:00:02',
             '-display', 'none', '-monitor', 'none', '-serial', 'file:' + str(runtime / 'serial.log'),
             '-qmp', 'unix:' + str(runtime / 'qmp.sock') + ',server=on,wait=off',
             '-pidfile', str(runtime / 'qemu.pid'), '-daemonize']

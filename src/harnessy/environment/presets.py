@@ -126,6 +126,8 @@ for image_id, image in IMAGES.items():
             packages = packages + ('openjdk-21-jdk-headless',)
             optional = UBUNTU_REVERSE_OPTIONAL
             supplemental = ('ghidra', 'python-re')
+        if tools_id == 'reverse':
+            supplemental += ('rea',)
         # Preserve the old Ubuntu preset names/IDs for existing workspaces.
         name = f'{image.name.replace(" LTS", "")} — {"Reverse Engineering" if tools_id == "reverse" else tools_name}'
         pid = f'{prefix}-{tools_id}'

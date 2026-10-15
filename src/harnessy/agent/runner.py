@@ -1037,8 +1037,9 @@ class AgentRunner:
                     'forensics/carving tools, UPX/PE/.NET helpers, multiarch build/debug utilities, and Python RE libraries. Ubuntu Reverse also provisions isolated angr, capa, FLOSS, firmware, Frida, and binary-format environments; use angr-python for angr scripts, capa/floss directly, re-python for LIEF/r2pipe/Keystone/Capstone/Unicorn/PE/ELF/.NET/Mach-O parsing, ubireader-extract-files/ubireader-info/jefferson for firmware filesystems, and frida/frida-ps/frida-trace for dynamic instrumentation when supported by the guest/target. The Ubuntu reverse preset also provisions official '
                     f'Ghidra {GHIDRA_VERSION} as ghidra-headless/ghidra. Use run_command/start_process to invoke these. '
                     'Because optional distro packages can vary and persistent VMs are not silently upgraded, confirm a '
-                    'specific optional command with command -v before relying on it. If a preset was upgraded after this '
-                    'VM was created, tell the user that Rebuild VM applies the new tool set while preserving Files/. '
+                    'specific optional command with command -v before relying on it. Use Workspace Environment → '
+                    'Manage Optional Tools → Apply / Retry Selected to add or update selected tools in an existing VM '
+                    'while preserving Files/. '
                     'On Linux ARM64, upstream Ghidra requires locally built native components; HarnessyXO attempts that '
                     'build during provisioning, while an x86_64 reverse VM uses the upstream prebuilt Linux natives.'
                 )
@@ -1147,7 +1148,7 @@ Rules:
 - Do not ask for web permission in conversational text. When Web is Ask or On, attempt the appropriate tool call; HarnessyXO enforces Off / Ask / On and obtains Ask approval. If denied, respect that decision without repeating the same request. When Web is Off, do not attempt web tools or claim current internet verification; explain what cannot be verified. Never claim to have checked a source when no successful retrieval occurred.
 - Code intelligence / LSP permission: {code_intelligence_permission}. Prefer find_symbol/find_references/go_to_definition/workspace_symbols/diagnostics for structured code navigation instead of repeatedly grepping when those tools fit. VM workspaces never launch a language server on the host; bounded source-index fallback remains available.
 - HarnessyXO diagnostics permission: {diagnostics_permission}. Discover get_last_request/get_generation_metrics/get_context_usage/get_tool_history/get_attachment_strategy/get_active_model/get_backend_status when debugging HarnessyXO's own routing, context, attachments, tools, or model behavior. Prefer these structured facts over guessing from UI symptoms.
-- For static reverse engineering of binaries, JavaScript/Electron applications or managed .NET files, discover rea_status/rea_tools/rea_analyze/rea_query when REA is enabled. Analyze one visible Project Files target first; subsequent static queries remain bound to that target and this run. REA results are evidence with explicit limitations, not recovered original source or runtime proof.
+- Reverse Engineer Anything (REA) is an optional CLI inside the workspace VM. Use run_command to check command -v rea, rea --version and rea --help before choosing commands; use the installed CLI help and current results to discover its capabilities and arguments. Use Workspace Environment → Manage Optional Tools → Apply / Retry Selected to install or update REA in an existing VM; a selected tool is not proof that it is installed or working. Use start_process/poll_process for long analyses. These commands use the ordinary Shell and Long-running process permissions. Keep inputs and deliverables in the owned project directory, and report analysis limitations without claiming recovered original source or runtime proof from static output.
 - Long-chat archive permission: {memory_permission}. HarnessyXO may keep older chat turns/assets in cold local history instead of resending them verbatim on every request. When available, use search_chat_history and read_chat_message before claiming an older detail is unavailable; read_chat_message also reactivates historical image attachments for the next model step.
 - Use list_project_access to discover explicitly shared sources. Shared transcript, memory and task state are not injected automatically: retrieve only what is needed with source_project_id via search_chat_history/read_chat_message, read_project_memory, get_task_state, search_upstream_memory, or linked-attachment tools. The current destination conversation and latest user request remain authoritative. Parenthood alone still does not expose a parent's transcript.
 - If the user asks you to work on files, actually inspect and modify them rather than merely explaining what you would do.
@@ -4490,9 +4491,6 @@ Rules:
                           exception_class=type(exc).__name__)
             raise
         finally:
-            rea_cleanup_interrupted = await self.toolbox.close_rea()
-            if rea_cleanup_interrupted:
-                terminal_status = 'cancelled'
             final_strategy = getattr(self, '_context_strategy', {}) or {}
             self._record_context_tuning(
                 'run_finished', outcome='completed' if terminal_status == 'success' else terminal_status,
@@ -4573,8 +4571,6 @@ Rules:
                         # Includes head-query failures and cancellation before
                         # the background task ever executes its first line.
                         await self._release_project_writer()
-            if rea_cleanup_interrupted:
-                raise asyncio.CancelledError
 
     async def _release_project_writer(self) -> None:
         release = asyncio.create_task(self.toolbox.release_mutation_lease())

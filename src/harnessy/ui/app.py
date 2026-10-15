@@ -44,8 +44,6 @@ from harnessy.agent.client import OpenAICompatibleClient  # noqa: E402
 from harnessy.agent.instruction_builder import (next_question as instruction_next_question, draft_instructions as instruction_draft,
     build_reference_context as instruction_reference_context)  # noqa: E402
 from harnessy.agent.runner import AgentRunner, CompletionCheckExhaustedError  # noqa: E402
-from harnessy.agent.rea import install_rea, rea_status
-from harnessy.core.rea_settings import REA_VERSION, normalize_rea_settings
 from harnessy.agent.queue_retries import retry_queued_run, queued_retry_continues
 from harnessy.agent.saved_retries import retry_saved_run, saved_run_retry_payload
 from harnessy.agent.prompt_references import resolve_run_prompt_reference, resolve_run_origin_message
@@ -191,7 +189,6 @@ _TERMINAL_START_TASKS: dict[str, asyncio.Task[Any]] = {}
 _TERMINAL_ERRORS: dict[str, str] = {}
 _FILE_OPERATION_TASKS: set[asyncio.Task[Any]] = set()
 _NOTIFICATION_TASKS: set[asyncio.Task[Any]] = set()
-_REA_SETTINGS_TASKS: set[asyncio.Task[Any]] = set()
 _NTFY_REPLY_SUPERVISOR_TASK: asyncio.Task[Any] | None = None
 _NTFY_REPLY_LISTENER_TASK: asyncio.Task[Any] | None = None
 _NTFY_NOTIFICATION_SEQUENCE = 0
@@ -3666,6 +3663,8 @@ class HarnessyPage:
                                     f'{len(selected_optional)}/{len(preset.optional_tool_ids)} selected initially. '
                                     'Checkboxes below are the saved selection.'
                                 ).classes('text-xs hy-muted')
+                                if 'rea' in preset.optional_tool_ids:
+                                    ui.label('REA is an optional VM command-line tool and uses shell/process permissions.').classes('text-xs hy-muted')
                                 if cfg.network:
                                     ui.label('Selected tools are installed best-effort during first setup. Uncheck heavy tools you do not need yet to reach Ready faster.').classes('text-xs hy-muted')
                                 else:
@@ -3686,6 +3685,7 @@ class HarnessyPage:
                                     for tool_id in preset.supplemental_tools:
                                         label = {
                                             'ghidra': 'Ghidra headless (heavy; ARM64 may build native components)',
+                                            'rea': 'REA CLI (Reverse Engineer Anything)',
                                             'python-re': 'Python RE environments (heavy: angr, capa, FLOSS, firmware, Frida)',
                                         }.get(tool_id, tool_id)
                                         box = ui.checkbox(label, value=tool_id in selected_optional).classes('w-full')
@@ -9294,7 +9294,7 @@ class HarnessyPage:
                         ui.timer(0.15, jump, once=True)
                 link.on('click', show_prompt)
             ui.label('This tool has not run. Allow once applies only to this request; permissions stay unchanged.').classes('text-xs')
-            permissions = ', '.join('REA reverse engineering' if value == 'rea' else str(value).replace('_', ' ')
+            permissions = ', '.join(str(value).replace('_', ' ')
                                     for value in request.get('required_permissions') or [])
             if permissions:
                 ui.label('Permission: ' + permissions + ' · Ask').classes('text-xs hy-muted')
@@ -18082,6 +18082,11 @@ window.harnessyTerminalFocus = function(terminalId) {
                                     ui.label(
                                         'Change the saved selection after creation. Newly selected missing tools can be installed into a running VM without rebuilding it.'
                                     ).classes('text-xs hy-muted')
+                                    if 'rea' in preset.optional_tool_ids:
+                                        ui.label(
+                                            'Select REA in Manage Optional Tools and apply to install or update its CLI inside this workspace VM. '
+                                            'The model uses it through Shell commands or Long-running processes.'
+                                        ).classes('text-xs hy-muted')
                             else:
                                 optional_manage_summary = None
                                 manage_tools_button = None
@@ -18153,6 +18158,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                     def tool_label(tool_id: str) -> str:
                         return {
                             'ghidra': 'Ghidra headless',
+                            'rea': 'REA CLI (Reverse Engineer Anything)',
                             'python-re': 'Python RE environments (angr, capa, FLOSS, firmware, Frida)',
                         }.get(tool_id, tool_id)
 
@@ -18181,6 +18187,11 @@ window.harnessyTerminalFocus = function(terminalId) {
                         ui.label(
                             'This changes optional tools only. Required workspace/runtime packages cannot be deselected here.'
                         ).classes('text-sm')
+                        if 'rea' in available:
+                            ui.label(
+                                'REA runs inside this workspace VM. Apply with REA selected to install or update it; '
+                                'Shell commands and Long-running processes permissions control model use.'
+                            ).classes('text-xs hy-muted')
                         if latest.network:
                             ui.label(
                                 'Public outbound is enabled. Missing selected tools can be installed immediately if the VM is running.'
@@ -18208,7 +18219,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                                         box.on_value_change(lambda e, tid=tool_id: set_choice(tid, bool(e.value)))
                                         status_labels[tool_id] = ui.label('Checking…').classes('text-xs hy-muted text-right').style('width:210px;white-space:pre-line')
                         remove_bundles = ui.checkbox(
-                            'Remove deselected HarnessyXO supplemental bundles (Ghidra / Python RE environments)', value=False,
+                            'Remove deselected HarnessyXO supplemental bundles (Ghidra / Python RE environments / REA CLI)', value=False,
                         ).classes('text-xs')
                         ui.label(
                             'For safety, deselecting distro package-manager tools does not automatically uninstall them or their dependencies. '
@@ -18668,7 +18679,6 @@ window.harnessyTerminalFocus = function(terminalId) {
         draft = deepcopy(original_settings)
         collectors: list[Any] = []
         instruction_writers: list[Any] = []
-        settings_cleanups: list[Any] = []
         dirty = {'value': False}
         dirty_label_ref: dict[str, Any] = {}
 
@@ -18690,8 +18700,6 @@ window.harnessyTerminalFocus = function(terminalId) {
                 dirty_label_ref['label'] = ui.label('').classes('text-xs hy-muted')
 
                 async def close_dialog() -> None:
-                    for cleanup in settings_cleanups:
-                        await cleanup()
                     dialog.close()
 
                 async def request_close() -> None:
@@ -18836,7 +18844,6 @@ window.harnessyTerminalFocus = function(terminalId) {
                             'browser': 'Browser automation',
                             'web': 'Web access',
                             'code_intelligence': 'Code intelligence / LSP',
-                            'rea': 'REA reverse engineering',
                             'diagnostics': 'HarnessyXO diagnostics',
                             'external_targets': 'External/Test Targets',
                         }
@@ -18846,7 +18853,6 @@ window.harnessyTerminalFocus = function(terminalId) {
                             agent_run_tab = ui.tab('Agent Settings').props('no-caps')
                             agent_instructions_tab = ui.tab('Global Instructions').props('no-caps')
                             tool_permissions_tab = ui.tab('Tool Permissions').props('no-caps')
-                            rea_tab = ui.tab('REA').props('no-caps')
                         with ui.tab_panels(agent_tabs, value=agent_run_tab).classes('hy-settings-agent-panels w-full'):
                             with ui.tab_panel(agent_run_tab):
                                 limit_steps = ui.switch(
@@ -18946,11 +18952,10 @@ window.harnessyTerminalFocus = function(terminalId) {
                                     'run inside the workspace VM with exactly one selected root at /workspace; sibling worktrees and controller '
                                     'metadata are outside that command view, with no ordinary host-shell fallback.'
                                 ).classes('text-xs hy-muted mt-2')
-
-                            with ui.tab_panel(rea_tab):
-                                settings_cleanups.append(self._build_rea_settings_panel(
-                                    agent, collectors, watch, dialog,
-                                ))
+                                ui.label(
+                                    'VM command-line tools such as REA use Shell commands and Long-running processes permissions. '
+                                    'Install or update them in Workspace Environment → Manage Optional Tools.'
+                                ).classes('text-xs hy-muted mt-2')
 
                         watch(limit_steps, steps, auto_memory, timeout, global_agent_slots, *permission_inputs.values())
 
@@ -19310,169 +19315,6 @@ window.harnessyTerminalFocus = function(terminalId) {
         with ui.column().classes('hy-settings-section-header'):
             ui.label(title).classes('hy-settings-section-title')
             ui.label(description).classes('hy-settings-section-description')
-
-    def _build_rea_settings_panel(
-        self, agent: dict[str, Any], collectors: list[Any], watch, dialog: Any,
-    ) -> Any:
-        """Draft REA preferences, with explicitly owned local package actions."""
-        config = normalize_rea_settings(agent.get('rea'))
-        operation: dict[str, Any] = {'task': None, 'alive': True}
-        with ui.column().classes('hy-settings-section w-full gap-2').props('data-hy-rea-settings=1'):
-            ui.label('Reverse Engineer Anything').classes('font-semibold')
-            ui.label(
-                'Analyze binaries with Ghidra, Hopper, or IDA installed on this machine. '
-                'REA works with any configured model backend.'
-            ).classes('text-xs hy-muted')
-            status_label = ui.label('Status not checked').classes('text-sm').props('data-hy-rea-status=1')
-            guidance_label = ui.label(
-                f'First launch sets up REA {REA_VERSION} automatically, including a supported Node.js '
-                'runtime when needed. Later launches reuse the cached setup. '
-                'Use Repair REA if setup is missing or damaged. Native analysis engines are installed separately.'
-            ).classes('text-xs hy-muted hy-wrap-anywhere').props('data-hy-rea-guidance=1')
-            with ui.row().classes('w-full gap-2'):
-                check_button = ui.button('Check status', icon='refresh').props('flat no-caps data-hy-rea-action=check')
-                install_button = ui.button(f'Repair REA {REA_VERSION}', icon='download').props('unelevated no-caps data-hy-rea-action=install')
-            provider = ui.select(
-                {'auto': 'Auto', 'ghidra': 'Ghidra', 'hopper': 'Hopper', 'ida': 'IDA'},
-                label='Analysis engine', value=config['provider'],
-            ).classes('w-full').props('data-hy-rea-field=provider')
-            timeout = ui.number(
-                'Analysis timeout (seconds)', value=config['timeout_seconds'], min=10, max=1800, step=10,
-            ).classes('w-full').props('data-hy-rea-field=timeout')
-            with ui.expansion('Advanced REA configuration', value=False).classes('w-full'):
-                command = ui.input('REA command', value=config['command']).classes('w-full').props('data-hy-rea-field=command')
-                ui.label('Leave blank to use the automatically prepared REA runtime or the rea command on PATH.').classes('text-xs hy-muted')
-                arguments = ui.textarea(
-                    'Command arguments (JSON array)', value=json.dumps(config['arguments'], ensure_ascii=False),
-                ).props('outlined rows=2 data-hy-rea-field=arguments').classes('w-full')
-                environment = ui.textarea(
-                    'Environment (JSON object)', value=json.dumps(config['environment'], indent=2, ensure_ascii=False),
-                ).props('outlined rows=4 data-hy-rea-field=environment').classes('w-full')
-                ui.label('Supported keys: REA_*, JAVA_HOME, and GHIDRA_INSTALL_DIR.').classes('text-xs hy-muted')
-            fields = (provider, timeout, command, arguments, environment)
-            watch(*fields)
-
-        def current_config() -> dict[str, Any]:
-            try:
-                args = json.loads(str(arguments.value or '[]'))
-                env = json.loads(str(environment.value or '{}'))
-            except (TypeError, ValueError) as exc:
-                raise ValueError('REA arguments and environment must contain valid JSON.') from exc
-            if (not isinstance(args, list) or len(args) > 32 or any(
-                    not isinstance(value, str) or '\x00' in value or len(value) > 4096 for value in args)):
-                raise ValueError('REA arguments must be a JSON array of up to 32 strings.')
-            if (not isinstance(env, dict) or any(
-                    not isinstance(key, str) or not isinstance(value, str) or '\x00' in key + value
-                    or not (key.startswith('REA_') or key in {'JAVA_HOME', 'GHIDRA_INSTALL_DIR'})
-                    for key, value in env.items())):
-                raise ValueError('REA environment must be a JSON object with string values and supported keys.')
-            selected = str(provider.value or 'auto')
-            if selected not in {'auto', 'ghidra', 'hopper', 'ida'}:
-                raise ValueError('Select a supported REA analysis engine.')
-            text = str(command.value or '').strip()
-            if '\x00' in text:
-                raise ValueError('REA command contains an invalid character.')
-            try:
-                seconds = int(timeout.value)
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise ValueError('REA timeout must be between 10 and 1800 seconds.') from exc
-            if isinstance(timeout.value, bool) or seconds != float(timeout.value) or not 10 <= seconds <= 1800:
-                raise ValueError('REA timeout must be a whole number between 10 and 1800 seconds.')
-            return normalize_rea_settings(dict(command=text, arguments=args, environment=env,
-                                               provider=selected, timeout_seconds=seconds))
-
-        def collect() -> None:
-            agent['rea'] = current_config()
-
-        collectors.append(collect)
-
-        def current_ui() -> bool:
-            return bool(operation['alive'] and dialog.value
-                        and self._ui_elements_alive(status_label, guidance_label, check_button, install_button))
-
-        async def run_action(install: bool = False) -> None:
-            if operation['task'] is not None or not current_ui():
-                return
-            try:
-                values = current_config()
-            except ValueError as exc:
-                ui.notify(str(exc), type='negative', timeout=6500)
-                return
-            for control in (check_button, install_button, *fields):
-                control.disable()
-            status_label.set_text('Repairing REA…' if install else 'Checking REA…')
-            task = asyncio.create_task(install_rea() if install else rea_status(values), name='harnessy-rea-settings')
-            operation['task'] = task
-            _REA_SETTINGS_TASKS.add(task)
-            try:
-                result = await task
-                if not current_ui():
-                    return
-                labels = {
-                    'ready': 'REA runtime ready', 'configured': 'Custom command configured (not yet verified)',
-                    'node_missing': 'Node.js not found', 'node_unsupported': 'Node.js version unsupported',
-                    'runtime_missing': 'REA not installed', 'version_mismatch': 'REA version mismatch',
-                    'install_failed': 'REA setup failed',
-                }
-                status = labels.get(str(result.get('status') or ''), 'REA check failed')
-                installed = install and result.get('ok') is True
-                if installed:
-                    status = 'REA setup ready'
-                version = result.get('version')
-                node_version = result.get('node_version')
-                suffix = ' · '.join(value for value in (
-                    f'REA {version}' if version else '', f'Node.js {node_version}' if node_version else '',
-                ) if value)
-                status_label.set_text(status + (' · ' + suffix if suffix else ''))
-                if installed:
-                    guidance = (
-                        'Your custom REA command remains selected and has not been verified. '
-                        'Repair prepared the managed REA runtime; it did not check your custom command.'
-                        if values['command'] else 'Native analysis engines are installed separately.'
-                    )
-                else:
-                    guidance = str(result.get('remediation') or
-                                   'Native analysis engines are installed separately.')
-                guidance_label.set_text(guidance)
-            except asyncio.CancelledError:
-                # Dialog close/shutdown owns cancellation and awaits the process
-                # cleanup through this same task. Do not repaint a departed UI.
-                pass
-            except Exception as exc:
-                if current_ui():
-                    status_label.set_text('REA repair failed' if install else 'REA check failed')
-                    guidance_label.set_text('Check your REA command and the startup setup message, then retry repair.')
-                log_event('harnessy', 'rea_settings_action_failed', install=install,
-                          error_type=type(exc).__name__)
-            finally:
-                _REA_SETTINGS_TASKS.discard(task)
-                if operation['task'] is task:
-                    operation['task'] = None
-                if current_ui():
-                    for control in (check_button, install_button, *fields):
-                        control.enable()
-
-        check_button.on('click', lambda: run_action(False))
-        install_button.on('click', lambda: run_action(True))
-
-        async def cleanup() -> None:
-            operation['alive'] = False
-            task = operation['task']
-            if task is not None:
-                task.cancel()
-                if task is not asyncio.current_task():
-                    await asyncio.gather(task, return_exceptions=True)
-                _REA_SETTINGS_TASKS.discard(task)
-
-        async def visibility_changed(event) -> None:
-            if not event.value:
-                await cleanup()
-
-        dialog.on_value_change(visibility_changed)
-        # A transient reconnect keeps this dialog usable. Only permanent
-        # client deletion ends ownership outside an explicit Settings close.
-        dialog.client.on_delete(cleanup)
-        return cleanup
 
     def _build_models_settings_panel(self, draft: dict[str, Any], collectors: list[Any], mark_dirty) -> None:
         models_cfg = draft['models']
@@ -21996,12 +21838,6 @@ def run_app() -> None:
 
     async def close_runtime_resources() -> None:
         global _NTFY_REPLY_SUPERVISOR_TASK, _NTFY_REPLY_TARGET, _RUN_QUEUE_SUPERVISOR_TASK, _EVENT_LOOP_WATCHDOG_TASK
-        rea_tasks = list(_REA_SETTINGS_TASKS)
-        for task in rea_tasks:
-            task.cancel()
-        if rea_tasks:
-            await asyncio.gather(*rea_tasks, return_exceptions=True)
-        _REA_SETTINGS_TASKS.clear()
         watchdog = _EVENT_LOOP_WATCHDOG_TASK
         _EVENT_LOOP_WATCHDOG_TASK = None
         if watchdog is not None and not watchdog.done():

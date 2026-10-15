@@ -434,6 +434,7 @@ WantedBy=multi-user.target
             # outbound later naturally schedules the selected tools once.
             'public_outbound': bool(self.config.network),
             'ghidra_version': GHIDRA_VERSION if 'ghidra' in selected_optional else '',
+            'rea_cli_schema': 1 if 'rea' in selected_optional else 0,
             'workspace_profile': 2,
         }
         return hashlib.sha256(
@@ -528,6 +529,20 @@ WantedBy=multi-user.target
                 'state': state,
                 'detail': f'{count}/{len(probes)} HarnessyXO Python RE environments detected.',
             }
+        if 'rea' in preset.supplemental_tools:
+            from .rea_cli import status_script
+            rc, stdout, _ = await self._run(
+                'shell', self.INSTANCE, '/bin/bash', '-lc', status_script(), timeout=10, check=False,
+            )
+            try:
+                details = json.loads(stdout) if rc == 0 else {}
+            except (ValueError, TypeError):
+                details = {}
+            if isinstance(details, dict) and details.get('state') in {'installed', 'partial', 'missing'}:
+                result['rea'] = {key: str(details[key]) for key in
+                                 ('state', 'detail', 'version', 'node_version', 'update_state', 'reason_code', 'phase') if key in details}
+            else:
+                result['rea'] = {'state': 'unknown', 'detail': 'Could not inspect the REA CLI in this guest.', 'update_state': 'unknown'}
         return result
 
     def _remove_supplemental_tools_script(self, tool_ids: tuple[str, ...]) -> str:
@@ -546,6 +561,9 @@ WantedBy=multi-user.target
                 "rm -f /usr/local/bin/ubireader-extract-files /usr/local/bin/ubireader-info /usr/local/bin/jefferson",
                 "rm -f /usr/local/bin/frida /usr/local/bin/frida-ps /usr/local/bin/frida-trace",
             ])
+        if 'rea' in selected:
+            from .rea_cli import remove_script
+            commands.append(remove_script())
         return '\n'.join(commands) + '\n'
 
     async def apply_optional_tools(
@@ -601,7 +619,7 @@ WantedBy=multi-user.target
                 )
                 missing_supplemental = tuple(
                     tool for tool in preset.supplemental_tools
-                    if tool in desired_set and inspection.get(tool, {}).get('state') != 'installed'
+                    if tool in desired_set and (tool == 'rea' or inspection.get(tool, {}).get('state') != 'installed')
                 )
                 remove_bundles = tuple(
                     tool for tool in preset.supplemental_tools
@@ -625,8 +643,8 @@ WantedBy=multi-user.target
                     await self._finalize_guest_provisioning()
                     await self._emit_progress(
                         progress, 'tools_pending', 'Optional tool downloads pending — public outbound is disabled.',
-                        detail=(f'{len(missing_packages) + len(missing_supplemental)} selected tool(s) are not fully installed. '
-                                'Enable public outbound and Apply again, or start after enabling it.'),
+                        detail=(f'{len(missing_packages) + len(missing_supplemental)} selected tool install/update action(s) are deferred. '
+                                'Existing installed tools remain available. Enable public outbound and Apply again, or start after enabling it.'),
                         stage_timeout_seconds=10.0,
                     )
                     return await self.status()
@@ -652,6 +670,10 @@ WantedBy=multi-user.target
                         elif 'HARNESSY_PROVISION_STAGE=python_re_tools' in text:
                             await self._emit_progress(progress, 'provisioning_python_re', 'Installing Python RE tool environments…',
                                                       detail='Post-creation tool reconciliation.', stage_timeout_seconds=self.TIMEOUT_PROVISION)
+                        elif 'HARNESSY_PROVISION_STAGE=rea_cli' in text:
+                            await self._emit_progress(progress, 'provisioning_rea', 'Installing or checking the REA CLI…',
+                                                      detail='Latest stable package inside this VM; a working cached version is retained on failure.',
+                                                      stage_timeout_seconds=self.TIMEOUT_PROVISION)
                     self._controller_output_callback = observe
                     try:
                         await self._run(
@@ -666,14 +688,15 @@ WantedBy=multi-user.target
                         self._controller_output_callback = previous_observer
 
                 final = await self.optional_tool_status()
-                unresolved = [tool for tool in desired if final.get(tool, {}).get('state') != 'installed']
+                unresolved = [tool for tool in desired if final.get(tool, {}).get('state') != 'installed'
+                              or (tool == 'rea' and final.get(tool, {}).get('update_state') == 'failed')]
                 if unresolved:
                     # Do not write a marker claiming this selection is complete.
                     # Leaving the previous revision in place makes the next Ready
                     # setup retry the still-missing selected tools automatically.
                     await self._emit_progress(
                         progress, 'tools_complete', 'Optional tool reconciliation completed with warnings.',
-                        detail='Still missing/partial: ' + ', '.join(unresolved) + '. HarnessyXO will retry them on a later setup.',
+                        detail='Needs attention: ' + ', '.join(unresolved) + '. Existing working tool versions are retained when an update check fails; Apply again to retry.',
                         stage_timeout_seconds=10.0,
                     )
                 else:
@@ -832,6 +855,9 @@ install_re_venv frida 'frida-tools' || true
 [ -x "$re_root/frida/bin/frida-ps" ] && ln -sfn "$re_root/frida/bin/frida-ps" /usr/local/bin/frida-ps || true
 [ -x "$re_root/frida/bin/frida-trace" ] && ln -sfn "$re_root/frida/bin/frida-trace" /usr/local/bin/frida-trace || true
 '''
+        if 'rea' in supplemental_tools:
+            from .rea_cli import install_script
+            supplemental += install_script(network=bool(self.config.network))
         script = f'''#!/usr/bin/env bash
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -1060,6 +1086,10 @@ printf '%s\\n' HARNESSY_PROVISION_STAGE=required_packages
                 'HARNESSY_PROVISION_STAGE=python_re_tools': (
                     'provisioning_python_re', 'Installing Python RE tool environments…',
                     'Installing isolated angr, capa, FLOSS and binary-analysis Python environments.',
+                ),
+                'HARNESSY_PROVISION_STAGE=rea_cli': (
+                    'provisioning_rea', 'Installing the REA CLI inside this VM…',
+                    'Resolving the latest stable npm package and verifying a guest-local Node runtime.',
                 ),
                 'HARNESSY_PROVISION_STAGE=finalizing': (
                     'finalizing_provisioning', 'Finalizing workspace tools…',

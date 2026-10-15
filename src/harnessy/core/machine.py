@@ -18,7 +18,6 @@ from .instructions import DEFAULT_GLOBAL_INSTRUCTIONS
 from .chat_templates import DEFAULT_CHAT_TEMPLATES, append_new_templates
 from .notifications import DEFAULT_NTFY_SETTINGS, normalize_ntfy_settings
 from .thinking import model_family
-from .rea_settings import DEFAULT_REA_SETTINGS, normalize_rea_settings
 
 GLOBAL_INSTRUCTIONS_NAME = 'GLOBAL_INSTRUCTIONS.md'
 
@@ -115,7 +114,6 @@ DEFAULT_TOOL_PERMISSIONS: dict[str, str] = {
     'browser': 'ask',
     'web': 'ask',
     'code_intelligence': 'on',
-    'rea': 'ask',
     'diagnostics': 'on',
     'external_targets': 'ask',
 }
@@ -181,7 +179,6 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         # backend concern; HarnessyXO never exceeds this agent ceiling.
         'global_agent_slots': 1,
         'tool_permissions': deepcopy(DEFAULT_TOOL_PERMISSIONS),
-        'rea': deepcopy(DEFAULT_REA_SETTINGS),
     },
     'chat': {
         'templates': deepcopy(DEFAULT_TEMPLATES),
@@ -1148,8 +1145,10 @@ def _normalize_settings(data: dict[str, Any]) -> dict[str, Any]:
     for key, default in DEFAULT_TOOL_PERMISSIONS.items():
         value = str(permissions.get(key, default) or default).strip().lower()
         normalized_permissions[key] = value if value in {'off', 'ask', 'on'} else default
+    # Keep inactive legacy REA preferences for rollback; they grant no tool access.
+    if 'rea' in permissions:
+        normalized_permissions['rea'] = deepcopy(permissions['rea'])
     agent['tool_permissions'] = normalized_permissions
-    agent['rea'] = normalize_rea_settings(agent.get('rea'))
     agent['step_limit_enabled'] = bool(agent.get('step_limit_enabled', False))
     agent['completion_check_enabled'] = bool(agent.get('completion_check_enabled', True))
     try:

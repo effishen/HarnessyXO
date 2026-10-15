@@ -19,7 +19,6 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
 from harnessy.core.machine import DEFAULT_TOOL_PERMISSIONS
-from harnessy.core.rea_settings import normalize_rea_settings
 from harnessy.environment.activity import activity
 from harnessy.core.memory_events import memory_origin
 from harnessy.core.workspace import (
@@ -40,7 +39,6 @@ from .client import OpenAICompatibleClient
 from .skills import SkillLibrary, SkillRecord
 from .scheduler import GLOBAL_AGENT_SLOTS, MODEL_GENERATION_SCHEDULER, WORKSPACE_MUTATIONS
 from .external_targets import ExternalTargetBroker, ExternalTargetError
-from .rea import ReaClient, ReaError, rea_status as local_rea_status
 
 ToolHandler = Callable[[dict[str, Any]], Awaitable[str]]
 
@@ -82,187 +80,6 @@ def tool_permission_reason(
     if ask <= approved_permissions:
         return 'approved_once'
     return 'ask'
-
-# Reviewed REA 6.4.0 static reads only. Discovery never expands this boundary.
-REA_NATIVE_QUERY_KEYS = {
-    # Hopper's list_documents enumerates other open GUI documents, so it is
-    # deliberately excluded from a target-scoped capability.
-    'list_procedures': (), 'list_segments': (),
-    'list_names': ('address',), 'list_strings': ('address',),
-    'procedure_address': ('procedure',), 'procedure_assembly': ('procedure',),
-    'procedure_pseudo_code': ('procedure',), 'procedure_info': ('procedure',),
-    'procedure_callers': ('procedure',), 'procedure_callees': ('procedure',),
-    'procedure_references': ('procedure', 'direction'),
-    'search_procedures': ('pattern', 'mode', 'case_sensitive'),
-    'search_strings': ('pattern', 'mode', 'case_sensitive'),
-    'xrefs': ('address',), 'address_name': ('address',),
-    'read_bytes': ('address', 'length'), 'address_to_file_offset': ('address',),
-    'inspect_native_instruction': ('address',), 'resolve_native_call_targets': ('address',),
-    'inspect_native_data_type': ('type', 'address'), 'inspect_native_load_image': (),
-    'inspect_macho': (), 'inspect_signature': (), 'list_architectures': (),
-    'demangle_swift': ('symbols',), 'binary_overview': (),
-    'analyze_function': ('procedure',), 'inspect_native_api': ('procedure',),
-    'batch_decompile': ('addresses',), 'get_call_graph': ('address', 'direction'),
-    'find_xrefs_to_name': ('name',), 'trace_feature': ('query', 'case_sensitive'),
-    'trace_call_path': ('start', 'goal', 'direction'),
-}
-REA_MANAGED_QUERY_KEYS = {'inspect_managed_members': (), 'inspect_managed_native_boundaries': ()}
-REA_SHARED_QUERY_KEYS = {'inspect_analysis_view': ('source', 'view'), 'get_evidence_bundle': ('detail', 'filters')}
-REA_QUERY_KEYS = {**REA_NATIVE_QUERY_KEYS, **REA_MANAGED_QUERY_KEYS, **REA_SHARED_QUERY_KEYS}
-REA_VIEW_KEYS = {'summary': ('kind',), 'facet': ('kind', 'facet'),
-                 'page': ('kind', 'collection', 'offset', 'limit'),
-                 'native': ('kind', 'facet', 'offset', 'limit'),
-                 'item': ('kind', 'collection', 'selector')}
-REA_RESULT_MAX_CHARS = 64_000
-
-
-def _rea_content(raw: dict[str, Any]) -> Any:
-    structured = raw.get('structuredContent')
-    if structured is not None:
-        return structured
-    texts = [part.get('text', '') for part in raw.get('content', [])
-             if isinstance(part, dict) and part.get('type') == 'text']
-    text = '\n'.join(str(value) for value in texts)
-    try:
-        return json.loads(text)
-    except (ValueError, TypeError):
-        return {'message': text}
-
-
-def _rea_failed(raw: dict[str, Any]) -> bool:
-    content = _rea_content(raw)
-    return bool(raw.get('isError')) or (isinstance(content, dict) and content.get('ok') is False)
-
-
-def _rea_evidence_ids(value: Any) -> set[str]:
-    result: set[str] = set()
-    pending = [(value, 0)]
-    visited = 0
-    while pending and visited < 20_000:
-        item, depth = pending.pop()
-        visited += 1
-        if depth > 20:
-            continue
-        if isinstance(item, dict):
-            for key, child in item.items():
-                if key in {'evidence_id', 'parent_evidence_id'} and isinstance(child, str) and re.fullmatch(r'ev_[a-f0-9]{64}', child):
-                    result.add(child)
-                elif isinstance(child, (dict, list)):
-                    pending.append((child, depth + 1))
-        elif isinstance(item, list):
-            pending.extend((child, depth + 1) for child in item[:1000] if isinstance(child, (dict, list)))
-    return result
-
-
-def _rea_failure_evidence_ids(value: Any) -> set[str]:
-    """Only server-acknowledged retained recovery references grant view access."""
-    result: set[str] = set()
-    pending = [(value, 0)]
-    visited = 0
-    while pending and visited < 20_000:
-        item, depth = pending.pop()
-        visited += 1
-        if depth > 20:
-            continue
-        if isinstance(item, dict):
-            for key, child in item.items():
-                if key in {'evidence_reference', 'partial_observation'} and isinstance(child, dict):
-                    identifier = child.get('evidence_id')
-                    if child.get('kind') == 'retained-evidence' and isinstance(identifier, str) and re.fullmatch(r'ev_[a-f0-9]{64}', identifier):
-                        result.add(identifier)
-                if isinstance(child, (dict, list)):
-                    pending.append((child, depth + 1))
-        elif isinstance(item, list):
-            pending.extend((child, depth + 1) for child in item[:1000] if isinstance(child, (dict, list)))
-    return result
-
-
-def _rea_model_schema(name: str, original: Any) -> dict[str, Any]:
-    """Show the supported wrapper subset, keeping only reachable definitions."""
-    schema = json.loads(json.dumps(original)) if isinstance(original, dict) else {'type': 'object'}
-    definitions = schema.get('$defs', {})
-    properties = schema.get('properties', {})
-    schema['properties'] = {key: value for key, value in properties.items() if key in REA_QUERY_KEYS[name]}
-    schema['required'] = [key for key in schema.get('required', []) if key in schema['properties']]
-    schema['additionalProperties'] = False
-    schema.pop('examples', None)  # Upstream examples may select another document or inline Evidence.
-    if name == 'get_evidence_bundle':
-        schema['properties']['detail'] = {'type': 'string', 'enum': ['summary'], 'default': 'summary'}
-    if name == 'inspect_analysis_view':
-        schema['properties']['source'] = {'type': 'object', 'properties': {
-            'kind': {'type': 'string', 'const': 'retained-evidence'},
-            'evidence_id': {'type': 'string', 'pattern': '^ev_[a-f0-9]{64}$',
-                            'description': 'Evidence ID returned by this authorized target in this run.'},
-        }, 'required': ['kind', 'evidence_id'], 'additionalProperties': False}
-        view_ref = properties.get('view', {}).get('$ref', '').removeprefix('#/$defs/')
-        view_schema = definitions.get(view_ref, properties.get('view', {}))
-        branches = []
-        for branch in view_schema.get('oneOf', []):
-            branch_properties = branch.get('properties', {})
-            kind_schema = branch_properties.get('kind', {})
-            kind_schema = definitions.get(kind_schema.get('$ref', '').removeprefix('#/$defs/'), kind_schema)
-            kind = kind_schema.get('const')
-            if kind not in REA_VIEW_KEYS:
-                continue
-            branch = json.loads(json.dumps(branch))
-            if kind in {'native', 'page'}:
-                branch['properties']['limit'] = {'type': 'integer', 'minimum': 1, 'maximum': 100, 'default': 64}
-            if kind == 'item':
-                branch['properties']['selector'] = {'oneOf': [
-                    {'type': 'object', 'properties': {key: detail}, 'required': [key], 'additionalProperties': False}
-                    for key, detail in [('index', {'type': 'integer', 'minimum': 0}),
-                                        ('name', {'type': 'string'}),
-                                        ('node_id', {'type': 'string', 'pattern': '^jag_node_[a-f0-9]{64}$'})]
-                ]}
-            branches.append(branch)
-        schema['properties']['view'] = {'oneOf': branches}
-    retained = {}
-    pending = [schema['properties']]
-    while pending:
-        value = pending.pop()
-        if isinstance(value, dict):
-            reference = value.get('$ref', '')
-            if reference.startswith('#/$defs/'):
-                key = reference.removeprefix('#/$defs/')
-                if key not in retained and key in definitions:
-                    retained[key] = definitions[key]
-                    pending.append(definitions[key])
-            pending.extend(child for child in value.values() if isinstance(child, (dict, list)))
-        elif isinstance(value, list):
-            pending.extend(value)
-    if retained:
-        schema['$defs'] = retained
-    else:
-        schema.pop('$defs', None)
-    return schema
-
-
-def _bounded_rea_response(payload: dict[str, Any]) -> str:
-    encoded = json.dumps(payload, ensure_ascii=False)
-    if len(encoded) <= REA_RESULT_MAX_CHARS:
-        return encoded
-    # Keep failures and exact retained Evidence identities usable even when a
-    # provider returns an unpaginated procedure or inventory. The preview is
-    # explicitly partial and never presented as complete Evidence.
-    result = {
-        'ok': payload.get('ok') is True, 'operation': payload.get('operation'),
-        'target': payload.get('target'), 'isError': bool(payload.get('isError')),
-        'truncated': True, 'original_result_chars': len(encoded),
-        'evidence_ids': sorted(_rea_evidence_ids(payload))[:100],
-        'limits': 'Model delivery was truncated. Use a narrower query or inspect_analysis_view with an owned evidence_id.',
-        'result_preview': encoded[:54_000],
-    }
-    content = payload.get('result')
-    if isinstance(content, dict):
-        for key in ('evidence_id', 'parent_evidence_id', 'error_code', 'code', 'error', 'message', 'limitations', 'unknowns', 'coverage'):
-            if key in content:
-                field = content[key]
-                serialized = json.dumps(field, ensure_ascii=False)
-                result[key] = field if len(serialized) < 2000 else serialized[:1800] + ' [truncated]'
-    while len(json.dumps(result, ensure_ascii=False)) > REA_RESULT_MAX_CHARS:
-        result['result_preview'] = result['result_preview'][:-4000]
-    return json.dumps(result, ensure_ascii=False)
-
 
 # Attachment retrieval must stay materially smaller than an ordinary model
 # context.  The tool schema still accepts the historical knobs so older model
@@ -415,11 +232,6 @@ class WorkspaceToolbox:
         self.agent_slot_lease = agent_slot_lease
         self.thinking_selection = thinking
         self._subagent_count = 0
-        self._rea_client: ReaClient | None = None
-        self._rea_target: dict[str, Any] | None = None
-        self._rea_analysis_attempted = False
-        self._rea_evidence: set[str] = set()
-        self._rea_execution_active = ''
         self.handlers: dict[str, ToolHandler] = {
             'list_files': self.list_files,
             'get_workspace_state': self.get_workspace_state,
@@ -498,10 +310,6 @@ class WorkspaceToolbox:
             'describe_tool': self.describe_tool,
             'list_skills': self.list_skills,
             'read_skill': self.read_skill,
-            'rea_status': self.rea_status,
-            'rea_tools': self.rea_tools,
-            'rea_analyze': self.rea_analyze,
-            'rea_query': self.rea_query,
         }
         self.registry = self._build_registry()
 
@@ -1037,24 +845,6 @@ class WorkspaceToolbox:
             ToolDefinition('package_working_copy', 'Export the entire active working root as a downloadable ZIP. This is not a normal completion step: use it only when the latest user request explicitly asks for a ZIP, archive, packaged release, or whole-workspace export.', {
                 'type': 'object', 'properties': {'output_name': {'type': 'string'}},
             }, 'filesystem', 'filesystem_write', exposure='discoverable'),
-            ToolDefinition('rea_status', 'Check local Reverse Engineer Anything configuration and prerequisites without installing or downloading anything. Discover REA for static binary, JavaScript/Electron or managed .NET investigation.', {
-                'type': 'object', 'properties': {}, 'additionalProperties': False,
-            }, 'rea', 'rea', read_only=True, exposure='discoverable', approve_when_ask=False),
-            ToolDefinition('rea_tools', 'List a bounded catalogue of reviewed REA static analysis/query schemas. Query a specific capability rather than loading the full catalogue. Runtime, browser, network, device, patch and installation tools are excluded.', {
-                'type': 'object', 'properties': {'query': {'type': 'string'}, 'limit': {'type': 'integer', 'minimum': 1, 'maximum': 10, 'default': 6}},
-                'additionalProperties': False,
-            }, 'rea', 'rea', read_only=True, exposure='discoverable', approve_when_ask=False),
-            ToolDefinition('rea_analyze', 'Authorize and statically analyze one visible Project Files target with local REA. Native analysis opens the target and returns its overview; JavaScript/Electron and managed .NET use their execution-free parsers. Choose a project-relative or Files/... path. Subsequent rea_query calls remain bound to this same run and target. This never runs the target program.', {
-                'type': 'object', 'properties': {
-                    'path': {'type': 'string'}, 'kind': {'type': 'string', 'enum': ['native', 'javascript', 'managed']},
-                    'provider': {'type': 'string', 'enum': ['auto', 'ghidra', 'hopper', 'ida']},
-                }, 'required': ['path', 'kind'], 'additionalProperties': False,
-            }, 'rea', 'rea', read_only=True, exposure='discoverable', additional_permissions=('filesystem_read',)),
-            ToolDefinition('rea_query', 'Run one reviewed static REA query against this run\'s already authorized target. Use rea_tools for exact argument schemas. Omit document/path fields: HarnessyXO binds the target. inspect_analysis_view accepts only an evidence_id previously returned in this run; get_evidence_bundle is summary-only. New targets require rea_analyze approval.', {
-                'type': 'object', 'properties': {'tool': {'type': 'string'}, 'arguments': {'type': 'object'}},
-                'required': ['tool'], 'additionalProperties': False,
-            }, 'rea', 'rea', read_only=True, exposure='discoverable', approve_when_ask=False,
-                additional_permissions=('filesystem_read',)),
             ToolDefinition('list_tool_categories', 'List available tool categories without loading every tool schema.', {
                 'type': 'object', 'properties': {}
             }, 'discovery', None, read_only=True),
@@ -1529,7 +1319,7 @@ class WorkspaceToolbox:
                 })
                 record['result'] = result
                 return result
-            if definition.category in {'filesystem', 'shell', 'processes', 'git', 'code_intelligence', 'rea'}:
+            if definition.category in {'filesystem', 'shell', 'processes', 'git', 'code_intelligence'}:
                 try:
                     root_selection_current = self.workspace.active_root_path(self.chat_id).resolve() == self.root
                 except (OSError, ValueError):
@@ -1579,13 +1369,7 @@ class WorkspaceToolbox:
                     self.workspace.root, chat_id=self.chat_id, run_id=self.run_id,
                     tool=name, tool_call_id=self.tool_call_id,
                 ) as memory_scope:
-                    previous_rea_execution = self._rea_execution_active
-                    if definition.category == 'rea':
-                        self._rea_execution_active = name
-                    try:
-                        result = await handler(arguments)
-                    finally:
-                        self._rea_execution_active = previous_rea_execution
+                    result = await handler(arguments)
             finally:
                 record['execution_duration_seconds'] = max(0.0, time.perf_counter() - execution_started)
             record['memory_event_ids'] = [event['id'] for event in memory_scope['events']]
@@ -3890,264 +3674,6 @@ class WorkspaceToolbox:
             'message': "Download saved in this chat's private Artifacts / Downloads area.",
         })
         return json.dumps(result, ensure_ascii=False)
-
-    def _rea_settings(self) -> dict[str, Any]:
-        agent = self.settings.get('agent') if isinstance(self.settings.get('agent'), dict) else {}
-        return normalize_rea_settings(agent.get('rea'))
-
-    def _require_rea_execution(self, name: str) -> None:
-        if self._rea_execution_active != name:
-            raise PermissionError('REA target operations must pass through the HarnessyXO tool permission and approval gate.')
-        if self.workspace.active_root_path(self.chat_id).resolve() != self.root:
-            self._rea_target = None
-            raise PermissionError('The active Project Files root changed. Start a new run before using REA.')
-
-    def _rea_service(self) -> ReaClient:
-        if self._rea_client is None or self._rea_client.closed:
-            identity = hashlib.sha256(f'{self.workspace.id}\0{self.chat_id}\0{self.run_id}'.encode()).hexdigest()
-            directory = self.workspace.meta / 'rea-sessions' / identity
-            directory.mkdir(parents=True, exist_ok=True)
-            self._rea_client = ReaClient(self._rea_settings(), working_directory=directory)
-        return self._rea_client
-
-    async def close_rea(self) -> bool:
-        """Settle controller cleanup even under repeated Stop cancellation.
-
-        Return whether cleanup itself was interrupted so a whole-run finalizer
-        can release its other ownership before propagating cancellation.
-        """
-        client, self._rea_client = self._rea_client, None
-        self._rea_target = None
-        self._rea_analysis_attempted = False
-        self._rea_evidence.clear()
-        if client is None:
-            return False
-        closing = asyncio.create_task(client.close())
-        interrupted = False
-        while not closing.done():
-            try:
-                await asyncio.shield(closing)
-            except asyncio.CancelledError:
-                interrupted = True
-            except Exception:
-                break
-        try:
-            closing.result()
-        except asyncio.CancelledError:
-            interrupted = True
-        except Exception as exc:
-            # Never log upstream target text or an arbitrary server response.
-            log_event('runtime', 'rea_cleanup_failed', exception_class=type(exc).__name__)
-        return interrupted
-
-    async def _rea_call(self, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        try:
-            return await self._rea_service().call_tool(operation, arguments)
-        except ReaError as exc:
-            if isinstance(getattr(exc, 'tool_result', None), dict):
-                return exc.tool_result
-            content = {'ok': False, 'error_code': exc.code, 'error': str(exc)}
-            if isinstance(getattr(exc, 'rpc_error', None), dict) and exc.rpc_error:
-                content['server_error'] = exc.rpc_error
-            return {'isError': True, 'structuredContent': content}
-
-    def _rea_response(self, operation: str, raw: dict[str, Any], *, target: str = '') -> str:
-        content = _rea_content(raw)
-        self._rea_evidence.update(_rea_failure_evidence_ids(content) if _rea_failed(raw) else _rea_evidence_ids(content))
-        if len(self._rea_evidence) > 2048:
-            self._rea_evidence = set(sorted(self._rea_evidence)[:2048])
-        return _bounded_rea_response({
-            'ok': not _rea_failed(raw), 'operation': operation, 'isError': bool(raw.get('isError')),
-            'target': target or (self._rea_target or {}).get('logical_path', ''), 'result': content,
-        })
-
-    async def rea_status(self, _arguments: dict[str, Any]) -> str:
-        status = await local_rea_status(self._rea_settings())
-        return _bounded_rea_response({'ok': status.get('ok') is not False, 'operation': 'rea_status', 'result': status})
-
-    async def rea_tools(self, arguments: dict[str, Any]) -> str:
-        query = str(arguments.get('query') or '').strip().lower()[:300]
-        limit = max(1, min(int(arguments.get('limit', 6)), 10))
-        try:
-            rows = await self._rea_service().list_tools()
-        except ReaError as exc:
-            return _bounded_rea_response({'ok': False, 'operation': 'rea_tools', 'error_code': exc.code, 'error': str(exc)})
-        selected = []
-        for row in rows:
-            if not isinstance(row, dict) or row.get('name') not in REA_QUERY_KEYS:
-                continue
-            name = str(row['name'])
-            description = str(row.get('description') or '')[:1400]
-            if query and query not in name.lower() and query not in description.lower():
-                continue
-            selected.append({'name': name, 'description': description, 'inputSchema': _rea_model_schema(name, row.get('inputSchema'))})
-        selected.sort(key=lambda row: (row['name'] != query, row['name']))
-        return _bounded_rea_response({
-            'ok': True, 'operation': 'rea_tools', 'result': {'tools': selected[:limit],
-                'matched_count': len(selected), 'returned_count': min(len(selected), limit),
-                'more_available': len(selected) > limit,
-                'scope': 'Reviewed static queries only. Omit document and path fields; managed paths are injected. '
-                    'inspect_analysis_view only accepts owned retained Evidence; get_evidence_bundle is summary-only.'},
-        })
-
-    async def _rea_check_directory(self, target: Path) -> None:
-        """Check recursive input containment off the application event loop."""
-        stopping = threading.Event()
-
-        def inspect() -> None:
-            count = 0
-            deadline = time.monotonic() + 5.0
-            for base, dirs, files in os.walk(target, followlinks=False):
-                if stopping.is_set():
-                    return
-                for name in [*dirs, *files]:
-                    count += 1
-                    if count > 20_000 or time.monotonic() > deadline:
-                        raise ValueError('REA directory containment check exceeded its bounded scan. Select a smaller input directory.')
-                    item = Path(base) / name
-                    if item.is_symlink() and not item.resolve().is_relative_to(target):
-                        raise PermissionError('REA cannot analyze a directory containing a symlink outside its authorized input root.')
-
-        checking = asyncio.create_task(asyncio.to_thread(inspect))
-        try:
-            await asyncio.shield(checking)
-        except asyncio.CancelledError:
-            stopping.set()
-            while not checking.done():
-                try:
-                    await asyncio.shield(checking)
-                except (asyncio.CancelledError, Exception):
-                    pass
-            if not checking.cancelled():
-                checking.exception()
-            raise
-
-    async def rea_analyze(self, arguments: dict[str, Any]) -> str:
-        self._require_rea_execution('rea_analyze')
-        self._rea_target = None
-        self._rea_evidence.clear()
-        if set(arguments) - {'path', 'kind', 'provider'}:
-            raise ValueError('REA analysis accepts only path, kind and provider.')
-        kind = str(arguments.get('kind') or '').lower()
-        if kind not in {'native', 'javascript', 'managed'}:
-            raise ValueError('REA kind must be native, javascript or managed.')
-        target = self._resolve(arguments.get('path'), must_exist=True)
-        if not target.is_file() and not target.is_dir():
-            raise ValueError('REA requires a regular file or an application directory.')
-        if kind == 'managed' and not target.is_file():
-            raise ValueError('Managed analysis requires one regular PE/CLI file.')
-        if target.is_dir():
-            await self._rea_check_directory(target)
-        provider = str(arguments.get('provider') or self._rea_settings()['provider']).lower()
-        if provider not in {'auto', 'ghidra', 'hopper', 'ida'}:
-            raise ValueError('REA provider must be auto, ghidra, hopper or ida.')
-        # Discovery and the first analysis reuse one controller. Switching an
-        # attempted target starts a fresh controller so its retained bundle
-        # cannot contain Evidence from the previously authorized target.
-        if self._rea_analysis_attempted and await self.close_rea():
-            raise asyncio.CancelledError
-        self._rea_analysis_attempted = True
-        logical = self._logical_relative(target)
-        if kind == 'native':
-            operation, call_arguments = 'open_binary', {'path': str(target), 'provider_id': provider}
-        elif kind == 'javascript':
-            operation, call_arguments = 'analyze_javascript_application', {'input_path': str(target), 'detail': 'summary'}
-        else:
-            operation, call_arguments = 'inspect_managed_artifact', {'path': str(target)}
-        raw = await self._rea_call(operation, call_arguments)
-        if _rea_failed(raw):
-            if _rea_failure_evidence_ids(_rea_content(raw)):
-                # An oversized or partial analysis is still a failure. Its
-                # acknowledged retained Evidence may be inspected, but an
-                # unsuccessful native open never authorizes session queries.
-                self._rea_target = {'logical_path': logical, 'path': target, 'kind': kind, 'queries_ready': False,
-                                    'identity': (self.workspace.id, self.chat_id, self.run_id, str(self.root))}
-            return self._rea_response(operation, raw, target=logical)
-        self._rea_target = {'logical_path': logical, 'path': target, 'kind': kind, 'queries_ready': True,
-                            'identity': (self.workspace.id, self.chat_id, self.run_id, str(self.root))}
-        # Save opening/producer Evidence before an overview or a later query.
-        self._rea_evidence.update(_rea_evidence_ids(_rea_content(raw)))
-        if kind == 'native':
-            overview = await self._rea_call('binary_overview', {})
-            content = {'opened_target': _rea_content(raw), 'overview': _rea_content(overview)}
-            raw = {'isError': _rea_failed(overview), 'structuredContent': content}
-        return self._rea_response(operation, raw, target=logical)
-
-    async def rea_query(self, arguments: dict[str, Any]) -> str:
-        self._require_rea_execution('rea_query')
-        target = self._rea_target
-        if target is None or target['identity'] != (self.workspace.id, self.chat_id, self.run_id, str(self.root)):
-            raise PermissionError('Use rea_analyze to authorize a target in this run before querying REA.')
-        # Re-evaluate live Project Access grants and endpoint symlinks.
-        current = self._resolve(target['logical_path'], must_exist=True)
-        if current != target['path']:
-            self._rea_target = None
-            raise PermissionError('The authorized REA path changed. Use rea_analyze again.')
-        if current.is_dir():
-            await self._rea_check_directory(current)
-        if set(arguments) - {'tool', 'arguments'}:
-            raise ValueError('REA query accepts only tool and arguments.')
-        name = str(arguments.get('tool') or '')
-        allowed = dict(REA_SHARED_QUERY_KEYS)
-        if target.get('queries_ready'):
-            allowed.update(REA_MANAGED_QUERY_KEYS if target['kind'] == 'managed' else
-                           REA_NATIVE_QUERY_KEYS if target['kind'] == 'native' else {})
-        if name not in allowed:
-            raise PermissionError('That operation is outside the reviewed static REA query boundary for this target kind.')
-        params = arguments.get('arguments', {})
-        if not isinstance(params, dict) or set(params) - set(allowed[name]):
-            raise ValueError('Unsupported REA arguments. Target paths, document selection and commands are not accepted.')
-        params = json.loads(json.dumps(params, allow_nan=False))
-        if len(json.dumps(params)) > 32_000:
-            raise ValueError('REA query arguments exceed the bounded input limit.')
-        pending = [params]
-        while pending:
-            value = pending.pop()
-            if isinstance(value, dict):
-                if set(value) & {'path', 'input_path', 'output', 'output_path', 'snapshot_path', 'document', 'command'}:
-                    raise ValueError('REA query target paths, outputs, document selection and commands are not accepted.')
-                pending.extend(child for child in value.values() if isinstance(child, (dict, list)))
-            elif isinstance(value, list):
-                pending.extend(value)
-        if name in {'xrefs', 'address_name', 'read_bytes', 'address_to_file_offset',
-                    'inspect_native_instruction', 'resolve_native_call_targets'} and not str(params.get('address') or '').strip():
-            raise ValueError('This REA query requires an explicit address.')
-        if name in {'search_procedures', 'search_strings'} and params.get('mode', 'literal') not in {'literal', 'regex'}:
-            raise ValueError('REA search mode must be literal or regex.')
-        if name == 'read_bytes' and (type(params.get('length', 256)) is not int or not 1 <= params.get('length', 256) <= 4096):
-            raise ValueError('REA read_bytes length must be between 1 and 4096.')
-        if name in {'batch_decompile', 'demangle_swift'}:
-            values = params.get('addresses' if name == 'batch_decompile' else 'symbols', [])
-            if not isinstance(values, list) or len(values) > 32:
-                raise ValueError('REA batch queries may contain at most 32 entries.')
-        if name == 'inspect_analysis_view':
-            source, view = params.get('source'), params.get('view')
-            if (not isinstance(source, dict) or set(source) != {'kind', 'evidence_id'}
-                    or source.get('kind') != 'retained-evidence' or source.get('evidence_id') not in self._rea_evidence):
-                raise PermissionError('REA views require a retained evidence_id returned by this authorized target in this run.')
-            if (not isinstance(view, dict) or view.get('kind') not in REA_VIEW_KEYS
-                    or set(view) - set(REA_VIEW_KEYS[view['kind']])
-                    or type(view.get('limit', 64)) is not int or not 1 <= view.get('limit', 64) <= 100):
-                raise ValueError('REA views require a supported static view with a page limit between 1 and 100.')
-            if view['kind'] == 'page':
-                view.setdefault('limit', 64)
-                view.setdefault('offset', 0)
-            if view['kind'] == 'item':
-                selector = view.get('selector')
-                if not isinstance(selector, dict) or len(selector) != 1 or set(selector) - {'index', 'name', 'node_id'}:
-                    raise ValueError('REA item views select an observed index, name or graph node ID.')
-        if name == 'get_evidence_bundle':
-            if params.get('detail', 'summary') != 'summary':
-                raise ValueError('HarnessyXO exposes only REA evidence summaries; select a retained Evidence view for detail.')
-            params['detail'] = 'summary'
-            filters = params.get('filters', {})
-            if not isinstance(filters, dict) or set(filters) - {'evidence_id', 'operation', 'target_sha256', 'analysis_profile_digest', 'procedure_address'}:
-                raise ValueError('Unsupported REA evidence-summary filters.')
-            if filters.get('evidence_id') and filters['evidence_id'] not in self._rea_evidence:
-                raise PermissionError('That REA Evidence ID was not returned for this run\'s authorized target.')
-        if name in REA_MANAGED_QUERY_KEYS:
-            params['path'] = str(current)
-        return self._rea_response(name, await self._rea_call(name, params))
 
     def _code_intelligence(self) -> CodeIntelligenceService:
         return CodeIntelligenceService(self.root, environment=self.environment, guest_root=self.guest_root,

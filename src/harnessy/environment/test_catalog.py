@@ -1,7 +1,7 @@
 """Test guest catalog. UI, validation and controllers share these capabilities.
 
 Official download sources/checksums checked 2026-09-25; OpenWrt 23.05.2 added
-and checked 2026-10-10. Release image versions
+and checked 2026-10-10. Malta MIPS images checked 2026-10-15. Release image versions
 are deliberately explicit; updating a catalog entry never replaces an existing
 guest disk. These are test targets, independent of workspace VM presets.
 """
@@ -61,6 +61,10 @@ OPENWRT_RELEASE_IMAGES = {
         'arm64': ('armsr/armv8', 'armsr-armv8',
                   '15b08d4fa7ce483b4878866f56e1f520bfa8eada59087a7c46c4613817e12a65',
                   'f969399d881abef448311acddeed519fa500bd8d59622ab471beddf8dd32466d'),
+        # This release publishes Malta big-endian 32-bit only.
+        'mips': ('malta/be', 'malta-be',
+                 '94effccff827cd7ecb20dd8cd39ffecdc96903224b186d21ec7691cda63d08ca',
+                 '1b5d129f97f833c4881d579f9cbac1c2037b0331b27ba09b8933cc1f7f9b3e24'),
     },
     'openwrt-25.12.5': {
         'x86_64': ('x86/64', 'x86-64',
@@ -69,7 +73,33 @@ OPENWRT_RELEASE_IMAGES = {
         'arm64': ('armsr/armv8', 'armsr-armv8',
                   '03172dd9a91e7cb477ab73bcb5de544bfe19f42698d7f66d9b2bb80ca692eaa6',
                   '8cf43c4901efae72b0a04bb655158e03335067e8757926bca4c81d5c952aca51'),
+        'mips': ('malta/be', 'malta-be',
+                 'ce4ac4c84a5e01060f6da1a8e68edccb9cfdd6b3c59ca93675c6eb8e50264fa0',
+                 'ced8942d9286483cd29be4ce3b05eff73beb8f9e070d498e484e18c1dbb94c96'),
+        'mipsel': ('malta/le', 'malta-le',
+                   '04ded27e51a895a19c47278d8a94343343bc1d6b20997b699cf5a35e34ecaa40',
+                   'dc38c11c362cdce58ced8e641e20933d4bb0ce052d03f4cdd24b0ab215a8f4e3'),
+        'mips64': ('malta/be64', 'malta-be64',
+                   'a831396eef699cf6635ffa561f053a60296caab129ce153f4af9f1fba2320574',
+                   '57c923eab8be964e9e9e2657dd72afa0d474c94f23b963e8194caa2cf9c89fdb'),
+        'mips64el': ('malta/le64', 'malta-le64',
+                     '99e435801adcd95b4796d067982eef52e9447a67c70a5cbd8e4e291b387b353c',
+                     '50afe00a917b26686c2e48178a744e8778c4e82c458c76e11b634e3beb98a7b8'),
     },
 }
 # Preserve the original current-release mapping for callers which use the alias.
 OPENWRT_IMAGES = OPENWRT_RELEASE_IMAGES['openwrt-25.12.5']
+
+
+def target_architectures(os_name: str) -> dict[str, str]:
+    """Only advertise image variants whose exact upstream bytes are pinned."""
+    labels = {
+        'arm64': 'ARM64 (Apple Silicon / ARM hosts)',
+        'x86_64': 'x86-64 (Intel / AMD)',
+        'mips': 'MIPS32 big-endian (Malta)',
+        'mipsel': 'MIPS32 little-endian (Malta)',
+        'mips64': 'MIPS64 big-endian (Malta)',
+        'mips64el': 'MIPS64 little-endian (Malta)',
+    }
+    supported = OPENWRT_RELEASE_IMAGES[os_name] if guest_os(os_name).family == 'openwrt' else ('arm64', 'x86_64')
+    return {arch: labels[arch] for arch in labels if arch in supported}

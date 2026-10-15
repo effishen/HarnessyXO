@@ -245,6 +245,9 @@ def _evidence(row: dict[str, Any]) -> dict[str, Any]:
         'target_id', 'target_backend', 'target_action', 'target_stage', 'target_outcome',
         'target_failure_code', 'operation_id', 'attempt', 'attempts', 'probe_attempts',
         'target_view_failure_code', 'target_interface',
+        'target_radio_kind', 'target_radio_observation', 'target_radio_status', 'target_radio_reason',
+        'target_radio_detail', 'target_radio_requested', 'target_radio_verified',
+        'target_radio_count', 'target_radio_interface_count',
         'error_code', 'target_validation', 'permission', 'permission_decision',
         'permission_source', 'permission_reason', 'permission_target_mode',
         'permission_target_state', 'permission_changed', 'permission_states',
@@ -285,7 +288,7 @@ def _startup_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str
         'recent_receipts': receipts[-120:],
         'counts_are_retained_records': True,
     }
-    lines = ['Startup evidence: STARTUP.json retains launcher update and REA setup receipts.']
+    lines = ['Startup evidence: STARTUP.json retains launcher update receipts and historical host REA setup receipts. REA now runs as a workspace VM tool.']
     if not receipts:
         lines.append('  No startup receipts were recorded in the examined logs; updater decisions and REA setup checks cannot be reconstructed.')
     else:
@@ -302,7 +305,7 @@ def _startup_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str
                 lines.append(f'    Initial archive mismatches: {check.get("mismatch_count", "unrecorded")}; executable metadata repairs: {check.get("executable_repairs", "unrecorded")}; only executable metadata differed: {check.get("only_executable_metadata", "unrecorded")}.')
                 for item in check.get('mismatches', []):
                     lines.append(f'      {item["path"]}: {item["reason"]}.')
-        lines.append(f'  REA setup failures recorded: {len(failures)}; with storage component facts: {len(storage)}.')
+        lines.append(f'  Historical host REA setup failures recorded: {len(failures)}; with storage component facts: {len(storage)}.')
         for row in failures[-3:]:
             if not row.get('storage_issue'):
                 lines.append(f'  {row["timestamp"]} [{row["session_scope"]}] REA setup failed: code {row.get("error_code", "unrecorded")}; status {row.get("status", "unrecorded")}; exception class {row.get("exception_class", "unrecorded")}.')
@@ -587,7 +590,8 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
                                          and row.get('session_scope') == failure.get('session_scope')
                                          and row.get('target_id') == failure.get('target_id')
                                          and row.get('operation_id') == failure.get('operation_id')
-                                         and str(row.get('event')).startswith('test_target_operation_')][-16:],
+                                         and (str(row.get('event')).startswith('test_target_operation_')
+                                              or row.get('event') == 'test_target_radio_result')][-16:],
         })
     counts = Counter(str(row.get('event', '')) for row in rows)
     durations = [row['drift_seconds'] for row in rows
@@ -626,6 +630,12 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         target_lines.append('  No test-target lifecycle observations in examined logs. Target creation/startup timing and failures cannot be reconstructed from their absence.')
     else:
         target_lines.append(f'  Test-target lifecycle records examined: {len(target_rows)}; failure observations: {sum(bool(_target_failure_classification(row)) for row in target_rows)}.')
+    for row in [item for item in target_rows if item.get('event') == 'test_target_radio_result'][-4:]:
+        target_lines.append(f'  {row["timestamp"]} radio {row.get("target_radio_kind", "unrecorded")}: '
+                            f'{row.get("target_radio_status", "unrecorded")} / {row.get("target_radio_reason", "unrecorded")}; '
+                            f'detail {row.get("target_radio_detail", "unrecorded")}; '
+                            f'verified virtual radios {row.get("target_radio_count", "unrecorded")}; '
+                            f'interfaces {row.get("target_radio_interface_count", "unrecorded")}.')
     target_lines.extend(['  A running VM monitor does not establish that its guest shell or web service is ready.', ''])
     from .logging import _export_metadata
     metadata = _export_metadata(Path(latest))

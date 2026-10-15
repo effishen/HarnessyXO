@@ -1743,7 +1743,7 @@ def _privacy_manifest(*, include_content: bool = False) -> str:
         'separately from execution and coordination time. It never reads saved settings or exports '
         'commands, target names or credentials. Missing receipts leave the reason for a dialog unverified.\n\n'
         'STARTUP.json contains bounded launcher update outcomes, reviewed application-relative archive '
-        'mismatches, executable metadata repairs, and REA storage-validation facts. Storage descendants '
+        'mismatches, executable metadata repairs, and historical host REA storage-validation facts. Storage descendants '
         'outside known runtime components use fixed parent labels. File contents, home paths, raw errors '
         'and credentials are excluded from these receipts in both export modes. The collector reads logs '
         'only and does not check Git, run an installer, or open an application database.\n\n'
