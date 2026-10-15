@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.6.91
+
+- Detect denied KVM access before native Linux QEMU Create/Start. Check the running process's effective access to `/dev/kvm`, including opening and immediately closing the existing device without creating a VM. Report `KVM_ACCESS_DENIED` with the host permission error and instructions to refresh group membership in a new shell or login.
+- Run the same check before Factory Reset, rebuild or snapshot restore can stop or replace the current guest. A blocked operation leaves its disk intact. Keep Stop/Delete available and preserve foreign-architecture software emulation, hosts without KVM and macOS VZ behavior.
+- Highlight a recorded QEMU KVM permission denial in the diagnostic support summary, with corroborating device-access and active-process-group facts when available. Distinguish the original launch error from later QMP cleanup failures and avoid claiming account group membership from a running process's groups.
+- Preserve existing workspace data, tools, model progress and public startup updates. Leave README unchanged and keep the same 11 Markdown resources; private QA stays outside the application package.
+
 ## v0.6.90
 
 - Include scrubbed Lima host-agent and QEMU controller errors in the default diagnostics download, including unfamiliar error wording. Keep guest console output and command payloads excluded while preserving technical failure details such as permissions, memory, firmware, device properties and disk locks.

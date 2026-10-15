@@ -1,4 +1,4 @@
-# HarnessyXO v0.6.90 Features
+# HarnessyXO v0.6.91 Features
 
 ## Model progress across backends
 
@@ -30,6 +30,8 @@
 - On Linux ARM64 and x86-64 hosts, install a verified private Lima 2.2.1 distribution with matching additional guest agents when `python3 run.py` or VM Create/Start finds Lima missing. Keep an existing usable Lima on your PATH in preference to the managed copy.
 - Verify official release checksums, stage the complete tool bundle before activating it, and reuse a verified cache offline. Restore the managed tool path inside the application process without changing shell profiles or system PATH settings.
 - Keep ordinary host package installation and privilege checks for QEMU and other required tools. Run HarnessyXO with your normal account; official Lima refuses root operation.
+- Before native Linux QEMU Create/Start, check the current process's effective access to the existing KVM device. A permission denial gives `KVM_ACCESS_DENIED` and host repair instructions instead of allowing QEMU to fail after launch. Group changes require a new shell or login before restarting HarnessyXO.
+- Check KVM access before Factory Reset, rebuild and snapshot restore can stop or replace guest state. Blocked operations preserve the current disk; Stop/Delete remain available. Keep foreign-architecture software emulation, absent-KVM behavior and macOS VZ unchanged.
 
 ## Public GitHub startup updates
 
@@ -58,6 +60,7 @@ Workspace and machine databases use WAL so background reads can coexist with mes
 
 ## Actionable support diagnostics
 
+- Highlight a recorded QEMU KVM permission denial and corroborating host device/process-access facts near the start of the support summary. Distinguish the launch cause from QMP cleanup errors; a process's active groups do not establish the account's saved group membership.
 - Include scrubbed host-agent and QEMU control-plane errors in the default download, rather than only recognized signal codes. Keep unfamiliar technical wording while excluding credentials, private paths, command payloads and guest console content. Guest serial logs still contribute fixed boot/error signals without guest output.
 - Preserve bounded failure receipts before Start, Factory Reset or rebuild replaces the current VM logs. Retain controller command and lifecycle correlation, requested VM configuration and resource snapshots with their capture time; identify stale or prior-attempt sources explicitly. Capture test-target QEMU launcher output separately from guest serial output.
 - Include HOST_STATE.json with read-only host prerequisites, OS/CPU, memory/swap and cgroup limits, resource pressure, disk/inode space, application process counters, KVM access, firmware metadata, known tool versions and dependency versions when available. Mark unsupported platforms and unavailable probes explicitly. Export-time host state does not establish resource availability at an earlier failure.

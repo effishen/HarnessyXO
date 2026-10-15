@@ -9,7 +9,9 @@ from collections import Counter
 from datetime import datetime
 import hashlib
 import json
+import math
 from pathlib import Path
+import re
 from typing import Any
 from .permissions import PERMISSION_EVENTS
 from .startup import STARTUP_EVENTS
@@ -48,6 +50,9 @@ def _bounded_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _vm_failure_classification(row: dict[str, Any]) -> str | None:
     event = row.get('event')
+    if (event == 'vm_host_preflight_failed' and row.get('error_code') == 'KVM_ACCESS_DENIED'
+            and row.get('kvm_present') is True and row.get('kvm_accessible') is False):
+        return 'vm_host_kvm_access_denied'
     if event == 'environment_command_spawn_failed':
         return 'vm_controller_spawn_failed'
     if event == 'vm_lifecycle_finished' and row.get('outcome') == 'failed':
@@ -70,6 +75,121 @@ def _vm_failure_classification(row: dict[str, Any]) -> str | None:
     if event == 'workspace_environment_shutdown_stop_failed':
         return 'vm_shutdown_stop_unverified'
     return None
+
+
+_KVM_PERMISSION_ERROR = re.compile(
+    r'(?:Could not access KVM kernel module|failed to initialize kvm):\s*Permission denied\b', re.I)
+
+
+def _saved_kvm_error(source: dict[str, Any], receipt: dict[str, Any]) -> bool:
+    evidence = source.get('evidence', {})
+    text = evidence.get('diagnostic_text', '') if isinstance(evidence, dict) else ''
+    if not isinstance(text, str):
+        return False
+    if source.get('name') == 'controller_stderr':
+        return bool(_KVM_PERMISSION_ERROR.search(text))
+    try:
+        started = math.floor(receipt['command_started_at_epoch'])
+        captured = math.ceil(datetime.fromisoformat(receipt['captured_at']).timestamp())
+    except (KeyError, ValueError, TypeError, OverflowError):
+        return False
+    for line in text.splitlines():
+        if not _KVM_PERMISSION_ERROR.search(line):
+            continue
+        stamp = re.search(r'\btime=(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d))\b', line)
+        if stamp:
+            try:
+                observed = datetime.fromisoformat(stamp[1].replace('Z', '+00:00')).timestamp()
+            except (ValueError, OverflowError):
+                continue
+            if started <= observed <= captured:
+                return True
+    return False
+
+
+def _host_kvm_facts(report: dict[str, Any] | None) -> dict[str, Any]:
+    """Corroborating export-time facts, never an account database assertion."""
+    if not isinstance(report, dict):
+        return {}
+    from .host_state import validate_host_diagnostics
+    safe = validate_host_diagnostics(report)
+    device, process = safe.get('kvm', {}), safe.get('process', {})
+    if device.get('status') != 'ok':
+        return {}
+    facts: dict[str, Any] = {'capture_scope': 'export_time'}
+    for key in ('mode', 'uid', 'gid', 'readable', 'writable'):
+        if key in device:
+            facts[key] = device[key]
+    for key in ('uid', 'euid', 'gid', 'egid'):
+        if key in process:
+            facts['process_' + key] = process[key]
+    groups = process.get('supplementary_group_ids')
+    if isinstance(groups, list) and len(groups) < 256 and type(device.get('gid')) is int:
+        active = set(groups) | {process.get('gid'), process.get('egid')}
+        facts['device_group_active'] = device['gid'] in active
+    return facts
+
+
+def _kvm_permission_cause(failure: dict[str, Any], rows: list[dict[str, Any]],
+                          vm_report: dict[str, Any] | None,
+                          host_facts: dict[str, Any]) -> dict[str, Any] | None:
+    """Require an explicit guard or native error tied to this controller attempt."""
+    if not _vm_failure_classification(failure):
+        return None
+    operation = failure.get('operation_id')
+    for row in [failure] + rows:
+        if _vm_failure_classification(row) != 'vm_host_kvm_access_denied':
+            continue
+        if row is not failure and (not isinstance(operation, str)
+                or row.get('operation_id') != operation
+                or row.get('session_scope') != failure.get('session_scope')
+                or row.get('workspace_id') != failure.get('workspace_id')):
+            continue
+        return {'code': 'KVM_ACCESS_DENIED', 'source': 'host_kvm_preflight',
+                'host_access': host_facts}
+    command = failure.get('command_id')
+    if not isinstance(command, str) or not re.fullmatch(r'[0-9a-f]{32}', command):
+        return None
+    for row in rows:
+        if (row.get('command_id') != command or row.get('session_scope') != failure.get('session_scope')
+                or row.get('event') not in {'environment_command_finished', 'vm_startup_observation'}):
+            continue
+        evidence = row.get('controller_evidence')
+        stderr = evidence.get('stderr', {}) if isinstance(evidence, dict) else {}
+        if isinstance(stderr, dict) and _KVM_PERMISSION_ERROR.search(str(stderr.get('diagnostic_text', ''))):
+            return {'code': 'KVM_ACCESS_DENIED', 'source': 'current_controller_stderr',
+                    'command_id': command, 'host_access': host_facts}
+    for workspace in (vm_report or {}).get('workspaces', []):
+        for receipt in workspace.get('failure_receipts', []):
+            if (receipt.get('command_id') != command or receipt.get('correlation_scope') != 'controller_command'
+                    or receipt.get('reason') not in {'controller_error', 'controller_timeout', 'controller_cancelled'}
+                    or (isinstance(operation, str) and receipt.get('operation_id') != operation)):
+                continue
+            for source in receipt.get('sources', []):
+                if (source.get('name') not in {'controller_stderr', 'ha.stderr.log'}
+                        or source.get('status') != 'included'
+                        or source.get('timestamp_scope') not in {'current_controller_output', 'file_updated_during_attempt'}):
+                    continue
+                if _saved_kvm_error(source, receipt):
+                    return {'code': 'KVM_ACCESS_DENIED', 'source': 'same_attempt_saved_qemu_stderr',
+                            'command_id': command, 'receipt_id': receipt['receipt_id'],
+                            'host_access': host_facts}
+    return None
+
+
+def _kvm_cause_lines(cause: dict[str, Any]) -> list[str]:
+    prefix = ('The host preflight blocked this operation because the process lacks read/write KVM access.'
+              if cause.get('source') == 'host_kvm_preflight' else
+              'QEMU reported the startup cause: KVM access was denied (Permission denied).')
+    lines = [prefix]
+    facts = cause.get('host_access') or {}
+    if facts:
+        observed = {key: value for key, value in facts.items() if key != 'capture_scope'}
+        lines.append('Corroborating host access facts at export time: ' + json.dumps(observed, sort_keys=True) + '.')
+        if facts.get('device_group_active') is False:
+            lines.append('The KVM device\'s owning group was not active in this HarnessyXO process; this does not establish the account\'s saved group membership.')
+    lines.append('Give your normal account read/write access through the KVM device\'s owning group. After a group change, fully sign out and back in, then restart HarnessyXO so it receives the new groups. Check device ACL/container policy if access remains denied.')
+    return lines
 
 
 def _target_failure_classification(row: dict[str, Any]) -> str | None:
@@ -362,6 +482,7 @@ def _evidence(row: dict[str, Any]) -> dict[str, Any]:
         'error_type', 'terminal_stop_reason', 'terminal_reason', 'backend_done_reason',
         'source', 'technical_error', 'controller_evidence', 'requested_vm_config',
         'environment_action', 'lifecycle_action', 'preservation_reason', 'failure_receipt', 'host_resources',
+        'kvm_present', 'kvm_accessible',
     )
     evidence = {key: row[key] for key in keys if key in row}
     if _is_lock(row):
@@ -606,7 +727,8 @@ def _vm_log_coverage(report: dict[str, Any] | None) -> tuple[dict[str, Any] | No
 
 
 def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = None,
-                          target_report: dict[str, Any] | None = None) -> tuple[dict[str, Any], str]:
+                          target_report: dict[str, Any] | None = None,
+                          host_report: dict[str, Any] | None = None) -> tuple[dict[str, Any], str]:
     rows, coverage = _rows(Path(latest))
     # After a restart, the previous process may contain the failure the user
     # wants to report. Examine only the same bounded previous tail the ZIP keeps.
@@ -636,6 +758,8 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         if launcher_sources >= 2:
             break
     rows = _bounded_rows(sorted(rows, key=lambda row: row['timestamp']))
+    safe_vm_report, vm_lines = _vm_log_coverage(vm_report)
+    host_kvm_facts = _host_kvm_facts(host_report)
     observation_keys = {(row.get('session_scope'), row.get('command_id')) for row in rows
                         if row.get('event') == 'vm_startup_observation' and isinstance(row.get('command_id'), str)
                         and _vm_failure_classification(row)}
@@ -655,6 +779,9 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         target_classification = _target_failure_classification(failure)
         permission_classification = _permission_failure_classification(failure)
         startup_classification = _startup_failure_classification(failure)
+        vm_cause = _kvm_permission_cause(failure, rows, safe_vm_report, host_kvm_facts)
+        if vm_cause:
+            vm_classification = 'vm_host_kvm_access_denied'
         target_operation = _target_operation_rows(rows, failure) if target_classification else []
         target_analysis = _target_startup_analysis(rows, failure, target_operation) if target_classification else None
         if vm_classification == 'vm_controller_interrupted' and not isinstance(failure.get('controller_signal'), str):
@@ -689,7 +816,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         missing: list[str] = []
         if not vm_classification and not target_classification and not permission_classification and not startup_classification and not _has_frames(failure) and not any(_has_frames(row) for row in database_errors):
             missing.append('exception_traceback_unavailable')
-        if vm_classification and not any(
+        if vm_classification and not vm_cause and not any(
                 isinstance(row.get('controller_evidence'), dict) and any(
                     isinstance(value, dict) and value.get('diagnostic_text') for value in row['controller_evidence'].values())
                 for row in controller_evidence):
@@ -717,6 +844,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
             'controller_evidence': controller_evidence[-8:],
             'target_operation_evidence': [_evidence(row) for row in target_operation][-16:],
             'target_startup_analysis': target_analysis,
+            'vm_cause': vm_cause,
         })
     counts = Counter(str(row.get('event', '')) for row in rows)
     durations = [row['drift_seconds'] for row in rows
@@ -736,7 +864,6 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
     index['permission_audit'] = permission_audit
     startup_audit, startup_lines = _startup_audit(rows)
     index['startup_audit'] = startup_audit
-    safe_vm_report, vm_lines = _vm_log_coverage(vm_report)
     if safe_vm_report is not None:
         index['vm_log_evidence'] = safe_vm_report
     target_rows = [row for row in rows if str(row.get('event')).startswith('test_target_')]
@@ -781,12 +908,16 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
     index['control_plane_timeline'] = control_rows[-1200:]
     index['control_plane_coverage'] = {'rows_available': len(control_rows), 'rows_retained': min(len(control_rows), 1200),
         'row_limit': 1200, 'row_limit_reached': len(control_rows) > 1200, 'source_coverage': coverage}
+    latest_vm = next((item for item in reversed(incidents) if item['classification'].startswith('vm_')), None)
+    primary_cause = (_kvm_cause_lines(latest_vm['vm_cause']) + ['']
+                     if latest_vm and latest_vm.get('vm_cause') else [])
     lines = [
         'HarnessyXO support summary', '==========================', '',
         'Start here; machine-readable evidence is in INCIDENTS.json.',
         f'Session application version: {version}; capture time: {metadata.get("captured_at", "unrecorded")}.',
         'This summary examines bounded current/previous-session log tails and startup receipts from up to two recent launcher sessions. Counts are not whole-session totals.',
         'Nearby events and tracked transactions are evidence for investigation, not proven lock ownership.', '',
+        *primary_cause,
         *model_lines,
         f'Recorded failures in examined logs: {len(failures)} (latest {len(incidents)} shown)',
         f'Event-loop stalls: {counts["event_loop_stall"]}; maximum recorded delay: {max(durations, default=0):.3f}s',
@@ -844,7 +975,9 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
                         lines.append('  Its missing-radio results describe guest capabilities after the interrupted start; they are not radio installation failures.')
                 lines.append('  Inspect target_operation_evidence, target_startup_analysis and TARGET_LOGS.json; a shell probe failure does not establish that the VM failed to boot.')
         if classification.startswith('vm_'):
-            if classification == 'vm_controller_timeout':
+            if classification == 'vm_host_kvm_access_denied' and incident.get('vm_cause'):
+                lines.extend('  ' + value for value in _kvm_cause_lines(incident['vm_cause']))
+            elif classification == 'vm_controller_timeout':
                 lines.append('  HarnessyXO reached its controller wait deadline; this does not by itself establish an SSH failure.')
             elif classification == 'vm_ssh_requirement_failed':
                 lines.append('  Lima explicitly reported failure to satisfy its SSH boot requirement. The underlying guest cause is not established.')

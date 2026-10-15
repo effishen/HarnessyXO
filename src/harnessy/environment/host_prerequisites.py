@@ -6,6 +6,7 @@ failures are actionable; privileges are never solicited through the browser.
 """
 from __future__ import annotations
 import asyncio
+import errno
 import json
 import os
 import platform
@@ -25,6 +26,92 @@ _INSTALL_LOCKS: dict[int, asyncio.Lock] = {}
 
 class HostPrerequisiteError(RuntimeError):
     pass
+
+
+class HostKVMAccessError(HostPrerequisiteError):
+    code = 'KVM_ACCESS_DENIED'
+
+
+def _effective_kvm_access() -> bool:
+    try:
+        return os.access('/dev/kvm', os.R_OK | os.W_OK, effective_ids=True)
+    except (TypeError, NotImplementedError):
+        # Older Python/platform builds may lack effective-ID access checks.
+        # A real-ID check is equivalent only when real/effective identities match.
+        if ((getattr(os, 'getuid', lambda: None)() != getattr(os, 'geteuid', lambda: None)())
+                or (getattr(os, 'getgid', lambda: None)() != getattr(os, 'getegid', lambda: None)())):
+            return False
+        return os.access('/dev/kvm', os.R_OK | os.W_OK)
+
+
+def validate_native_kvm_access(architecture: str, vm_type: str) -> dict[str, Any]:
+    """Check Lima's native Linux KVM selection without starting a guest.
+
+    Lima selects KVM when the native Linux host can stat /dev/kvm; a later
+    permission failure does not trigger its absent-device TCG fallback.
+    """
+    host_os = platform.system()
+    host_arch = canonical_arch(platform.machine())
+    foreign = canonical_arch(architecture) != host_arch
+    present = host_os == 'Linux' and Path('/dev/kvm').exists()
+    accessible = bool(present and _effective_kvm_access())
+    report = {'host_os': host_os, 'host_architecture': host_arch, 'vm_type': vm_type,
+              'foreign_architecture': foreign, 'kvm_present': present, 'kvm_accessible': accessible}
+    if host_os != 'Linux' or vm_type != 'qemu' or foreign or not present:
+        return report
+    active_group: bool | None = None
+    try:
+        device_gid = Path('/dev/kvm').stat().st_gid
+        active_group = device_gid == os.getegid() or device_gid in os.getgroups()
+        report['kvm_device_group_active'] = active_group
+    except (OSError, AttributeError):
+        pass
+    denied: OSError | None = None
+    if accessible:
+        try:
+            descriptor = os.open('/dev/kvm', os.O_RDWR | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NONBLOCK', 0))
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EPERM}:
+                denied = exc
+                accessible = False
+                report['kvm_accessible'] = False
+            else:
+                # An unavailable driver is not evidence that adding a group
+                # will repair it. Do not create a VM or choose TCG here.
+                number = f' (errno {exc.errno})' if isinstance(exc.errno, int) else ''
+                raise HostPrerequisiteError(
+                    '[KVM_UNAVAILABLE] /dev/kvm could not be opened' + number + '. '
+                    'Check the host KVM driver/device configuration, then retry Start. '
+                    'The guest does not need a reset or rebuild for this host check.'
+                ) from exc
+        else:
+            os.close(descriptor)  # Opening the subsystem handle creates no VM; no ioctl is issued.
+    if not accessible:
+        if active_group:
+            repair = (
+                'This process already has the device group. Check host ACLs and service/container '
+                'device-security restrictions; adding the same group again will not repair that denial. '
+            )
+        else:
+            repair = (
+                'Stop HarnessyXO and add your normal host account to the group owning /dev/kvm '
+                '(usually kvm; for example: sudo usermod -aG kvm "$(id -un)"). '
+                'Sign out and back in, or open a host shell with newgrp kvm, then restart python3 run.py '
+                'from that fresh session. Existing processes keep their old groups even if the account '
+                'has already been added. A service/container must also receive the device group/access. '
+            )
+        error = HostKVMAccessError(
+            '[KVM_ACCESS_DENIED] The HarnessyXO process cannot read and write /dev/kvm. '
+            'Lima selects KVM for this native Linux VM and will fail to start it. '
+            + repair +
+            'Guest reset or rebuild is not needed for this host permission repair.'
+        )
+        error.kvm_device_group_active = active_group
+        if denied is not None:
+            error.errno = denied.errno
+            raise error from denied
+        raise error
+    return report
 
 
 def repaired_path(path: str | None = None) -> str:
@@ -136,6 +223,7 @@ def _guest_agent_path(binary: str, arch: str) -> Path | None:
 
 
 async def inspect_prerequisites(architecture: str, vm_type: str) -> dict[str, Any]:
+    acceleration = validate_native_kvm_access(architecture, vm_type)
     paths = {name: discover_binary(name) for name in required_binaries(architecture, vm_type)}
     missing = [name for name, path in paths.items() if not path]
     version = ''
@@ -170,16 +258,11 @@ async def inspect_prerequisites(architecture: str, vm_type: str) -> dict[str, An
             if rc:
                 raise HostPrerequisiteError(f'{name} was found at {paths[name]} but cannot run: {text.strip()[-500:]}. '
                                             'Repair this installation; reinstalling or rebuilding the guest is not a PATH fix.')
-    host_os = platform.system()
-    host_arch = canonical_arch(platform.machine())
-    kvm_present = host_os == 'Linux' and Path('/dev/kvm').exists()
-    kvm_accessible = bool(kvm_present and os.access('/dev/kvm', os.R_OK | os.W_OK))
     return {'paths': paths, 'missing': missing, 'lima_version': version,
             'foreign_architecture': foreign, 'guest_agent': str(guest_agent) if guest_agent else None,
-            'host_os': host_os, 'host_architecture': host_arch, 'vm_type': vm_type,
-            # /dev/kvm is an accelerator, not a correctness prerequisite: Lima/QEMU
-            # can still use software emulation when it is absent or inaccessible.
-            'kvm_present': kvm_present, 'kvm_accessible': kvm_accessible}
+            # Absent-device / foreign-architecture TCG behavior remains Lima's
+            # choice. Present-but-inaccessible native KVM is an early error.
+            **acceleration}
 
 
 async def infrastructure_active() -> bool:

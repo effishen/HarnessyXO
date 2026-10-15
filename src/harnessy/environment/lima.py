@@ -33,7 +33,8 @@ from .presets import (
     MINIMUM_PACKAGES, RPM_MINIMUM,
 )
 from .packages import package_commands, missing_packages_script
-from .host_prerequisites import discover_binary, repaired_path, ensure_host_prerequisites
+from .host_prerequisites import (discover_binary, repaired_path, ensure_host_prerequisites,
+                                 validate_native_kvm_access, HostKVMAccessError)
 from .activity import reserve_policy_change, reserve_environment_change, activity, acquire_activity
 from .base import load_environment_config, save_environment_config
 
@@ -2769,11 +2770,23 @@ exit $rc
         await ensure_host_prerequisites(self.config, vm_type=self._vm_type(), progress=report,
                                         allow_install=allow_install)
 
+    def _preflight_acceleration_access(self) -> None:
+        try:
+            validate_native_kvm_access(self.config.architecture, self._vm_type())
+        except HostKVMAccessError as exc:
+            log_event('runtime', 'vm_host_preflight_failed', workspace=str(self.workspace_root),
+                      provider='lima', error_code='KVM_ACCESS_DENIED', kvm_present=True,
+                      kvm_accessible=False, kvm_device_group_active=getattr(exc, 'kvm_device_group_active', None),
+                      errno=getattr(exc, 'errno', None),
+                      **self._controller_diagnostic_fields())
+            raise
+
     @_lifecycle_diagnostics('create')
     async def create(self, progress=None) -> EnvironmentStatus:
         current = await self.status()
         if current.created:
             return current
+        self._preflight_acceleration_access()
         await self._ensure_host_prerequisites(progress=progress)
         self._write_template()
         self._write_readiness(ready=False, phase='creating')
@@ -3036,12 +3049,14 @@ exit $rc
 
         status = await self.status()
         if not status.running:
+            self._preflight_acceleration_access()
             await self._ensure_host_prerequisites(progress=progress)
         if not status.created:
             await report('creating_vm', 'Creating workspace VM…')
             status = await self._call_with_optional_progress(self.create, progress=progress)
         binding_needs_reconcile = not self._runtime_binding_matches()
         if status.running and binding_needs_reconcile:
+            self._preflight_acceleration_access()
             await report(
                 'reconciling_environment', 'Updating workspace VM configuration…',
                 detail='Stopping the VM briefly to rebind working roots and remove legacy per-boot provisioning.',
@@ -3470,6 +3485,7 @@ exit $rc
         requested = str(tag or '').strip()
         if not requested:
             raise ValueError('snapshot tag is required')
+        self._preflight_acceleration_access()
         await self._emit_progress(
             progress, 'preparing_restore', f'Preparing snapshot {requested} for restore…',
         )
@@ -3549,6 +3565,7 @@ exit $rc
         status = await self.status()
         if not status.created:
             return await self._call_with_optional_progress(self.start, progress=progress)
+        self._preflight_acceleration_access()
         await self._preserve_vm_failure(reason='before_reset', operation='reset')
         await self._emit_progress(
             progress, 'factory_reset', 'Factory resetting VM while preserving working roots…',
@@ -3563,6 +3580,7 @@ exit $rc
 
     @_lifecycle_diagnostics('rebuild')
     async def rebuild(self, progress=None) -> EnvironmentStatus:
+        self._preflight_acceleration_access()
         status = await self.status()
         if status.created:
             await self._preserve_vm_failure(reason='before_delete', operation='rebuild')

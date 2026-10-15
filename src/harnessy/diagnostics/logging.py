@@ -299,7 +299,7 @@ _PRIVACY_SAFE_STRING_LIST_KEYS = {
 _VM_DIAGNOSTIC_ENUMS = {
     'controller_action': frozenset({'start', 'stop', 'create', 'delete', 'edit', 'clone', 'snapshot', 'list', 'shell',
                                     'factory-reset', 'restart', '--version', 'other', 'unknown'}),
-    'outcome': frozenset({'controller_error', 'controller_timeout', 'cancelled', 'completed'}),
+    'outcome': frozenset({'controller_error', 'controller_timeout', 'cancelled', 'completed', 'failed'}),
     'last_boot_milestone': frozenset({'launching_instance', 'launching_vz', 'ssh_port_assigned', 'waiting_ssh',
                                      'waiting_guest_agent', 'waiting_boot_scripts', 'lima_ready', 'unknown'}),
     'controller_failure_kind': frozenset({'ssh_requirement_wait_failed', 'startup_fatal', 'unknown'}),
@@ -2166,7 +2166,15 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
             vm_report, vm_members = _collect_vm_export(latest, include_content=include_content)
             target_report, target_members = _collect_test_target_export(latest, include_content=include_content)
             try:
-                incidents, summary = build_support_summary(latest, vm_report=vm_report, target_report=target_report)
+                from .host_state import collect_host_diagnostics, validate_host_diagnostics
+                host_report = validate_host_diagnostics(collect_host_diagnostics())
+            except Exception as exc:
+                from .technical import technical_error_evidence
+                host_report = {'schema_version': 1, 'status': 'collector_failed',
+                               'technical_error': technical_error_evidence(exc)}
+            try:
+                incidents, summary = build_support_summary(latest, vm_report=vm_report, target_report=target_report,
+                                                           host_report=host_report)
             except Exception as exc:
                 from .technical import technical_error_evidence
                 # Export is itself a recovery action. A corrupt log or summary
@@ -2188,13 +2196,6 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
             zf.writestr('MODEL_REQUESTS.json', json.dumps(incidents.get('model_request_audit', {
                 'schema_version': 1, 'status': 'unavailable', 'reason': 'summary_generation_failed',
             }), ensure_ascii=False, indent=2, allow_nan=False))
-            try:
-                from .host_state import collect_host_diagnostics, validate_host_diagnostics
-                host_report = validate_host_diagnostics(collect_host_diagnostics())
-            except Exception as exc:
-                from .technical import technical_error_evidence
-                host_report = {'schema_version': 1, 'status': 'collector_failed',
-                               'technical_error': technical_error_evidence(exc)}
             zf.writestr('HOST_STATE.json', json.dumps(host_report, ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('CONTROL_PLANE_TIMELINE.json', json.dumps({
                 'schema_version': 1, 'coverage': incidents.get('control_plane_coverage', {}),
