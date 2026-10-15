@@ -1,4 +1,4 @@
-# HarnessyXO v0.6.91 Features
+# HarnessyXO v0.6.92 Features
 
 ## Model progress across backends
 
@@ -30,6 +30,8 @@
 - On Linux ARM64 and x86-64 hosts, install a verified private Lima 2.2.1 distribution with matching additional guest agents when `python3 run.py` or VM Create/Start finds Lima missing. Keep an existing usable Lima on your PATH in preference to the managed copy.
 - Verify official release checksums, stage the complete tool bundle before activating it, and reuse a verified cache offline. Restore the managed tool path inside the application process without changing shell profiles or system PATH settings.
 - Keep ordinary host package installation and privilege checks for QEMU and other required tools. Run HarnessyXO with your normal account; official Lima refuses root operation.
+- Starting `python3 run.py` can complete normal Linux KVM group setup. If needed, the host terminal asks for your sudo password to add your current account to the standard `kvm` group owning the device. The launcher then restarts with refreshed group access and verifies the device before continuing. An account already added to the group skips the administrator command.
+- Keep automatic group refresh to one attempt and run the app under your normal account. Noninteractive launches and restricted or nonstandard host devices show the remaining setup requirement. Passwords and terminal authentication output are not collected by startup diagnostics.
 - Before native Linux QEMU Create/Start, check the current process's effective access to the existing KVM device. A permission denial gives `KVM_ACCESS_DENIED` and host repair instructions instead of allowing QEMU to fail after launch. Group changes require a new shell or login before restarting HarnessyXO.
 - Check KVM access before Factory Reset, rebuild and snapshot restore can stop or replace guest state. Blocked operations preserve the current disk; Stop/Delete remain available. Keep foreign-architecture software emulation, absent-KVM behavior and macOS VZ unchanged.
 

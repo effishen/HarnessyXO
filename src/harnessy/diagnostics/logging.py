@@ -1120,7 +1120,21 @@ def _session_is_launcher_only(path: Path) -> bool:
         '"event":"controller_access_token_enabled"',  # previous releases
         '"event":"controller_password_login_enabled"',
     )
-    return '"event":"launcher_exec_application"' in text and not any(event in text for event in application_events)
+    handoff = '"event":"launcher_exec_application"' in text
+    if not handoff:
+        from .startup import is_kvm_refresh_handoff
+        for line in text.splitlines():
+            parts = line.split(' ', 3)
+            if len(parts) != 4:
+                continue
+            try:
+                body = json.loads(parts[3])
+            except (ValueError, TypeError, RecursionError):
+                continue
+            if isinstance(body, dict) and body.get('event') == 'launcher_kvm_setup' and is_kvm_refresh_handoff(body):
+                handoff = True
+                break
+    return handoff and not any(event in text for event in application_events)
 
 
 def _zip_snapshot_file(zf: zipfile.ZipFile, source: Path, arcname: str, *, tail_bytes: int | None = None) -> None:

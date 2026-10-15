@@ -377,7 +377,7 @@ def _rows(latest: Path, *, session_scope: str = 'current', tail_bytes: int = _TA
 def _launcher_startup_rows(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Recover reviewed startup receipts discarded by the launcher's exec."""
     from .logging import _read_snapshot_bytes
-    from .startup import validate_startup_event
+    from .startup import is_kvm_refresh_handoff, validate_startup_event
 
     limit = 512 * 1024
     payload = _read_snapshot_bytes(path / 'harnessy.log', tail_bytes=limit)
@@ -398,6 +398,7 @@ def _launcher_startup_rows(path: Path) -> tuple[list[dict[str, Any]], list[dict[
                     'controller_password_login_enabled', 'controller_access_token_enabled',
                 }
             safe = validate_startup_event(body.get('event'), body) if isinstance(body, dict) else None
+            launcher_handoff = launcher_handoff or bool(safe and is_kvm_refresh_handoff(safe))
         except (ValueError, TypeError, RecursionError):
             continue
         if safe is not None:
@@ -490,6 +491,46 @@ def _evidence(row: dict[str, Any]) -> dict[str, Any]:
     return evidence
 
 
+_KVM_SETUP_DESCRIPTIONS = {
+    'KVM_NOT_REQUIRED': 'KVM setup was not required on this host.',
+    'KVM_DEVICE_ABSENT': 'The KVM device was absent; group repair was not applicable.',
+    'KVM_READY': 'The launch verified usable KVM access.',
+    'KVM_GROUP_REFRESH_VERIFIED': 'The refreshed launch verified usable KVM access.',
+    'KVM_IDENTITY_UNSAFE': 'Automatic setup stopped because the launch identity was unsafe.',
+    'KVM_DEVICE_UNAVAILABLE': 'The KVM device could not be safely inspected.',
+    'KVM_ACCOUNT_UNAVAILABLE': 'The account could not be resolved for automatic setup.',
+    'KVM_DEVICE_GROUP_UNAVAILABLE': 'The KVM device owning group could not be resolved.',
+    'KVM_MEMBERSHIP_UNAVAILABLE': 'Saved group membership could not be inspected.',
+    'KVM_NONINTERACTIVE': 'Privileged setup could not prompt in this noninteractive launch.',
+    'KVM_ACTIVE_GROUP_DENIED': 'The device group was active, but KVM access was still denied; inspect device ACL/container policy.',
+    'KVM_TOOLS_UNAVAILABLE': 'A required setup or group-refresh tool was unavailable.',
+    'KVM_SUDO_UNAVAILABLE': 'sudo was unavailable for privileged group setup.',
+    'KVM_GROUP_REFRESH_UNAVAILABLE': 'The group-refresh tool was unavailable.',
+    'KVM_SUDO_DENIED': 'sudo did not authorize the group setup.',
+    'KVM_SETUP_CANCELLED': 'KVM setup was cancelled.',
+    'KVM_SETUP_TIMEOUT': 'The bounded KVM setup operation timed out.',
+    'KVM_SETUP_FAILED': 'KVM setup did not complete.',
+    'KVM_RELAUNCH_FAILED': 'The requested group-refresh relaunch failed.',
+    'KVM_IDENTITY_CHANGED': 'The refreshed launch changed the user identity; setup stopped.',
+    'KVM_MEMBERSHIP_NOT_UPDATED': 'The requested saved group membership was not verified.',
+    'KVM_GROUP_REFRESH_REQUIRED': 'Saved membership was present; a launch with refreshed groups was requested.',
+    'KVM_GROUP_ADDED_REFRESH_REQUIRED': 'Saved group membership was added; a launch with refreshed groups was requested.',
+    'KVM_REFRESH_RETRY_STOPPED': 'KVM remained inaccessible after the refresh attempt; automatic retries stopped.',
+}
+
+
+def _kvm_setup_lines(receipt: dict[str, Any]) -> list[str]:
+    state, reason = receipt.get('status', 'unrecorded'), receipt.get('reason_code', 'unrecorded')
+    lines = [f'KVM startup setup {receipt["timestamp"]} [{receipt["session_scope"]}]: {state} / {reason}.']
+    if reason in _KVM_SETUP_DESCRIPTIONS:
+        lines.append(_KVM_SETUP_DESCRIPTIONS[reason])
+    facts = {key: receipt[key] for key in ('device_gid', 'kvm_present', 'kvm_accessible',
+             'device_group_active', 'saved_member', 'membership_changed', 'refresh_attempted') if key in receipt}
+    if facts:
+        lines.append('Recorded setup facts: ' + json.dumps(facts, sort_keys=True) + '.')
+    return lines
+
+
 def _startup_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
     from .startup import UPDATE_STATES, UPDATE_SUCCESS_STATES, validate_startup_event
 
@@ -502,6 +543,7 @@ def _startup_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str
             safe[key] = row[key]
         receipts.append(safe)
     checks = [row for row in receipts if row['event'] == 'launcher_source_update']
+    kvm_checks = [row for row in receipts if row['event'] == 'launcher_kvm_setup']
     failures = [row for row in receipts if row['event'] == 'launcher_rea_setup_failed']
     storage = [row for row in failures if row.get('storage_issue')]
     outcomes = Counter(row['state'] for row in checks if row.get('state') in UPDATE_STATES)
@@ -513,12 +555,15 @@ def _startup_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str
                                            if state not in UPDATE_SUCCESS_STATES),
         'rea_setup_failure_records': len(failures),
         'rea_storage_failure_records': len(storage),
+        'kvm_setup_records': len(kvm_checks),
+        'kvm_setup_reason_counts': dict(Counter(row['reason_code'] for row in kvm_checks if 'reason_code' in row)),
+        'latest_kvm_setup': kvm_checks[-1] if kvm_checks else None,
         'recent_receipts': receipts[-120:],
         'counts_are_retained_records': True,
     }
-    lines = ['Startup evidence: STARTUP.json retains launcher update receipts and historical host REA setup receipts. REA now runs as a workspace VM tool.']
+    lines = ['Startup evidence: STARTUP.json retains launcher update and KVM setup receipts, plus historical host REA setup receipts. REA now runs as a workspace VM tool.']
     if not receipts:
-        lines.append('  No startup receipts were recorded in the examined logs; updater decisions and REA setup checks cannot be reconstructed.')
+        lines.append('  No startup receipts were recorded in the examined logs; updater, KVM setup and REA setup decisions cannot be reconstructed.')
     else:
         lines.append(f'  Source checks recorded: {len(checks)}; skipped/uncompleted update outcome records: {audit["source_update_skip_records"]}.')
         if outcomes:
@@ -543,6 +588,9 @@ def _startup_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str
             lines.append(f'  {row["timestamp"]} [{row["session_scope"]}] REA storage component {issue["component"]}: {issue["reason"]}; mode {issue.get("mode", "unrecorded")}; owned by current user: {owner}.')
         if failures:
             lines.append('  These are recorded setup checks; they do not establish what created the storage state or why an earlier install failed.')
+        lines.append(f'  KVM setup records: {len(kvm_checks)}. Counts are retained receipts, not setup attempts or password prompts.')
+        for row in kvm_checks[-4:]:
+            lines.extend('  ' + value for value in _kvm_setup_lines(row))
     lines.append('')
     return audit, lines
 
@@ -909,15 +957,23 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
     index['control_plane_coverage'] = {'rows_available': len(control_rows), 'rows_retained': min(len(control_rows), 1200),
         'row_limit': 1200, 'row_limit_reached': len(control_rows) > 1200, 'source_coverage': coverage}
     latest_vm = next((item for item in reversed(incidents) if item['classification'].startswith('vm_')), None)
+    latest_kvm_setup = startup_audit.get('latest_kvm_setup')
+    setup_verified_after_failure = bool(latest_vm and latest_kvm_setup
+        and latest_kvm_setup.get('status') == 'ready' and latest_kvm_setup.get('kvm_accessible') is True
+        and latest_kvm_setup.get('reason_code') in {'KVM_READY', 'KVM_GROUP_REFRESH_VERIFIED'}
+        and latest_kvm_setup['timestamp'] >= latest_vm['failure']['timestamp'])
     primary_cause = (_kvm_cause_lines(latest_vm['vm_cause']) + ['']
-                     if latest_vm and latest_vm.get('vm_cause') else [])
+                     if latest_vm and latest_vm.get('vm_cause') and not setup_verified_after_failure else [])
+    primary_setup = _kvm_setup_lines(latest_kvm_setup) + [''] if latest_kvm_setup else []
+    if setup_verified_after_failure and latest_vm.get('vm_cause'):
+        primary_setup.insert(-1, 'Earlier recorded KVM-denied VM attempts predate this verified setup check; VM boot readiness is a separate check.')
     lines = [
         'HarnessyXO support summary', '==========================', '',
         'Start here; machine-readable evidence is in INCIDENTS.json.',
         f'Session application version: {version}; capture time: {metadata.get("captured_at", "unrecorded")}.',
         'This summary examines bounded current/previous-session log tails and startup receipts from up to two recent launcher sessions. Counts are not whole-session totals.',
         'Nearby events and tracked transactions are evidence for investigation, not proven lock ownership.', '',
-        *primary_cause,
+        *primary_setup, *primary_cause,
         *model_lines,
         f'Recorded failures in examined logs: {len(failures)} (latest {len(incidents)} shown)',
         f'Event-loop stalls: {counts["event_loop_stall"]}; maximum recorded delay: {max(durations, default=0):.3f}s',

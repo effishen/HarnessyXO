@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.6.92
+
+- Handle normal Linux KVM group setup when starting `python3 run.py`. If access is missing, add your current account to the standard `kvm` device group through the host terminal's sudo prompt, then relaunch with that group active. If membership was already saved, refresh the launch without repeating the administrator command.
+- Verify KVM access again in the refreshed launcher before continuing. Keep the app under your normal account, retain startup source checks and the installation lock, and limit automatic group refresh to one attempt. Cancellation stops setup; unavailable terminal authentication or host device restrictions remain explicit.
+- Record content-free KVM setup and refresh outcomes in startup diagnostics. Keep passwords, account names, command arguments and terminal authentication output out of these receipts. Preserve the existing early VM checks and guest disks when setup remains blocked.
+- Preserve macOS startup, foreign-architecture software emulation, hosts without KVM, workspace data, tools and public updates. Leave README unchanged and keep the same 11 Markdown resources; private QA stays outside the application package.
+
 ## v0.6.91
 
 - Detect denied KVM access before native Linux QEMU Create/Start. Check the running process's effective access to `/dev/kvm`, including opening and immediately closing the existing device without creating a VM. Report `KVM_ACCESS_DENIED` with the host permission error and instructions to refresh group membership in a new shell or login.

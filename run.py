@@ -18,6 +18,7 @@ from pathlib import Path
 
 MIN_PYTHON = (3, 10)
 APP_ROOT = Path(__file__).resolve().parent
+KVM_REFRESH_ENV = 'HARNESSY_KVM_REFRESH_UID'
 try:
     RELEASE_VERSION = (APP_ROOT / 'VERSION').read_text('utf-8').strip() or 'dev'
 except OSError:
@@ -166,6 +167,98 @@ def fail(message: str) -> "NoReturn":
     raise SystemExit(1)
 
 
+def launcher_kvm_selection() -> tuple[str, str] | None:
+    """Check native Linux workspaces, including a new installation's default.
+
+    A launcher with only foreign-architecture workspaces has no native KVM
+    requirement. The regular Create/Start checks remain authoritative later.
+    """
+    import platform
+    if platform.system() != 'Linux':
+        return None
+    from harnessy.core.machine import MachineStore
+    from harnessy.environment.base import load_environment_config
+    from harnessy.environment.presets import canonical_arch, execution_mode
+
+    host_arch = canonical_arch(platform.machine())
+    configured = False
+    for registration in MachineStore().list_workspaces():
+        path = Path(registration.path).expanduser()
+        if not path.is_dir():
+            continue
+        config = load_environment_config(path)
+        if config is None:
+            continue
+        configured = True
+        vm_type = execution_mode(config.architecture, host_arch=host_arch, host_os='Linux')[0]
+        if str(config.provider) == 'lima' and vm_type == 'qemu' and canonical_arch(config.architecture) == host_arch:
+            return config.architecture, vm_type
+    return None if configured else (host_arch, 'qemu')
+
+
+def valid_kvm_refresh_identity(refresh_uid: str) -> bool:
+    return (1 <= len(refresh_uid) <= 10 and refresh_uid.isascii() and refresh_uid.isdecimal()
+            and 0 < int(refresh_uid) < 2**32 and hasattr(os, 'getuid')
+            and os.getuid() == int(refresh_uid) and os.geteuid() == int(refresh_uid))
+
+
+def prepare_launcher_kvm_access(app_dir: Path, install_lock, diagnostic_event=None) -> None:
+    """Do terminal-only host setup before VM checks or application startup."""
+    refresh_uid = os.environ.pop(KVM_REFRESH_ENV, None)
+    refresh_attempted = refresh_uid is not None
+
+    def receipt(**fields) -> None:
+        if diagnostic_event:
+            diagnostic_event('harnessy', 'launcher_kvm_setup', **fields)
+
+    if refresh_attempted:
+        if not valid_kvm_refresh_identity(refresh_uid):
+            receipt(status='action_required', reason_code='KVM_IDENTITY_CHANGED', refresh_attempted=True)
+            fail('KVM group refresh could not verify the original normal account. '
+                 'Start python3 run.py from your normal host account; HarnessyXO was not started.')
+    try:
+        selection = launcher_kvm_selection()
+        if selection is None:
+            return
+        from harnessy.environment.kvm_startup import prepare_kvm_startup
+        plan = prepare_kvm_startup(
+            *selection, python_executable=sys.executable, script_path=app_dir / 'run.py',
+            script_args=tuple(sys.argv[1:]), refresh_attempted=refresh_attempted,
+        )
+    except Exception:
+        receipt(status='action_required', reason_code='KVM_SETUP_FAILED', refresh_attempted=refresh_attempted)
+        print('Automatic KVM setup could not finish. The app will still open; '
+              'VM Start will show any remaining host permission requirement.', file=sys.stderr, flush=True)
+        return
+
+    receipt(**plan.diagnostic_fields())
+    if plan.message:
+        print(plan.message, file=sys.stderr if plan.status == 'action_required' else sys.stdout, flush=True)
+    if plan.status == 'cancelled':
+        raise SystemExit(130)
+    if plan.status != 'relaunch':
+        return
+
+    # Only host group setup has run; no application is serving yet. Release
+    # this launcher's lock immediately before replacing it. sg may close FDs
+    # or fork, so the fresh launcher acquires its own normal lifetime lock and
+    # repeats source verification instead of weakening updater handoff checks.
+    env = dict(os.environ)
+    env[KVM_REFRESH_ENV] = str(os.getuid())
+    from harnessy_update import HANDOFF_ENV, LOCK_ENV
+    env.pop(HANDOFF_ENV, None)
+    env.pop(LOCK_ENV, None)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    install_lock.close()
+    try:
+        os.execve(plan.relaunch_argv[0], list(plan.relaunch_argv), env)
+    except OSError:
+        receipt(status='action_required', reason_code='KVM_RELAUNCH_FAILED', refresh_attempted=True)
+        fail('KVM group setup finished, but the refreshed launcher could not start. '
+             'Sign out and back in, then run python3 run.py again. HarnessyXO was not started.')
+
+
 def check_registered_host_prerequisites() -> None:
     """Use the same selected-backend checks as VM Create/Start.
 
@@ -253,6 +346,13 @@ def main() -> None:
             "Run this launcher with a newer Python, for example:\n"
             "  python3.12 run.py"
         )
+
+    refresh_uid = os.environ.get(KVM_REFRESH_ENV)
+    if refresh_uid is not None and not valid_kvm_refresh_identity(refresh_uid):
+        # Check before source/dependency/diagnostic writes as well as before
+        # application startup. A group refresh must never switch accounts.
+        fail('KVM group refresh could not verify the original normal account. '
+             'Start python3 run.py from your normal host account; HarnessyXO was not started.')
 
     script_dir = Path(__file__).resolve().parent
     app_dir = find_app_dir(script_dir)
@@ -384,6 +484,7 @@ def main() -> None:
     # harnessy_app.py prepends .vendor. Make the dependencies which were just
     # verified or installed importable here as well.
     prepend_import_path(vendor_dir)
+    prepare_launcher_kvm_access(app_dir, install_lock, diagnostic_event)
     try:
         check_registered_host_prerequisites()
     except Exception as exc:

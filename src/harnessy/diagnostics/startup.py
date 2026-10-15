@@ -7,7 +7,18 @@ from typing import Any
 
 STARTUP_EVENTS = frozenset({
     'launcher_source_update', 'launcher_rea_setup_start', 'launcher_rea_ready',
-    'launcher_rea_setup_failed',
+    'launcher_rea_setup_failed', 'launcher_kvm_setup',
+})
+KVM_SETUP_STATUSES = frozenset({'skipped', 'ready', 'relaunch', 'action_required', 'cancelled'})
+KVM_SETUP_REASONS = frozenset({
+    'KVM_NOT_REQUIRED', 'KVM_DEVICE_ABSENT', 'KVM_READY', 'KVM_GROUP_REFRESH_VERIFIED',
+    'KVM_IDENTITY_UNSAFE', 'KVM_DEVICE_UNAVAILABLE', 'KVM_ACCOUNT_UNAVAILABLE',
+    'KVM_DEVICE_GROUP_UNAVAILABLE', 'KVM_MEMBERSHIP_UNAVAILABLE', 'KVM_NONINTERACTIVE',
+    'KVM_ACTIVE_GROUP_DENIED', 'KVM_TOOLS_UNAVAILABLE', 'KVM_SUDO_UNAVAILABLE',
+    'KVM_GROUP_REFRESH_UNAVAILABLE', 'KVM_SUDO_DENIED', 'KVM_SETUP_CANCELLED',
+    'KVM_SETUP_TIMEOUT', 'KVM_SETUP_FAILED', 'KVM_MEMBERSHIP_NOT_UPDATED',
+    'KVM_GROUP_REFRESH_REQUIRED', 'KVM_GROUP_ADDED_REFRESH_REQUIRED', 'KVM_REFRESH_RETRY_STOPPED',
+    'KVM_RELAUNCH_FAILED', 'KVM_IDENTITY_CHANGED',
 })
 UPDATE_STATES = frozenset({
     'zip_version_unrecognized', 'zip_local_changes', 'installation_changed',
@@ -159,7 +170,17 @@ def validate_startup_event(event: Any, value: Any) -> dict[str, Any] | None:
     if not isinstance(event, str) or event not in STARTUP_EVENTS or not isinstance(value, dict):
         return None
     safe: dict[str, Any] = {'event': event}
-    if event == 'launcher_source_update':
+    if event == 'launcher_kvm_setup':
+        for key, allowed in (('status', KVM_SETUP_STATUSES), ('reason_code', KVM_SETUP_REASONS)):
+            if isinstance(value.get(key), str) and value[key] in allowed:
+                safe[key] = value[key]
+        if type(value.get('device_gid')) is int and 0 <= value['device_gid'] <= 2**32 - 1:
+            safe['device_gid'] = value['device_gid']
+        for key in ('kvm_present', 'kvm_accessible', 'device_group_active', 'saved_member',
+                    'membership_changed', 'refresh_attempted'):
+            if type(value.get(key)) is bool:
+                safe[key] = value[key]
+    elif event == 'launcher_source_update':
         state = value.get('state')
         if isinstance(state, str) and state in UPDATE_STATES:
             safe['state'] = state
@@ -187,3 +208,10 @@ def validate_startup_event(event: Any, value: Any) -> dict[str, Any] | None:
         }:
             safe['exception_class'] = exception
     return safe
+
+
+def is_kvm_refresh_handoff(value: Any) -> bool:
+    """Recognize only the reviewed receipt emitted before a group-refresh exec."""
+    safe = validate_startup_event('launcher_kvm_setup', value)
+    return bool(safe and safe.get('status') == 'relaunch' and safe.get('reason_code') in {
+        'KVM_GROUP_REFRESH_REQUIRED', 'KVM_GROUP_ADDED_REFRESH_REQUIRED'})
