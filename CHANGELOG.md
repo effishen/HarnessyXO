@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.89
+
+- Show a shared model-request display across backends: animated waiting and request elapsed time, actual prompt-processing progress and cache counts when available, and an explicit unavailable state when the server supplies no progress. Keep the previous completed call's decode speed, prompt-processing speed and time to first output separate from current live metrics.
+- Request native streamed prompt progress from llama.cpp. Count newly processed tokens against uncached work, handle fully cached prompts, preserve native timing precision and final usage, and keep concurrent request telemetry separate. Leave generic OpenAI-compatible requests free of llama.cpp-specific options.
+- Refresh quiet-stream status after each health check and advance the displayed wait locally. Distinguish a reachable backend from confirmed request progress; repeated counters and transport heartbeats do not count as new model work. Preserve Stop and existing request deadlines without retrying generation.
+- Lead support diagnostics with the current model request and include MODEL_REQUESTS.json. Retain bounded timestamps, local request correlation, numeric progress/usage/timings and fixed timing provenance without prompt, reasoning, response or tool-argument text. Label older evidence and incomplete coverage explicitly.
+- Preserve existing VMs, tools, settings and public startup updates. Leave README unchanged and keep the same 11 Markdown resources; private QA stays outside the application package.
+
 ## v0.6.88
 
 - Finish OpenWrt startup when QEMU has booted but its launcher output remains open. If the launch handoff times out, verify this target’s QMP identity and running state before continuing shell/bootstrap checks with the same ports and disk. Leave unverified state explicit instead of launching a replacement VM.

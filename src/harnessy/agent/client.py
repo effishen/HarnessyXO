@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import time
+import uuid
 from copy import deepcopy
 from collections.abc import AsyncIterator
 from contextlib import aclosing
@@ -15,7 +16,7 @@ import httpx
 
 from harnessy.diagnostics import log_event, log_stream_event
 from harnessy.agent.telemetry import (LiveRateSelection, OllamaLogReader, OmlxPrefixCacheLogReader, UnscopedTelemetryLease, generation_rate,
-    llama_cpp_stream_status, omlx_stream_status, omlx_activity_status, omlx_request_health, number)
+    llama_cpp_stream_status, llama_cpp_prompt_progress, _LLAMA_TIMING_FIELDS, omlx_stream_status, omlx_activity_status, omlx_request_health, number)
 from harnessy.agent.stream_watchdog import StreamProgressWatchdog, watched_queue
 from harnessy.core.thinking import (canonical, resolve_thinking, thinking_payload, model_family, level_label,
     detected_profile, control_description, model_default_status, ThinkingConfigurationError)
@@ -129,6 +130,99 @@ class LLMServerError(RuntimeError):
                 or ('[metal]' in gpu_error_text and 'caused gpu hang error' in gpu_error_text)):
             self.code = 'backend_gpu_hang'
         super().__init__(f'{provider_label} returned HTTP {self.status_code}: {self.body[:2000]}')
+
+
+class _StreamObservation:
+    """Bounded numeric receipts for one invocation, never prompts or output."""
+    def __init__(self, client_request_id: str | None = None):
+        self.client_request_id = client_request_id or uuid.uuid4().hex
+        self.started = time.perf_counter()
+        self.counts = dict(protocol_chunks=0, timings_samples=0,
+                           prompt_progress_samples=0, usage_samples=0,
+                           transport_events=0, malformed_json_events=0)
+        self.first_payload_seconds: float | None = None
+        self.first_output_seconds: float | None = None
+        self.last_output_seconds: float | None = None
+        self.last_payload_seconds: float | None = None
+        self.accepted_seconds: float | None = None
+
+    def event(self, payload: dict[str, Any]) -> None:
+        log_stream_event({**payload, 'client_request_id': self.client_request_id})
+
+    def transport(self, *, accepted: bool = False, malformed: bool = False) -> None:
+        self.counts['transport_events'] += 1
+        if accepted and self.accepted_seconds is None:
+            self.accepted_seconds = max(0.0, time.perf_counter() - self.started)
+        if malformed:
+            self.counts['malformed_json_events'] += 1
+
+    def observe(self, data: Any, *, provider: str) -> None:
+        if not isinstance(data, dict):
+            return
+        elapsed = max(0.0, time.perf_counter() - self.started)
+        self.counts['protocol_chunks'] += 1
+        self.last_payload_seconds = elapsed
+        if self.first_payload_seconds is None:
+            self.first_payload_seconds = elapsed
+        if StreamProgressWatchdog._payload_has_output(data):
+            if self.first_output_seconds is None:
+                self.first_output_seconds = elapsed
+            self.last_output_seconds = elapsed
+        raw_timings = data.get('timings')
+        timings = {key: value for key in _LLAMA_TIMING_FIELDS
+                   if isinstance(raw_timings, dict) and (value := number(raw_timings.get(key))) is not None}
+        raw_usage = data.get('usage')
+        usage = {key: int(value) for key in ('prompt_tokens', 'completion_tokens', 'total_tokens', 'cached_tokens')
+                 if isinstance(raw_usage, dict) and (value := number(raw_usage.get(key))) is not None and value.is_integer() and value <= 2**53}
+        if isinstance(raw_usage, dict) and isinstance(raw_usage.get('prompt_tokens_details'), dict):
+            cached = number(raw_usage['prompt_tokens_details'].get('cached_tokens'))
+            if cached is not None and cached.is_integer() and cached <= 2**53:
+                usage['cached_tokens'] = int(cached)
+        progress = llama_cpp_prompt_progress(data)
+        self.counts['timings_samples'] += int(isinstance(raw_timings, dict))
+        self.counts['prompt_progress_samples'] += int(progress is not None)
+        self.counts['usage_samples'] += int(isinstance(raw_usage, dict))
+        payload: dict[str, Any] = {
+            'provider': provider, 'kind': 'protocol_chunk',
+            'timings_present': isinstance(raw_timings, dict),
+            'usage_present': isinstance(raw_usage, dict),
+            'prompt_progress_present': isinstance(data.get('prompt_progress'), dict),
+            'prompt_progress_valid': progress is not None,
+            'timings': timings, 'usage': usage,
+            'prompt_progress': progress or {},
+        }
+        if provider == 'ollama':
+            message = data.get('message') if isinstance(data.get('message'), dict) else {}
+            payload.update(
+                keys=sorted(data), message_keys=sorted(message),
+                content_chars=len(str(message.get('content') or '')),
+                thinking_chars=len(str(message.get('thinking') or '')),
+                tool_call_count=len(message.get('tool_calls') or []),
+                done=data.get('done') is True, done_reason=data.get('done_reason'),
+            )
+        else:
+            choices = data.get('choices') if isinstance(data.get('choices'), list) else []
+            first = choices[0] if choices and isinstance(choices[0], dict) else {}
+            delta = first.get('delta') if isinstance(first.get('delta'), dict) else {}
+            payload.update(choice_count=len(choices), delta_keys=sorted(delta),
+                content_chars=len(str(delta.get('content') or '')),
+                reasoning_chars=len(str(delta.get('reasoning_content') or delta.get('reasoning') or '')),
+                finish_reason=first.get('finish_reason'))
+        self.event(payload)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {**self.counts,
+                'accepted_seconds': self.accepted_seconds,
+                'first_payload_seconds': self.first_payload_seconds,
+                'first_output_seconds': self.first_output_seconds,
+                'last_output_seconds': self.last_output_seconds,
+                'last_payload_seconds': self.last_payload_seconds,
+                'elapsed_seconds': max(0.0, time.perf_counter() - self.started)}
+
+    def log(self, *, provider: str, observation: str) -> None:
+        log_event('backend', 'stream_observation', provider=provider,
+                  client_request_id=self.client_request_id,
+                  observation=observation, **self.snapshot())
 
 
 class OpenAICompatibleClient:
@@ -1054,6 +1148,7 @@ class OpenAICompatibleClient:
             # OpenAI-compatible endpoint; generic servers never receive this
             # llama.cpp-specific request field.
             payload['timings_per_token'] = True
+            payload['return_progress'] = True
         payload.update(thinking_payload(self.profile, self.thinking, 'openai'))
         return payload
 
@@ -1248,6 +1343,7 @@ class OpenAICompatibleClient:
             'message_text_length': text_length,
             'tool_count': len(payload.get('tools') or []),
             'server_timings_requested': bool(payload.get('timings_per_token')) if 'timings_per_token' in payload else None,
+            'server_progress_requested': bool(payload.get('return_progress')) if 'return_progress' in payload else None,
             'stream_usage_requested': bool((payload.get('stream_options') or {}).get('include_usage')) if 'stream_options' in payload else None,
         }
 
@@ -1300,18 +1396,57 @@ class OpenAICompatibleClient:
             budget(0)
         payload = self._payload(messages, tools, backend=backend, max_output_tokens=max_output_tokens)
         backend_label = 'llama.cpp' if backend == 'llamacpp' else ('oMLX' if backend == 'omlx' else 'openai')
+        observation = _StreamObservation()
         request_summary = self._request_summary(payload, backend_label, self.endpoint)
+        request_summary['client_request_id'] = observation.client_request_id
         request_summary.update(self._thinking_request_summary('openai'))
-        log_event('backend', 'request_start', provider='openai', model=self.model, endpoint=self.endpoint, request=request_summary)
+        log_event('backend', 'request_start', provider='openai', model=self.model, endpoint=self.endpoint, request=request_summary, client_request_id=observation.client_request_id)
         yield {'type': 'request', 'request': request_summary}
         if backend == 'omlx':
-            async with aclosing(self._stream_omlx_transport(payload)) as stream:
+            async with aclosing(self._stream_omlx_transport(payload, observation=observation)) as stream:
                 async for event in stream:
                     yield event
             return
 
         queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
         timeout = httpx.Timeout(connect=15.0, read=None, write=60.0, pool=15.0)
+
+        native_progress: dict[str, int | float] | None = None
+        native_generating = False
+        native_generated_high_water = 0
+        def native_status(data: Any) -> dict[str, Any] | None:
+            nonlocal native_progress, native_generating, native_generated_high_water
+            if backend != 'llamacpp':
+                return None
+            if StreamProgressWatchdog._payload_has_output(data):
+                native_generating = True
+            status = llama_cpp_stream_status(data)
+            if not status:
+                return None
+            if status.get('phase') == 'generating':
+                generated = int(status.get('generated') or 0)
+                if generated < native_generated_high_water:
+                    return None
+                native_generated_high_water = generated
+                native_generating = True
+                return status
+            if native_generating:
+                return None
+            progress = status.get('native_prompt_progress')
+            if isinstance(progress, dict):
+                if native_progress and (
+                    progress['total'] != native_progress['total']
+                    or progress['cache'] != native_progress['cache']
+                    or progress['processed'] < native_progress['processed']
+                    or progress['time_ms'] < native_progress['time_ms']
+                ):
+                    return None
+                native_progress = progress
+            return status
+
+        async def health_probe(request_id: str) -> dict[str, Any]:
+            observation.log(provider='openai', observation='health_check')
+            return await self._stream_health_probe(backend, request_id)
 
         async def pump_response() -> None:
             try:
@@ -1322,15 +1457,19 @@ class OpenAICompatibleClient:
                             log_event('backend', 'request_http_error', provider='openai', model=self.model,
                                       status=response.status_code, body_chars=len(body))
                             raise LLMServerError(response.status_code, body)
+                        observation.transport(accepted=True)
                         await queue.put(('accepted', None))
                         content_type = response.headers.get('content-type', '')
                         if 'text/event-stream' not in content_type and 'application/json' in content_type:
                             body = await response.aread()
-                            await queue.put(('json', json.loads(body)))
+                            data = json.loads(body)
+                            observation.observe(data, provider='openai')
+                            await queue.put(('json', data))
                             return
                         async for raw_line in response.aiter_lines():
                             line = raw_line.strip()
                             if not line or line.startswith(':'):
+                                observation.transport()
                                 await queue.put(('transport', None))
                                 continue
                             if line.startswith('data:'):
@@ -1340,12 +1479,17 @@ class OpenAICompatibleClient:
                             try:
                                 data = json.loads(line)
                             except json.JSONDecodeError as exc:
-                                log_stream_event({
+                                observation.event({
                                     'provider': 'openai', 'kind': 'malformed_json',
                                     'error': str(exc), 'line_chars': len(line), 'preview': line[:1000],
                                 })
+                                observation.transport(malformed=True)
                                 await queue.put(('transport', None))
                                 continue
+                            observation.observe(data, provider='openai')
+                            status = native_status(data)
+                            if status:
+                                await queue.put(('runtime_status', status))
                             await queue.put(('data', data))
             except BaseException as exc:
                 await queue.put(('error', exc))
@@ -1353,15 +1497,18 @@ class OpenAICompatibleClient:
                 await queue.put(('done', None))
 
         response_task = asyncio.create_task(pump_response(), name='harnessy-openai-stream')
-        watchdog = StreamProgressWatchdog(backend_label)
+        watchdog = StreamProgressWatchdog(backend_label, client_request_id=observation.client_request_id)
         try:
             async for kind, value in watched_queue(
-                queue, watchdog, lambda request_id: self._stream_health_probe(backend, request_id),
+                queue, watchdog, health_probe,
             ):
                 if kind == 'watchdog':
                     yield {'type': 'stream_watchdog', **dict(value or {})}
                     continue
                 if kind in {'accepted', 'transport'}:
+                    continue
+                if kind == 'runtime_status':
+                    yield {'type': 'runtime_status', 'status': value}
                     continue
                 if kind == 'error':
                     if isinstance(value, asyncio.CancelledError):
@@ -1371,14 +1518,14 @@ class OpenAICompatibleClient:
                     raise RuntimeError(str(value))
                 if kind == 'done':
                     log_event('backend', 'request_complete', provider='openai', model=self.model,
-                              finish_reason='stream_end')
+                              finish_reason='stream_end', client_request_id=observation.client_request_id, **observation.counts)
                     break
                 if kind == 'json':
                     data = value if isinstance(value, dict) else {}
                     if data.get('error'):
                         raise LLMServerError(500, json.dumps(data), provider_label=backend_label)
                     if backend == 'llamacpp':
-                        status = llama_cpp_stream_status(data)
+                        status = native_status(data)
                         if status:
                             yield {'type': 'runtime_status', 'status': status}
                     if data.get('usage'):
@@ -1387,10 +1534,11 @@ class OpenAICompatibleClient:
                     message = choice.get('message', {}) if isinstance(choice, dict) else {}
                     if isinstance(message, dict) and message.get('tool_calls'):
                         raw_calls = message.get('tool_calls')
-                        log_stream_event({'provider': 'openai', 'kind': 'tool_call_message', 'tool_calls': raw_calls})
+                        observation.event({'provider': 'openai', 'kind': 'tool_call_message', 'tool_calls': raw_calls})
                         log_event('tools', 'tool_stream_raw', provider='openai', semantics='message', tool_calls=raw_calls)
                     log_event('backend', 'request_complete', provider='openai', model=self.model,
-                              finish_reason=choice.get('finish_reason') if isinstance(choice, dict) else None)
+                              finish_reason=choice.get('finish_reason') if isinstance(choice, dict) else None,
+                              client_request_id=observation.client_request_id, **observation.counts)
                     yield {
                         'type': 'message', 'message': message,
                         'finish_reason': choice.get('finish_reason') if isinstance(choice, dict) else None,
@@ -1399,23 +1547,11 @@ class OpenAICompatibleClient:
                 if kind != 'data' or not isinstance(value, dict):
                     continue
                 data = value
-                if backend == 'llamacpp':
-                    status = llama_cpp_stream_status(data)
-                    if status:
-                        yield {'type': 'runtime_status', 'status': status}
                 if data.get('error'):
                     raise LLMServerError(500, json.dumps(data), provider_label=backend_label)
                 choices = data.get('choices') or []
                 first_choice = choices[0] if choices else {}
                 first_delta = first_choice.get('delta') or {} if isinstance(first_choice, dict) else {}
-                log_stream_event({
-                    'provider': 'openai', 'kind': 'protocol_chunk',
-                    'choice_count': len(choices),
-                    'delta_keys': sorted(first_delta.keys()) if isinstance(first_delta, dict) else [],
-                    'content_chars': len(str(first_delta.get('content') or '')) if isinstance(first_delta, dict) else 0,
-                    'reasoning_chars': len(str(first_delta.get('reasoning_content') or first_delta.get('reasoning') or '')) if isinstance(first_delta, dict) else 0,
-                    'finish_reason': first_choice.get('finish_reason') if isinstance(first_choice, dict) else None,
-                })
                 if data.get('usage'):
                     yield {'type': 'usage', 'usage': data.get('usage'), 'raw': data}
                 if not choices:
@@ -1424,10 +1560,11 @@ class OpenAICompatibleClient:
                 delta = choice.get('delta') or {}
                 if isinstance(delta, dict) and delta.get('tool_calls'):
                     raw_calls = delta.get('tool_calls')
-                    log_stream_event({'provider': 'openai', 'kind': 'tool_call_delta', 'tool_calls': raw_calls})
+                    observation.event({'provider': 'openai', 'kind': 'tool_call_delta', 'tool_calls': raw_calls})
                     log_event('tools', 'tool_stream_raw', provider='openai', semantics='delta', tool_calls=raw_calls)
                 yield {'type': 'delta', 'delta': delta, 'finish_reason': choice.get('finish_reason')}
         finally:
+            observation.log(provider='openai', observation='transport_closed')
             if not response_task.done():
                 response_task.cancel()
             try:
@@ -1435,7 +1572,7 @@ class OpenAICompatibleClient:
             except asyncio.CancelledError:
                 pass
 
-    async def _stream_omlx_transport(self, payload: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
+    async def _stream_omlx_transport(self, payload: dict[str, Any], *, observation: _StreamObservation | None = None) -> AsyncIterator[dict[str, Any]]:
         """Confirm oMLX's synthetic abort notice before treating it as output.
 
         oMLX can yield ``[Error: Request aborted: ...]`` as content or reasoning
@@ -1445,6 +1582,7 @@ class OpenAICompatibleClient:
         abort detail, allowing wrapper characters to be filtered by oMLX's
         tool/reasoning parser. Real output must still prevent replay.
         """
+        observation = observation or _StreamObservation()
         capacity_phrase = 'Request aborted: process memory limit exceeded '
         notice_prefixes = tuple(
             marker + capacity_phrase for marker in ('[Error: ', 'Error: ', '')
@@ -1452,7 +1590,7 @@ class OpenAICompatibleClient:
         pending: list[dict[str, Any]] = []
         notice = ''
         checking = True
-        async with aclosing(self._stream_omlx_transport_raw(payload)) as stream:
+        async with aclosing(self._stream_omlx_transport_raw(payload, observation=observation)) as stream:
             try:
                 async for event in stream:
                     delta = event.get('delta')
@@ -1515,13 +1653,14 @@ class OpenAICompatibleClient:
                 for held in pending:
                     yield held
 
-    async def _stream_omlx_transport_raw(self, payload: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
+    async def _stream_omlx_transport_raw(self, payload: dict[str, Any], *, observation: _StreamObservation | None = None) -> AsyncIterator[dict[str, Any]]:
         """Stream oMLX while independently polling its live activity endpoint.
 
         The OpenAI-compatible usage event remains the authoritative final
         accounting source.  /admin/api/activity is only used while the request
         is in flight so the UI can show real PP/TG speed instead of an estimate.
         """
+        observation = observation or _StreamObservation()
         queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
         stop = asyncio.Event()
         timeout = httpx.Timeout(connect=15.0, read=None, write=60.0, pool=15.0)
@@ -1534,6 +1673,10 @@ class OpenAICompatibleClient:
             body = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
             raise LLMServerError(500, body, provider_label='oMLX')
 
+        async def health_probe(request_id: str) -> dict[str, Any]:
+            observation.log(provider='openai', observation='health_check')
+            return await self._stream_health_probe('omlx', request_id)
+
         async def pump_response() -> None:
             try:
                 async with httpx.AsyncClient(timeout=timeout) as client:
@@ -1543,15 +1686,19 @@ class OpenAICompatibleClient:
                             log_event('backend', 'request_http_error', provider='openai', model=self.model,
                                       status=response.status_code, body_chars=len(body))
                             raise LLMServerError(response.status_code, body)
+                        observation.transport(accepted=True)
                         await queue.put(('accepted', None))
                         content_type = response.headers.get('content-type', '')
                         if 'text/event-stream' not in content_type and 'application/json' in content_type:
                             body = await response.aread()
-                            await queue.put(('json', json.loads(body)))
+                            data = json.loads(body)
+                            observation.observe(data, provider='openai')
+                            await queue.put(('json', data))
                             return
                         async for raw_line in response.aiter_lines():
                             line = raw_line.strip()
                             if not line or line.startswith(':'):
+                                observation.transport()
                                 await queue.put(('transport', None))
                                 continue
                             if line.startswith('data:'):
@@ -1561,12 +1708,14 @@ class OpenAICompatibleClient:
                             try:
                                 data = json.loads(line)
                             except json.JSONDecodeError as exc:
-                                log_stream_event({
+                                observation.event({
                                     'provider': 'openai', 'kind': 'malformed_json',
                                     'error': str(exc), 'line_chars': len(line), 'preview': line[:1000],
                                 })
+                                observation.transport(malformed=True)
                                 await queue.put(('transport', None))
                                 continue
+                            observation.observe(data, provider='openai')
                             await queue.put(('data', data))
             except BaseException as exc:
                 await queue.put(('error', exc))
@@ -1658,12 +1807,12 @@ class OpenAICompatibleClient:
 
         response_task = asyncio.create_task(pump_response(), name='harnessy-omlx-stream')
         activity_task = asyncio.create_task(pump_activity(), name='harnessy-omlx-live-activity')
-        watchdog = StreamProgressWatchdog('oMLX')
+        watchdog = StreamProgressWatchdog('oMLX', client_request_id=observation.client_request_id)
         last_activity_phase = 'prompt_processing'
         ambiguous_reported = False
         try:
             async for kind, value in watched_queue(
-                queue, watchdog, lambda request_id: self._stream_health_probe('omlx', request_id),
+                queue, watchdog, health_probe,
             ):
                 if kind == 'watchdog':
                     yield {'type': 'stream_watchdog', **dict(value or {})}
@@ -1695,7 +1844,7 @@ class OpenAICompatibleClient:
                     raise RuntimeError(str(value))
                 if kind == 'done':
                     log_event('backend', 'request_complete', provider='openai', model=self.model,
-                              finish_reason='stream_end')
+                              finish_reason='stream_end', client_request_id=observation.client_request_id, **observation.counts)
                     break
                 if kind == 'json':
                     data = value if isinstance(value, dict) else {}
@@ -1709,7 +1858,7 @@ class OpenAICompatibleClient:
                     message = choice.get('message', {}) if isinstance(choice, dict) else {}
                     if isinstance(message, dict) and message.get('tool_calls'):
                         raw_calls = message.get('tool_calls')
-                        log_stream_event({'provider': 'openai', 'kind': 'tool_call_message', 'tool_calls': raw_calls})
+                        observation.event({'provider': 'openai', 'kind': 'tool_call_message', 'tool_calls': raw_calls})
                         log_event('tools', 'tool_stream_raw', provider='openai', semantics='message', tool_calls=raw_calls)
                     yield {'type': 'message', 'message': message,
                            'finish_reason': choice.get('finish_reason') if isinstance(choice, dict) else None}
@@ -1725,14 +1874,6 @@ class OpenAICompatibleClient:
                 choices = data.get('choices') or []
                 first_choice = choices[0] if choices else {}
                 first_delta = first_choice.get('delta') or {} if isinstance(first_choice, dict) else {}
-                log_stream_event({
-                    'provider': 'openai', 'kind': 'protocol_chunk',
-                    'choice_count': len(choices),
-                    'delta_keys': sorted(first_delta.keys()) if isinstance(first_delta, dict) else [],
-                    'content_chars': len(str(first_delta.get('content') or '')) if isinstance(first_delta, dict) else 0,
-                    'reasoning_chars': len(str(first_delta.get('reasoning_content') or first_delta.get('reasoning') or '')) if isinstance(first_delta, dict) else 0,
-                    'finish_reason': first_choice.get('finish_reason') if isinstance(first_choice, dict) else None,
-                })
                 if data.get('usage'):
                     yield {'type': 'usage', 'usage': data.get('usage'), 'raw': data}
                 if not choices:
@@ -1741,10 +1882,11 @@ class OpenAICompatibleClient:
                 delta = choice.get('delta') or {}
                 if isinstance(delta, dict) and delta.get('tool_calls'):
                     raw_calls = delta.get('tool_calls')
-                    log_stream_event({'provider': 'openai', 'kind': 'tool_call_delta', 'tool_calls': raw_calls})
+                    observation.event({'provider': 'openai', 'kind': 'tool_call_delta', 'tool_calls': raw_calls})
                     log_event('tools', 'tool_stream_raw', provider='openai', semantics='delta', tool_calls=raw_calls)
                 yield {'type': 'delta', 'delta': delta, 'finish_reason': choice.get('finish_reason')}
         finally:
+            observation.log(provider='openai', observation='transport_closed')
             stop.set()
             activity_lease.close()
             if not activity_task.done():
@@ -1829,7 +1971,9 @@ class OpenAICompatibleClient:
             messages, tools, runtime_context_window=preflight_context,
             max_output_tokens=max_output_tokens,
         )
+        observation = _StreamObservation()
         request_summary = self._request_summary(payload, 'ollama', f'{self.ollama_root}/api/chat')
+        request_summary['client_request_id'] = observation.client_request_id
         request_summary.update(self._thinking_request_summary('ollama'))
         request_summary['context_window_profile_cap'] = int(self.profile.get('context_window') or 0) or None
         request_summary['runtime_context_window_before_request'] = preflight_context or None
@@ -1838,6 +1982,7 @@ class OpenAICompatibleClient:
         log_event(
             'backend', 'request_start', provider='ollama', model=self.model,
             endpoint=f'{self.ollama_root}/api/chat', request=request_summary,
+            client_request_id=observation.client_request_id,
         )
         log_event(
             'backend', 'phase', provider='ollama', model=self.model, phase='prompt_processing',
@@ -1853,6 +1998,10 @@ class OpenAICompatibleClient:
         queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
         timeout = httpx.Timeout(connect=15.0, read=None, write=60.0, pool=15.0)
 
+        async def health_probe(request_id: str) -> dict[str, Any]:
+            observation.log(provider='ollama', observation='health_check')
+            return await self._stream_health_probe('ollama', request_id)
+
         async def pump_response() -> None:
             try:
                 async with httpx.AsyncClient(timeout=timeout) as client:
@@ -1861,32 +2010,26 @@ class OpenAICompatibleClient:
                             body = (await response.aread()).decode(errors='replace')
                             log_event('backend', 'request_http_error', provider='ollama', model=self.model, status=response.status_code, body_chars=len(body))
                             raise LLMServerError(response.status_code, body, provider_label='Ollama')
+                        observation.transport(accepted=True)
                         await queue.put(('accepted', None))
                         async for line in response.aiter_lines():
                             line = line.strip()
                             if not line:
+                                observation.transport()
                                 await queue.put(('transport', None))
                                 continue
                             try:
                                 data = json.loads(line)
                             except json.JSONDecodeError as exc:
-                                log_stream_event({
+                                observation.event({
                                     'provider': 'ollama', 'kind': 'malformed_json',
                                     'error': str(exc), 'line_chars': len(line), 'preview': line[:1000],
                                 })
+                                observation.transport(malformed=True)
                                 await queue.put(('transport', None))
                                 continue
                             message = data.get('message') or {} if isinstance(data, dict) else {}
-                            log_stream_event({
-                                'provider': 'ollama', 'kind': 'protocol_chunk',
-                                'keys': sorted(data.keys()) if isinstance(data, dict) else [],
-                                'message_keys': sorted(message.keys()) if isinstance(message, dict) else [],
-                                'content_chars': len(str(message.get('content') or '')) if isinstance(message, dict) else 0,
-                                'thinking_chars': len(str(message.get('thinking') or '')) if isinstance(message, dict) else 0,
-                                'tool_call_count': len(message.get('tool_calls') or []) if isinstance(message, dict) else 0,
-                                'done': bool(data.get('done')) if isinstance(data, dict) else False,
-                                'done_reason': data.get('done_reason') if isinstance(data, dict) else None,
-                            })
+                            observation.observe(data, provider='ollama')
                             await queue.put(('data', data))
             except BaseException as exc:
                 await queue.put(('error', exc))
@@ -1977,7 +2120,7 @@ class OpenAICompatibleClient:
         task = asyncio.create_task(pump_response(), name='harnessy-ollama-stream')
         telemetry_task = asyncio.create_task(pump_runtime_status(), name='harnessy-ollama-runtime-status')
         log_task = asyncio.create_task(pump_log_status(), name='harnessy-ollama-log-status')
-        watchdog = StreamProgressWatchdog('Ollama')
+        watchdog = StreamProgressWatchdog('Ollama', client_request_id=observation.client_request_id)
         runtime_state: dict[str, Any] = {}
         last_runtime: dict[str, Any] = {}
         last_phase = ''
@@ -1985,7 +2128,7 @@ class OpenAICompatibleClient:
         saw_done = False
         try:
             async for kind, value in watched_queue(
-                queue, watchdog, lambda request_id: self._stream_health_probe('ollama', request_id),
+                queue, watchdog, health_probe,
             ):
                 if kind == 'watchdog':
                     yield {'type': 'stream_watchdog', **dict(value or {})}
@@ -2050,7 +2193,7 @@ class OpenAICompatibleClient:
                 if kind == 'done':
                     if not saw_done:
                         log_event('backend', 'backend_eof', provider='ollama', model=self.model, expected_done=False)
-                        log_stream_event({'provider': 'ollama', 'kind': 'backend_eof', 'expected_done': False})
+                        observation.event({'provider': 'ollama', 'kind': 'backend_eof', 'expected_done': False})
                         raise RuntimeError(
                             'Ollama stream closed before the required final done:true event. '
                             'The model response is incomplete and HarnessyXO will not treat it as a successful finish.'
@@ -2071,7 +2214,7 @@ class OpenAICompatibleClient:
                 if message.get('tool_calls'):
                     raw_tool_calls = message.get('tool_calls') or []
                     normalized_tool_calls = self._normalize_ollama_tool_calls(raw_tool_calls)
-                    log_stream_event({
+                    observation.event({
                         'provider': 'ollama',
                         'kind': 'tool_call_raw_snapshot',
                         'tool_calls': raw_tool_calls,
@@ -2085,7 +2228,7 @@ class OpenAICompatibleClient:
                     # semantic distinction so the runner replaces by index rather
                     # than concatenating repeated names/JSON.
                     delta['tool_calls'] = normalized_tool_calls
-                    log_stream_event({
+                    observation.event({
                         'provider': 'ollama',
                         'kind': 'tool_call_snapshot',
                         'tool_calls': normalized_tool_calls,
@@ -2114,9 +2257,11 @@ class OpenAICompatibleClient:
                     log_event(
                         'backend', 'request_complete', provider='ollama', model=self.model,
                         prompt_tokens=prompt, completion_tokens=completion, done_reason=data.get('done_reason'),
+                        client_request_id=observation.client_request_id, **observation.counts,
                     )
                     yield {'type': 'usage', 'usage': usage, 'raw': data}
         finally:
+            observation.log(provider='ollama', observation='transport_closed')
             telemetry_stop.set()
             log_reader.close()
             if not log_task.done():

@@ -38,8 +38,10 @@ def _bounded_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                    or (row.get('event') == 'tool_execution_complete'
                        and ('permission_decision' in row or 'target_validation' in row))][-600:]
     startup = [row for row in rows if row.get('event') in STARTUP_EVENTS][-120:]
-    recent = rows[-(_MAX_ROWS - len(targets) - len(permissions) - len(startup)):]
-    retained = {id(row): row for row in targets + permissions + startup + recent}
+    from .model_requests import MODEL_EVENTS
+    models = [row for row in rows if row.get('event') in MODEL_EVENTS][-600:]
+    recent = rows[-(_MAX_ROWS - len(targets) - len(permissions) - len(startup) - len(models)):]
+    retained = {id(row): row for row in targets + permissions + startup + models + recent}
     return sorted(retained.values(), key=lambda row: row['timestamp'])
 
 
@@ -747,12 +749,16 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
     session = metadata.get('session', {})
     version = session.get('app_version', 'unrecorded')
     index['session_app_version'] = version
+    from .model_requests import build_model_audit
+    model_audit, model_lines = build_model_audit(rows, coverage, Path(latest), metadata.get('captured_at'))
+    index['model_request_audit'] = model_audit
     lines = [
         'HarnessyXO support summary', '==========================', '',
         'Start here; machine-readable evidence is in INCIDENTS.json.',
         f'Session application version: {version}; capture time: {metadata.get("captured_at", "unrecorded")}.',
         'This summary examines bounded current/previous-session log tails and startup receipts from up to two recent launcher sessions. Counts are not whole-session totals.',
         'Nearby events and tracked transactions are evidence for investigation, not proven lock ownership.', '',
+        *model_lines,
         f'Recorded failures in examined logs: {len(failures)} (latest {len(incidents)} shown)',
         f'Event-loop stalls: {counts["event_loop_stall"]}; maximum recorded delay: {max(durations, default=0):.3f}s',
         f'During-stall stack samples: {counts["event_loop_stall_sample"]}',

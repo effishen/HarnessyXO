@@ -281,6 +281,10 @@ def _safe_event_field(key: str, value: Any) -> Any:
         return '<redacted>'
     if key in {'archive_check', 'storage_issue'}:
         return _privacy_safe_value(value, key=key)
+    if key in {'client_request_id', 'usage', 'timings', 'backend_timings',
+               'prompt_progress', 'native_prompt_progress', 'throughput_source',
+               'prefill_throughput_source', 'timing_source', 'tps_source', 'provenance', 'output_provenance'}:
+        return _privacy_safe_value(value, key=key)
     if key in {
         'permission_decision', 'permission_states', 'required_permissions',
         'permission_source', 'permission_reason', 'permission_target_mode',
@@ -902,12 +906,25 @@ print(path)
         return logging.getLogger(f'harnessy.{name}')
 
     def stream_event(self, event: Any) -> None:
+        # Legacy callers remain valid. Stamp the receipt itself so a retained
+        # protocol tail can be joined to a local invocation without response
+        # content, provider IDs or an assumed one-chunk/one-token relationship.
+        if isinstance(event, dict):
+            from .model_requests import timestamp, validate_protocol_receipt
+            event = dict(event)
+            event['timestamp'] = (timestamp(event.get('timestamp'))
+                or datetime.now().astimezone().isoformat(timespec='milliseconds'))
+            if event.get('kind') == 'model_protocol_receipt':
+                event = validate_protocol_receipt(event)
         try:
             line = json.dumps(self._safe(event), ensure_ascii=False, separators=(',', ':'))
         except Exception:
             line = repr(event)[:4000]
         encoded = line + '\n'
         with self._lock:
+            if self._stream_tail.maxlen and len(self._stream_tail) >= self._stream_tail.maxlen:
+                removed = self._stream_tail.popleft()
+                self._stream_tail_chars -= len(removed) + 1
             self._stream_tail.append(line)
             self._stream_tail_chars += len(encoded)
             while self._stream_tail and self._stream_tail_chars > _STREAM_TAIL_MAX_CHARS:
@@ -1072,6 +1089,7 @@ def _zip_snapshot_file(zf: zipfile.ZipFile, source: Path, arcname: str, *, tail_
         # Launcher/storage receipts are reviewed metadata in both export modes;
         # content-rich mode does not turn those records into raw error exports.
         payload = _sanitize_startup_log_bytes(payload)
+        payload = _sanitize_model_receipt_bytes(payload)
     try:
         zf.writestr(arcname, payload)
     except OSError:
@@ -1233,6 +1251,23 @@ def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
     lowered = key.lower()
     if _is_sensitive_log_key(lowered):
         return '<redacted>'
+    from .model_requests import (SOURCE_ENUMS, identifier, numeric_projection, provenance_projection,
+                                 source_label, timestamp, validate_protocol_receipt)
+    if isinstance(value, dict) and value.get('kind') == 'model_protocol_receipt':
+        return validate_protocol_receipt(value)
+    if lowered == 'client_request_id':
+        return identifier(value)
+    if lowered == 'timestamp':
+        return timestamp(value)
+    if lowered in SOURCE_ENUMS:
+        return source_label(value, lowered)
+    if lowered == 'observation':
+        return value if isinstance(value, str) and value in {'health_check', 'transport_closed'} else None
+    if lowered in {'usage', 'timings', 'backend_timings', 'prompt_progress', 'native_prompt_progress'}:
+        kind = 'timings' if lowered == 'backend_timings' else 'prompt_progress' if lowered == 'native_prompt_progress' else lowered
+        return numeric_projection(value, kind=kind)
+    if lowered in {'provenance', 'output_provenance'}:
+        return provenance_projection(value)
     from .startup import (STARTUP_EVENTS, validate_archive_check,
                           validate_startup_event, validate_storage_issue)
     if isinstance(value, dict) and isinstance(value.get('event'), str) and value['event'] in STARTUP_EVENTS:
@@ -1415,6 +1450,21 @@ def _sanitize_startup_log_bytes(payload: bytes) -> bytes:
             out.append(b' '.join(parts[:3]) + b' ' + json.dumps(
                 safe, ensure_ascii=False, separators=(',', ':'), allow_nan=False,
             ).encode('utf-8') + (b'\n' if line.endswith(b'\n') else b''))
+    return b''.join(out)
+
+
+def _sanitize_model_receipt_bytes(payload: bytes) -> bytes:
+    """New numeric protocol receipts remain content-free in either ZIP mode."""
+    from .model_requests import validate_protocol_receipt
+    out: list[bytes] = []
+    for line in payload.splitlines(keepends=True):
+        try:
+            value = json.loads(line)
+            safe = validate_protocol_receipt(value)
+        except (ValueError, TypeError, RecursionError):
+            safe = None
+        out.append((json.dumps(safe, ensure_ascii=False, separators=(',', ':'),
+                               allow_nan=False).encode() + b'\n') if safe is not None else line)
     return b''.join(out)
 
 
@@ -1910,6 +1960,9 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
                 'schema_version': 1, 'status': 'unavailable', 'reason': 'summary_generation_failed',
             }), ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('STARTUP.json', json.dumps(incidents.get('startup_audit', {
+                'schema_version': 1, 'status': 'unavailable', 'reason': 'summary_generation_failed',
+            }), ensure_ascii=False, indent=2, allow_nan=False))
+            zf.writestr('MODEL_REQUESTS.json', json.dumps(incidents.get('model_request_audit', {
                 'schema_version': 1, 'status': 'unavailable', 'reason': 'summary_generation_failed',
             }), ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('VM_LOGS.json', json.dumps(vm_report, ensure_ascii=False, indent=2, allow_nan=False))

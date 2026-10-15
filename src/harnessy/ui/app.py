@@ -107,7 +107,7 @@ from harnessy.environment.presets import IMAGES, TOOL_BUNDLES, FUTURE_IMAGES, se
 from harnessy.environment import ENVIRONMENT_OPERATIONS, ENVIRONMENT_STATUS, EnvironmentConfig, EnvironmentManager, PRESETS, get_preset  # noqa: E402
 
 from harnessy.ui.status import context_presentation, endpoint_display, live_tool_duration_text, metric_matches_profile, run_presentation
-from harnessy.ui.status import auto_context_presentation
+from harnessy.ui.status import auto_context_presentation, request_elapsed_seconds, stream_wait_detail
 from harnessy.ui.sidebar_status import ChatRunStatus, chat_run_statuses
 
 HOME_SCOPE_ID = '__harnessy_home__'
@@ -823,7 +823,9 @@ html[data-hy-events-mode="compact"] .hy-activity-card.hy-activity-failed:not(.hy
 .hy-health-row[data-hy-stale=true]::after {content:"(last check)";flex:0 0 auto;font-size:10px;opacity:.66;}
 .hy-health-label {min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
 .hy-statusbar { position:relative; flex:0 0 auto !important; min-height:40px; width:100%; min-width:0; border-top:1px solid var(--hy-border); font-size:11.5px; overflow:hidden; white-space:nowrap; padding:5px 12px max(6px, env(safe-area-inset-bottom)) !important; box-sizing:border-box; gap:10px !important; align-items:center !important; background:var(--hy-page-surface); z-index:3; container-type:inline-size; }
-.hy-status-content {flex:1 1 0%; min-width:0; display:flex; align-items:center; gap:12px; overflow:hidden;}
+.hy-status-content {flex:1 1 0%; min-width:0; display:flex; flex-direction:column; align-items:stretch; gap:2px; overflow:hidden;}
+.hy-status-current {width:100%; min-width:0; display:flex; align-items:center; gap:12px; overflow:hidden;}
+.hy-status-previous {font-size:10.5px; white-space:normal; overflow-wrap:anywhere;}
 .hy-status-phase {flex:0 1 auto; min-width:36px; overflow:hidden; text-overflow:ellipsis;}
 .hy-status-tps, .hy-status-elapsed {flex:0 0 auto;}
 .hy-status-agents {flex:0 0 auto; min-height:24px !important; padding:0 5px !important; font-size:11.5px !important; color:inherit !important;}
@@ -4732,17 +4734,18 @@ class HarnessyPage:
         return True
 
     @staticmethod
-    def _live_tps_text(state: dict[str, Any]) -> str:
+    def _live_tps_text(state: dict[str, Any], *, now: float | None = None) -> str:
         rate = number(state.get('tps'))
         kind = str(state.get('tps_kind') or 'unavailable')
         observed = number(state.get('tps_observed_at')) or 0.0
-        fresh = observed > 0 and 0 <= time.perf_counter() - observed <= RATE_TTL
+        fresh = observed > 0 and 0 <= (time.perf_counter() if now is None else now) - observed <= RATE_TTL
         if rate is None or not fresh or kind == 'unavailable':
             return 'Live TPS unavailable'
         return f'{rate:.1f} tok/s' + (' avg' if kind == 'average' else '')
 
     @staticmethod
-    def _live_state_phase_text(state: dict[str, Any]) -> str:
+    def _live_state_phase_text(state: dict[str, Any], *, now: float | None = None) -> str:
+        now = time.perf_counter() if now is None else now
         phase = str(state.get('phase') or '')
         backend = str(state.get('backend') or '')
         status = str(state.get('status') or '')
@@ -4754,58 +4757,69 @@ class HarnessyPage:
         else:
             label = {
                 'waiting': 'Waiting for model…',
-                'prefill': 'Prefill',
+                'prefill': 'Prompt Processing',
                 'prompt_processing': 'Prompt Processing',
                 'generating': 'Generating',
             }.get(phase, phase.replace('_', ' ').title() or status or 'Working…')
-        if phase == 'waiting' and status and status not in {'Waiting for model…', 'Ready'}:
+        if (phase == 'waiting' and not state.get('request_started_perf') and status
+                and status not in {'Waiting for model…', 'Ready'}):
             label = status
-        try:
-            started = float(state.get('phase_started') or 0.0)
-        except (TypeError, ValueError):
-            started = 0.0
-        elapsed = max(0.0, time.perf_counter() - started) if started else 0.0
+        elapsed = request_elapsed_seconds(state, now)
         parts = [label]
         if backend:
             parts.append(backend)
-        processed = int(state.get('processed') or 0)
-        total = int(state.get('total') or 0)
-        generated = int(state.get('generated') or 0)
+        processed = max(0, int(state.get('processed') or 0))
+        total = max(0, int(state.get('total') or 0))
+        generated = max(0, int(state.get('generated') or 0))
         if phase in {'prompt_processing', 'prefill'}:
             cached_value = state.get('cached_tokens')
-            cached_tokens = int(cached_value or 0) if cached_value is not None else None
+            cached_tokens = max(0, int(cached_value or 0)) if cached_value is not None else None
             uncached_value = state.get('uncached_total')
-            uncached_total = int(uncached_value or 0) if uncached_value is not None else None
+            uncached_total = max(0, int(uncached_value or 0)) if uncached_value is not None else None
             cache_rate = number(state.get('cache_hit_rate'))
-            if processed:
-                progress_total = uncached_total if uncached_total is not None and uncached_total > 0 else total
-                if progress_total > 0:
-                    percent = min(100.0, max(0.0, processed * 100.0 / progress_total))
-                    parts.append(f'{processed:,}/{progress_total:,} tok · {percent:.0f}%')
-                else:
-                    parts.append(f'{processed:,} tok')
-            if cache_rate is not None and total > 0:
+            progress_total = uncached_total if uncached_total is not None else (
+                max(0, total - cached_tokens) if cached_tokens is not None else total)
+            if total > 0 and cached_tokens is not None and cached_tokens >= total and progress_total == 0:
+                parts.append('Fully cached · 100%')
+            elif progress_total > 0:
+                percent = min(100.0, max(0.0, processed * 100.0 / progress_total))
+                parts.append(f'Processed {processed:,}/{progress_total:,} tok · {percent:.0f}%')
+            elif processed:
+                parts.append(f'Processed {processed:,} tok')
+            else:
+                parts.append('Progress unavailable')
+            if cached_tokens is not None:
+                parts.append(f'{cached_tokens:,} cached')
+            if total > 0:
+                parts.append(f'{total:,} total')
+            if cache_rate is not None:
                 parts.append(f'Cache hit {min(100.0, max(0.0, cache_rate)):.1f}%')
-                if cached_tokens is not None:
-                    parts.append(f'{cached_tokens:,} cached')
             prefill_rate = number(state.get('prefill_tps'))
             observed = number(state.get('tps_observed_at')) or 0.0
-            fresh = observed > 0 and 0 <= time.perf_counter() - observed <= RATE_TTL
+            fresh = observed > 0 and 0 <= now - observed <= RATE_TTL
             if prefill_rate is not None and prefill_rate > 0 and fresh:
-                parts.append(f'{prefill_rate:.1f} tok/s pp')
+                parts.append(f'{prefill_rate:.1f} tok/s PP')
         elif phase == 'generating':
             # Throughput belongs to the entire decoder call, not this phase.
-            parts.append('Call ' + HarnessyPage._live_tps_text(state))
+            parts.append('Call ' + HarnessyPage._live_tps_text(state, now=now))
+            if generated:
+                parts.append(f'{generated:,} generated tok')
+            if tool_building and int(tool_building.get('argument_chars') or 0):
+                parts.append(f"{int(tool_building['argument_chars']):,} argument chars")
             spans = state.get('phase_timings') or []
             active_span = next((span for span in reversed(spans) if not span.get('complete')), None)
             if active_span and active_span.get('available'):
-                elapsed = max(0.0, time.perf_counter() - float(active_span['started_perf']))
-                parts.append(f'~{elapsed:.1f}s')
+                span_elapsed = max(0.0, now - float(active_span['started_perf']))
+                parts.append(f'~{span_elapsed:.1f}s')
             else:
                 parts.append('Timing unavailable')
-            return ' · '.join(parts)
-        if elapsed:
-            parts.append(f'{elapsed:.1f}s')
+        elif phase == 'waiting':
+            parts.append('Progress unavailable')
+        if elapsed is not None and phase in {'waiting', 'prefill', 'prompt_processing'}:
+            parts.append(f'Request {elapsed:.1f}s')
+        wait_detail = stream_wait_detail(state, now)
+        if wait_detail:
+            parts.append(wait_detail)
         return ' · '.join(parts)
 
     async def _sync_active_live_agent_ui(self) -> None:
@@ -9939,6 +9953,7 @@ class HarnessyPage:
             'outcome': '',
             'step': 0,
             'thinking': selected_thinking,
+            'model_profile_id': str(profile.get('id') or ''),
             'model': str(profile.get('model') or ''),
             'model_settings': model_settings_snapshot(profile, requested_thinking),
             'reasoning': '',
@@ -10504,6 +10519,7 @@ class HarnessyPage:
                     assistant_persisted=False,
                     phase_active=True, phase='waiting', backend='', phase_started=time.perf_counter(),
                     status='Waiting for model…', processed=0, total=0, generated=0, tps=0.0, prefill_tps=0.0, tps_kind='unavailable', tps_source='', tps_observed_at=0.0, tool_building=None,
+                    request_started_perf=0.0, request_started_at='', stream_watchdog=None,
                     last_visible_output_at=float(current['last_visible_output_at']),
                 )
                 start_model_segment(str(event.get('created_at') or ''))
@@ -10558,6 +10574,31 @@ class HarnessyPage:
                             kind='answer', channel=partial, output={},
                         )
                 return
+            if event_type == 'model_request':
+                started = number(event.get('request_started_perf')) or time.perf_counter()
+                publish_live_state(
+                    request_started_perf=min(started, time.perf_counter()),
+                    request_started_at=str(event.get('request_started_at') or ''),
+                    stream_watchdog=None,
+                )
+                phase_state.update(processed=0, total=0, generated=0, cached_tokens=None,
+                                   uncached_total=None, cache_hit_rate=None, prefill_tps=0.0,
+                                   tps=0.0, tps_kind='unavailable', tps_observed_at=0.0)
+                publish_live_state(**{key: phase_state[key] for key in (
+                    'processed', 'total', 'generated', 'cached_tokens', 'uncached_total',
+                    'cache_hit_rate', 'prefill_tps', 'tps', 'tps_kind', 'tps_observed_at')})
+                refresh_phase_display()
+                return
+            if event_type == 'model_stream_watchdog':
+                watch = None if event.get('status') == 'recovered' else {
+                    'status': str(event.get('status') or ''),
+                    'quiet_seconds': number(event.get('quiet_seconds')) or 0.0,
+                    'observed_perf': time.perf_counter(),
+                    'health': dict(event.get('health') or {}),
+                }
+                publish_live_state(stream_watchdog=watch)
+                refresh_phase_display()
+                return
             if event_type == 'model_phase_timing':
                 publish_live_state(phase_timings=[dict(row) for row in event.get('spans') or []])
                 refresh_phase_display()
@@ -10599,6 +10640,10 @@ class HarnessyPage:
                 return
             if event_type == 'model_runtime_status':
                 runtime_phase = str(event.get('phase') or '')
+                if (runtime_phase in {'prefill', 'prompt_processing'}
+                        and phase_state.get('phase') == 'generating'
+                        and (int(phase_state.get('generated') or 0) > 0 or current.get('active_output'))):
+                    return
                 if runtime_phase:
                     phase_state['phase'] = runtime_phase
                     phase_state['active'] = runtime_phase in {'waiting', 'prompt_processing', 'prefill', 'generating'}
@@ -10731,6 +10776,7 @@ class HarnessyPage:
                 publish_live_state(
                     phase_active=True, phase='waiting', phase_started=time.perf_counter(),
                     status=message, processed=0, total=0, generated=0, cached_tokens=None, uncached_total=None, cache_hit_rate=None, cache_hit_source='', tps=0.0, prefill_tps=0.0, tps_kind='unavailable', tps_source='', tps_observed_at=0.0, tool_building=None,
+                    request_started_perf=0.0, request_started_at='', stream_watchdog=None,
                 )
                 view = current.get('view')
                 if isinstance(view, AssistantView) and live_render_available(view.root):
@@ -11338,47 +11384,51 @@ class HarnessyPage:
         self._status_revision = None
         with self.status_container:
             with ui.element('div').classes('hy-status-content'):
-                phase = ui.label('Ready').classes('hy-status-phase')
-                with phase:
-                    phase_tooltip = ui.tooltip('Current Project / Chat activity.').classes('hy-status-tooltip')
-                rate = ui.label('').classes('hy-muted hy-status-tps')
-                elapsed = ui.label('').classes('hy-muted hy-status-elapsed')
-                agents = ui.button('Agents: 0 / 1', on_click=self.open_run_queue_dialog).props(
-                    'flat dense no-caps aria-label="Open active agents and run queue"'
-                ).classes('hy-muted hy-status-agents')
-                with agents:
-                    agents_tooltip = ui.tooltip('No active agents. Click to open the global run queue.').style(
-                        'white-space:pre-wrap;max-width:460px'
-                    )
-                current_chat = ws.get_chat(chat_id)
-                if current_chat is not None and current_chat.archived_at is not None:
-                    root_identity = {
-                        'working_root_id': f'archive-{current_chat.public_id}',
-                        'working_root_kind': 'permanent_archive',
-                        'working_root_label': 'Permanently archived project snapshot',
-                    }
-                else:
-                    root_identity = ws.working_root_identity(ws.active_root_path(chat_id))
-                root_label = ui.label(
-                    f"Root · {root_identity['working_root_label']}"
-                ).classes('hy-muted hy-status-root')
-                with root_label:
-                    ui.tooltip(
-                        f"This Project / Chat uses {root_identity['working_root_label']} "
-                        f"(opaque ID {root_identity['working_root_id']}).\n"
-                        'The Workspace File Explorer shows Files/References and every canonical Project folder. '
-                        'Model tools use this exact Project folder plus live read-only upstream inputs.'
-                    ).style('white-space:pre-wrap;max-width:460px')
-                with ui.element('div').classes('hy-status-context-group'):
-                    context_label = ui.label('').classes('hy-muted hy-status-context')
-                    # Keep the actual tooltip handle, not the fluent label.
-                    with context_label:
-                        context_tooltip = ui.tooltip('').style('white-space:pre-wrap;max-width:440px')
-                    auto_context_label = ui.label('').classes('hy-status-auto-context').props('tabindex=0')
-                    with auto_context_label:
-                        auto_context_tooltip = ui.tooltip('').style('white-space:pre-wrap;max-width:440px')
-                    auto_context_label.on('focus', lambda: auto_context_tooltip.run_method('show'))
-                    auto_context_label.on('blur', lambda: auto_context_tooltip.run_method('hide'))
+                with ui.element('div').classes('hy-status-current'):
+                    phase = ui.label('Ready').classes('hy-status-phase')
+                    with phase:
+                        phase_tooltip = ui.tooltip('Current Project / Chat activity.').classes('hy-status-tooltip')
+                    rate = ui.label('').classes('hy-muted hy-status-tps')
+                    elapsed = ui.label('').classes('hy-muted hy-status-elapsed')
+                    agents = ui.button('Agents: 0 / 1', on_click=self.open_run_queue_dialog).props(
+                        'flat dense no-caps aria-label="Open active agents and run queue"'
+                    ).classes('hy-muted hy-status-agents')
+                    with agents:
+                        agents_tooltip = ui.tooltip('No active agents. Click to open the global run queue.').style(
+                            'white-space:pre-wrap;max-width:460px'
+                        )
+                    current_chat = ws.get_chat(chat_id)
+                    if current_chat is not None and current_chat.archived_at is not None:
+                        root_identity = {
+                            'working_root_id': f'archive-{current_chat.public_id}',
+                            'working_root_kind': 'permanent_archive',
+                            'working_root_label': 'Permanently archived project snapshot',
+                        }
+                    else:
+                        root_identity = ws.working_root_identity(ws.active_root_path(chat_id))
+                    root_label = ui.label(
+                        f"Root · {root_identity['working_root_label']}"
+                    ).classes('hy-muted hy-status-root')
+                    with root_label:
+                        ui.tooltip(
+                            f"This Project / Chat uses {root_identity['working_root_label']} "
+                            f"(opaque ID {root_identity['working_root_id']}).\n"
+                            'The Workspace File Explorer shows Files/References and every canonical Project folder. '
+                            'Model tools use this exact Project folder plus live read-only upstream inputs.'
+                        ).style('white-space:pre-wrap;max-width:460px')
+                    with ui.element('div').classes('hy-status-context-group'):
+                        context_label = ui.label('').classes('hy-muted hy-status-context')
+                        # Keep the actual tooltip handle, not the fluent label.
+                        with context_label:
+                            context_tooltip = ui.tooltip('').style('white-space:pre-wrap;max-width:440px')
+                        auto_context_label = ui.label('').classes('hy-status-auto-context').props('tabindex=0')
+                        with auto_context_label:
+                            auto_context_tooltip = ui.tooltip('').style('white-space:pre-wrap;max-width:440px')
+                        auto_context_label.on('focus', lambda: auto_context_tooltip.run_method('show'))
+                        auto_context_label.on('blur', lambda: auto_context_tooltip.run_method('hide'))
+                previous = ui.label('').classes('hy-muted hy-status-previous').props('data-hy-previous-call=1')
+                with previous:
+                    previous_tooltip = ui.tooltip('').style('white-space:pre-wrap;max-width:440px')
             with ui.element('div').classes('hy-status-monitor-wrap'):
                 with ui.element('button').props('type=button aria-label="Performance details"').classes('hy-status-icon-btn') as performance_button:
                     ui.html('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3" y="3" width="18" height="13" rx="1.5"/><path d="M8 21h8M12 16v5M6 12l4-4 3 3 5-5"/></svg>').classes('hy-monitor-glyph')
@@ -11386,6 +11436,7 @@ class HarnessyPage:
                 performance_button.tooltip('Performance details').classes('hy-status-tooltip')
         self._status_refs = dict(
             phase=phase, rate=rate, elapsed=elapsed, agents=agents, context=context_label,
+            previous=previous, previous_tooltip=previous_tooltip,
             phase_tooltip=phase_tooltip, agents_tooltip=agents_tooltip,
             context_tooltip=context_tooltip,
             auto_context=auto_context_label, auto_context_tooltip=auto_context_tooltip,
@@ -11411,7 +11462,8 @@ class HarnessyPage:
                 if ws:
                     self._status_latest = ws.latest_generation_metric(key[1]) or {}
                 self._status_revision = revision
-            values = run_presentation(live, self._status_latest, time.perf_counter())
+            latest = self._status_latest if metric_matches_profile(self._status_latest, self._status_profile) else {}
+            values = run_presentation(live, latest, time.perf_counter())
             slot_state = GLOBAL_AGENT_SLOTS.snapshot()
             try:
                 slot_limit = max(1, min(int(
@@ -11447,6 +11499,7 @@ class HarnessyPage:
                 detail = detail + '\n' + ' · '.join(cache_bits)
             for name, value in {
                 'phase': values['phase'], 'rate': values['rate'], 'elapsed': values['elapsed'],
+                'previous': values['previous'], 'previous_tooltip': values['previous_detail'],
                 'agents': f"Agents: {len(active_agents)} / {slot_limit}",
                 'agents_tooltip': agent_detail,
                 'context': context, 'context_tooltip': detail, 'phase_tooltip': values['detail'],
@@ -11456,7 +11509,7 @@ class HarnessyPage:
                 if getattr(element, '_hy_status_text', None) != value:
                     element.set_text(value)
                     element._hy_status_text = value
-                    if name in {'rate', 'elapsed'}:
+                    if name in {'rate', 'elapsed', 'previous'}:
                         element.set_visibility(bool(value))
         except RuntimeError as exc:
             if not _is_stale_ui_error(exc):
@@ -20459,6 +20512,9 @@ async def _run_headless_turn(
                     reasoning='', answer='', stream_segments=[], output_provenance={}, phase_timings=[],
                     active_output='', assistant_persisted=False, current_tool=None,
                     phase_active=True, phase='waiting', phase_started=time.perf_counter(),
+                    request_started_perf=0.0, request_started_at='', stream_watchdog=None,
+                    processed=0, total=0, generated=0, cached_tokens=None, uncached_total=None,
+                    cache_hit_rate=None, prefill_tps=0.0, tps=0.0, tps_kind='unavailable', tps_observed_at=0.0,
                 )
             elif event_type == 'model_output_segment_start':
                 kind = 'reasoning' if event.get('kind') == 'reasoning' else 'answer'
@@ -20480,6 +20536,19 @@ async def _run_headless_turn(
                         'mixed_text_events': 0,
                     })
                 publish(active_output=kind)
+            elif event_type == 'model_request':
+                publish(
+                    request_started_perf=min(number(event.get('request_started_perf')) or time.perf_counter(), time.perf_counter()),
+                    request_started_at=str(event.get('request_started_at') or ''), stream_watchdog=None,
+                    processed=0, total=0, generated=0, cached_tokens=None, uncached_total=None,
+                    cache_hit_rate=None, prefill_tps=0.0, tps=0.0, tps_kind='unavailable', tps_observed_at=0.0,
+                )
+            elif event_type == 'model_stream_watchdog':
+                publish(stream_watchdog=None if event.get('status') == 'recovered' else {
+                    'status': str(event.get('status') or ''),
+                    'quiet_seconds': number(event.get('quiet_seconds')) or 0.0,
+                    'observed_perf': time.perf_counter(), 'health': dict(event.get('health') or {}),
+                })
             elif event_type == 'model_phase':
                 publish(
                     phase_active=True,
@@ -20489,6 +20558,10 @@ async def _run_headless_turn(
                     current_images=int(event.get('current_images') or 0),
                 )
             elif event_type == 'model_runtime_status':
+                if (event.get('phase') in {'prefill', 'prompt_processing'}
+                        and state.get('phase') == 'generating'
+                        and (int(state.get('generated') or 0) > 0 or state.get('active_output'))):
+                    return
                 publish(
                     phase=str(event.get('phase') or state.get('phase') or ''),
                     processed=int(event.get('processed') or 0),

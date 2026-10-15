@@ -37,6 +37,50 @@ def elapsed_text(seconds: Any) -> str:
     return f'{hours}:{minutes:02}:{seconds:02}' if hours else f'{minutes:02}:{seconds:02}'
 
 
+def request_elapsed_seconds(live: dict[str, Any], now: float) -> float | None:
+    """A current request's monotonic age, with a legacy phase-clock fallback."""
+    started = positive_number(live.get('request_started_perf')) or positive_number(live.get('phase_started'))
+    return max(0.0, now - started) if started and started <= now else None
+
+
+def previous_call_presentation(latest: dict[str, Any]) -> tuple[str, str]:
+    """Completed-call measurements stay separate from all live request rates."""
+    parts = []
+    tps = positive_number(latest.get('tps'))
+    if tps:
+        parts.append(f'decode {tps:.1f} tok/s')
+    ttft = positive_number(latest.get('ttft_seconds'))
+    if ttft:
+        parts.append(f'TTFT {ttft:.1f}s')
+    prefill = positive_number(latest.get('prefill_tps'))
+    if prefill:
+        parts.append(f'PP {prefill:.1f} tok/s')
+    text = 'Previous call · ' + ' · '.join(parts) if parts else ''
+    return text, ('Last completed model call. These are not this request’s live speeds. '
+                  'TTFT is time to first token; PP is prompt processing. Open Stats for full measurements.')
+
+
+def stream_wait_detail(live: dict[str, Any], now: float) -> str:
+    """Tick the observed quiet interval without turning reachability into progress."""
+    watch = live.get('stream_watchdog')
+    if not isinstance(watch, dict) or watch.get('status') not in {'suspected', 'waiting'}:
+        return ''
+    quiet = positive_number(watch.get('quiet_seconds'))
+    observed = positive_number(watch.get('observed_perf'))
+    if observed and now >= observed:
+        quiet += now - observed
+    health = watch.get('health') if isinstance(watch.get('health'), dict) else {}
+    if health.get('backend_reachable') is False:
+        detail = 'Backend unreachable at last check'
+    elif health.get('backend_reachable') is True:
+        detail = ('Backend reports request active' if health.get('request_scoped')
+                  and health.get('request_state') in {'pending', 'active', 'running', 'prefill', 'generating'}
+                  else 'Backend reachable; inference progress unconfirmed')
+    else:
+        detail = 'Inference progress unconfirmed'
+    return f'Quiet {quiet:.0f}s · {detail}'
+
+
 def live_tool_duration_text(
     name: str, arguments: dict[str, Any] | None, started_perf: float,
     *, now_perf: float, default_timeout_seconds: int = 180,
@@ -168,12 +212,12 @@ def auto_context_presentation(
 
 def run_presentation(live: dict[str, Any] | None, latest: dict[str, Any], now: float) -> dict[str, str]:
     live = live or {}
+    previous, previous_detail = previous_call_presentation(latest)
     if not live.get('active') or live.get('finished'):
         outcome = str(live.get('outcome') or '')
         phase = {'stopped': 'Stopped', 'error': 'Error'}.get(outcome, 'Ready')
-        tps = positive_number(latest.get('tps'))
         duration = positive_number(latest.get('duration_seconds'))
-        return {'phase': phase, 'rate': f'Last {tps:.1f} tok/s' if tps else '',
+        return {'phase': phase, 'rate': '', 'previous': previous, 'previous_detail': previous_detail,
                 'elapsed': 'Last ' + elapsed_text(duration) if duration else '',
                 'detail': 'Last completed model generation; not live throughput. Open Stats for full timings.'}
     phase = str(live.get('phase') or '')
@@ -195,13 +239,13 @@ def run_presentation(live: dict[str, Any] | None, latest: dict[str, Any], now: f
     elif live.get('tool_building'):
         label = 'Generating tool'
     elif phase in {'prefill', 'prompt_processing'}:
-        label = 'Prefill'
+        label = 'Prompt Processing'
     elif phase == 'generating':
         label = 'Generating'
     elif status_lower.startswith(('building', 'preparing')):
         label = 'Preparing'
     elif phase == 'waiting':
-        label = 'Waiting for model'
+        label = 'Waiting for model · progress unavailable'
     else:
         label = 'Working'
     rate = ''
@@ -215,9 +259,22 @@ def run_presentation(live: dict[str, Any] | None, latest: dict[str, Any], now: f
     kind = str(live.get('tps_kind') or 'unavailable')
     if label in {'Generating', 'Generating tool'} and tps is not None and at and 0 <= now - at <= RATE_TTL and kind != 'unavailable':
         rate = f'{tps:.1f} tok/s' + (' avg' if kind == 'average' else '')
+    elif label == 'Prompt Processing' and at and 0 <= now - at <= RATE_TTL:
+        prefill = positive_number(live.get('prefill_tps'))
+        if prefill:
+            rate = f'{prefill:.1f} tok/s PP'
+    request_age = request_elapsed_seconds(live, now)
     start = positive_number(live.get('run_started'))
-    elapsed = elapsed_text(max(0, now - start)) if start else ''
-    detail = f'{label}: {tool.get("name") or status or phase}. Elapsed is the whole current run.'
+    elapsed = ('Request ' + elapsed_text(request_age) if request_age is not None
+               and label in {'Waiting for model · progress unavailable', 'Prompt Processing'} else
+               'Run ' + elapsed_text(max(0, now - start)) if start else '')
+    detail = f'{label}: {tool.get("name") or status or phase}. '
+    detail += ('Elapsed is this model request.' if elapsed.startswith('Request ')
+               else 'Elapsed is the whole current run.')
     if label in {'Generating', 'Generating tool'} and not rate:
         detail += ' Live speed is not available yet or is stale.'
-    return {'phase': label, 'rate': rate, 'elapsed': elapsed, 'detail': detail}
+    wait_detail = stream_wait_detail(live, now)
+    if wait_detail:
+        detail += '\n' + wait_detail
+    return {'phase': label, 'rate': rate, 'elapsed': elapsed, 'detail': detail,
+            'previous': previous, 'previous_detail': previous_detail}

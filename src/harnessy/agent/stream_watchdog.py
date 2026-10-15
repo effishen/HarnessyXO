@@ -74,9 +74,11 @@ class StreamProgressWatchdog:
         gone_confirm_seconds: float = STREAM_STALL_GONE_CONFIRM_SECONDS,
         probe_seconds: float = STREAM_STALL_PROBE_SECONDS,
         probe_timeout_seconds: float = STREAM_STALL_PROBE_TIMEOUT_SECONDS,
+        client_request_id: str = '',
         clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         self.backend = str(backend or 'model backend')
+        self.client_request_id = str(client_request_id or '')
         self.suspect_seconds = max(0.01, float(suspect_seconds))
         self.initial_seconds = max(self.suspect_seconds, float(initial_seconds))
         self.active_seconds = max(self.suspect_seconds, float(active_seconds))
@@ -92,13 +94,19 @@ class StreamProgressWatchdog:
         self.suspected_at: float | None = None
         self.missing_confirmed_at: float | None = None
         self.saw_output = False
+        self.saw_prompt_progress = False
         self.request_id = ''
         self.last_runtime_signature: tuple[Any, ...] | None = None
+        self.runtime_processed = 0
+        self.runtime_generated = 0
+        self.payload_counters: dict[str, int] = {}
         self.last_health: dict[str, Any] = {}
 
     @property
     def phase(self) -> str:
-        return 'generation' if self.saw_output else 'initial prefill / model startup'
+        if self.saw_output:
+            return 'generation'
+        return 'prompt processing' if self.saw_prompt_progress else 'waiting for model progress'
 
     def silence_seconds(self, now: float | None = None) -> float:
         observed = self.clock() if now is None else float(now)
@@ -143,15 +151,7 @@ class StreamProgressWatchdog:
         output = cls._payload_has_output(value)
         if output:
             return True, True
-        usage = value.get('usage')
-        if isinstance(usage, dict) and any(
-            isinstance(item, (int, float)) and not isinstance(item, bool)
-            for item in usage.values()
-        ):
-            return True, False
         if value.get('done') is True:
-            return True, False
-        if any(value.get(key) is not None for key in ('prompt_eval_count', 'eval_count')):
             return True, False
         choices = value.get('choices') if isinstance(value.get('choices'), list) else []
         if any(isinstance(choice, dict) and choice.get('finish_reason') for choice in choices):
@@ -160,10 +160,30 @@ class StreamProgressWatchdog:
 
     @staticmethod
     def _counter(value: Any) -> int:
+        if isinstance(value, bool):
+            return 0
         try:
             return max(0, int(float(value or 0)))
         except (TypeError, ValueError, OverflowError):
             return 0
+
+    def _payload_counters_advanced(self, value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        usage = value.get('usage') if isinstance(value.get('usage'), dict) else {}
+        counters = {f'usage.{key}': usage.get(key) for key in (
+            'prompt_tokens', 'completion_tokens', 'total_tokens', 'cached_tokens',
+            'input_tokens', 'output_tokens', 'reasoning_tokens',
+        )}
+        counters.update({key: value.get(key) for key in ('prompt_eval_count', 'eval_count')})
+        advanced = False
+        for key, raw in counters.items():
+            count = self._counter(raw)
+            previous = self.payload_counters.get(key, 0)
+            if count > previous:
+                self.payload_counters[key] = count
+                advanced = True
+        return advanced
 
     def _mark_progress(self, *, output: bool = False) -> dict[str, Any] | None:
         now = self.clock()
@@ -182,19 +202,24 @@ class StreamProgressWatchdog:
             'backend': self.backend,
             'phase': self.phase,
             'quiet_seconds': quiet,
+            'elapsed_seconds': max(0.0, now - self.started_at),
+            'client_request_id': self.client_request_id,
         }
 
     def observe(self, kind: str, value: Any) -> dict[str, Any] | None:
         """Observe one sanitized queue item and report a recovery if applicable."""
         event_kind = str(kind or '')
-        if event_kind in {'accepted', 'transport', 'data', 'json', 'message', 'runtime_status', 'log_status'}:
+        # This is decoded transport activity, not a raw socket-byte clock.
+        # Runtime/log polling counters can prove progress separately below.
+        if event_kind in {'accepted', 'transport', 'data', 'json'}:
             self.observe_transport()
         if event_kind in {'data', 'json', 'message'}:
             progress, output = self._payload_is_progress(value)
             # Empty JSON/SSE chunks remain transport activity only. They do not
             # extend an inference deadline unless they carry output, usage,
             # completion, or another monotonic request counter.
-            return self._mark_progress(output=output) if progress else None
+            counters_advanced = self._payload_counters_advanced(value)
+            return self._mark_progress(output=output) if progress or counters_advanced else None
         if event_kind not in {'runtime_status', 'log_status'} or not isinstance(value, dict):
             return None
 
@@ -212,10 +237,16 @@ class StreamProgressWatchdog:
         if signature == self.last_runtime_signature:
             return None
         self.last_runtime_signature = signature
-        # A first status containing no request counters is reachability
-        # telemetry, not proof that inference advanced.
-        if not any(signature[1:]) and signature[0] not in {'prompt_processing', 'prefill', 'generating'}:
+        processed = signature[1]
+        advanced = processed > self.runtime_processed or generated > self.runtime_generated
+        self.runtime_processed = max(self.runtime_processed, processed)
+        self.runtime_generated = max(self.runtime_generated, generated)
+        # A phase label, prompt size, context allocation, or repeated/regressing
+        # status is telemetry, not evidence that this request advanced.
+        if not advanced:
             return None
+        if processed > 0 and signature[0] in {'prompt_processing', 'prefill'}:
+            self.saw_prompt_progress = True
         return self._mark_progress(output=generated > 0)
 
     async def check(
@@ -262,6 +293,7 @@ class StreamProgressWatchdog:
         now = self.clock()
         log_event(
             'backend', 'stream_health_checked', backend=self.backend, phase=self.phase,
+            client_request_id=self.client_request_id,
             watchdog_request_state=request_state,
             watchdog_evidence=self.last_health.get('evidence'),
             request_scoped=request_scoped, request_id_seen=bool(self.request_id),
@@ -286,14 +318,16 @@ class StreamProgressWatchdog:
             self.missing_confirmed_at = None
             self.next_probe_at = now + self.probe_seconds
 
-        if self.suspected_at is not None:
-            return None
-        self.suspected_at = now
+        first_notice = self.suspected_at is None
+        if first_notice:
+            self.suspected_at = now
         return {
-            'status': 'suspected',
+            'status': 'suspected' if first_notice else 'waiting',
             'backend': self.backend,
             'phase': self.phase,
-            'quiet_seconds': quiet,
+            'quiet_seconds': self.silence_seconds(now),
+            'elapsed_seconds': max(0.0, now - self.started_at),
+            'client_request_id': self.client_request_id,
             'health': dict(self.last_health),
         }
 

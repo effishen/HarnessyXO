@@ -111,6 +111,23 @@ def datetime_from_perf(started_perf: float, mark_perf: float | None) -> str | No
         return None
 
 
+def _stream_watchdog_status_message(event: dict[str, Any], backend: str) -> str:
+    """Describe observed waiting/health without claiming inference progress."""
+    if event.get('status') == 'recovered':
+        return f'Model progress resumed · {backend}'
+    quiet = max(0.0, number(event.get('quiet_seconds')) or 0.0)
+    health = event.get('health') if isinstance(event.get('health'), dict) else {}
+    if health.get('request_scoped') is True and health.get('request_state') == 'active':
+        detail = 'request active; waiting for inference progress'
+    elif health.get('request_scoped') is True and health.get('request_state') == 'gone':
+        detail = 'request not active; awaiting confirmation'
+    elif health.get('backend_reachable') is True:
+        detail = 'backend reachable; inference progress unconfirmed'
+    else:
+        detail = 'backend health unconfirmed; waiting for inference progress'
+    return f'Model quiet for {quiet:.0f}s · {backend} · {detail}'
+
+
 PASTED_TEXT_PREFIX = 'pasted-text-'
 PASTED_TEXT_INLINE_MAX_CHARS = 128_000
 ADAPTIVE_RETRIEVAL_RETENTION_STEPS = 6
@@ -2707,6 +2724,7 @@ Rules:
         metric_id = self.workspace.add_generation_metric(self.chat_id, metric)
         return {
             'metric_id': metric_id,
+            'client_request_id': str(request_debug.get('client_request_id') or ''),
             'backend': backend_label,
             'prompt_tokens': prompt_tokens,
             'completion_tokens': completion_tokens,
@@ -4837,6 +4855,8 @@ Rules:
             step_raw_usage: dict[str, Any] = {}
             step_backend_timings: dict[str, Any] = {}
             step_request_debug: dict[str, Any] = {}
+            request_started_at = ''
+            request_started_perf: float | None = None
             step_reasoning_while_off = False
             step_generating_emitted = False
             step_finish_reason = ''
@@ -5140,6 +5160,8 @@ Rules:
                         await self._record_stream_stall_activity(exc, step=step, emit_event=emit_event)
                         raise
                     if event['type'] == 'request':
+                        request_started_perf = time.perf_counter()
+                        request_started_at = datetime.now().astimezone().isoformat(timespec='milliseconds')
                         debug = dict(event.get('request') or {})
                         debug['thinking_selected'] = self.thinking
                         debug['skill_selected'] = self.skill
@@ -5171,25 +5193,30 @@ Rules:
                         log_event(
                             'runtime', 'model_request', workspace_id=getattr(self.workspace, 'id', None),
                             chat_id=self.chat_id, step=step + 1, max_steps=max_steps, request=debug,
+                            client_request_id=str(debug.get('client_request_id') or ''),
                         )
                         backend = str(debug.get('backend') or 'backend').strip()
                         backend_label = 'Ollama' if backend.lower() == 'ollama' else ('oMLX' if backend.lower() == 'omlx' else backend)
+                        await emit_event(
+                            'model_request', step=step, backend=backend_label,
+                            client_request_id=str(debug.get('client_request_id') or ''),
+                            request_started_at=request_started_at,
+                            request_started_perf=request_started_perf,
+                        )
                         per_message = list(debug.get('message_image_counts') or [])
                         current_images = int(per_message[-1] if per_message else 0)
-                        # Native Ollama begins prompt ingestion as soon as the
-                        # request is submitted.  Calling this merely "Waiting"
-                        # hid several minutes of real prefill work on long chats.
-                        initial_phase = 'prompt_processing' if backend.lower() == 'ollama' else 'waiting'
-                        status = (
-                            f"Prompt Processing · {backend_label}"
-                            if initial_phase == 'prompt_processing'
-                            else f"Waiting for model… · {backend_label}"
-                        )
+                        # Submission or an HTTP health response does not show
+                        # whether the model is loading, queued, or processing
+                        # its prompt. Runtime counters can establish that phase.
+                        initial_phase = 'waiting'
+                        status = f"Waiting for model… · {backend_label}"
                         if current_images:
                             status += f" · {current_images} image{'s' if current_images != 1 else ''}"
                         await on_status(status)
                         await emit_event(
                             'model_phase', step=step, phase=initial_phase, backend=backend_label, current_images=current_images,
+                            request_started_at=request_started_at,
+                            request_started_perf=request_started_perf,
                         )
                         continue
                     if event['type'] == 'stream_watchdog':
@@ -5197,16 +5224,18 @@ Rules:
                         watchdog_backend = str(event.get('backend') or step_request_debug.get('backend') or 'backend')
                         quiet_seconds = float(event.get('quiet_seconds') or 0.0)
                         health = event.get('health') if isinstance(event.get('health'), dict) else {}
-                        if watchdog_status == 'recovered':
-                            await on_status(f'Model stream resumed · {watchdog_backend}')
-                        else:
-                            await on_status(
-                                f'Model stream quiet for {quiet_seconds:.0f}s · checking {watchdog_backend} health…'
-                            )
+                        await on_status(_stream_watchdog_status_message(event, watchdog_backend))
                         await emit_event(
                             'model_stream_watchdog', step=step, status=watchdog_status,
                             backend=watchdog_backend, phase=str(event.get('phase') or ''),
                             quiet_seconds=quiet_seconds,
+                            request_started_at=request_started_at,
+                            request_started_perf=request_started_perf,
+                            request_elapsed_seconds=(
+                                max(0.0, time.perf_counter() - request_started_perf)
+                                if request_started_perf is not None else None
+                            ),
+                            client_request_id=str(event.get('client_request_id') or step_request_debug.get('client_request_id') or ''),
                             health={
                                 key: value for key, value in health.items()
                                 if key in {'backend_reachable', 'request_state', 'request_scoped', 'evidence'}

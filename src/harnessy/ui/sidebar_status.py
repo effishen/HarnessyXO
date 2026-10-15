@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Any
 
 from harnessy.core.machine import completion_hold_label, completion_wait_reason
+from harnessy.ui.status import elapsed_text, request_elapsed_seconds, stream_wait_detail
 
 
 @dataclass(frozen=True)
@@ -24,6 +26,7 @@ def chat_run_statuses(
     completion_hold: dict[str, Any] | None = None,
     completion_blocker: dict[str, Any] | None = None,
     completion_blocker_slots: list[dict[str, Any]] | None = None,
+    now_perf: float | None = None,
 ) -> tuple[ChatRunStatus | None, ChatRunStatus | None]:
     """Return independent current-work and pending-job indicators.
 
@@ -37,6 +40,7 @@ def chat_run_statuses(
     running = any(job.get('status') == 'running' for job in jobs)
     live = live if live.get('active') and not live.get('finished') else {}
     if slots:
+        now = time.perf_counter() if now_perf is None else now_perf
         slots = sorted(slots, key=lambda row: (row.get('kind') == 'subagent', int(row['slot'])))
         slot_text = f"Slot {slots[0]['slot']}" + (f' +{len(slots) - 1}' if len(slots) > 1 else '')
         phase = str(live.get('phase') or '') if live.get('phase_active') else ''
@@ -54,6 +58,14 @@ def chat_run_statuses(
         ) for row in slots]
         if label == 'PP':
             details.append('Prompt processing (PP)')
+        if label in {'PP', 'Waiting'}:
+            request_age = request_elapsed_seconds(live, now)
+            if request_age is not None:
+                label += ' ' + elapsed_text(request_age)
+                details.append('Current model request elapsed: ' + elapsed_text(request_age))
+            wait_detail = stream_wait_detail(live, now)
+            if wait_detail:
+                details.append(wait_detail)
         if live.get('status'):
             details.append(str(live['status']))
         if awaiting_approval:

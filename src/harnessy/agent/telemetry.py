@@ -116,55 +116,87 @@ def generation_rate(values: dict[str, Any], previous: dict[str, Any] | None = No
     return {}
 
 
+_LLAMA_TIMING_FIELDS = (
+    'cache_n', 'prompt_n', 'prompt_ms', 'prompt_per_token_ms', 'prompt_per_second',
+    'predicted_n', 'predicted_ms', 'predicted_per_token_ms', 'predicted_per_second',
+    'draft_n', 'draft_n_accepted',
+)
+
+
+def llama_cpp_prompt_progress(data: Any) -> dict[str, int | float] | None:
+    """Validate only this response's native prefill counters, including cache."""
+    raw = data.get('prompt_progress') if isinstance(data, dict) else None
+    if not isinstance(raw, dict):
+        return None
+    counts = {}
+    for key in ('total', 'cache', 'processed'):
+        value = number(raw.get(key))
+        if value is None or not value.is_integer() or value > 2**53:
+            return None
+        counts[key] = int(value)
+    elapsed = number(raw.get('time_ms'))
+    if elapsed is None or not counts['cache'] <= counts['processed'] <= counts['total']:
+        return None
+    return {**counts, 'time_ms': elapsed}
+
+
 def llama_cpp_stream_status(data: Any, *, observed_at: float | None = None) -> dict[str, Any] | None:
-    """Normalize request-scoped llama.cpp ``timings`` into HarnessyXO telemetry.
+    """Normalize request-scoped llama.cpp progress/timings without text estimates.
 
-    llama-server can attach cumulative timing counters to every streamed
-    OpenAI-compatible chunk when ``timings_per_token`` is enabled.  Keep only
-    documented numeric fields: never copy response content, prompts, tool
-    arguments, or other payload data into live telemetry.
+    Native prompt_progress.processed includes the cached prefix. The common UI
+    counter contract reports newly evaluated work and its uncached denominator,
+    while retaining the full prompt size and cache count separately.
     """
-    if not isinstance(data, dict) or not isinstance(data.get('timings'), dict):
+    if not isinstance(data, dict):
         return None
-    raw = data['timings']
-    keys = (
-        'cache_n', 'prompt_n', 'prompt_ms', 'prompt_per_token_ms', 'prompt_per_second',
-        'predicted_n', 'predicted_ms', 'predicted_per_token_ms', 'predicted_per_second',
-        'draft_n', 'draft_n_accepted',
-    )
-    timings = {key: value for key in keys if (value := number(raw.get(key))) is not None}
-    if not timings:
+    raw = data.get('timings') if isinstance(data.get('timings'), dict) else {}
+    timings = {key: value for key in _LLAMA_TIMING_FIELDS
+               if (value := number(raw.get(key))) is not None}
+    progress = llama_cpp_prompt_progress(data)
+    if not timings and progress is None:
         return None
+    now = time.perf_counter() if observed_at is None else float(observed_at)
+    predicted_count = int(number(timings.get('predicted_n')) or 0)
+    if progress is not None and predicted_count == 0:
+        total, cached, processed = (int(progress[key]) for key in ('total', 'cache', 'processed'))
+        newly_processed = processed - cached
+        elapsed_ms = float(progress['time_ms'])
+        native_prefill_rate = number(timings.get('prompt_per_second'))
+        prefill_rate = (native_prefill_rate if native_prefill_rate and newly_processed > 0 else
+                        newly_processed * 1000.0 / elapsed_ms if elapsed_ms > 0 and newly_processed > 0 else None)
+        status: dict[str, Any] = {
+            'backend': 'llama.cpp', 'phase': 'prompt_processing',
+            'request_scoped': True,
+            'processed': newly_processed, 'total': total, 'generated': 0,
+            'cached_tokens': cached, 'uncached_total': total - cached,
+            'cache_hit_rate': cached * 100.0 / total if total else None,
+            'cache_hit_source': 'llama.cpp_stream', 'context_used': total,
+            'prefill_tps': prefill_rate,
+            'tps': 0.0, 'tps_kind': 'unavailable',
+            'tps_source': 'llama.cpp_stream', 'tps_observed_at': now,
+            'native_prompt_progress': progress,
+        }
+        if timings:
+            status['backend_timings'] = timings
+        return status
 
-    predicted = number(timings.get('predicted_n'))
-    prompt = number(timings.get('prompt_n'))
-    cached = number(timings.get('cache_n'))
-    decode_tps = number(timings.get('predicted_per_second'))
-    prefill_tps = number(timings.get('prompt_per_second'))
-    predicted_count = int(predicted or 0)
-    prompt_count = int(prompt or 0)
-    cached_count = int(cached or 0)
+    prompt_count = int(number(timings.get('prompt_n')) or 0)
+    cached_count = int(number(timings.get('cache_n')) or 0)
     generating = predicted_count > 0
-    status: dict[str, Any] = {
+    decode_tps = number(timings.get('predicted_per_second'))
+    status = {
         'backend': 'llama.cpp',
         'phase': 'generating' if generating else 'prompt_processing',
-        'processed': prompt_count,
-        'total': prompt_count + cached_count,
+        'request_scoped': True,
+        'processed': prompt_count, 'total': prompt_count + cached_count,
         'generated': predicted_count,
         'context_used': prompt_count + cached_count + predicted_count,
-        'prefill_tps': prefill_tps,
-        'tps_source': 'llama.cpp_stream',
-        'tps_observed_at': time.perf_counter() if observed_at is None else float(observed_at),
+        'prefill_tps': number(timings.get('prompt_per_second')),
+        'tps_source': 'llama.cpp_stream', 'tps_observed_at': now,
         'backend_timings': timings,
+        'tps': decode_tps if generating and decode_tps is not None else 0.0,
+        'tps_kind': 'average' if generating and decode_tps is not None else 'unavailable',
     }
-    if generating and decode_tps is not None:
-        # llama.cpp reports a cumulative request average here. It is refreshed
-        # with streamed timing samples, while remaining an average by meaning.
-        status['tps'] = decode_tps
-        status['tps_kind'] = 'average'
-    else:
-        status['tps'] = 0.0
-        status['tps_kind'] = 'unavailable'
     return status
 
 

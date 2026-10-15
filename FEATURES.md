@@ -1,4 +1,12 @@
-# HarnessyXO v0.6.88 Features
+# HarnessyXO v0.6.89 Features
+
+## Model progress across backends
+
+- Use one current-request display for every backend. Show an animated wait with increasing elapsed time before output; show real prompt-processing counters, cache reuse and throughput when the backend exposes them. Explicitly report unavailable progress instead of estimating percentages or inventing live token rates.
+- Ask native llama.cpp for streamed prompt progress. Separate newly evaluated work from cached tokens, including zero-work and fully cached prompts. Preserve native generation timing and final usage. Generic OpenAI-compatible servers receive only their supported common request options.
+- Keep previous completed-call speed and time to first output on a separately labelled line while the next request waits. Reset current-request clocks and counters between calls and keep chat/profile state distinct.
+- Update quiet status after each health probe. Backend reachability does not prove inference progress; repeated counters and stream heartbeats do not reset the work-progress deadline. Keep cancellation and existing request deadlines.
+- Backend versions and proxies can omit progress even when requests succeed. In that case the shared display continues to show a truthful wait until output arrives.
 
 ## Workspace test-target tabs
 
@@ -50,6 +58,8 @@ Workspace and machine databases use WAL so background reads can coexist with mes
 
 ## Actionable support diagnostics
 
+- Put the current model request, its wait and the previous completed call near the start of SUMMARY.txt. Include MODEL_REQUESTS.json with bounded correlation, coverage and timing evidence; distinguish current waits from older VM incidents.
+- Retain timestamped, locally correlated numeric prompt progress, usage and native timings without copying model text, tool arguments or token-ID arrays. Use explicit correlation for new requests and label legacy timestamp candidates and missing evidence. A local request ID does not establish provider-side inference activity.
 - Include bounded Lima guest boot and host-agent evidence in the normal download. `VM_LOGS.json` reports available, missing and limited sources; raw tails use the existing content option.
 - Record fixed boot/SSH milestones and distinguish native controller failure, HarnessyXO timeout and cancellation. Observe status after startup failure without retrying a blocked model command.
 - Give Lima's readiness-event wait the same 20-minute allowance as HarnessyXO; retain guest-requirement limits and the existing isolation/readiness guard.
