@@ -62,10 +62,45 @@ class _DiagnosticsZipFile(zipfile.ZipFile):
         if isinstance(encoded, (bytes, bytearray)):
             data = _TARGET_VIEW_CAPABILITY.sub(lambda match: match.group(1) + b'<redacted>', encoded)
         return super().writestr(zinfo_or_arcname, data, compress_type=compress_type, compresslevel=compresslevel)
+
+    def read_log(self, source, member, *, tail_bytes=None):
+        from .operational import ExportCoverage
+        if not hasattr(self, 'source_coverage'):
+            self.source_coverage = ExportCoverage()
+        return self.source_coverage.read(source, member, _read_snapshot_bytes, tail_bytes)
+
+    def write_log(self, member, payload, row, projection):
+        from .operational import ExportCoverage, APP_FILE_TAIL_BYTES, APP_TOTAL_READ_BYTES
+        payload = _TARGET_VIEW_CAPABILITY.sub(lambda match: match.group(1) + b'<redacted>', payload)
+        used = sum(item['exported_bytes'] for item in self.source_coverage.sources)
+        cap = max(0, min(APP_FILE_TAIL_BYTES, APP_TOTAL_READ_BYTES - used))
+        if len(payload) > cap:
+            payload = payload[-cap:].partition(b'\n')[2] if cap else b''
+            if row is not None:
+                row['export_truncated'] = True
+        self.writestr(member, payload)
+        ExportCoverage.written(row, payload, projection)
 _FILE_OPERATION_TIMELINE_MAX_EVENTS = 1000
 _FILE_OPERATION_TIMELINE_LOG_TAIL_BYTES = 8 * 1024 * 1024
 _PRIVACY_SAFE_BUNDLE = 'HarnessyXO-Diagnostics-Latest.zip'
 _FULL_CONTENT_BUNDLE = 'HarnessyXO-Diagnostics-Latest-Including-Content.zip'
+
+
+def _trusted_controller_event(value: Any) -> bool:
+    return (isinstance(value, dict)
+        and value.get('event') in {'environment_command_finished', 'environment_command_timeout',
+            'environment_command_cancelled', 'vm_startup_observation', 'environment_command_spawn_failed'}
+        and value.get('provider') == 'lima'
+        and value.get('controller_action') in {'start', 'create', 'stop', 'delete', 'factory-reset', 'restart'}
+        and isinstance(value.get('command_id'), str)
+        and re.fullmatch(r'[0-9a-f]{32}', value['command_id']) is not None)
+
+
+def _controller_evidence(value: Any, *, trusted: bool = False) -> dict[str, Any]:
+    from .technical import validate_technical_evidence
+    return {name: validate_technical_evidence(value[name],
+                trusted_source='controller_' + name if trusted else None)
+            for name in ('stderr', 'stdout') if isinstance(value, dict) and isinstance(value.get(name), dict)}
 
 _CONTEXT_TUNING_EVENTS = frozenset({
     'request_prepared', 'request_succeeded', 'recovery_retry', 'recovery_exhausted',
@@ -279,6 +314,10 @@ def _safe_event_field(key: str, value: Any) -> Any:
     """Keep reviewed structured evidence intact, without widening raw limits."""
     if _is_sensitive_log_key(key):
         return '<redacted>'
+    if key in {'technical_error', 'controller_evidence', 'host_resources', 'requested_vm_config', 'environment_action',
+               'error_type', 'terminal_stop_reason', 'terminal_reason', 'backend_done_reason',
+               'completion_state', 'last_error_code', 'source', 'state', 'component', 'missing_dependency'}:
+        return _privacy_safe_value(value, key=key)
     if key in {'archive_check', 'storage_issue'}:
         return _privacy_safe_value(value, key=key)
     if key in {'client_request_id', 'usage', 'timings', 'backend_timings',
@@ -838,7 +877,9 @@ class DiagnosticsManager:
         # secret-key checks for top-level password/token fields.
         payload = {
             'event': event,
-            **{k: _safe_event_field(k, v) for k, v in fields.items()},
+            **{k: (_controller_evidence(v, trusted=True) if k == 'controller_evidence'
+                    and _trusted_controller_event({'event': event, **fields})
+                    else _safe_event_field(k, v)) for k, v in fields.items()},
         }
         logger.log(level, json.dumps(payload, ensure_ascii=False, separators=(',', ':')))
         if level >= logging.ERROR:
@@ -978,23 +1019,25 @@ print(path)
             snapshot['disk'] = {'total': usage.total, 'used': usage.used, 'free': usage.free}
         except OSError:
             pass
-        if sys.platform == 'darwin':
-            commands = {
-                'memory': ['vm_stat'],
-                'processes': ['ps', '-axo', 'pid,ppid,%cpu,%mem,comm'],
-            }
-        else:
-            commands = {
-                'memory': ['sh', '-lc', 'free -b 2>/dev/null || cat /proc/meminfo 2>/dev/null | head -30'],
-                'processes': ['ps', '-eo', 'pid,ppid,%cpu,%mem,comm'],
-            }
-        for key, cmd in commands.items():
-            try:
-                completed = subprocess.run(cmd, capture_output=True, text=True, timeout=2, check=False)
-                snapshot[key] = (completed.stdout or completed.stderr)[:12000]
-            except Exception as exc:
-                snapshot[key] = f'<unavailable: {exc}>'
-        self.logger('system').info(json.dumps(self._safe(snapshot), ensure_ascii=False, separators=(',', ':')))
+        # Immediate fault snapshots must not enumerate unrelated process names
+        # or run a shell. The explicit export collects bounded host probes.
+        try:
+            import resource
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            snapshot['process_resources'] = {'user_seconds': usage.ru_utime,
+                'system_seconds': usage.ru_stime, 'maximum_rss_native_units': usage.ru_maxrss,
+                'major_faults': usage.ru_majflt, 'minor_faults': usage.ru_minflt}
+        except (ImportError, OSError, ValueError):
+            snapshot['process_resource_status'] = 'unavailable'
+        try:
+            from .host_state import collect_resource_snapshot
+            snapshot['host_resources'] = collect_resource_snapshot()
+        except Exception as exc:
+            from .technical import technical_error_evidence
+            snapshot['host_resources'] = {'status': 'collector_failed',
+                                          'technical_error': technical_error_evidence(exc)}
+        self.logger('system').info(json.dumps({key: _safe_event_field(key, value)
+            for key, value in snapshot.items()}, ensure_ascii=False, separators=(',', ':')))
 
     def _prune_sessions(self) -> None:
         if self.root is None:
@@ -1069,7 +1112,7 @@ print(path)
 def _session_is_launcher_only(path: Path) -> bool:
     if not _diagnostic_source_allowed(path / 'harnessy.log'):
         return True
-    payload = _read_snapshot_bytes(path / 'harnessy.log')
+    payload = _read_snapshot_bytes(path / 'harnessy.log', tail_bytes=512 * 1024)
     if payload is None:
         return False
     text = payload.decode('utf-8', errors='ignore')
@@ -1082,7 +1125,9 @@ def _session_is_launcher_only(path: Path) -> bool:
 
 def _zip_snapshot_file(zf: zipfile.ZipFile, source: Path, arcname: str, *, tail_bytes: int | None = None) -> None:
     """Write exactly the bytes present at snapshot time, even if logs keep growing."""
-    payload = _read_snapshot_bytes(source, tail_bytes=tail_bytes)
+    payload, row = (zf.read_log(source, arcname, tail_bytes=tail_bytes)
+                    if isinstance(zf, _DiagnosticsZipFile) else
+                    (_read_snapshot_bytes(source, tail_bytes=tail_bytes), None))
     if payload is None:
         return
     if re.fullmatch(r'.+\.log(?:\.\d+)?', source.name):
@@ -1091,7 +1136,10 @@ def _zip_snapshot_file(zf: zipfile.ZipFile, source: Path, arcname: str, *, tail_
         payload = _sanitize_startup_log_bytes(payload)
         payload = _sanitize_model_receipt_bytes(payload)
     try:
-        zf.writestr(arcname, payload)
+        if isinstance(zf, _DiagnosticsZipFile):
+            zf.write_log(arcname, payload, row, 'explicit_content_mode')
+        else:
+            zf.writestr(arcname, payload)
     except OSError:
         return
 
@@ -1191,7 +1239,7 @@ def _summarize_stream_segments(value: Any) -> dict[str, Any]:
     return {'redacted': True, 'count': len(rows), 'kinds': kinds}
 
 
-def _safe_error_summary(value: Any) -> Any:
+def _legacy_error_summary(value: Any) -> Any:
     recognized_classes = {
         name for module in (builtins, sqlite3) for name, item in vars(module).items()
         if isinstance(item, type) and issubclass(item, BaseException)
@@ -1247,10 +1295,89 @@ def _safe_error_summary(value: Any) -> Any:
     return out
 
 
+def _safe_error_summary(value: Any) -> Any:
+    """Retain technical causes instead of reducing all errors to a fingerprint."""
+    from .technical import technical_error_evidence, validate_technical_evidence
+    from .faults import exception_evidence, validate_fault_evidence
+    if isinstance(value, BaseException):
+        return {'technical_error': technical_error_evidence(value), 'fault': exception_evidence(value)}
+    legacy = _legacy_error_summary(value)
+    technical = (validate_technical_evidence(value.get('technical_error')) if isinstance(value, dict)
+                 and isinstance(value.get('technical_error'), dict) else
+                 validate_technical_evidence(value) if isinstance(value, dict)
+                 and value.get('schema_version') == 1 else technical_error_evidence(value))
+    if isinstance(legacy, dict):
+        legacy['technical_error'] = technical
+        if isinstance(value, dict) and (fault := validate_fault_evidence(value.get('fault'))) is not None:
+            legacy['fault'] = fault
+        return legacy
+    return {'technical_error': technical} if value else legacy
+
+
 def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
     lowered = key.lower()
     if _is_sensitive_log_key(lowered):
         return '<redacted>'
+    if not key and _trusted_controller_event(value):
+        return {str(name): (_controller_evidence(item, trusted=True) if name == 'controller_evidence'
+                           else _privacy_safe_value(item, key=str(name)))
+                for name, item in list(value.items())[:120]}
+    from .operational import LABEL_FIELDS, operational_label
+    if (lowered in LABEL_FIELDS or lowered in {'error_type', 'exception_class', 'exception_type'}) and not isinstance(value, dict):
+        return operational_label(value, lowered)
+    if lowered == 'technical_error':
+        from .technical import validate_technical_evidence
+        return validate_technical_evidence(value)
+    if lowered == 'controller_evidence':
+        return _controller_evidence(value)
+    if lowered == 'host_resources':
+        from .host_state import validate_resource_snapshot
+        return validate_resource_snapshot(value)
+    if lowered == 'environment_action':
+        return value if isinstance(value, str) and value in {'create', 'start', 'stop', 'reset', 'rebuild', 'destroy', 'restore', 'snapshot', 'tools', 'network'} else None
+    if lowered == 'lifecycle_action':
+        return value if isinstance(value, str) and value in {'create', 'start', 'stop', 'reset', 'rebuild', 'destroy'} else None
+    if lowered == 'preservation_reason':
+        return value if isinstance(value, str) and value in {'before_start', 'before_reset', 'before_delete',
+            'controller_error', 'controller_timeout', 'controller_cancelled', 'controller_spawn_error'} else None
+    if lowered == 'failure_receipt':
+        raw = value if isinstance(value, dict) else {}
+        safe = {'schema_version': 1}
+        if raw.get('status') in {'preserved', 'no_evidence', 'limited', 'unavailable', 'unsafe', 'rejected', 'busy', 'cancelled'}:
+            safe['status'] = raw['status']
+        for name in ('receipt_id', 'operation_id', 'command_id'):
+            if isinstance(raw.get(name), str) and re.fullmatch(r'[0-9a-f]{32}', raw[name]):
+                safe[name] = raw[name]
+        for name in ('sources', 'bytes_saved'):
+            if type(raw.get(name)) is int and 0 <= raw[name] <= 2**31:
+                safe[name] = raw[name]
+        if raw.get('guest_console_omitted') is True:
+            safe['guest_console_omitted'] = True
+        return safe
+    if lowered == 'requested_vm_config':
+        value = value if isinstance(value, dict) else {}
+        safe = {name: value[name] for name, allowed in {
+            'architecture': {'arm64', 'amd64'}, 'vm_type': {'qemu', 'vz'},
+        }.items() if isinstance(value.get(name), str) and value[name] in allowed}
+        for name in ('cpus', 'memory_mb', 'disk_gb'):
+            if type(value.get(name)) is int and 0 <= value[name] <= 2**31:
+                safe[name] = value[name]
+        return safe
+    if lowered == 'processes' and isinstance(value, str):
+        # Older system snapshots used ps output. Keep numeric resource facts
+        # while removing unrelated executable names and all command text.
+        samples = []
+        for line in value.splitlines()[:512]:
+            match = re.match(r'\s*(\d+)\s+(\d+)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+', line)
+            if match:
+                samples.append({'pid': int(match[1]), 'ppid': int(match[2]),
+                    'cpu_percent': float(match[3]), 'memory_percent': float(match[4])})
+        return {'samples': samples, 'command_content_omitted': True}
+    if lowered == 'memory' and isinstance(value, str):
+        facts = {}
+        for name, numbers in re.findall(r'(?m)^(Mem|Swap):\s+([\d\s]+)$', value):
+            facts[name.lower()] = [int(item) for item in numbers.split()[:7]]
+        return facts or {'raw_content_omitted': True}
     from .model_requests import (SOURCE_ENUMS, identifier, numeric_projection, provenance_projection,
                                  source_label, timestamp, validate_protocol_receipt)
     if isinstance(value, dict) and value.get('kind') == 'model_protocol_receipt':
@@ -1476,7 +1603,8 @@ def _sanitize_structured_log_bytes(payload: bytes) -> bytes:
         # Logging format: YYYY-MM-DD HH:MM:SS,mmm LEVEL <JSON message>
         parts = line.split(' ', 3)
         if len(parts) != 4:
-            out.append(_privacy_marker(line, label='unstructured-log-line'))
+            out.append(json.dumps({'kind': 'unstructured_technical_observation',
+                'content_omitted': True, 'evidence': _safe_error_summary(line)}, separators=(',', ':')))
             continue
         date, clock, level, message = parts
         try:
@@ -1484,7 +1612,8 @@ def _sanitize_structured_log_bytes(payload: bytes) -> bytes:
             if level not in {'INFO', 'WARNING', 'ERROR', 'DEBUG', 'CRITICAL'}:
                 raise ValueError('invalid level')
         except ValueError:
-            out.append(_privacy_marker(line, label='unstructured-log-line'))
+            out.append(json.dumps({'kind': 'unstructured_technical_observation',
+                'content_omitted': True, 'evidence': _safe_error_summary(line)}, separators=(',', ':')))
             continue
         try:
             decoded = json.loads(message)
@@ -1624,7 +1753,7 @@ def _privacy_environment_timeline(latest: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for channel in ('runtime', 'tools', 'targets'):
         source = latest / f'{channel}.log'
-        payload = _read_snapshot_bytes(source)
+        payload = _read_snapshot_bytes(source, tail_bytes=2 * 1024 * 1024)
         if payload is None:
             continue
         for line in payload.decode('utf-8', errors='replace').splitlines():
@@ -1750,7 +1879,9 @@ def _zip_privacy_safe_log(
         tail_bytes = min(tail_bytes, cap) if tail_bytes is not None else cap
     elif is_database:
         tail_bytes = min(tail_bytes, _DATABASE_LOG_MAX_BYTES) if tail_bytes is not None else _DATABASE_LOG_MAX_BYTES
-    payload = _read_snapshot_bytes(source, tail_bytes=tail_bytes)
+    payload, row = (zf.read_log(source, arcname, tail_bytes=tail_bytes)
+                    if isinstance(zf, _DiagnosticsZipFile) else
+                    (_read_snapshot_bytes(source, tail_bytes=tail_bytes), None))
     if payload is None:
         return
     if is_context:
@@ -1759,13 +1890,85 @@ def _zip_privacy_safe_log(
         payload = _sanitize_database_log_bytes(payload)
     elif source.name == 'backend-stream-tail.log':
         payload = _sanitize_stream_tail_bytes(payload)
-    elif source.name == 'system.log':
-        # System snapshots are generated entirely by HarnessyXO and contain no
-        # conversation/model/tool payloads. Retain them verbatim for host diagnosis.
-        pass
+    elif source.name.startswith(('console', 'crash-')):
+        payload = _project_freeform_technical_bytes(payload)
     else:
         payload = _sanitize_structured_log_bytes(payload)
-    zf.writestr(arcname, payload)
+    if isinstance(zf, _DiagnosticsZipFile):
+        zf.write_log(arcname, payload, row, 'technical_metadata_content_omitted')
+    else:
+        zf.writestr(arcname, payload)
+
+
+def _project_freeform_technical_bytes(payload: bytes) -> bytes:
+    """Free-form console/crash output is not a trusted controller channel."""
+    from .technical import technical_error_evidence
+    rows = []
+    for number, line in enumerate(payload.decode('utf-8', errors='replace').splitlines()[-8192:]):
+        # Preserve structured app events when stdout capture duplicated them;
+        # arbitrary guest/model/file lines retain only technical signatures.
+        projected = _safe_error_summary(line)
+        rows.append({'line': number + 1, 'content_omitted': True,
+                     'evidence_source': 'text_signature',
+                     'technical_error': projected.get('technical_error', {}) if isinstance(projected, dict) else {},
+                     **{key: projected[key] for key in ('exception_class', 'error_code', 'json_error')
+                        if isinstance(projected, dict) and key in projected},
+                     'chars': len(line), 'sha256_12': hashlib.sha256(line.encode()).hexdigest()[:12]})
+    return ''.join(json.dumps(row, separators=(',', ':'), allow_nan=False) + '\n' for row in rows).encode()
+
+
+def _export_retained_technical_logs(zf, root: Path, latest: Path, *, include_content: bool) -> None:
+    """Cover retained application sessions and crash/console technical facts.
+
+    The current/previous aliases remain compatible; every source attempt and
+    all source limits are disclosed by EXPORT_COVERAGE.json.
+    """
+    from itertools import islice
+    existing = set(zf.namelist())
+    for channel in _LOG_NAMES:
+        expected = latest / (channel + '.log')
+        if 'latest/' + expected.name not in existing:
+            _zip_privacy_safe_log(zf, expected, 'latest/' + expected.name)
+    sessions = root / 'sessions'
+    folders = []
+    try:
+        for folder in islice(sessions.iterdir(), 256):
+            if folder.is_dir() and not folder.is_symlink():
+                folders.append(folder)
+        folders.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    except OSError:
+        pass
+    current = (_read_snapshot_bytes(latest / 'CURRENT_SESSION.txt', tail_bytes=256) or b'').decode(errors='replace').strip()
+    for folder in folders[:_SESSION_KEEP]:
+        if folder.name == current:
+            continue
+        session = _validated_session_id(folder.name) or hashlib.sha256(folder.name.encode()).hexdigest()
+        try:
+            paths = sorted(islice(folder.rglob('*'), 2048))
+        except OSError:
+            continue
+        for source in paths:
+            if not re.fullmatch(r'.+\.log(?:\.\d+)?', source.name):
+                continue
+            known = re.fullmatch(r'(?:' + '|'.join(re.escape(name) for name in _LOG_NAMES)
+                                + r'|console|console-error|backend-stream-tail)\.log(?:\.\d+)?', source.name)
+            name = source.name if known else 'additional-' + hashlib.sha256(str(source.relative_to(folder)).encode()).hexdigest()[:16] + '.log'
+            member = f'retained-session-logs/{session}/{name}'
+            if member in existing:
+                continue
+            if include_content:
+                _zip_snapshot_file(zf, source, member)
+            else:
+                _zip_privacy_safe_log(zf, source, member)
+            existing.add(member)
+    crash_dir = root / 'crashes'
+    try:
+        crashes = sorted(islice(crash_dir.glob('*.log'), 256), key=lambda path: path.lstat().st_mtime, reverse=True)
+    except OSError:
+        crashes = []
+    for source in crashes[:20]:
+        member = 'crash-technical/' + hashlib.sha256(source.name.encode()).hexdigest()[:24] + '.jsonl'
+        _zip_privacy_safe_log(zf, source, member)
 
 
 def _privacy_manifest(*, include_content: bool = False) -> str:
@@ -1785,6 +1988,14 @@ def _privacy_manifest(*, include_content: bool = False) -> str:
         'shape/JSON parse positions, privacy-safe shell operation classes, recognized errno/error '\
         'signatures, environment-claim labels, lifecycle deltas, backend status, and system snapshots '\
         'remain available. ENVIRONMENT_TIMELINE.json provides a bounded semantic VM/tool timeline.\n\n'
+        'EXPORT_COVERAGE.json records attempted application log sources, original/read/exported lengths, '
+        'missing/unsafe/unreadable sources, line omissions and explicit file/byte/retention bounds. '
+        'Retained session logs and projected console/crash technical facts are included under those bounds; '
+        'arbitrary console/model/guest/file text stays omitted. COLLECTOR_ERRORS.json retains typed collection failures. '
+        'HOST_STATE.json captures bounded technical host prerequisites/resources without commands, accounts, '
+        'environment values or filesystem paths. CONTROL_PLANE_TIMELINE.json preserves bounded operational receipts, '
+        'requested VM configuration, lifecycle/request/exit identities, and trusted sanitized controller diagnostics. '
+        'Saved pre-retry/reset/failure VM receipts keep earlier evidence separate from current boot logs.\n\n'
         'SUMMARY.txt and INCIDENTS.json describe recent failures, relevant tool completion, '\
         'nearby event-loop stalls, and missing evidence. EXPORT_METADATA.json identifies '\
         'the session, application/runtime versions when recorded, and capture time with its timezone.\n\n'
@@ -1816,7 +2027,7 @@ def _privacy_manifest(*, include_content: bool = False) -> str:
         'member byte counts relative to the bounded source measurements.\n\n'
         + ('Raw bounded serial/hostagent tails are also included under vm-logs/ because content-rich mode was '
            'explicitly selected. They may contain guest/project text. Unsafe or symlinked sources remain excluded; '
-           'VM_LOGS.json metadata and incident summaries remain content-free.\n\n' if include_content else '') +
+           'VM_LOGS.json metadata and incident summaries retain reviewed technical evidence only.\n\n' if include_content else '') +
         'Structured fault evidence retains reviewed exception classes, SQLite numeric codes/names, '\
         'bounded exception cause/context chains, and static source module/function/line locations. '\
         'Stack frames never contain local variables, source lines, exception messages, or plaintext '\
@@ -1888,9 +2099,11 @@ def _collect_vm_export(latest: Path, *, include_content: bool) -> tuple[dict[str
         # allowing a malformed report to break an otherwise useful archive.
         json.dumps(report, ensure_ascii=False, allow_nan=False)
         return report, accepted
-    except Exception:
+    except Exception as exc:
+        from .technical import technical_error_evidence
         return {'schema_version': 1, 'status': 'unavailable', 'reason': 'collector_failed',
-                'mode': 'raw_bounded_tails' if include_content else 'signals_only', 'workspaces': []}, {}
+                'mode': 'raw_bounded_tails' if include_content else 'signals_only', 'workspaces': [],
+                'technical_error': technical_error_evidence(exc)}, {}
 
 
 def _collect_test_target_export(latest: Path, *, include_content: bool) -> tuple[dict[str, Any], dict[str, bytes]]:
@@ -1918,9 +2131,11 @@ def _collect_test_target_export(latest: Path, *, include_content: bool) -> tuple
                 raise ValueError('Invalid target collection bounds')
         json.dumps(report, ensure_ascii=False, allow_nan=False)
         return report, members
-    except Exception:
+    except Exception as exc:
+        from .technical import technical_error_evidence
         return {'schema_version': 1, 'status': 'unavailable', 'reason': 'collector_failed',
-                'mode': 'raw_bounded_tails' if include_content else 'signals_only', 'targets': []}, {}
+                'mode': 'raw_bounded_tails' if include_content else 'signals_only', 'targets': [],
+                'technical_error': technical_error_evidence(exc)}, {}
 
 
 def collect_existing_diagnostics(app_root: Path, *, include_content: bool = False) -> Path | None:
@@ -1933,6 +2148,12 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
     root = app_root / '.logs'
     latest = root / 'latest'
     if not latest.is_dir():
+        try:
+            from .technical import technical_error_evidence
+            log_event('harnessy', 'diagnostics_export_unavailable', reason='latest_logs_missing',
+                      technical_error=technical_error_evidence(FileNotFoundError()))
+        except Exception:
+            pass
         return None
     bundle_name = _FULL_CONTENT_BUNDLE if include_content else _PRIVACY_SAFE_BUNDLE
     target = root / bundle_name
@@ -1946,11 +2167,13 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
             target_report, target_members = _collect_test_target_export(latest, include_content=include_content)
             try:
                 incidents, summary = build_support_summary(latest, vm_report=vm_report, target_report=target_report)
-            except Exception:
+            except Exception as exc:
+                from .technical import technical_error_evidence
                 # Export is itself a recovery action. A corrupt log or summary
                 # bug must not prevent collection of the remaining evidence.
                 incidents = {'schema_version': 1, 'summary_status': 'unavailable',
-                             'reason': 'summary_generation_failed', 'incidents': []}
+                             'reason': 'summary_generation_failed', 'incidents': [],
+                             'technical_error': technical_error_evidence(exc)}
                 summary = ('HarnessyXO support summary\n\n'
                            'The incident summary could not be generated. Remaining diagnostic evidence is included.\n'
                            'VM_LOGS.json records VM log source coverage; available retained VM evidence is under vm-logs/.\n')
@@ -1965,6 +2188,23 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
             zf.writestr('MODEL_REQUESTS.json', json.dumps(incidents.get('model_request_audit', {
                 'schema_version': 1, 'status': 'unavailable', 'reason': 'summary_generation_failed',
             }), ensure_ascii=False, indent=2, allow_nan=False))
+            try:
+                from .host_state import collect_host_diagnostics, validate_host_diagnostics
+                host_report = validate_host_diagnostics(collect_host_diagnostics())
+            except Exception as exc:
+                from .technical import technical_error_evidence
+                host_report = {'schema_version': 1, 'status': 'collector_failed',
+                               'technical_error': technical_error_evidence(exc)}
+            zf.writestr('HOST_STATE.json', json.dumps(host_report, ensure_ascii=False, indent=2, allow_nan=False))
+            zf.writestr('CONTROL_PLANE_TIMELINE.json', json.dumps({
+                'schema_version': 1, 'coverage': incidents.get('control_plane_coverage', {}),
+                'records': incidents.get('control_plane_timeline', []),
+            }, ensure_ascii=False, indent=2, allow_nan=False))
+            zf.writestr('COLLECTOR_ERRORS.json', json.dumps({
+                'schema_version': 1, 'collectors': {name: value for name, value in
+                    (('summary', incidents), ('workspace_vm', vm_report), ('test_targets', target_report), ('host', host_report))
+                    if value.get('technical_error')},
+            }, ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('VM_LOGS.json', json.dumps(vm_report, ensure_ascii=False, indent=2, allow_nan=False))
             for name, payload in vm_members.items():
                 zf.writestr(name, payload)
@@ -1994,10 +2234,16 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
                     'ENVIRONMENT_TIMELINE.json',
                     json.dumps(timeline, ensure_ascii=False, indent=2).encode('utf-8'),
                 )
-            for path in sorted(latest.rglob('*')):
-                if not path.is_file() or not _diagnostic_source_allowed(path):
+            from itertools import islice
+            for path in sorted(islice(latest.rglob('*'), 2048)):
+                if not path.is_file() and not path.is_symlink():
                     continue
                 arcname = str(path.relative_to(root))
+                if re.fullmatch(r'.+\.log(?:\.\d+)?', path.name):
+                    known = re.fullmatch(r'(?:' + '|'.join(re.escape(name) for name in _LOG_NAMES)
+                        + r'|console|console-error|backend-stream-tail)\.log(?:\.\d+)?', path.name)
+                    if not known or path.parent != latest:
+                        arcname = 'latest/additional-' + hashlib.sha256(str(path.relative_to(latest)).encode()).hexdigest()[:16] + '.log'
                 if re.fullmatch(r'context_tuning\.log(?:\.\d+)?', path.name):
                     _zip_privacy_safe_log(zf, path, arcname)
                     continue
@@ -2018,8 +2264,6 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
                 if include_content:
                     _zip_snapshot_file(zf, path, arcname)
                     continue
-                if path.name in {'console.log', 'console-error.log'}:
-                    continue
                 if re.fullmatch(r'.+\.log(?:\.\d+)?', path.name):
                     _zip_privacy_safe_log(zf, path, arcname)
 
@@ -2027,7 +2271,7 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
 
             current_name = ''
             try:
-                current_name = (_read_snapshot_bytes(latest / 'CURRENT_SESSION.txt') or b'').decode('utf-8', errors='ignore').strip()
+                current_name = (_read_snapshot_bytes(latest / 'CURRENT_SESSION.txt', tail_bytes=256) or b'').decode('utf-8', errors='ignore').strip()
             except OSError:
                 pass
             sessions_dir = root / 'sessions'
@@ -2074,9 +2318,19 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
                     crashes = []
                 for path in crashes:
                     _zip_snapshot_file(zf, path, str(path.relative_to(root)))
+            _export_retained_technical_logs(zf, root, latest, include_content=include_content)
+            coverage = zf.source_coverage.report()
+            coverage['archive_members'] = [{'name': info.filename, 'exported_bytes': info.file_size}
+                                           for info in zf.infolist()]
+            zf.writestr('EXPORT_COVERAGE.json', json.dumps(coverage, ensure_ascii=False, indent=2, allow_nan=False))
         tmp.replace(target)
         return target
-    except (OSError, zipfile.BadZipFile):
+    except (OSError, zipfile.BadZipFile) as exc:
+        try:
+            from .technical import technical_error_evidence
+            log_event('harnessy', 'diagnostics_export_failed', technical_error=technical_error_evidence(exc))
+        except Exception:
+            pass
         try:
             tmp.unlink(missing_ok=True)
         except OSError:

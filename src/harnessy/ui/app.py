@@ -1563,21 +1563,21 @@ class HarnessyPage:
         with ui.dialog() as dialog, ui.card().classes('w-[620px] max-w-[94vw] gap-3'):
             ui.label('Download Diagnostics').classes('text-lg font-semibold')
             ui.label(
-                'Privacy-safe diagnostics are the default. Chat text, model reasoning/answers, raw tool '
-                'arguments/results, prompt bodies, file contents, paths, and raw payload previews are stripped. '
-                'Timing, token/context metrics, finish reasons, tool names, argument shape, privacy-safe shell '
-                'operation classes, recognized errno/error signatures, lifecycle deltas, and environment-claim '
-                'labels are retained. A bounded ENVIRONMENT_TIMELINE.json correlates those events without raw content. '
-                'VM_LOGS.json lists available Lima boot and host-agent logs, with recognized boot and SSH events '
-                'included by default. Collection reads existing logs without starting the VM.'
+                'Includes scrubbed technical logs and errors, model timing/token metrics, VM startup/reset '
+                'history, host software versions and resource state. Coverage reports show missing or '
+                'truncated sources.'
+            ).classes('text-sm hy-muted')
+            ui.label(
+                'Chat messages, model reasoning/answers, file contents, tool commands/results and '
+                'credentials are excluded. Guest console logs contribute boot/error signals only. '
+                'Collection does not start VMs or run guest commands.'
             ).classes('text-sm hy-muted')
             include_content = ui.checkbox(
                 'Include conversation/model/tool content', value=False,
             ).classes('w-full')
             ui.label(
-                'Only enable this when raw payload evidence is specifically needed. The resulting bundle may '
-                'contain conversation text, reasoning, commands, file contents, paths, and tool results. '
-                'This option also includes bounded raw VM log tails, which may contain guest output and credentials.'
+                'Enable only when raw content is needed. This adds chat/model/tool payloads and bounded '
+                'raw VM log tails, which may include guest output and credentials.'
             ).classes('text-xs hy-muted')
 
             async def download() -> None:

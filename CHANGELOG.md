@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.6.90
+
+- Include scrubbed Lima host-agent and QEMU controller errors in the default diagnostics download, including unfamiliar error wording. Keep guest console output and command payloads excluded while preserving technical failure details such as permissions, memory, firmware, device properties and disk locks.
+- Preserve bounded failed-start evidence before the next Start, Factory Reset or rebuild replaces the VM logs. Correlate controller commands and lifecycle operations, record the requested VM configuration, and distinguish launch-time resource snapshots from later export-time state. Retain test-target QEMU launcher errors as well as guest boot signals.
+- Add HOST_STATE.json with available OS, CPU, memory/swap, cgroup limits, resource pressure, disk/inode space, application process state, KVM access, firmware metadata, known tool versions and Python dependency versions. Probes are read-only and report missing, unsupported or unsafe sources explicitly.
+- Keep useful exception facts across cause chains: OS/DNS errors, process exit codes and signals, timeout durations, HTTP status, TLS verification codes and JSON error positions. Preserve reviewed run stop reasons and operation labels instead of reducing them to hashes.
+- Add an export coverage ledger and retained technical evidence. State per-source read/export sizes, truncation, exclusions and collection failures; keep diagnostics available when an individual collector fails. Update the download dialog and support summary to describe the expanded default evidence.
+- Preserve chat/file content and credential exclusions, existing VM lifecycle behavior, model progress and public startup updates. Leave README unchanged and keep the same 11 Markdown resources; private QA stays outside the application package.
+
 ## v0.6.89
 
 - Show a shared model-request display across backends: animated waiting and request elapsed time, actual prompt-processing progress and cache counts when available, and an explicit unavailable state when the server supplies no progress. Keep the previous completed call's decode speed, prompt-processing speed and time to first output separate from current live metrics.

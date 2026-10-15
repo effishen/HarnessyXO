@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
+import re
+import uuid
 
 from .base import EnvironmentConfig, WorkspaceEnvironment, load_environment_config, save_environment_config
 from .lima import LimaVMEnvironment
@@ -8,6 +12,34 @@ from .presets import PRESETS
 
 
 _PROVIDER_CACHE: dict[str, tuple[dict, WorkspaceEnvironment]] = {}
+_OPERATION_CONTEXT: ContextVar[tuple[str, str]] = ContextVar('environment_operation', default=('', ''))
+_OPERATION_ACTIONS = frozenset({'create', 'start', 'stop', 'reset', 'rebuild', 'destroy',
+                              'restore', 'snapshot', 'tools', 'network'})
+
+
+def current_environment_operation() -> dict[str, str]:
+    """Return task-local correlation, never another task's cached provider state."""
+    operation_id, action = _OPERATION_CONTEXT.get()
+    return {'operation_id': operation_id, 'environment_action': action} if operation_id else {}
+
+
+@contextmanager
+def environment_operation_context(operation_id: str = '', action: str = ''):
+    """Correlate nested controller calls, including asyncio.wait_for children.
+
+    A UI operation supplies its existing ID. Standalone lifecycle requests get
+    one ID that is retained by nested reset/stop/start calls. Context restoration
+    also prevents status polls on the shared provider inheriting stale IDs.
+    """
+    previous_id, previous_action = _OPERATION_CONTEXT.get()
+    supplied_id = operation_id if isinstance(operation_id, str) and re.fullmatch(r'[0-9a-f]{32}', operation_id) else ''
+    context = (supplied_id or previous_id or uuid.uuid4().hex,
+               action if action in _OPERATION_ACTIONS and (supplied_id or not previous_id) else previous_action)
+    token = _OPERATION_CONTEXT.set(context)
+    try:
+        yield current_environment_operation()
+    finally:
+        _OPERATION_CONTEXT.reset(token)
 
 
 class EnvironmentManager:

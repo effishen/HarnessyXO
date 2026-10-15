@@ -8,10 +8,16 @@ from __future__ import annotations
 
 import ast
 import builtins
+import errno
 import hashlib
+import json
 import math
 import re
+import signal
+import socket
 import sqlite3
+import ssl
+import subprocess
 import sys
 import sysconfig
 import threading
@@ -20,6 +26,7 @@ from functools import lru_cache
 from pathlib import Path
 from types import FrameType
 from typing import Any, Callable
+from urllib.error import HTTPError
 
 MAX_FAULT_FRAMES = 32
 MAX_EXCEPTION_CHAIN = 4
@@ -39,6 +46,22 @@ _SQLITE_ERROR_NAMES = frozenset(
     name for name, value in vars(sqlite3).items()
     if name.startswith('SQLITE_') and isinstance(value, int)
 )
+_DNS_ERROR_NAMES = {
+    getattr(socket, name): name for name in sorted(vars(socket))
+    if name.startswith('EAI_') and type(getattr(socket, name)) is int
+}
+_SSL_ERROR_NAMES = {
+    getattr(ssl, name): name for name in sorted(vars(ssl))
+    if name.startswith('SSL_ERROR_') and isinstance(getattr(ssl, name), int)
+}
+_NATIVE_EXCEPTION_TYPES = frozenset(
+    (item.__module__, item.__name__) for item in (
+        socket.gaierror, socket.herror, ssl.SSLError, ssl.SSLZeroReturnError,
+        ssl.SSLWantReadError, ssl.SSLWantWriteError, ssl.SSLSyscallError,
+        ssl.SSLEOFError, ssl.SSLCertVerificationError,
+    )
+)
+_MAX_TECHNICAL_NUMBER = 2**53 - 1
 RUN_DIAGNOSTIC_STAGES = frozenset({
     'initializing', 'waiting', 'prompt_processing', 'prefill', 'generating',
     'tool', 'model_complete', 'unknown',
@@ -178,15 +201,132 @@ def _exception_identifier(exc: BaseException) -> tuple[str, str]:
         return module, name
     if module == 'sqlite3' and name in _SQLITE_EXCEPTIONS:
         return module, name
+    if (module, name) in _NATIVE_EXCEPTION_TYPES:
+        return module, name
     path = _path_for_module(module)
     if path and name in _source_symbols(str(path))[1]:
         return module, name
     return 'external', 'UnknownException'
 
 
+def _instance_fields(value: Any) -> dict[str, Any]:
+    """Read native instance facts without invoking arbitrary property access."""
+    try:
+        fields = object.__getattribute__(value, '__dict__')
+        return fields if isinstance(fields, dict) else {}
+    except Exception:
+        return {}
+
+
+def _signed_code(value: Any) -> int | None:
+    return value if type(value) is int and -(2**31) <= value < 2**31 else None
+
+
+def _nonnegative_number(value: Any) -> int | float | None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    return value if 0 <= value <= _MAX_TECHNICAL_NUMBER and math.isfinite(value) else None
+
+
+def _validated_native_facts(value: Any) -> dict[str, Any]:
+    """Revalidate technical scalars; messages, command data and locations are absent."""
+    if not isinstance(value, dict):
+        return {}
+    safe: dict[str, Any] = {}
+    code = _signed_code(value.get('errno'))
+    if code is not None:
+        safe['errno'] = code
+        namespace = value.get('errno_namespace')
+        if not isinstance(namespace, str) or namespace not in {'system', 'getaddrinfo', 'gethostbyname'}:
+            namespace = 'system'
+        if namespace != 'system':
+            safe['errno_namespace'] = namespace
+        name = (_DNS_ERROR_NAMES.get(code) if namespace == 'getaddrinfo' else
+                None if namespace == 'gethostbyname' else errno.errorcode.get(code))
+        if name is not None:
+            safe['errno_name'] = name
+    returncode = _signed_code(value.get('returncode'))
+    if returncode is not None:
+        safe['returncode'] = returncode
+        if returncode < 0:
+            try:
+                safe['termination_signal'] = signal.Signals(-returncode).name
+            except ValueError:
+                pass
+    timeout = _nonnegative_number(value.get('timeout_seconds'))
+    if timeout is not None:
+        safe['timeout_seconds'] = timeout
+    positions = value.get('json_error')
+    if isinstance(positions, dict):
+        position: dict[str, int] = {}
+        for key, minimum in (('line', 1), ('column', 1), ('char', 0)):
+            number = positions.get(key)
+            if type(number) is int and minimum <= number <= _MAX_TECHNICAL_NUMBER:
+                position[key] = number
+        if position:
+            safe['json_error'] = position
+    status = value.get('http_status_code')
+    if type(status) is int and 100 <= status <= 599:
+        safe['http_status_code'] = status
+    verify = value.get('tls_verify_code')
+    if type(verify) is int and 0 <= verify < 2**31:
+        safe['tls_verify_code'] = verify
+    ssl_code = value.get('ssl_error_code')
+    if type(ssl_code) is int and 0 <= ssl_code < 2**31:
+        safe['ssl_error_code'] = ssl_code
+        if ssl_code in _SSL_ERROR_NAMES:
+            safe['ssl_error_name'] = _SSL_ERROR_NAMES[ssl_code]
+    return safe
+
+
+def _native_exception_facts(exc: BaseException) -> dict[str, Any]:
+    """Capture typed exception facts, never format an exception or read a body."""
+    facts: dict[str, Any] = {}
+    # Native descriptors expose numeric facts. Each family is isolated so a
+    # malformed subclass cannot suppress useful facts from the remaining ones.
+    if isinstance(exc, OSError):
+        try:
+            key = 'ssl_error_code' if isinstance(exc, ssl.SSLError) else 'errno'
+            facts[key] = OSError.errno.__get__(exc)
+            if isinstance(exc, socket.gaierror):
+                facts['errno_namespace'] = 'getaddrinfo'
+            elif isinstance(exc, socket.herror):
+                facts['errno_namespace'] = 'gethostbyname'
+        except Exception:
+            pass
+    if isinstance(exc, subprocess.CalledProcessError):
+        facts['returncode'] = _instance_fields(exc).get('returncode')
+    if isinstance(exc, subprocess.TimeoutExpired):
+        facts['timeout_seconds'] = _instance_fields(exc).get('timeout')
+    if isinstance(exc, json.JSONDecodeError):
+        fields = _instance_fields(exc)
+        facts['json_error'] = {'line': fields.get('lineno'), 'column': fields.get('colno'),
+                               'char': fields.get('pos')}
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        try:
+            facts['tls_verify_code'] = ssl.SSLCertVerificationError.verify_code.__get__(exc)
+        except (AttributeError, TypeError):
+            # CPython versions expose these facts as instance attributes.
+            facts['tls_verify_code'] = _instance_fields(exc).get('verify_code')
+        except Exception:
+            pass
+    fields = _instance_fields(exc)
+    status = fields.get('status_code')
+    if status is None and isinstance(exc, HTTPError):
+        status = fields.get('code')
+    if status is None:
+        # httpx/requests status errors retain a response object. Only its
+        # explicit numeric status attribute is inspected; URLs, headers, body,
+        # request and response representations are never accessed.
+        status = _instance_fields(fields.get('response')).get('status_code')
+    facts['http_status_code'] = status
+    return _validated_native_facts(facts)
+
+
 def _exception_part(exc: BaseException) -> dict[str, Any]:
     module, name = _exception_identifier(exc)
     result: dict[str, Any] = {'exception_module': module, 'exception_type': name, 'frames': []}
+    result.update(_native_exception_facts(exc))
     try:
         code = getattr(exc, 'sqlite_errorcode', None)
         sqlite_name = getattr(exc, 'sqlite_errorname', None)
@@ -207,7 +347,7 @@ def _exception_part(exc: BaseException) -> dict[str, Any]:
 
 
 def exception_evidence(exc: BaseException) -> dict[str, Any]:
-    """Capture causes and SQLite result codes without evaluating exception text."""
+    """Capture technical facts and causes without evaluating exception text."""
     result = _exception_part(exc)
     result['chain'] = []
     seen = {id(exc)}
@@ -237,7 +377,9 @@ def _validated_exception_part(value: Any) -> dict[str, Any] | None:
     module, name = value.get('exception_module'), value.get('exception_type')
     if not isinstance(module, str) or not isinstance(name, str):
         return None
-    valid = (module == 'builtins' and name in _BUILTIN_EXCEPTIONS) or (module == 'sqlite3' and name in _SQLITE_EXCEPTIONS)
+    valid = ((module == 'builtins' and name in _BUILTIN_EXCEPTIONS)
+             or (module == 'sqlite3' and name in _SQLITE_EXCEPTIONS)
+             or (module, name) in _NATIVE_EXCEPTION_TYPES)
     if module == 'external' and name == 'UnknownException':
         valid = True
     if not valid and isinstance(module, str) and isinstance(name, str):
@@ -246,6 +388,7 @@ def _validated_exception_part(value: Any) -> dict[str, Any] | None:
     if not valid:
         return None
     result = {'exception_module': module, 'exception_type': name, 'frames': validate_frames(value.get('frames'))}
+    result.update(_validated_native_facts(value))
     code, sqlite_name = value.get('sqlite_errorcode'), value.get('sqlite_errorname')
     if type(code) is int and 0 <= code <= 0x7fffffff:
         result['sqlite_errorcode'] = code

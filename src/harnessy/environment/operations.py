@@ -12,7 +12,7 @@ from typing import Any
 
 from harnessy.diagnostics import log_event
 
-from .manager import EnvironmentManager
+from .manager import EnvironmentManager, environment_operation_context
 from .activity import reserve_policy_change, reserve_environment_change
 
 
@@ -552,7 +552,8 @@ class EnvironmentOperationRegistry:
             provider = EnvironmentManager(workspace_root).provider()
             state = self.state(workspace_root)
             remaining = max(0.1, state.deadline - time.time()) if state.deadline else self._deadline_seconds(action)
-            result = await asyncio.wait_for(execute(provider), timeout=remaining)
+            with environment_operation_context(operation_id, action):
+                result = await asyncio.wait_for(execute(provider), timeout=remaining)
             self._validate_result(action, result, snapshot_tag=str(payload.get('name') or ''))
             if action == 'snapshot':
                 from .status import ENVIRONMENT_STATUS

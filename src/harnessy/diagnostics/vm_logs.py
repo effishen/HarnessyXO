@@ -1,6 +1,6 @@
 """Bounded, read-only Lima boot evidence for the normal diagnostics bundle.
 
-The default projection contains fixed signal codes and reviewed measurements,
+The default projection contains boot signals plus scrubbed control-plane errors,
 never a guest message. Raw tails require the existing content-rich export opt-in.
 This module deliberately has no database or VM/controller dependency.
 """
@@ -15,12 +15,15 @@ import re
 import stat
 import threading
 import time
+import uuid
 from collections import OrderedDict, deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from ..core.paths import settings_path
+from .technical import (MAX_TECHNICAL_CHARS, MAX_TECHNICAL_LINES,
+                        technical_error_evidence, validate_technical_evidence)
 
 VM_LOG_FILENAMES = ('serial.log', 'serialp.log', 'serialv.log', 'ha.stderr.log', 'ha.stdout.log')
 MAX_WORKSPACES = 8
@@ -36,12 +39,23 @@ MAX_REGISTRY_ROOTS = 64
 MAX_SESSION_ENTRIES = 256
 MAX_PREVIOUS_SESSIONS = 8
 COLLECTION_SECONDS = 5.0
+MAX_FAILURE_RECEIPTS = 8
+MAX_FAILURE_RECEIPT_BYTES = 64 * 1024
+_FAILURE_NAME = re.compile(r'^\d{8}T\d{12}Z-[0-9a-f]{32}\.json$')
+_FAILURE_REASONS = {'before_start', 'before_reset', 'before_delete', 'controller_error',
+                    'controller_timeout', 'controller_cancelled', 'controller_spawn_error'}
+_FAILURE_OPERATIONS = {'start', 'create', 'stop', 'delete', 'factory-reset', 'restart', 'reset', 'rebuild'}
+_FAILURE_LOCK = threading.Lock()
 _LIMITS = {
     'workspaces': MAX_WORKSPACES, 'files': MAX_VM_FILES,
     'tail_bytes_per_file': PER_FILE_TAIL_BYTES, 'read_bytes_total': MAX_READ_BYTES,
     'export_bytes_total': MAX_EXPORT_BYTES, 'discovery_bytes_total': MAX_DISCOVERY_BYTES,
     'signal_rows_per_file': MAX_SIGNAL_ROWS, 'parse_lines_per_file': MAX_PARSE_LINES,
     'collection_seconds': COLLECTION_SECONDS,
+    'control_plane_chars_per_source': MAX_TECHNICAL_CHARS,
+    'control_plane_lines_per_source': MAX_TECHNICAL_LINES,
+    'failure_receipts': MAX_FAILURE_RECEIPTS,
+    'failure_receipt_bytes': MAX_FAILURE_RECEIPT_BYTES,
 }
 _REGISTRY: OrderedDict[str, None] = OrderedDict()
 _REGISTRY_LOCK = threading.Lock()
@@ -486,6 +500,22 @@ def _signals(line: str, kind: str, line_number: int) -> list[dict[str, Any]]:
     return list(projected.values())
 
 
+def _control_plane_evidence(lines: list[str], source: str) -> dict[str, Any]:
+    """Keep a QEMU failure even if subsequent SSH cleanup fills the tail."""
+    selected = lines
+    if len(lines) > MAX_TECHNICAL_LINES:
+        important = [index for index, line in enumerate(lines) if re.search(
+            r'qemu\[stderr\]|(?:virtiofsd-\d+|swtpm)\[stderr\]|'
+            r'"level"\s*:\s*"(?:error|fatal|panic)"|\blevel=(?:error|fatal|panic)\b', line)]
+        indices = set(important[-MAX_TECHNICAL_LINES // 2:])
+        recent = [index for index in range(len(lines) - 1, -1, -1) if index not in indices]
+        indices.update(recent[:MAX_TECHNICAL_LINES - len(indices)])
+        selected = [lines[index] for index in sorted(indices)]
+    evidence = technical_error_evidence('\n'.join(selected), source=source)
+    evidence['truncated'] |= len(selected) < len(lines)
+    return evidence
+
+
 def _technical_tail(data: bytes, kind: str, truncated: bool, deadline: float) -> tuple[bytes, dict[str, Any]]:
     lines = _complete_lines(data, truncated)
     retained: deque[dict[str, Any]] = deque(maxlen=MAX_SIGNAL_ROWS)
@@ -502,10 +532,318 @@ def _technical_tail(data: bytes, kind: str, truncated: bool, deadline: float) ->
         for signal in signals:
             codes.add(signal['code'])
             retained.append(signal)
-    output = b''.join((json.dumps(row, sort_keys=True, ensure_ascii=True, separators=(',', ':')) + '\n').encode('ascii') for row in retained)
+    rows = list(retained)
+    diagnostic = None
+    if kind in {'hostagent', 'qemu'} and time.monotonic() < deadline:
+        diagnostic = _control_plane_evidence(lines[-MAX_PARSE_LINES:], kind)
+        diagnostic['truncated'] |= truncated or len(lines) > MAX_PARSE_LINES
+        if diagnostic.get('diagnostic_text'):
+            rows.append({'kind': 'control_plane', 'diagnostic': diagnostic})
+    output = b''.join((json.dumps(row, sort_keys=True, ensure_ascii=True, separators=(',', ':')) + '\n').encode('ascii') for row in rows)
     return output, {'line_count': len(lines), 'signals_count': recognized,
                     'signals_exported': len(retained), 'signals_limited': limited or recognized > MAX_SIGNAL_ROWS,
-                    'evidence_codes': sorted(codes)}
+                    'evidence_codes': sorted(codes),
+                    'control_plane_included': bool(diagnostic and diagnostic.get('diagnostic_text')),
+                    'control_plane_truncated': bool(diagnostic and diagnostic.get('truncated')),
+                    'content_omitted': kind == 'serial' or bool(diagnostic and diagnostic.get('omitted_content'))}
+
+
+def _uuid(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError):
+        return None
+    return parsed.hex if value.lower() in {parsed.hex, str(parsed)} else None
+
+
+def _requested_config(value: Any) -> dict[str, Any]:
+    value = value if isinstance(value, dict) else {}
+    result = {}
+    for key, choices in {'architecture': {'arm64', 'amd64'}, 'vm_type': {'qemu', 'vz'}}.items():
+        if isinstance(value.get(key), str) and value.get(key) in choices:
+            result[key] = value[key]
+    for key, maximum in {'cpus': 4096, 'memory_mb': 2**32, 'disk_gb': 2**24}.items():
+        number = value.get(key)
+        if isinstance(number, int) and not isinstance(number, bool) and 0 < number <= maximum:
+            result[key] = number
+    return result
+
+
+def validate_failure_receipt(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or value.get('schema_version') != 1:
+        return None
+    identifier = _uuid(value.get('receipt_id'))
+    timestamp = _timestamp(value.get('captured_at'))
+    if (identifier is None or timestamp is None or not isinstance(value.get('reason'), str)
+            or value.get('reason') not in _FAILURE_REASONS or not isinstance(value.get('operation'), str)
+            or value.get('operation') not in _FAILURE_OPERATIONS):
+        return None
+    result = {'schema_version': 1, 'receipt_id': identifier, 'captured_at': timestamp,
+              'reason': value['reason'], 'operation': value['operation'], 'sources': [],
+              'guest_console_omitted': True, 'correlation_scope': 'capture_operation',
+              'requested_config': _requested_config(value.get('requested_config'))}
+    started = value.get('command_started_at_epoch')
+    if isinstance(started, (int, float)) and not isinstance(started, bool) and 0 <= started <= 1e12 and math.isfinite(started):
+        result['command_started_at_epoch'] = started
+        if _uuid(value.get('command_id')):
+            result['correlation_scope'] = 'controller_command'
+    for key in ('command_id', 'operation_id'):
+        identifier = _uuid(value.get(key))
+        if identifier:
+            result[key] = identifier
+    if isinstance(value.get('host_resources'), dict):
+        from .host_state import validate_resource_snapshot
+        result['host_resources'] = validate_resource_snapshot(value['host_resources'])
+    sources = value.get('sources') if isinstance(value.get('sources'), list) else []
+    for source in sources[:4]:
+        if (not isinstance(source, dict) or not isinstance(source.get('name'), str)
+                or source.get('name') not in {'controller_stderr', 'controller_stdout', 'ha.stderr.log', 'ha.stdout.log'}):
+            continue
+        expected = 'hostagent' if source['name'].startswith('ha.') else source['name']
+        evidence = validate_technical_evidence(source.get('evidence'), trusted_source=expected)
+        if evidence['source'] != expected:
+            continue
+        item = {'name': source['name'], 'status': _enum(source.get('status'),
+                                 {'included', 'missing', 'unsafe', 'unreadable', 'limited'}, 'unreadable'),
+                                 'bytes_read': _integer(source.get('bytes_read'), PER_FILE_TAIL_BYTES),
+                                 'truncated': source.get('truncated') is True, 'evidence': evidence}
+        mtime = source.get('mtime_unix')
+        if isinstance(mtime, (int, float)) and not isinstance(mtime, bool) and 0 <= mtime <= 1e12 and math.isfinite(mtime):
+            item['mtime_unix'] = mtime
+        scope = 'existing_before_operation' if value['reason'].startswith('before_') else 'stale_or_unknown'
+        if source['name'].startswith('controller_'):
+            scope = 'current_controller_output'
+        elif 'command_started_at_epoch' in result and item.get('mtime_unix', -1) >= result['command_started_at_epoch']:
+            scope = 'file_updated_during_attempt'
+        item['timestamp_scope'] = scope
+        result['sources'].append(item)
+    return result
+
+
+class _CaptureCancelled(Exception):
+    pass
+
+
+def _check_capture_cancelled(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise _CaptureCancelled()
+
+
+def _failure_directory(root: Path, *, create: bool,
+                       cancel_event: threading.Event | None = None) -> tuple[Path, int]:
+    """Descriptor-relative traversal refuses redirects even on the write path."""
+    path = root / '.harnessy' / 'diagnostics' / 'vm-failures'
+    if not _allowed_path(path):
+        raise ValueError('unsafe')
+    flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
+    if os.open not in os.supports_dir_fd or os.mkdir not in os.supports_dir_fd:
+        raise ValueError('safe_directory_operations_unavailable')
+    _check_capture_cancelled(cancel_event)
+    fd = os.open(path.anchor, flags)
+    try:
+        for component in path.parts[1:]:
+            _check_capture_cancelled(cancel_event)
+            try:
+                child = os.open(component, flags, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                _check_capture_cancelled(cancel_event)
+                try:
+                    os.mkdir(component, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                _check_capture_cancelled(cancel_event)
+                child = os.open(component, flags, dir_fd=fd)
+            try:
+                _check_capture_cancelled(cancel_event)
+            except _CaptureCancelled:
+                os.close(child)
+                raise
+            if not stat.S_ISDIR(os.fstat(child).st_mode):
+                os.close(child)
+                raise ValueError('unsafe')
+            os.close(fd)
+            fd = child
+        return path, fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def preserve_vm_failure(workspace_root: Path | str, *, reason: str, operation: str = 'start',
+                        controller_stderr: str = '', controller_stdout: str = '', command_id: str = '',
+                        operation_id: str = '', requested_config: Any = None,
+                        host_resources: Any = None, command_started_at_epoch: Any = None,
+                        cancel_event: threading.Event | None = None) -> dict[str, Any]:
+    """Save scrubbed failure evidence before Lima overwrites its log files.
+
+    Call only for host lifecycle controller commands, never guest shell output.
+    This does not invoke Lima/QEMU or inspect an application database. The caller
+    must bound its worker wait and set ``cancel_event`` on timeout/cancellation.
+    Cooperative checks discard an interrupted capture after blocked I/O returns,
+    before it can read a later boot's logs or promote a stale receipt.
+    """
+    root = _workspace_path(workspace_root)
+    if (root is None or not isinstance(reason, str) or reason not in _FAILURE_REASONS
+            or not isinstance(operation, str) or operation not in _FAILURE_OPERATIONS):
+        return {'schema_version': 1, 'status': 'rejected'}
+    lock_deadline = time.monotonic() + 0.5
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            return {'schema_version': 1, 'status': 'cancelled'}
+        remaining = lock_deadline - time.monotonic()
+        if remaining <= 0:
+            return {'schema_version': 1, 'status': 'busy'}
+        if _FAILURE_LOCK.acquire(timeout=min(0.05, remaining)):
+            break
+    descriptor = None
+    temp_name = None
+    try:
+        _check_capture_cancelled(cancel_event)
+        deadline = time.monotonic() + 2.0
+        receipt: dict[str, Any] = {'schema_version': 1, 'receipt_id': uuid.uuid4().hex,
+            'captured_at': datetime.now().astimezone().isoformat(timespec='milliseconds'),
+            'reason': reason, 'operation': operation, 'command_id': command_id, 'operation_id': operation_id,
+            'requested_config': requested_config, 'host_resources': host_resources,
+            'command_started_at_epoch': command_started_at_epoch,
+            'guest_console_omitted': True, 'sources': []}
+        for name, text in (('controller_stderr', controller_stderr), ('controller_stdout', controller_stdout)):
+            _check_capture_cancelled(cancel_event)
+            if not isinstance(text, str) or not text:
+                continue
+            receipt['sources'].append({'name': name, 'status': 'included',
+                'bytes_read': min(len(text.encode('utf-8', errors='replace')), PER_FILE_TAIL_BYTES),
+                'truncated': len(text) > PER_FILE_TAIL_BYTES,
+                'evidence': technical_error_evidence(text[-PER_FILE_TAIL_BYTES:], source=name)})
+        for name in ('ha.stderr.log', 'ha.stdout.log'):
+            _check_capture_cancelled(cancel_event)
+            item = _read_tail(root / '.harnessy' / 'environment' / 'vm' / 'lima' / 'harnessy' / name,
+                              PER_FILE_TAIL_BYTES if time.monotonic() < deadline else 0)
+            _check_capture_cancelled(cancel_event)
+            data = item['data']
+            receipt['sources'].append({'name': name, 'status': item['status'], 'bytes_read': len(data),
+                'truncated': item['truncated'], 'mtime_unix': item.get('mtime_unix'), 'evidence': _control_plane_evidence(
+                    _complete_lines(data, item['truncated']), 'hostagent')})
+        if (not any(source['bytes_read'] for source in receipt['sources'])
+                and not (reason.startswith('controller_') and isinstance(host_resources, dict) and host_resources)):
+            return {'schema_version': 1, 'status': 'no_evidence'}
+        safe = validate_failure_receipt(receipt)
+        if safe is None:
+            return {'schema_version': 1, 'status': 'rejected'}
+        payload = json.dumps(safe, ensure_ascii=True, separators=(',', ':'), allow_nan=False).encode('ascii')
+        # Four individually bounded sources may exceed the receipt envelope,
+        # especially after JSON escaping. Keep the latest diagnostic tails and
+        # state the truncation rather than losing the entire failure receipt.
+        text_cap = 8000
+        while len(payload) > MAX_FAILURE_RECEIPT_BYTES and text_cap >= 250:
+            for source in safe['sources']:
+                evidence = source['evidence']
+                text = evidence.get('diagnostic_text')
+                if isinstance(text, str) and len(text) > text_cap:
+                    evidence['diagnostic_text'] = text[-text_cap:]
+                    evidence['truncated'] = True
+                    source['truncated'] = True
+            payload = json.dumps(safe, ensure_ascii=True, separators=(',', ':'), allow_nan=False).encode('ascii')
+            text_cap //= 2
+        if len(payload) > MAX_FAILURE_RECEIPT_BYTES:
+            return {'schema_version': 1, 'status': 'limited'}
+        _check_capture_cancelled(cancel_event)
+        _, descriptor = _failure_directory(root, create=True, cancel_event=cancel_event)
+        _check_capture_cancelled(cancel_event)
+        stamp = datetime.now().astimezone().strftime('%Y%m%dT%H%M%S%fZ')
+        name = stamp + '-' + safe['receipt_id'] + '.json'
+        temp_name = '.' + safe['receipt_id'] + '.tmp'
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
+        _check_capture_cancelled(cancel_event)
+        output = os.open(temp_name, flags, 0o600, dir_fd=descriptor)
+        try:
+            view = memoryview(payload)
+            while view:
+                _check_capture_cancelled(cancel_event)
+                written = os.write(output, view)
+                if written <= 0:
+                    raise OSError('short write')
+                view = view[written:]
+            _check_capture_cancelled(cancel_event)
+            os.fsync(output)
+            _check_capture_cancelled(cancel_event)
+        finally:
+            os.close(output)
+        _check_capture_cancelled(cancel_event)
+        os.rename(temp_name, name, src_dir_fd=descriptor, dst_dir_fd=descriptor)
+        temp_name = None
+        if cancel_event is not None and cancel_event.is_set():
+            # A cancellation may race the atomic promotion itself. Remove only
+            # this uniquely named receipt if it arrived during that syscall.
+            os.unlink(name, dir_fd=descriptor)
+            raise _CaptureCancelled()
+        names = []
+        with os.scandir(descriptor) as entries:
+            for index, entry in enumerate(entries):
+                if index >= MAX_SESSION_ENTRIES:
+                    break
+                if _FAILURE_NAME.fullmatch(entry.name) and entry.is_file(follow_symlinks=False):
+                    names.append(entry.name)
+        for old in sorted(names, reverse=True)[MAX_FAILURE_RECEIPTS:]:
+            _check_capture_cancelled(cancel_event)
+            os.unlink(old, dir_fd=descriptor)
+        return {'schema_version': 1, 'status': 'preserved', 'receipt_id': safe['receipt_id'],
+                'captured_at': safe['captured_at'], 'reason': reason, 'operation': operation,
+                'sources': len(safe['sources']), 'bytes_saved': len(payload), 'guest_console_omitted': True}
+    except _CaptureCancelled:
+        return {'schema_version': 1, 'status': 'cancelled'}
+    except (OSError, ValueError, TypeError):
+        return {'schema_version': 1, 'status': 'unavailable'}
+    finally:
+        if descriptor is not None:
+            if temp_name:
+                try:
+                    os.unlink(temp_name, dir_fd=descriptor)
+                except OSError:
+                    pass
+            os.close(descriptor)
+        _FAILURE_LOCK.release()
+
+
+def _failure_receipts(root: Path, deadline: float, cap: int, count: int = MAX_FAILURE_RECEIPTS) -> tuple[list[dict[str, Any]], int, bool]:
+    receipts = []
+    consumed = 0
+    limited = False
+    descriptor = None
+    try:
+        path, descriptor = _failure_directory(root, create=False)
+        names = []
+        with os.scandir(descriptor) as entries:
+            for index, entry in enumerate(entries):
+                if index >= MAX_SESSION_ENTRIES:
+                    limited = True
+                    break
+                if _FAILURE_NAME.fullmatch(entry.name) and entry.is_file(follow_symlinks=False):
+                    names.append(entry.name)
+        limited |= len(names) > count
+        for name in sorted(names, reverse=True)[:count]:
+            if time.monotonic() >= deadline or cap - consumed < MAX_FAILURE_RECEIPT_BYTES:
+                limited = True
+                break
+            read = _read_tail(path / name, MAX_FAILURE_RECEIPT_BYTES)
+            consumed += len(read['data'])
+            if read['status'] != 'included' or read['truncated']:
+                continue
+            try:
+                safe = validate_failure_receipt(json.loads(read['data']))
+            except (ValueError, RecursionError):
+                continue
+            if safe is not None:
+                receipts.append(safe)
+    except (OSError, ValueError):
+        pass
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return receipts, consumed, limited
 
 
 def collect_vm_diagnostics(latest: Path, include_content: bool = False) -> dict[str, Any]:
@@ -518,9 +856,10 @@ def collect_vm_diagnostics(latest: Path, include_content: bool = False) -> dict[
     members: dict[str, bytes] = {}
     read_total = 0
     export_total = 0
+    receipt_count = 0
     for root, origin in roots:
         identifier = hashlib.sha256(str(root).encode('utf-8')).hexdigest()
-        workspace: dict[str, Any] = {'workspace_id': identifier, 'source': origin, 'sources': [], 'evidence_codes': []}
+        workspace: dict[str, Any] = {'workspace_id': identifier, 'source': origin, 'sources': [], 'evidence_codes': [], 'failure_receipts': []}
         workspace_codes: set[str] = set()
         for filename in VM_LOG_FILENAMES:
             kind = 'hostagent' if filename.startswith('ha.') else 'serial'
@@ -551,7 +890,6 @@ def collect_vm_diagnostics(latest: Path, include_content: bool = False) -> dict[
                     output = tail if start and output[start - 1:start] == b'\n' else tail.partition(b'\n')[2]
                     source['signals_limited'] = True
                     source['truncated'] = True
-                source['signals_exported'] = output.count(b'\n')
                 member = f'vm-logs/{identifier}/{filename}.technical.jsonl'
                 members[member] = output
                 source['archive_member'] = member
@@ -572,6 +910,13 @@ def collect_vm_diagnostics(latest: Path, include_content: bool = False) -> dict[
                 workspace_codes.update(source['evidence_codes'])
             workspace['sources'].append(source)
         workspace['evidence_codes'] = sorted(workspace_codes)
+        receipts, receipt_bytes, receipt_limited = _failure_receipts(root, deadline, MAX_READ_BYTES - read_total,
+                                                                  MAX_FAILURE_RECEIPTS - receipt_count)
+        workspace['failure_receipts'] = receipts
+        workspace['failure_receipts_limited'] = receipt_limited
+        workspace['failure_receipts_bytes_read'] = receipt_bytes
+        read_total += receipt_bytes
+        receipt_count += len(receipts)
         report['workspaces'].append(workspace)
     report = validate_vm_report(report)
     return {'report': report, 'members': members}
@@ -608,6 +953,7 @@ def validate_vm_report(report: Any) -> dict[str, Any]:
     for key in ('workspaces_limited', 'discovery_limited', 'previous_session_scanned'):
         safe['discovery'][key] = discovery.get(key) is True
     seen_ids = set()
+    receipt_count = 0
     workspaces = report.get('workspaces') if isinstance(report.get('workspaces'), list) else []
     for workspace in workspaces[:MAX_WORKSPACES] if status != 'unavailable' else []:
         if not isinstance(workspace, dict):
@@ -618,7 +964,14 @@ def validate_vm_report(report: Any) -> dict[str, Any]:
         seen_ids.add(identifier)
         origin = workspace.get('source')
         origin = _enum(origin, {'app_logs', 'registered', 'previous_session_logs'}, 'registered')
-        retained = {'workspace_id': identifier, 'source': origin, 'sources': [], 'evidence_codes': []}
+        retained = {'workspace_id': identifier, 'source': origin, 'sources': [], 'evidence_codes': [], 'failure_receipts': [],
+                    'failure_receipts_limited': workspace.get('failure_receipts_limited') is True,
+                    'failure_receipts_bytes_read': _integer(workspace.get('failure_receipts_bytes_read'), MAX_READ_BYTES)}
+        for value in workspace.get('failure_receipts', [])[:MAX_FAILURE_RECEIPTS - receipt_count] if isinstance(workspace.get('failure_receipts'), list) else []:
+            receipt = validate_failure_receipt(value)
+            if receipt is not None:
+                retained['failure_receipts'].append(receipt)
+                receipt_count += 1
         sources = workspace.get('sources') if isinstance(workspace.get('sources'), list) else []
         seen_files = set()
         for source in sources[:len(VM_LOG_FILENAMES)]:
@@ -638,6 +991,8 @@ def validate_vm_report(report: Any) -> dict[str, Any]:
                 item[key] = _integer(source.get(key), cap)
             item['truncated'] = source.get('truncated') is True
             item['signals_limited'] = source.get('signals_limited') is True
+            for key in ('control_plane_included', 'control_plane_truncated', 'content_omitted'):
+                item[key] = source.get(key) is True
             item['evidence_codes'] = _codes(source.get('evidence_codes'))
             mtime = source.get('mtime_unix')
             if isinstance(mtime, (int, float)) and not isinstance(mtime, bool) and 0 <= mtime <= 1e12 and math.isfinite(mtime):
@@ -656,10 +1011,14 @@ def validate_vm_report(report: Any) -> dict[str, Any]:
         safe['workspaces'].append(retained)
     all_sources = [source for workspace in safe['workspaces'] for source in workspace['sources']]
     safe['summary'] = {'workspaces': len(safe['workspaces']), 'sources': len(all_sources),
-                       'bytes_read': sum(source['bytes_read'] for source in all_sources),
+                       'bytes_read': sum(source['bytes_read'] for source in all_sources) + sum(workspace['failure_receipts_bytes_read'] for workspace in safe['workspaces']),
                        'bytes_exported': sum(source['bytes_exported'] for source in all_sources),
                        'recognized_signals': sum(source['signals_count'] for source in all_sources)}
+    safe['summary']['failure_receipts'] = sum(len(workspace['failure_receipts']) for workspace in safe['workspaces'])
+    safe['omissions'] = {'guest_console_text': mode != 'raw_bounded_tails', 'command_and_guest_output_records': True,
+                         'credentials_and_identifying_paths': True,
+                         'control_plane_policy': 'scrubbed_technical_text', 'raw_control_plane_included': mode == 'raw_bounded_tails'}
     for source_status in ('included', 'missing', 'unsafe', 'unreadable', 'limited'):
         safe['summary'][source_status] = sum(source['status'] == source_status for source in all_sources)
-    safe['summary']['bounded'] = sum(source['truncated'] or source['signals_limited'] or source['status'] == 'limited' for source in all_sources)
+    safe['summary']['bounded'] = sum(source['truncated'] or source['signals_limited'] or source['control_plane_truncated'] or source['status'] == 'limited' for source in all_sources)
     return safe

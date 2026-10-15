@@ -25,6 +25,7 @@ _ERROR_EVENTS = frozenset({
     'agent_run_error', 'headless_run_error', 'uncaught_exception',
     'sqlite_operation_error', 'tool_execution_error', 'request_error',
     'environment_command_timeout', 'workspace_environment_shutdown_stop_failed',
+    'environment_command_spawn_failed', 'vm_failure_evidence_unavailable', 'run_blocked_by_infrastructure',
 })
 
 
@@ -47,6 +48,10 @@ def _bounded_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _vm_failure_classification(row: dict[str, Any]) -> str | None:
     event = row.get('event')
+    if event == 'environment_command_spawn_failed':
+        return 'vm_controller_spawn_failed'
+    if event == 'vm_lifecycle_finished' and row.get('outcome') == 'failed':
+        return 'vm_lifecycle_failed'
     if event == 'vm_startup_observation':
         if row.get('outcome') == 'controller_timeout':
             return 'vm_controller_timeout'
@@ -354,6 +359,9 @@ def _evidence(row: dict[str, Any]) -> dict[str, Any]:
         'approval_wait_seconds', 'execution_duration_seconds', 'coordination_wait_seconds',
         'state', 'changed', 'archive_check', 'storage_issue', 'version', 'status',
         'exception_class',
+        'error_type', 'terminal_stop_reason', 'terminal_reason', 'backend_done_reason',
+        'source', 'technical_error', 'controller_evidence', 'requested_vm_config',
+        'environment_action', 'lifecycle_action', 'preservation_reason', 'failure_receipt', 'host_resources',
     )
     evidence = {key: row[key] for key in keys if key in row}
     if _is_lock(row):
@@ -569,6 +577,16 @@ def _vm_log_coverage(report: dict[str, Any] | None) -> tuple[dict[str, Any] | No
     bounded = sum(bool(source.get('truncated') or source.get('signals_limited'))
                   for workspace in workspaces for source in workspace.get('sources', []))
     lines.append(f'  Sources with bounded/truncated evidence: {bounded}. Counts are retained tails, not complete boot histories.')
+    receipts = [receipt for workspace in workspaces for receipt in workspace.get('failure_receipts', [])]
+    lines.append(f'  Saved pre-retry/reset/failure receipts: {len(receipts)}. These preserve earlier boot evidence separately from current runtime logs.')
+    for receipt in receipts[-3:]:
+        lines.append(f'  Saved VM receipt {receipt.get("captured_at", "unrecorded")}: '
+                     f'{receipt.get("reason", "unrecorded")} / {receipt.get("operation", "unrecorded")}.')
+        for source in receipt.get('sources', []):
+            evidence = source.get('evidence') or {}
+            text = evidence.get('diagnostic_text') if isinstance(evidence, dict) else None
+            if isinstance(text, str) and text:
+                lines.append('    Sanitized ' + source.get('name', 'controller') + ': ' + text[-2000:].replace('\n', '\n    '))
     discovery = safe.get('discovery', {})
     if discovery.get('workspaces_limited') or discovery.get('discovery_limited'):
         lines.append('  Workspace discovery reached a configured bound; additional workspace/log sources may be absent.')
@@ -669,8 +687,13 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         stalls = [row for row in before if row.get('event') in {'event_loop_stall', 'event_loop_stall_sample'}]
         transcript_deferrals = [row for row in related if row.get('event') == 'transcript_refresh_deferred']
         missing: list[str] = []
-        if not target_classification and not permission_classification and not startup_classification and not _has_frames(failure) and not any(_has_frames(row) for row in database_errors):
+        if not vm_classification and not target_classification and not permission_classification and not startup_classification and not _has_frames(failure) and not any(_has_frames(row) for row in database_errors):
             missing.append('exception_traceback_unavailable')
+        if vm_classification and not any(
+                isinstance(row.get('controller_evidence'), dict) and any(
+                    isinstance(value, dict) and value.get('diagnostic_text') for value in row['controller_evidence'].values())
+                for row in controller_evidence):
+            missing.append('controller_diagnostic_text_not_recorded')
         if target_analysis and target_analysis['launch_wait'] == 'timeout':
             if target_analysis['launcher_returncode'] is None:
                 missing.append('target_launcher_exit_status_not_recorded')
@@ -752,6 +775,12 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
     from .model_requests import build_model_audit
     model_audit, model_lines = build_model_audit(rows, coverage, Path(latest), metadata.get('captured_at'))
     index['model_request_audit'] = model_audit
+    control_rows = [row for row in rows if row.get('level') in {'WARNING', 'ERROR', 'CRITICAL'}
+                    or str(row.get('event')).startswith(('vm_', 'environment_', 'workspace_mapping_', 'test_target_'))
+                    or row.get('event') in {'headless_run_error', 'agent_run_error', 'run_blocked_by_infrastructure'}]
+    index['control_plane_timeline'] = control_rows[-1200:]
+    index['control_plane_coverage'] = {'rows_available': len(control_rows), 'rows_retained': min(len(control_rows), 1200),
+        'row_limit': 1200, 'row_limit_reached': len(control_rows) > 1200, 'source_coverage': coverage}
     lines = [
         'HarnessyXO support summary', '==========================', '',
         'Start here; machine-readable evidence is in INCIDENTS.json.',
@@ -838,6 +867,16 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
                 value = states[-1].get('controller_status')
                 if isinstance(value, str):
                     lines.append(f'  Bounded controller status after failure: {value}; this is not proof of guest SSH readiness.')
+            for receipt in reversed(incident['controller_evidence']):
+                evidence = receipt.get('controller_evidence') or {}
+                stderr = evidence.get('stderr') if isinstance(evidence, dict) else None
+                if isinstance(stderr, dict) and stderr.get('diagnostic_text'):
+                    lines.append('  Sanitized controller stderr: ' + stderr['diagnostic_text'][-3000:].replace('\n', '\n    '))
+                    break
+        if failure.get('terminal_stop_reason'):
+            lines.append(f'  Terminal stop reason: {failure["terminal_stop_reason"]}.')
+        if failure.get('requested_vm_config'):
+            lines.append('  Requested VM configuration: ' + json.dumps(failure['requested_vm_config'], sort_keys=True) + '.')
         fault = failure.get('fault') or failure.get('exception_evidence') or {}
         if isinstance(fault, dict):
             if fault.get('exception_type') or fault.get('exception_class'):
@@ -845,6 +884,14 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
             for frame in fault.get('frames', [])[-6:]:
                 if isinstance(frame, dict):
                     lines.append(f'  Frame: {frame.get("module", "external")}:{frame.get("line", "?")} {frame.get("function", "unknown")}')
+            for part in [fault] + (fault.get('chain') if isinstance(fault.get('chain'), list) else []):
+                if not isinstance(part, dict):
+                    continue
+                facts = {key: part[key] for key in ('errno', 'errno_name', 'errno_namespace', 'returncode',
+                    'termination_signal', 'timeout_seconds', 'json_error', 'http_status_code',
+                    'tls_verify_code', 'ssl_error_code', 'ssl_error_name') if key in part}
+                if facts:
+                    lines.append('  Exception technical facts: ' + json.dumps(facts, sort_keys=True) + '.')
         for db in incident['nearby_database_errors']:
             lines.append(f'  Database: {db.get("db_role", "unknown")} (identity {db.get("db_id", "unrecorded")})')
             lines.append(f'  Operation: {db.get("operation", "unknown")} / {db.get("statement_kind", "unknown")}; '

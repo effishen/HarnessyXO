@@ -3,6 +3,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import codecs
+from concurrent.futures import Future
+from contextvars import copy_context
+import errno
+import functools
 import hashlib
 import inspect
 import json
@@ -12,6 +16,7 @@ import re
 import shlex
 import shutil
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path, PurePosixPath
@@ -51,6 +56,39 @@ _LIMA_VERSION_LOCK_LOOPS: dict[str, asyncio.AbstractEventLoop] = {}
 _RUNTIME_READY_BOOT: dict[str, str] = {}
 _START_LOCKS: dict[str, asyncio.Lock] = {}
 _START_LOCK_LOOPS: dict[str, asyncio.AbstractEventLoop] = {}
+
+# A disconnected filesystem must not exhaust executor workers or block process
+# shutdown. At most one daemon worker performs diagnostic I/O; later requests
+# report unavailable until that actual call has returned.
+_DIAGNOSTIC_IO_LOCK = threading.Lock()
+_DIAGNOSTIC_IO_FUTURE: Future | None = None
+
+
+async def _bounded_diagnostic_io(function, *args, timeout: float, **kwargs):
+    global _DIAGNOSTIC_IO_FUTURE
+    with _DIAGNOSTIC_IO_LOCK:
+        if _DIAGNOSTIC_IO_FUTURE is not None and not _DIAGNOSTIC_IO_FUTURE.done():
+            raise BlockingIOError(errno.EAGAIN, 'VM diagnostics collection is already in progress')
+        future = Future()
+        context = copy_context()
+
+        def collect() -> None:
+            if not future.set_running_or_notify_cancel():
+                return
+            try:
+                result = context.run(function, *args, **kwargs)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+
+        _DIAGNOSTIC_IO_FUTURE = future
+        try:
+            threading.Thread(target=collect, name='harnessy-vm-diagnostics', daemon=True).start()
+        except BaseException:
+            future.cancel()
+            raise
+    return await asyncio.wait_for(asyncio.wrap_future(future), timeout=timeout)
 
 FILES_BACKING_GUEST_PATH = '/mnt/harnessyxo-files'
 PRIVATE_WORKTREES_GUEST_PATH = '/mnt/harnessyxo-worktrees'
@@ -101,6 +139,40 @@ def workspace_projection_probe_failure(stderr: str) -> str | None:
     return None
 
 
+def _lifecycle_diagnostics(action: str):
+    """Give direct/model lifecycle requests the same scope as UI operations."""
+    def decorate(method):
+        @functools.wraps(method)
+        async def observed(self, *args, **kwargs):
+            from .manager import environment_operation_context
+            from harnessy.diagnostics.technical import technical_error_evidence
+
+            with environment_operation_context(action=action):
+                fields = self._controller_diagnostic_fields()
+                started = time.monotonic()
+                log_event('runtime', 'vm_lifecycle_requested', workspace=str(self.workspace_root),
+                          provider='lima', lifecycle_action=action, **fields)
+                try:
+                    result = await method(self, *args, **kwargs)
+                except asyncio.CancelledError:
+                    log_event('runtime', 'vm_lifecycle_finished', workspace=str(self.workspace_root),
+                              provider='lima', lifecycle_action=action, outcome='cancelled',
+                              elapsed_seconds=max(0.0, time.monotonic() - started), **fields)
+                    raise
+                except Exception as exc:
+                    log_event('runtime', 'vm_lifecycle_finished', workspace=str(self.workspace_root),
+                              provider='lima', lifecycle_action=action, outcome='failed',
+                              elapsed_seconds=max(0.0, time.monotonic() - started),
+                              technical_error=technical_error_evidence(exc), **fields)
+                    raise
+                log_event('runtime', 'vm_lifecycle_finished', workspace=str(self.workspace_root),
+                          provider='lima', lifecycle_action=action, outcome='completed',
+                          elapsed_seconds=max(0.0, time.monotonic() - started), **fields)
+                return result
+        return observed
+    return decorate
+
+
 class LimaVMEnvironment(WorkspaceEnvironment):
     """Persistent workspace VM using Lima as a fixed host-side controller.
 
@@ -130,6 +202,8 @@ class LimaVMEnvironment(WorkspaceEnvironment):
     TIMEOUT_PROVISION_CHECK = 12.0
     TIMEOUT_SHELL_SHORT = 8.0
     TIMEOUT_CONTROLLER_STOP_GRACE = 1.5
+    TIMEOUT_DIAGNOSTIC_RESOURCES = 2.0
+    TIMEOUT_DIAGNOSTIC_PRESERVE = 3.0
 
 
     def __init__(self, workspace_root: Path, config: EnvironmentConfig) -> None:
@@ -152,6 +226,7 @@ class LimaVMEnvironment(WorkspaceEnvironment):
         self._runtime_guard_verified = False
         self._runtime_boot_id = ''
         self._controller_output_callback = None
+        self._diagnostic_workspace_id: str | None = None
         # Register only the runtime already owned by this provider. The support
         # collector never searches unrelated home directories for Lima logs.
         try:
@@ -1331,7 +1406,7 @@ message: "HarnessyXO workspace VM · {preset.name} · {self.config.architecture}
         log_event(
             'runtime', 'vm_startup_post_failure_state', workspace=str(self.workspace_root),
             provider='lima', controller_action='start', parent_start_command_id=command_id,
-            controller_status=controller_status, ready=False,
+            controller_status=controller_status, ready=False, **self._controller_diagnostic_fields(),
         )
 
     @classmethod
@@ -2143,16 +2218,150 @@ exit $rc
         prefix = 'view_user=$(id -un); exec /usr/bin/sudo -n /bin/bash -c '
         return prefix + shlex.quote(supervisor) + ' ' + argv + ' "$view_user"'
 
+    def _requested_vm_config(self) -> dict[str, Any]:
+        # Keep only the requested machine facts, never mounts, tool selections,
+        # template text, guest commands or user-provided labels.
+        return {
+            'architecture': self.config.architecture,
+            'vm_type': self._vm_type(),
+            'cpus': self.config.cpu,
+            'memory_mb': self.config.memory_mb,
+            'disk_gb': self.config.disk_gb,
+        }
+
+    def _controller_diagnostic_fields(self) -> dict[str, Any]:
+        from .manager import current_environment_operation
+
+        fields: dict[str, Any] = {**current_environment_operation(),
+                                  'requested_vm_config': self._requested_vm_config()}
+        # UUID metadata is immutable for a provider. Read it once through the
+        # collector's nonblocking, regular-file-only, no-symlink opener. A FIFO
+        # or redirected metadata path must not block or redirect VM operations.
+        if getattr(self, '_diagnostic_workspace_id', None) is None:
+            self._diagnostic_workspace_id = ''
+            descriptor = None
+            try:
+                from harnessy.diagnostics.vm_logs import _open_regular
+
+                descriptor = _open_regular(self.workspace_root / '.harnessy' / 'workspace.json')
+                if os.fstat(descriptor).st_size <= 65536:
+                    payload = os.read(descriptor, 65537)
+                    data = json.loads(payload) if len(payload) <= 65536 else None
+                    workspace_id = data.get('id') if isinstance(data, dict) else None
+                    if isinstance(workspace_id, str) and re.fullmatch(r'[0-9a-f]{32}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', workspace_id):
+                        self._diagnostic_workspace_id = workspace_id
+            except Exception:
+                pass
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+        if self._diagnostic_workspace_id:
+            fields['workspace_id'] = self._diagnostic_workspace_id
+        return fields
+
+    async def _preserve_vm_failure(
+        self, *, reason: str, operation: str, command_id: str = '',
+        controller_stdout: str = '', controller_stderr: str = '',
+        host_resources: dict[str, Any] | None = None,
+        command_started_at_epoch: float | None = None,
+    ) -> None:
+        """Preserve bounded scrubbed evidence before controller logs change.
+
+        Collection is read-only with respect to the VM. Failure to write a
+        diagnostics receipt must never change an authorized lifecycle action.
+        """
+        from harnessy.diagnostics.technical import technical_error_evidence
+
+        fields = self._controller_diagnostic_fields()
+        cancel_event = threading.Event()
+        try:
+            from harnessy.diagnostics.vm_logs import preserve_vm_failure
+
+            if host_resources is None:
+                host_resources = await self._collect_host_resources()
+            receipt = await _bounded_diagnostic_io(
+                preserve_vm_failure, self.workspace_root, reason=reason, operation=operation,
+                controller_stdout=controller_stdout, controller_stderr=controller_stderr,
+                command_id=command_id, operation_id=fields.get('operation_id', ''),
+                requested_config=fields['requested_vm_config'],
+                host_resources=host_resources,
+                command_started_at_epoch=command_started_at_epoch,
+                cancel_event=cancel_event, timeout=self.TIMEOUT_DIAGNOSTIC_PRESERVE,
+            )
+        except asyncio.CancelledError:
+            cancel_event.set()
+            raise
+        except Exception as exc:
+            cancel_event.set()
+            evidence = technical_error_evidence(exc)
+            if isinstance(exc, asyncio.TimeoutError):
+                evidence['timeout_seconds'] = self.TIMEOUT_DIAGNOSTIC_PRESERVE
+            log_event('runtime', 'vm_failure_evidence_unavailable', workspace=str(self.workspace_root),
+                      provider='lima', preservation_reason=reason, controller_action=operation,
+                      command_id=command_id, technical_error=evidence, **fields)
+            return
+        log_event('runtime', 'vm_failure_evidence_preserved', workspace=str(self.workspace_root),
+                  provider='lima', preservation_reason=reason, controller_action=operation,
+                  command_id=command_id, failure_receipt=receipt, **fields)
+
+    async def _collect_host_resources(self) -> dict[str, Any]:
+        # Capture at the lifecycle event, rather than treating an export made
+        # hours later as evidence of launch-time resource availability.
+        try:
+            from harnessy.diagnostics.host_state import collect_resource_snapshot
+
+            return await _bounded_diagnostic_io(collect_resource_snapshot, [self.workspace_root],
+                                                timeout=self.TIMEOUT_DIAGNOSTIC_RESOURCES)
+        except Exception as exc:
+            from harnessy.diagnostics.technical import technical_error_evidence
+
+            evidence = technical_error_evidence(exc)
+            if isinstance(exc, asyncio.TimeoutError):
+                evidence['timeout_seconds'] = self.TIMEOUT_DIAGNOSTIC_RESOURCES
+            return {'schema_version': 1, 'capture_scope': 'current_host_resources',
+                    'status': 'unavailable', 'collection_error': evidence,
+                    **({'errno': evidence['errno']} if 'errno' in evidence else {})}
+
     async def _run(
         self, *args: str, timeout: float | None = 120.0, check: bool = False,
         input_text: str | None = None,
     ) -> tuple[int, str, str]:
+        from harnessy.diagnostics.technical import technical_error_evidence
+
         binary = self._binary()
         cmd = [binary, '--tty=false', *args]
         command_id = uuid.uuid4().hex
-        started = time.monotonic()
         controller_action = self._controller_action(args)
+        diagnostic_fields = self._controller_diagnostic_fields()
+        trusted_control_plane = controller_action in {'start', 'create', 'stop', 'delete', 'factory-reset', 'restart'}
+        if controller_action == 'start':
+            await self._preserve_vm_failure(reason='before_start', operation='start', command_id=command_id)
+        launch_resources = await self._collect_host_resources() if trusted_control_plane else {}
+        started = time.monotonic()
+        started_at_epoch = time.time()
         startup = {'last_boot_milestone': 'unknown', 'controller_failure_kind': 'unknown'}
+        stdout_buffer = bytearray()
+        stderr_buffer = bytearray()
+        buffer_limit = 512 * 1024
+
+        def controller_evidence() -> dict[str, Any]:
+            if not trusted_control_plane:
+                return {}
+            return {
+                'stdout': technical_error_evidence(bytes(stdout_buffer), source='controller_stdout'),
+                'stderr': technical_error_evidence(bytes(stderr_buffer), source='controller_stderr'),
+            }
+
+        async def preserve_failure(reason: str, resources: dict[str, Any]) -> None:
+            if trusted_control_plane:
+                await self._preserve_vm_failure(
+                    reason=reason, operation=controller_action, command_id=command_id,
+                    controller_stdout=stdout_buffer.decode('utf-8', errors='replace'),
+                    controller_stderr=stderr_buffer.decode('utf-8', errors='replace'),
+                    host_resources=resources,
+                    command_started_at_epoch=started_at_epoch,
+                )
+
         native_limit = None
         for argument in args[1:]:
             match = re.fullmatch(r'--timeout=(\d+(?:\.\d+)?)s', argument)
@@ -2179,25 +2388,38 @@ exit $rc
                 provider='lima', command_id=command_id, controller_action='start', outcome=outcome,
                 controller_returncode=returncode, controller_signal=controller_signal,
                 elapsed_seconds=elapsed, app_limit_seconds=timeout,
-                native_limit_seconds=native_limit, **startup,
+                native_limit_seconds=native_limit, **startup, **diagnostic_fields,
             )
         log_event(
             'runtime', 'vm_controller_command', workspace=str(self.workspace_root),
             provider='lima', command_id=command_id, controller_action=controller_action,
-            argv=cmd[1:], timeout_seconds=timeout,
+            argv=cmd[1:], timeout_seconds=timeout, command_started_at_epoch=started_at_epoch,
+            host_resources=launch_resources, **diagnostic_fields,
         )
         log_event(
             'runtime', 'environment_command_started', workspace=str(self.workspace_root),
             provider='lima', command_id=command_id, controller_action=controller_action,
-            argv=cmd[1:], timeout_seconds=timeout,
+            argv=cmd[1:], timeout_seconds=timeout, command_started_at_epoch=started_at_epoch,
+            host_resources=launch_resources, **diagnostic_fields,
         )
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE if input_text is not None else None,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=self._host_env(),
-        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE if input_text is not None else None,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=self._host_env(),
+            )
+        except Exception as exc:
+            elapsed = max(0.0, time.monotonic() - started)
+            failure_resources = await self._collect_host_resources() if trusted_control_plane else {}
+            log_event('runtime', 'environment_command_spawn_failed', workspace=str(self.workspace_root),
+                      provider='lima', command_id=command_id, controller_action=controller_action,
+                      elapsed_seconds=elapsed, technical_error=technical_error_evidence(exc),
+                      host_resources=failure_resources, **diagnostic_fields)
+            record_startup('controller_error', None, elapsed)
+            await preserve_failure('controller_spawn_error', failure_resources)
+            raise
 
         async def stop_controller() -> None:
             if process.returncode is not None:
@@ -2226,7 +2448,7 @@ exit $rc
         try:
             payload = input_text.encode('utf-8') if input_text is not None else None
             observer = self._controller_output_callback
-            if observer is None and controller_action != 'start':
+            if observer is None and not trusted_control_plane:
                 communicate = process.communicate(payload)
                 stdout_b, stderr_b = await asyncio.wait_for(communicate, timeout=timeout) if timeout else await communicate
             else:
@@ -2234,10 +2456,6 @@ exit $rc
                     process.stdin.write(payload)
                     await process.stdin.drain()
                     process.stdin.close()
-                stdout_buffer = bytearray()
-                stderr_buffer = bytearray()
-                buffer_limit = 512 * 1024
-
                 async def drain(stream, stream_name: str, buffer: bytearray) -> None:
                     if stream is None:
                         return
@@ -2264,6 +2482,7 @@ exit $rc
                                 'runtime', 'environment_command_progress_callback_failed',
                                 workspace=str(self.workspace_root), provider='lima',
                                 command_id=command_id, error=f'{type(callback_exc).__name__}: {callback_exc}',
+                                **diagnostic_fields,
                             )
 
                     while True:
@@ -2305,13 +2524,16 @@ exit $rc
             elapsed = max(0.0, time.monotonic() - started)
             observed_returncode = process.returncode
             await stop_controller()
+            failure_resources = await self._collect_host_resources() if trusted_control_plane else {}
             log_event(
                 'runtime', 'environment_command_timeout', workspace=str(self.workspace_root),
                 provider='lima', command_id=command_id, controller_action=controller_action, argv=cmd[1:],
                 timeout_seconds=timeout, elapsed_seconds=elapsed,
                 controller_returncode=observed_returncode,
+                controller_evidence=controller_evidence(), host_resources=failure_resources, **diagnostic_fields,
             )
             record_startup('controller_timeout', observed_returncode, elapsed)
+            await preserve_failure('controller_timeout', failure_resources)
             if controller_action == 'start':
                 await self._observe_startup_failure_state(command_id)
             raise asyncio.TimeoutError(f'Lima controller timed out: {" ".join(args)}') from exc
@@ -2319,23 +2541,31 @@ exit $rc
             elapsed = max(0.0, time.monotonic() - started)
             observed_returncode = process.returncode
             await asyncio.shield(stop_controller())
+            failure_resources = await self._collect_host_resources() if trusted_control_plane else {}
             log_event(
                 'runtime', 'environment_command_cancelled', workspace=str(self.workspace_root),
                 provider='lima', command_id=command_id, controller_action=controller_action, argv=cmd[1:],
-                elapsed_seconds=elapsed,
+                elapsed_seconds=elapsed, controller_returncode=observed_returncode,
+                controller_evidence=controller_evidence(), host_resources=failure_resources, **diagnostic_fields,
             )
             record_startup('cancelled', observed_returncode, elapsed)
+            await asyncio.shield(preserve_failure('controller_cancelled', failure_resources))
             raise
         stdout = stdout_b.decode(errors='replace')
         stderr = stderr_b.decode(errors='replace')
         elapsed = max(0.0, time.monotonic() - started)
+        failure_resources = await self._collect_host_resources() if trusted_control_plane and process.returncode else {}
         log_event(
             'runtime', 'environment_command_finished', workspace=str(self.workspace_root),
             provider='lima', command_id=command_id, controller_action=controller_action, argv=cmd[1:],
             returncode=int(process.returncode or 0), elapsed_seconds=elapsed,
             stdout_chars=len(stdout), stderr_chars=len(stderr),
+            controller_evidence=controller_evidence() if process.returncode else {},
+            host_resources=failure_resources, **diagnostic_fields,
         )
         record_startup('controller_error' if process.returncode else 'completed', process.returncode, elapsed)
+        if process.returncode:
+            await preserve_failure('controller_error', failure_resources)
         if check and process.returncode:
             if controller_action == 'start':
                 await self._observe_startup_failure_state(command_id)
@@ -2439,6 +2669,7 @@ exit $rc
             'generation': generation,
             'event': str(event or 'unknown'),
             'updated_at': time.time(),
+            **self._controller_diagnostic_fields(),
         }
         self.state_root.mkdir(parents=True, exist_ok=True)
         tmp = self.lifecycle_path.with_suffix('.tmp')
@@ -2447,6 +2678,7 @@ exit $rc
         log_event(
             'runtime', 'vm_lifecycle_generation_changed', workspace=str(self.workspace_root), provider='lima',
             generation=generation, lifecycle_event=payload['event'],
+            **self._controller_diagnostic_fields(),
         )
         return payload
 
@@ -2537,6 +2769,7 @@ exit $rc
         await ensure_host_prerequisites(self.config, vm_type=self._vm_type(), progress=report,
                                         allow_install=allow_install)
 
+    @_lifecycle_diagnostics('create')
     async def create(self, progress=None) -> EnvironmentStatus:
         current = await self.status()
         if current.created:
@@ -2785,6 +3018,7 @@ exit $rc
         self._write_readiness(ready=True, phase='ready', boot_id=boot_id, guard_hash=self._expected_guard_hash())
         log_event('runtime', 'vm_isolation_guard_verified', workspace=str(self.workspace_root), provider='lima', boot_id=boot_id)
 
+    @_lifecycle_diagnostics('start')
     async def start(self, progress=None) -> EnvironmentStatus:
         async with self._workspace_start_lock():
             return await self._start_locked(progress=progress)
@@ -2949,6 +3183,7 @@ exit $rc
             clear_environment_provider_cache(self.workspace_root)
             release()
 
+    @_lifecycle_diagnostics('stop')
     async def stop(self, *, force: bool = False) -> EnvironmentStatus:
         status = await self.status()
         if not status.created or not status.running:
@@ -3309,10 +3544,12 @@ exit $rc
 
         return await self._call_with_optional_progress(self.start, progress=restart_progress)
 
+    @_lifecycle_diagnostics('reset')
     async def reset(self, progress=None) -> EnvironmentStatus:
         status = await self.status()
         if not status.created:
             return await self._call_with_optional_progress(self.start, progress=progress)
+        await self._preserve_vm_failure(reason='before_reset', operation='reset')
         await self._emit_progress(
             progress, 'factory_reset', 'Factory resetting VM while preserving working roots…',
             stage_timeout_seconds=self.TIMEOUT_RESET,
@@ -3324,9 +3561,11 @@ exit $rc
         await self._emit_progress(progress, 'restarting_reset_vm', 'Starting reset workspace VM…')
         return await self._call_with_optional_progress(self.start, progress=progress)
 
+    @_lifecycle_diagnostics('rebuild')
     async def rebuild(self, progress=None) -> EnvironmentStatus:
         status = await self.status()
         if status.created:
+            await self._preserve_vm_failure(reason='before_delete', operation='rebuild')
             await self._emit_progress(
                 progress, 'rebuilding', 'Removing old workspace VM state…',
                 stage_timeout_seconds=self.TIMEOUT_DELETE,
@@ -3346,9 +3585,11 @@ exit $rc
         log_event('harnessy', 'vm_rebuilt', workspace=str(self.workspace_root), files_preserved=True)
         return await self._call_with_optional_progress(self.start, progress=progress)
 
+    @_lifecycle_diagnostics('destroy')
     async def destroy(self) -> None:
         status = await self.status()
         if status.created:
+            await self._preserve_vm_failure(reason='before_delete', operation='delete')
             await self.stop(force=True)
             await self._run('delete', '--force', self.INSTANCE, timeout=self.TIMEOUT_DELETE, check=True)
         shutil.rmtree(self.vm_root, ignore_errors=True)

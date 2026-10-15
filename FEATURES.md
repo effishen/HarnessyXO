@@ -1,4 +1,4 @@
-# HarnessyXO v0.6.89 Features
+# HarnessyXO v0.6.90 Features
 
 ## Model progress across backends
 
@@ -58,6 +58,11 @@ Workspace and machine databases use WAL so background reads can coexist with mes
 
 ## Actionable support diagnostics
 
+- Include scrubbed host-agent and QEMU control-plane errors in the default download, rather than only recognized signal codes. Keep unfamiliar technical wording while excluding credentials, private paths, command payloads and guest console content. Guest serial logs still contribute fixed boot/error signals without guest output.
+- Preserve bounded failure receipts before Start, Factory Reset or rebuild replaces the current VM logs. Retain controller command and lifecycle correlation, requested VM configuration and resource snapshots with their capture time; identify stale or prior-attempt sources explicitly. Capture test-target QEMU launcher output separately from guest serial output.
+- Include HOST_STATE.json with read-only host prerequisites, OS/CPU, memory/swap and cgroup limits, resource pressure, disk/inode space, application process counters, KVM access, firmware metadata, known tool versions and dependency versions when available. Mark unsupported platforms and unavailable probes explicitly. Export-time host state does not establish resource availability at an earlier failure.
+- Preserve typed exception facts through bounded cause chains: errno and DNS codes, subprocess exit/signal, timeout, HTTP status, TLS verification code and JSON position. Keep source frames without locals, source lines or arbitrary exception bodies.
+- Include a per-source export ledger with original/read/export sizes, projection, truncation, exclusions and collector failures. Retained logs have stated limits; missing evidence is not a successful health check. Collecting diagnostics does not start, reset or repair a VM.
 - Put the current model request, its wait and the previous completed call near the start of SUMMARY.txt. Include MODEL_REQUESTS.json with bounded correlation, coverage and timing evidence; distinguish current waits from older VM incidents.
 - Retain timestamped, locally correlated numeric prompt progress, usage and native timings without copying model text, tool arguments or token-ID arrays. Use explicit correlation for new requests and label legacy timestamp candidates and missing evidence. A local request ID does not establish provider-side inference activity.
 - Include bounded Lima guest boot and host-agent evidence in the normal download. `VM_LOGS.json` reports available, missing and limited sources; raw tails use the existing content option.

@@ -174,56 +174,92 @@ class OpenWrtTargetManager(TestTargetManager):
         # stdout/stderr open after the parent exits. Waiting for pipe EOF then
         # mistakes a running guest for a launch timeout. A private regular file
         # captures errors without making daemon FD lifetime part of readiness.
-        with tempfile.TemporaryFile(mode='w+b', dir=self.runtime_dir()) as capture:
-            proc = await asyncio.create_subprocess_exec(
-                *map(str, argv), cwd=self.root, env=self._env(),
-                stdin=asyncio.subprocess.DEVNULL, stdout=capture,
-                stderr=asyncio.subprocess.STDOUT,
-            )
+        try:
+            from harnessy.diagnostics.test_target_logs import open_qemu_control_plane_capture
+            capture_file = open_qemu_control_plane_capture(self.runtime_dir())
+        except (OSError, ValueError):
+            # Evidence setup must not prevent a VM launch. Preserve the private
+            # prior file and retain the original regular-file handoff behavior.
+            capture_file = tempfile.TemporaryFile(mode='w+b', dir=self.runtime_dir())
+        with capture_file as capture:
+            proc, evidence_error = None, None
             try:
+                proc = await asyncio.create_subprocess_exec(
+                    *map(str, argv), cwd=self.root, env=self._env(),
+                    stdin=asyncio.subprocess.DEVNULL, stdout=capture,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
                 try:
-                    await asyncio.wait_for(proc.wait(), timeout)
-                except asyncio.TimeoutError:
-                    self.stage('launch_reconcile', failure_code='controller_timeout',
-                               timeout_seconds=timeout)
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout)
+                    except asyncio.TimeoutError:
+                        self.stage('launch_reconcile', failure_code='controller_timeout',
+                                   timeout_seconds=timeout)
+                        if await self._owned_launch_running():
+                            if proc.returncode is None:
+                                self._reap_launcher_later(proc)
+                            self.stage('launch_recovered', returncode=proc.returncode,
+                                       timeout_seconds=timeout)
+                            if self.operation:
+                                self.operation.note(
+                                    'QEMU launch handoff exceeded its deadline, but this '
+                                    'target\'s running VM was verified. Checking its shell '
+                                    'and first-boot configuration with the existing ports.\n')
+                            return
+                        await self._stop_launcher(proc)
+                        raise TestTargetFailure(
+                            f'QEMU launch handoff did not finish within {timeout:g} seconds, '
+                            'and this target\'s running VM could not be verified. '
+                            'No replacement VM was launched. Download diagnostics for '
+                            'the launch stage and boot log, then inspect the VM state '
+                            'before retrying Start.', 'controller_timeout',
+                        ) from None
+                except asyncio.CancelledError:
+                    # Cancellation can arrive after QEMU has booted. Preserve a
+                    # UUID-verified running VM even when the spawned handle lingers.
                     if await self._owned_launch_running():
                         if proc.returncode is None:
                             self._reap_launcher_later(proc)
-                        self.stage('launch_recovered', returncode=proc.returncode,
-                                   timeout_seconds=timeout)
-                        if self.operation:
-                            self.operation.note(
-                                'QEMU launch handoff exceeded its deadline, but this '
-                                'target\'s running VM was verified. Checking its shell '
-                                'and first-boot configuration with the existing ports.\n')
-                        return
-                    await self._stop_launcher(proc)
+                    else:
+                        await self._stop_launcher(proc)
+                    raise
+                self.stage('launch', returncode=proc.returncode,
+                           timeout_seconds=timeout)
+                if proc.returncode:
+                    size = os.fstat(capture.fileno()).st_size
+                    detail = os.pread(capture.fileno(), 2000, max(0, size - 2000)).decode(errors='replace').strip()
                     raise TestTargetFailure(
-                        f'QEMU launch handoff did not finish within {timeout:g} seconds, '
-                        'and this target\'s running VM could not be verified. '
-                        'No replacement VM was launched. Download diagnostics for '
-                        'the launch stage and boot log, then inspect the VM state '
-                        'before retrying Start.', 'controller_timeout',
-                    ) from None
-            except asyncio.CancelledError:
-                # Cancellation can arrive after QEMU has booted. Preserve a
-                # UUID-verified running VM even when the spawned handle lingers.
-                if await self._owned_launch_running():
-                    if proc.returncode is None:
-                        self._reap_launcher_later(proc)
-                else:
-                    await self._stop_launcher(proc)
+                        f'QEMU launcher exited with status {proc.returncode}. '
+                        + (detail or 'Download diagnostics for the launch stage and VM boot log.'),
+                        'launch_failed', returncode=proc.returncode,
+                    )
+            except BaseException as error:
+                evidence_error = error
                 raise
-            self.stage('launch', returncode=proc.returncode,
-                       timeout_seconds=timeout)
-            if proc.returncode:
-                size = os.fstat(capture.fileno()).st_size
-                detail = os.pread(capture.fileno(), 2000, max(0, size - 2000)).decode(errors='replace').strip()
-                raise TestTargetFailure(
-                    f'QEMU launcher exited with status {proc.returncode}. '
-                    + (detail or 'Download diagnostics for the launch stage and VM boot log.'),
-                    'launch_failed', returncode=proc.returncode,
-                )
+            finally:
+                # Host launcher output is separate from -serial file:serial.log.
+                # Preserve a bounded, scrubbed receipt even for failed/cancelled
+                # handoff; this evidence path never changes VM lifecycle decisions.
+                try:
+                    from harnessy.diagnostics.test_target_logs import record_qemu_launcher_evidence
+                    size = os.fstat(capture.fileno()).st_size
+                    data = os.pread(capture.fileno(), 128 * 1024, max(0, size - 128 * 1024))
+                    operation = self.operation
+                    captured = record_qemu_launcher_evidence(
+                        self.runtime_dir(), data,
+                        stage=operation.stage if operation else 'launch',
+                        operation_id=operation.operation_id if operation else '',
+                        returncode=proc.returncode if proc is not None else None,
+                        timeout_seconds=timeout, error=evidence_error,
+                    )
+                    if not captured:
+                        from harnessy.diagnostics import log_event
+                        log_event('runtime', 'test_target_log_capture_failed', target_id=self.target.id,
+                                  target_backend='qemu', target_action='start', target_stage='launch',
+                                  target_failure_code='log_capture_failed')
+                except Exception:
+                    # Missing/unsafe evidence is explicit in TARGET_LOGS.json.
+                    pass
 
     async def prerequisites(self):
         names = ['ssh', 'ssh-keygen', qemu_binary(self.config['architecture'])]
