@@ -1,4 +1,4 @@
-# HarnessyXO v0.6.95 Features
+# HarnessyXO v0.6.96 Features
 
 ## Model progress across backends
 
@@ -45,7 +45,8 @@
 - Download updates from the public repository over HTTPS without GitHub login. Existing SSH checkouts keep their saved remote; the updater reads the matching public HTTPS source.
 - Include reviewed source-check and historical host REA storage evidence in `STARTUP.json` and the support summary, retaining bounded launcher receipts when the app starts.
 - Preserve settings, dependencies, runtime caches, workspaces and local code edits. Keep the current app available when a check fails.
-- Hold an installation lock for the lifetime of the app and detect incomplete source updates across restarts.
+- Hold an installation lock for the lifetime of the app and detect incomplete source updates across restarts. Keep it through launcher exec handoffs, then prevent native VM children and forked workers from retaining the app's lock. A stopped server releases its own descriptor.
+- If startup reports a held lock, identify processes using it with the printed fuser/lsof command. A child left by an older release can still hold an inherited lock after Ctrl+C. Other OS lock failures show their error code instead of claiming another server is running.
 - Publish versioned GitHub Release notes and verified downloads from committed application files, with the same 11 Markdown resources and no QA payload.
 
 ## REA in the workspace VM

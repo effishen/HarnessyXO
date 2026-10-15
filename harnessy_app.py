@@ -25,10 +25,22 @@ from harnessy_update import (
 
 try:
     _INSTALL_LOCK = acquire_install_lock(APP_ROOT)
+    # The launcher needs this descriptor across exec handoffs. The final app
+    # does not: native VM children must never retain its lifetime lock.
+    _INSTALL_LOCK.prevent_child_inheritance()
 except StartupAlreadyRunning:
-    raise SystemExit("HarnessyXO is already running from this folder. Close it before starting again.")
-except StartupLockUnsafe:
-    raise SystemExit("HarnessyXO cannot safely lock this installation. Check the folder permissions and update lock file.")
+    message = "A process still holds this folder's HarnessyXO launch lock."
+    if os.name != 'nt':
+        command = ('fuser -v .harnessy-update.lock' if sys.platform.startswith('linux')
+                   else 'lsof .harnessy-update.lock')
+        message += ("\nA child process may still hold it after the app stops."
+                    "\nFrom the HarnessyXO folder, inspect it with:\n  " + command)
+    raise SystemExit(message)
+except StartupLockUnsafe as exc:
+    code = getattr(exc.__cause__, 'errno', None)
+    detail = f" (OS error {code})" if type(code) is int else ""
+    raise SystemExit("HarnessyXO cannot safely lock this installation" + detail +
+                     ". Check the folder permissions and update lock file.")
 if validate_direct_start(APP_ROOT)["fatal"]:
     raise SystemExit("A previous startup update needs verification. Run python3 run.py before opening HarnessyXO directly.")
 os.environ.setdefault("HARNESSY_APP_ROOT", str(APP_ROOT))
@@ -87,4 +99,10 @@ except ModuleNotFoundError as exc:
 
 
 if __name__ == "__main__":
-    run_app()
+    try:
+        run_app()
+    except KeyboardInterrupt:
+        print("\nHarnessyXO server stopped.", flush=True)
+        raise SystemExit(130)
+    finally:
+        _INSTALL_LOCK.close()

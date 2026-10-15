@@ -33,6 +33,7 @@ MAX_COMMAND_OUTPUT = 2 * 1024 * 1024
 MAX_ARCHIVE_MISMATCHES = 8
 MAX_ARCHIVE_MODE_REPAIRS = 128
 _HELD_LOCKS: dict[str, "InstallLock"] = {}
+_RUNTIME_FORK_HOOK_REGISTERED = False
 _SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\Z")
 _PROTECTED = {".settings", ".vendor", ".logs", ".venv", ".harnessy", ".git", ".env"}
@@ -72,6 +73,28 @@ def _lock_file_safe(info: os.stat_result) -> bool:
 class InstallLock:
     def __init__(self, root: Path, fd: int, nonce: str):
         self.root, self.fd, self.nonce = root, fd, nonce
+        self._runtime_only = False
+
+    def prevent_child_inheritance(self) -> None:
+        """Keep the final app's lock private; launcher exec handoffs stay opt-in."""
+        global _RUNTIME_FORK_HOOK_REGISTERED
+        if self.fd < 0:
+            return
+        try:
+            os.set_inheritable(self.fd, False)
+        except OSError as exc:
+            raise StartupLockUnsafe("HarnessyXO's installation lock could not be isolated from child processes.") from exc
+        self._runtime_only = True
+        if os.environ.get(LOCK_ENV) == str(self.fd):
+            os.environ.pop(LOCK_ENV, None)
+        register = getattr(os, 'register_at_fork', None)
+        if os.name != 'nt' and callable(register) and not _RUNTIME_FORK_HOOK_REGISTERED:
+            try:
+                register(after_in_child=_close_runtime_locks_after_fork)
+            except (AttributeError, NotImplementedError):
+                pass  # No fork callback support; close-on-exec still applies.
+            else:
+                _RUNTIME_FORK_HOOK_REGISTERED = True
 
     def close(self) -> None:
         if self.fd < 0:
@@ -87,6 +110,17 @@ class InstallLock:
 
     def __exit__(self, *_args) -> None:
         self.close()
+
+
+def _close_runtime_locks_after_fork() -> None:
+    # flock belongs to the shared open file description. Only close the child's
+    # copy: LOCK_UN here would also release the still-running parent's lock.
+    for lock in tuple(_HELD_LOCKS.values()):
+        if lock._runtime_only:
+            try:
+                lock.close()
+            except OSError:
+                pass
 
 
 def acquire_install_lock(app_dir: Path) -> InstallLock:
@@ -133,8 +167,10 @@ def acquire_install_lock(app_dir: Path) -> InstallLock:
             import fcntl
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                raise StartupAlreadyRunning("HarnessyXO is already running from this folder.") from None
+            except OSError as exc:
+                if exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                    raise StartupAlreadyRunning("HarnessyXO is already running from this folder.") from None
+                raise StartupLockUnsafe("HarnessyXO's installation lock could not be acquired.") from exc
         if inherited:
             os.lseek(fd, 0, os.SEEK_SET)
             nonce = os.read(fd, 128).decode("ascii", errors="ignore").strip()
@@ -154,10 +190,10 @@ def acquire_install_lock(app_dir: Path) -> InstallLock:
         if fd >= 0:
             os.close(fd)
         raise
-    except OSError:
+    except OSError as exc:
         if fd >= 0:
             os.close(fd)
-        raise StartupLockUnsafe("HarnessyXO's installation lock could not be opened.") from None
+        raise StartupLockUnsafe("HarnessyXO's installation lock could not be opened.") from exc
 
 
 def _git_env(*, anonymous: bool = False) -> dict[str, str]:

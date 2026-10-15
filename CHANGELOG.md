@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.96
+
+- Fix the launch lock surviving Ctrl+C on Linux. The final app now makes its lock private before starting native tools, so uvloop-launched Lima and QEMU processes cannot inherit it. Forked workers close only their own copy; the running parent stays locked.
+- Keep the lock intact across startup update and launcher-to-app exec handoffs. Release the final app's descriptor when its server exits, including interrupted shutdown. Stop printing the final Python KeyboardInterrupt traceback for Ctrl+C; unexpected errors remain visible. Rapid repeated Ctrl+C can still print an upstream server shutdown-cancellation traceback before exit.
+- Report a held launch lock without claiming the web server is still running. Show the read-only fuser or lsof command to identify processes using the lock. Distinguish Unix OS lock errors from contention and show their numeric error code.
+- Existing VM processes started by an older version can retain an already-leaked lock until they stop. Inspect the reported holders and stop those leftover VMs before restarting; the new release prevents subsequent inheritance.
+- Preserve workspace and VM disk files, settings, model and queue behavior, and public startup updates. Leave README unchanged and keep the same 11 Markdown resources; private QA stays outside the application package.
+
 ## v0.6.95
 
 - Stop removed workspaces from leaving settled completion holds that pause new chats. Clean up those orphaned holds during startup, and remove the workspace registration and its settled blocking completion holds together. Cancel that workspace's pending queued runs in the same transaction, so a late worker cannot recreate the hold after removal. Keep registered projects, active work and backend-recovery holds protected.

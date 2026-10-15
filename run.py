@@ -365,9 +365,18 @@ def main() -> None:
     try:
         install_lock = acquire_install_lock(app_dir)
     except StartupAlreadyRunning:
-        fail("HarnessyXO is already running from this folder. Close it before starting again.")
-    except StartupLockUnsafe:
-        fail("HarnessyXO cannot safely lock this installation. Check the folder permissions and update lock file.")
+        message = "A process still holds this folder's HarnessyXO launch lock."
+        if os.name != 'nt':
+            command = ('fuser -v .harnessy-update.lock' if sys.platform.startswith('linux')
+                       else 'lsof .harnessy-update.lock')
+            message += ("\nA child process may still hold it after the app stops."
+                        "\nFrom the HarnessyXO folder, inspect it with:\n  " + command)
+        fail(message)
+    except StartupLockUnsafe as exc:
+        code = getattr(exc.__cause__, 'errno', None)
+        detail = f" (OS error {code})" if type(code) is int else ""
+        fail("HarnessyXO cannot safely lock this installation" + detail +
+             ". Check the folder permissions and update lock file.")
     update_result = {"outcome": "restart_handoff", "changed": False, "fatal": False}
     if not consume_update_handoff(app_dir):
         print("Checking HarnessyXO updates ...", flush=True)
