@@ -1,4 +1,4 @@
-# HarnessyXO v0.6.92 Features
+# HarnessyXO v0.6.93 Features
 
 ## Model progress across backends
 
@@ -11,6 +11,7 @@
 ## Workspace test-target tabs
 
 - Manage external devices and test VMs in **Workspace Environment → Test targets**.
+- Spot a ready test VM by its bold green Ready badge and check icon beside the name, green card outline and subtle tint. Other states have distinct icons and colours; the status wraps on smaller screens and stays readable in light and dark themes. A stopped, paused or unavailable current state clears an earlier Ready result.
 - Open guest Shell, LuCI Web UI and noVNC Desktop views as separate main-area tabs, preserving selected targets across browser reloads.
 - Keep guest pages isolated from HarnessyXO's browser origin; scope display access to the signed-in session and selected target, and revoke it on close or VM changes.
 - Verify OpenWrt readiness without requiring a hostname utility. Separate boot, shell and optional radio setup stages, with a bounded readiness deadline.

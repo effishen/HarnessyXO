@@ -396,15 +396,18 @@ def _render_target_desktop(page, tab, manager):
 
 def render_managed_target(page, ws, target, refresh):
     manager = TestTargetManager(ws, target)
-    with ui.card().classes('w-full hy-target-card') as panel:
-        with ui.row().classes('w-full items-center gap-2'):
+    with ui.card().classes('w-full hy-target-card').props('data-hy-target-state=neutral') as panel:
+        with ui.row().classes('w-full items-center gap-2 hy-target-header'):
             ui.icon('router' if manager.guest.interface == 'web' else ('desktop_windows' if manager.windows else 'computer'))
             ui.label(target.name).classes('font-semibold hy-target-name')
-            ui.badge(manager.guest.label).props('outline')
+            with ui.row().classes('hy-target-status items-center no-wrap').props(
+                    'role=status aria-live=polite aria-atomic=true data-hy-target-state=neutral') as state_badge:
+                operation_spinner = ui.spinner(size='20px').classes('hy-vm-busy-spinner').props('aria-hidden=true data-hy-target-spinner=1')
+                operation_spinner.set_visibility(False)
+                state_icon = ui.icon('schedule', size='20px').props('aria-hidden=true')
+                state_label = ui.label('Checking status…').classes('hy-target-state-text')
             ui.space()
-            operation_spinner = ui.spinner(size='20px').classes('hy-vm-busy-spinner').props('aria-hidden=true data-hy-target-spinner=1')
-            operation_spinner.set_visibility(False)
-            state_label = ui.label('Checking status…').classes('text-xs hy-muted').props('role=status aria-live=polite')
+            ui.badge(manager.guest.label).props('outline')
         operation_progress = ui.linear_progress(value=0).classes('hy-vm-busy-progress w-full').props(
             'indeterminate rounded size=4px aria-label="Test VM operation in progress" data-hy-target-progress=1')
         operation_progress.set_visibility(False)
@@ -528,7 +531,7 @@ def render_managed_target(page, ws, target, refresh):
             operation_spinner.set_visibility(active)
             operation_progress.set_visibility(active)
             operation_timing.set_visibility(active)
-            panel.props(f'aria-busy={str(active).lower()}')
+            visual_state, icon = 'neutral', 'schedule'
             actions = {'start': 'Starting VM', 'stop': 'Stopping VM', 'radios': 'Setting up emulated radios',
                        'snapshot': 'Creating snapshot', 'restore': 'Restoring snapshot', 'delete': 'Deleting VM'}
             stages = {'prerequisites': 'Checking requirements', 'download': 'Downloading guest image',
@@ -542,23 +545,42 @@ def render_managed_target(page, ws, target, refresh):
                       'bluetooth_verify': 'Verifying live Bluetooth controllers',
                       'ready': 'Finishing readiness checks'}
             if active:
+                visual_state = 'working'
                 action = actions.get(op.action, 'Working on VM')
                 stage = stages.get(op.stage, str(op.stage or '').replace('_', ' ').capitalize())
                 state_label.set_text(action + (' · ' + stage if stage else '…'))
                 elapsed = max(0, int(time.monotonic() - op.started))
                 minutes, seconds = divmod(elapsed, 60)
                 operation_timing.set_text(f'Elapsed {minutes}m {seconds:02d}s' if minutes else f'Elapsed {seconds}s')
+            elif observed_status['error']:
+                visual_state, icon = 'error', 'help_outline'
+                state_label.set_text('Status unavailable')
             elif op and op.state in {'failed', 'cancelled'}:
-                if (op.action == 'start' and op.state == 'failed' and observed_status['running']
+                visual_state, icon = ('error', 'error_outline') if op.state == 'failed' else ('warning', 'cancel')
+                if (op.action == 'start' and op.state == 'failed' and observed_status['state'] == 'running'
+                        and observed_status['running']
                         and not observed_status['error']):
+                    visual_state, icon = 'warning', 'warning_amber'
                     state_label.set_text('Guest running · Start setup incomplete')
                 else:
                     state_label.set_text(('Radio setup' if op.action == 'radios' else op.action.capitalize())
                                          + (' failed' if op.state == 'failed' else ' cancelled'))
-            elif op and op.state == 'succeeded' and op.action == 'start':
+            elif (op and op.state == 'succeeded' and op.action == 'start'
+                    and not manager.busy and observed_status['state'] == 'running' and observed_status['running']):
+                visual_state, icon = 'ready', 'check_circle'
                 state_label.set_text('Ready')
             else:
                 state_label.set_text(str(observed_status['state']).replace('_', ' ').title())
+                if observed_status['state'] == 'running' and observed_status['running']:
+                    visual_state, icon = 'running', 'play_circle_outline'
+                elif observed_status['state'] in {'paused', 'suspended'}:
+                    visual_state, icon = 'warning', 'pause_circle_outline'
+                elif observed_status['state'] in {'stopped', 'not_created'}:
+                    icon = 'stop_circle' if observed_status['state'] == 'stopped' else 'radio_button_unchecked'
+            panel.props(f'aria-busy={str(active).lower()} data-hy-target-state={visual_state}')
+            state_badge.props(f'data-hy-target-state={visual_state}')
+            state_icon.props(f'name={icon}')
+            state_icon.set_visibility(not active)
             for action, button in (('start', start_button), ('stop', stop_button)):
                 button.props(add='loading' if active and op.action == action else '',
                              remove='' if active and op.action == action else 'loading')

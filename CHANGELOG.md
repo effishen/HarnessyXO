@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.6.93
+
+- Make ready test VMs easy to spot: show a bold green Ready badge with a check icon beside the target name, plus a green card outline and subtle background tint. Keep the status visible in light and dark themes and let long names or status messages wrap on narrow screens.
+- Give active work, running guests, incomplete setup, failures and cancellation distinct status treatments. Keep the existing startup spinner, progress bar, elapsed time and action controls. Ready stays still and uses both text and an icon.
+- Clear the Ready presentation when a later status check reports a stopped or paused guest, or status becomes unavailable. A successful earlier Start no longer overrides the current observed state. Keep Running separate when the retained evidence does not establish completed setup.
+- Preserve host KVM startup setup, VM operations, workspace data, tools and public updates. Leave README unchanged and keep the same 11 Markdown resources; private QA stays outside the application package.
+
 ## v0.6.92
 
 - Handle normal Linux KVM group setup when starting `python3 run.py`. If access is missing, add your current account to the standard `kvm` device group through the host terminal's sudo prompt, then relaunch with that group active. If membership was already saved, refresh the launch without repeating the administrator command.
