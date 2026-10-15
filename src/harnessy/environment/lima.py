@@ -178,13 +178,14 @@ class LimaVMEnvironment(WorkspaceEnvironment):
         binary = discover_binary('limactl')
         if not binary:
             host = platform.system()
-            hint = (
-                'On macOS with Homebrew: brew install lima.'
-                if host == 'Darwin'
-                else 'On Linux, install Lima 2.x using its official binary/package method, Nix, or Linuxbrew/Homebrew, and ensure limactl is on PATH.'
-            )
+            if host == 'Linux':
+                raise LimaUnavailableError(
+                    'Lima (limactl) is not installed yet. Start the VM to install verified Lima '
+                    'and matching guest agents automatically. python3 run.py also prepares it.'
+                )
             raise LimaUnavailableError(
-                'Lima (limactl) is not installed. Install Lima on the host, then retry. ' + hint
+                'Lima (limactl) is not installed. Install Lima on the host, then retry. '
+                'On macOS with Homebrew: brew install lima.'
             )
         return binary
 

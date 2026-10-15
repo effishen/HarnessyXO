@@ -180,7 +180,9 @@ class TestTargetManager:
 
     async def _radio_command(self, script: str, *, timeout: float = 20) -> str:
         from harnessy.agent.external_targets import ExternalTargetBroker
-        result = await ExternalTargetBroker(self.workspace)._run_ssh(self.target, script, timeout=timeout)
+        result = await ExternalTargetBroker(self.workspace)._run_ssh(
+            self.target, 'sh -s', input_bytes=script.encode('utf-8'), timeout=timeout,
+        )
         if not result.ok:
             raise RuntimeError('The optional guest radio command failed.')
         return result.stdout
@@ -207,6 +209,7 @@ class TestTargetManager:
                       operation_id=op.operation_id if op and self.busy else '',
                       target_action=op.action if op and self.busy else 'status',
                       target_stage='radio_setup', target_radio_kind=kind,
+                      target_radio_backend=item['backend'],
                       target_radio_observation=observation,
                       target_radio_status=item['status'], target_radio_reason=item['reason'],
                       target_radio_detail=item.get('detail_code', 'none'),
@@ -214,14 +217,35 @@ class TestTargetManager:
                       target_radio_count=item['radio_count'], target_radio_interface_count=item['interface_count'])
 
     async def configure_radios(self) -> None:
-        if self.guest.family != 'openwrt' or not any(self.config['emulation'].values()):
+        if self.guest.family != 'openwrt':
             _RADIOS.pop(self.key, None)
             return
-        from .test_radios import configure_radios, radio_summary
-        self.stage('radio_setup', timeout_seconds=215)
+        from .test_radios import configure_radios, radio_summary, stop_radios
+        if not self.config['emulation']['bluetooth']:
+            # An unchecked selection must not restart our persistent controller
+            # service. Guest packages and unrelated Bluetooth services stay put.
+            try:
+                await stop_radios(self._radio_command)
+            except (OSError, RuntimeError, TimeoutError):
+                self.stage('radio_setup', failure_code='radio_setup_failed')
+                raise TestTargetFailure(
+                    'The VM shell is running, but the managed Bluetooth controllers could not be stopped. '
+                    'Retry Start on this running VM to complete controller cleanup.',
+                    'radio_setup_failed',
+                ) from None
+        if not any(self.config['emulation'].values()):
+            _RADIOS.pop(self.key, None)
+            return
+        self.stage('radio_setup', timeout_seconds=900)
         if self.operation:
-            self.operation.note('Checking requested guest radios. Wi-Fi setup may download signed packages for this exact OpenWrt release (up to 180 seconds).\n')
-        state = await configure_radios(self.config['emulation'], self._radio_command)
+            self.operation.note('Checking requested guest radios. Installing signed packages for this exact OpenWrt release. First-time Bluetooth setup may take several minutes; its package stage has a 10-minute limit.\n')
+        state = await configure_radios(
+            self.config['emulation'], self._radio_command, arch=self.config['architecture'],
+            on_stage=lambda stage: self.stage(stage, timeout_seconds={
+                'bluetooth_packages': 600, 'bluetooth_emulator': 30,
+                'bluetooth_attach': 45, 'bluetooth_verify': 15,
+            }.get(stage, 240)),
+        )
         _RADIOS[self.key] = (time.monotonic(), state)
         self._record_radio_result(state, observation='setup')
         if self.operation:
@@ -235,7 +259,7 @@ class TestTargetManager:
                 + radio_summary(state)
                 + ' Use Set up / repair radios on this running VM to retry. '
                 'Inspect Wi-Fi with iw dev and iw phy; AP/station configuration remains yours. '
-                'Stock OpenWrt cannot provide Bluetooth btvirt/VHCI controllers.',
+                'Bluetooth setup needs matching guest packages and the bundled software controller helper.',
                 'radio_setup_failed',
             )
 

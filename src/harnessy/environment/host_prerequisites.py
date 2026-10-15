@@ -32,10 +32,28 @@ def repaired_path(path: str | None = None) -> str:
     # Empty PATH entries mean CWD; do not introduce implicit host-workspace
     # command execution while repairing a GUI-launched process's PATH.
     entries = [entry for entry in entries if entry and Path(entry).is_absolute()]
+    if platform.system() == 'Linux':
+        from .managed_lima import managed_bin_directory, tool_root
+        managed = managed_bin_directory()
+        releases = tool_root() / 'releases'
+        # A cache invalidated in this process must not remain executable merely
+        # because an earlier discovery appended it to PATH. User-installed
+        # controllers outside our private cache keep their original priority.
+        entries = [entry for entry in entries
+                   if not (Path(entry).parent.parent == releases and Path(entry).name == 'bin')
+                   or (managed is not None and Path(entry) == managed)]
     for entry in (*_KNOWN_BIN_DIRS, str(Path.home() / '.local/bin')):
         if entry not in entries and Path(entry).is_dir():
             entries.append(entry)
+    if platform.system() == 'Linux':
+        if managed is not None and str(managed) not in entries:
+            entries.append(str(managed))
     return os.pathsep.join(entries)
+
+
+def restore_host_tool_path() -> None:
+    """Repair only this process's PATH from a verified existing tools cache."""
+    os.environ['PATH'] = repaired_path()
 
 
 def discover_binary(name: str) -> str | None:
@@ -123,6 +141,9 @@ async def inspect_prerequisites(architecture: str, vm_type: str) -> dict[str, An
     version = ''
     if paths.get('limactl'):
         rc, text = await _run_command([paths['limactl'], '--version'])
+        if (rc and platform.system() == 'Linux' and os.geteuid() == 0
+                and 'must not run as the root user' in text[:1024]):
+            raise HostPrerequisiteError('Lima cannot run as root. Start HarnessyXO with your normal user account.')
         version = _version(text)
         if rc or not version or tuple(map(int, version.split('.'))) < (2, 0, 0):
             raise HostPrerequisiteError('Installed Lima must be version 2.0.0 or later and executable. '
@@ -276,6 +297,35 @@ async def _install(missing: list[str], architecture: str, lima_version: str, *, 
                                     f'network access, and package availability, then retry.\n{output.strip()[-1800:]}')
 
 
+async def _install_linux_lima(*, progress=None) -> dict[str, Any]:
+    from .managed_lima import LIMA_VERSION, ManagedLimaError, install_managed_lima
+    await _progress(progress, 'installing_host_dependencies', f'Preparing Lima {LIMA_VERSION} for this Linux account…',
+                    detail='Downloading and verifying the official controller and matching guest agents. No administrator permission is needed.')
+    try:
+        result = await asyncio.to_thread(install_managed_lima)
+    except ManagedLimaError as exc:
+        if str(exc) == 'root_account_unsupported':
+            raise HostPrerequisiteError('Lima cannot run as root. Start HarnessyXO with your normal user account.') from None
+        raise HostPrerequisiteError('Automatic Linux Lima setup failed: ' + str(exc) +
+                                    '. Check host internet access and your private HarnessyXO tools-cache permissions, then retry VM Start.') from None
+    except Exception:
+        raise HostPrerequisiteError('Automatic Linux Lima setup could not complete. Check host internet access and tools-cache permissions, then retry VM Start.') from None
+    restore_host_tool_path()
+    await _progress(progress, 'host_dependencies_ready', f'Lima {LIMA_VERSION} and matching guest agents are ready.',
+                    cached=bool(result.get('cached')))
+    return result
+
+
+async def ensure_lima_controller(*, progress=None) -> str | None:
+    """Linux launcher bootstrap; existing PATH installations retain priority."""
+    restore_host_tool_path()
+    existing = discover_binary('limactl')
+    if existing is not None or platform.system() != 'Linux':
+        return existing
+    result = await _install_linux_lima(progress=progress)
+    return str(result['binary'])
+
+
 async def ensure_host_prerequisites(config, *, vm_type: str | None = None, progress=None,
                                     allow_install: bool = True) -> dict[str, Any]:
     if str(config.provider) != 'lima':
@@ -289,10 +339,16 @@ async def ensure_host_prerequisites(config, *, vm_type: str | None = None, progr
             if not allow_install:
                 raise HostPrerequisiteError('Missing host prerequisites: ' + ', '.join(report['missing']) +
                                             '. The VM is active; no packages were changed. Retry after work has stopped.')
-            if await infrastructure_active():
+            if platform.system() == 'Linux' and 'limactl' in report['missing']:
+                # A private missing-controller install neither modifies a
+                # package-managed Lima nor interrupts existing VM processes.
+                await _install_linux_lima(progress=progress)
+                report = await inspect_prerequisites(config.architecture, vm_type)
+            if report['missing'] and await infrastructure_active():
                 raise HostPrerequisiteError('Host VM infrastructure is active; missing prerequisites (' +
                                             ', '.join(report['missing']) + ') were not installed or upgraded. Retry during maintenance.')
-            await _install(report['missing'], config.architecture, report['lima_version'], progress=progress)
+            if report['missing']:
+                await _install(report['missing'], config.architecture, report['lima_version'], progress=progress)
             report = await inspect_prerequisites(config.architecture, vm_type)
             if report['missing']:
                 raise HostPrerequisiteError('Installation completed but verification still cannot find: ' + ', '.join(report['missing']) +

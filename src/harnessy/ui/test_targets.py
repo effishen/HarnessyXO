@@ -52,10 +52,9 @@ def open_vm_creator(ws, refresh, os_name='ubuntu-24.04'):
             with ui.column().classes('w-full gap-2') as radio_options:
                 ui.label('Guest radio emulation').classes('font-semibold text-sm')
                 wifi = ui.checkbox('Emulated Wi-Fi radios (mac80211_hwsim)', value=False)
-                bluetooth = ui.checkbox('Emulated Bluetooth controllers (requires custom image support)', value=False)
-                bluetooth.set_enabled(False)
-                ui.label('Bluetooth is unavailable in these stock OpenWrt images. After creating a VM, a manually customized guest with VHCI and btvirt can request it in Emulated radios.').classes('text-xs hy-muted')
-                ui.label('Software radios only: no real RF, USB dongle identity or access to nearby devices. Wi-Fi modules download on Start; stock OpenWrt images cannot provide a Bluetooth controller. The model is told what is requested and what actually becomes active.').classes('text-xs hy-muted')
+                bluetooth = ui.checkbox('Emulated Bluetooth controllers', value=False)
+                ui.label('On Start, HarnessyXO downloads matching guest packages and sets up two software Bluetooth controllers. First setup can take longer; progress appears on the target card.').classes('text-xs hy-muted')
+                ui.label('Software radios only: no physical RF, USB dongle identity or access to nearby devices. Matching Wi-Fi and Bluetooth dependencies download on Start. The model sees the saved selection and verified active controllers separately.').classes('text-xs hy-muted')
             prerequisite_hint = ui.label('').classes('text-xs hy-muted')
             start_now = ui.switch('Start after creating', value=True)
             error = ui.label('').classes('text-sm text-negative whitespace-pre-wrap').props('role=alert')
@@ -403,7 +402,14 @@ def render_managed_target(page, ws, target, refresh):
             ui.label(target.name).classes('font-semibold hy-target-name')
             ui.badge(manager.guest.label).props('outline')
             ui.space()
+            operation_spinner = ui.spinner(size='20px').classes('hy-vm-busy-spinner').props('aria-hidden=true data-hy-target-spinner=1')
+            operation_spinner.set_visibility(False)
             state_label = ui.label('Checking status…').classes('text-xs hy-muted').props('role=status aria-live=polite')
+        operation_progress = ui.linear_progress(value=0).classes('hy-vm-busy-progress w-full').props(
+            'indeterminate rounded size=4px aria-label="Test VM operation in progress" data-hy-target-progress=1')
+        operation_progress.set_visibility(False)
+        operation_timing = ui.label('').classes('text-xs hy-muted').props('aria-live=off')
+        operation_timing.set_visibility(False)
         c = manager.config
         radio_status = ui.label('').classes('text-xs hy-muted whitespace-pre-wrap') if manager.guest.family == 'openwrt' else None
         ui.label(f"{c['architecture']} · {c['cpu']} CPUs · {c['memory_mb']} MiB RAM · {c['disk_gb']} GiB disk · Internet enabled").classes('text-xs hy-muted')
@@ -423,9 +429,9 @@ def render_managed_target(page, ws, target, refresh):
             with ui.expansion('Emulated radios', icon='wifi').classes('w-full hy-target-details'):
                 requested = c.get('emulation') or {}
                 wifi = ui.checkbox('Emulated Wi-Fi radios (mac80211_hwsim)', value=bool(requested.get('wifi')))
-                bluetooth = ui.checkbox('Emulated Bluetooth controllers (requires custom image support)', value=bool(requested.get('bluetooth')))
-                ui.label('Guest software radios, with no real RF or USB dongle identity. Wi-Fi setup downloads matching signed simulator packages. Bluetooth is unavailable in stock OpenWrt images; it needs a custom image providing VHCI and btvirt. The model sees requested and verified active states separately.').classes('text-xs hy-muted')
-                ui.label('Stop this VM before changing the saved selection. Retry its saved setup on a running VM with Set up / repair radios. Unticking skips future setup; it leaves installed guest packages and existing interfaces in place. Network and wireless configuration is kept.').classes('text-xs hy-muted')
+                bluetooth = ui.checkbox('Emulated Bluetooth controllers', value=bool(requested.get('bluetooth')))
+                ui.label('Software radios only: no physical RF, USB dongle identity or access to nearby devices. Wi-Fi setup downloads matching signed simulator packages. Bluetooth downloads matching guest packages and sets up two software controllers on Start, then checks the live controllers. The model sees requested and verified active states separately.').classes('text-xs hy-muted')
+                ui.label('Stop this VM before changing the saved selection. Retry its saved setup on a running VM with Set up / repair radios. Unticking Bluetooth stops its managed controllers on the next Start; packages stay installed. Unticking Wi-Fi skips future setup and keeps existing interfaces. Network and wireless configuration is kept.').classes('text-xs hy-muted')
                 radio_error = ui.label('').classes('text-negative text-sm whitespace-pre-wrap').props('role=alert')
                 async def save_radios():
                     try:
@@ -454,7 +460,7 @@ def render_managed_target(page, ws, target, refresh):
                     await manager.request_stop()
                 else:
                     manager.begin(action, tag=tag)
-                state_label.set_text(action.capitalize() + ' in progress…')
+                update_operation_state()
                 await poll()
             except Exception as exc:
                 ui.notify(str(exc), type='warning', timeout=6000)
@@ -498,8 +504,8 @@ def render_managed_target(page, ws, target, refresh):
                 ui.button('Cancel', on_click=dialog.close).props('flat no-caps')
             dialog.open()
         with ui.row().classes('w-full gap-1'):
-            start_button = ui.button('Start', icon='play_arrow', on_click=lambda: start_action('start')).props('flat no-caps')
-            stop_button = ui.button('Stop', icon='stop', on_click=lambda: start_action('stop')).props('flat no-caps')
+            start_button = ui.button('Start', icon='play_arrow', on_click=lambda: start_action('start')).classes('hy-vm-busy-action').props('flat no-caps')
+            stop_button = ui.button('Stop', icon='stop', on_click=lambda: start_action('stop')).classes('hy-vm-busy-action').props('flat no-caps')
             shell_button = ui.button('Shell', icon='terminal', on_click=lambda: open_target_shell(page, manager)).props('flat no-caps')
             desktop_button = ui.button('Web UI' if manager.guest.interface == 'web' else 'Desktop', icon='language' if manager.guest.interface == 'web' else 'desktop_windows', on_click=lambda: open_target_desktop(page, manager)).props('flat no-caps')
             desktop_button.set_visibility(bool(c['desktop']))
@@ -510,6 +516,50 @@ def render_managed_target(page, ws, target, refresh):
             output = ui.label('').classes('text-xs w-full font-mono').style('white-space:pre-wrap;max-height:260px;overflow:auto')
         error_label = ui.label('').classes('text-negative text-sm whitespace-pre-wrap')
         radio_probe_busy = {'value': False}
+        observed_status = {'state': 'checking_status', 'running': False}
+
+        def update_operation_state():
+            if panel.is_deleted:
+                operation_timer.deactivate()
+                return
+            op = manager.operation
+            active = bool(manager.busy and op and op.state not in {'succeeded', 'failed', 'cancelled'})
+            operation_spinner.set_visibility(active)
+            operation_progress.set_visibility(active)
+            operation_timing.set_visibility(active)
+            panel.props(f'aria-busy={str(active).lower()}')
+            actions = {'start': 'Starting VM', 'stop': 'Stopping VM', 'radios': 'Setting up emulated radios',
+                       'snapshot': 'Creating snapshot', 'restore': 'Restoring snapshot', 'delete': 'Deleting VM'}
+            stages = {'prerequisites': 'Checking requirements', 'download': 'Downloading guest image',
+                      'prepare_disk': 'Preparing guest disk', 'launch': 'Booting guest',
+                      'wait_ssh': 'Waiting for guest SSH', 'probe_shell': 'Checking guest shell',
+                      'radio_setup': 'Preparing and checking emulated radios',
+                      'bluetooth_packages': 'Downloading matching Bluetooth packages',
+                      'bluetooth_emulator': 'Preparing Bluetooth software emulator',
+                      'bluetooth_attach': 'Attaching software Bluetooth controllers',
+                      'bluetooth_verify': 'Verifying live Bluetooth controllers',
+                      'ready': 'Finishing readiness checks'}
+            if active:
+                action = actions.get(op.action, 'Working on VM')
+                stage = stages.get(op.stage, str(op.stage or '').replace('_', ' ').capitalize())
+                state_label.set_text(action + (' · ' + stage if stage else '…'))
+                elapsed = max(0, int(time.monotonic() - op.started))
+                minutes, seconds = divmod(elapsed, 60)
+                operation_timing.set_text(f'Elapsed {minutes}m {seconds:02d}s' if minutes else f'Elapsed {seconds}s')
+            elif op and op.state in {'failed', 'cancelled'}:
+                state_label.set_text(('Radio setup' if op.action == 'radios' else op.action.capitalize())
+                                     + (' failed' if op.state == 'failed' else ' cancelled'))
+                error_label.set_text(op.error)
+            elif op and op.state == 'succeeded' and op.action == 'start':
+                state_label.set_text('Ready')
+            else:
+                state_label.set_text(str(observed_status['state']).replace('_', ' ').title())
+            for action, button in (('start', start_button), ('stop', stop_button)):
+                button.props(add='loading' if active and op.action == action else '',
+                             remove='' if active and op.action == action else 'loading')
+            start_button.set_text('Starting…' if active and op.action == 'start' else 'Start')
+            stop_button.set_text('Stopping…' if active and op.action == 'stop' else 'Stop')
+
         async def poll():
             if panel.is_deleted:
                 timer.deactivate()
@@ -523,11 +573,13 @@ def render_managed_target(page, ws, target, refresh):
                     refresh()
                     return
             busy = manager.busy
+            update_operation_state()
             try:
                 status = await manager.status()
                 if panel.is_deleted:
                     return
-                state_label.set_text(f'{op.action} in progress' if busy else status['state'].replace('_', ' ').title())
+                observed_status.update(state=status['state'], running=status['running'])
+                update_operation_state()
                 running = status['running']
                 if radio_status is not None:
                     from harnessy.environment.test_radios import radio_summary
@@ -559,14 +611,17 @@ def render_managed_target(page, ws, target, refresh):
                 delete_button.set_enabled(not busy and not running)
             except Exception as exc:
                 if not panel.is_deleted:
-                    state_label.set_text('Status unavailable')
+                    observed_status['state'] = 'status_unavailable'
+                    update_operation_state()
                     error_label.set_text(str(exc))
         for button in (start_button, stop_button, shell_button, desktop_button, snapshot_button, restore_button, delete_button):
             button.set_enabled(False)
         timer = ui.timer(5.0, poll)
+        operation_timer = ui.timer(0.3, update_operation_state)
         initial_timer = ui.timer(0.1, poll, once=True)
         def dispose():
             timer.deactivate()
+            operation_timer.deactivate()
             initial_timer.deactivate()
         panel.client.on_disconnect(dispose)
         return dispose

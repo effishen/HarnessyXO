@@ -17,6 +17,9 @@ _REASONS = {
     'iw_missing', 'insufficient_radios', 'btvirt_missing', 'vhci_missing',
     'service_conflict', 'service_start_failed', 'insufficient_controllers',
     'interfaces_missing', 'interface_create_failed',
+    'helper_unavailable', 'helper_integrity_failed', 'helper_install_failed',
+    'cli_missing', 'controller_attach_failed',
+    'crypto_unavailable',
 }
 _DETAIL_CODES = {
     'none', 'unknown', 'dns_resolution_failed', 'tls_verification_failed',
@@ -27,7 +30,7 @@ _DETAIL_CODES = {
 }
 _DESCRIPTIONS = {
     'wifi': 'Guest Linux mac80211_hwsim virtual Wi-Fi radios. Inspect with iw dev and iw phy; configure AP/station roles separately. Software tests only; no physical RF, nearby-network scan, USB dongle or chipset emulation.',
-    'bluetooth': 'Guest BlueZ btvirt with Linux VHCI virtual Bluetooth controllers. Software Bluetooth tests only; no physical RF, nearby-device scan or USB dongle emulation. Stock OpenWrt images lack these prerequisites.',
+    'bluetooth': 'Guest BlueZ software Bluetooth controllers over H4 pseudo-terminals and the Linux HCI UART driver. Inspect with hciconfig -a and bluetoothctl list. The two controllers share emulated air; no physical RF, nearby devices or USB dongle identity are provided.',
 }
 
 # A service belongs to us only when its complete body still matches. procd owns
@@ -93,6 +96,39 @@ for process in /proc/[0-9]*/exe; do
     case "$binary" in /usr/bin/btvirt|/usr/sbin/btvirt|/usr/libexec/btvirt) btvirt_running=1; break;; esac
 done
 printf 'HX_RADIO_V1 wifi=%s wifi_interfaces=%s iw=%s bluetooth=%s vhci=%s btvirt=%s btvirt_running=%s\n' "$wifi" "$wifi_interfaces" "$iw_present" "$bluetooth" "$vhci" "$btvirt" "$btvirt_running"
+h4_installed=0
+[ -x /usr/libexec/harnessy-test-bt ] && h4_installed=1
+h4_helper=0
+h4_attach0=0
+h4_attach1=0
+for process in /proc/[0-9]*; do
+    binary="$(readlink -f "$process/exe" 2>/dev/null || true)"
+    case "$binary" in
+        /usr/libexec/harnessy-test-bt) h4_helper=1;;
+        /usr/bin/btattach|/usr/sbin/btattach)
+            args="$(tr '\000' ' ' < "$process/cmdline" 2>/dev/null || true)"
+            case "$args" in *' /var/run/harnessy-test-bluetooth/hci0 '*) h4_attach0=1;; esac
+            case "$args" in *' /var/run/harnessy-test-bluetooth/hci1 '*) h4_attach1=1;; esac
+        ;;
+    esac
+done
+h4_cli=0
+if command -v hciconfig >/dev/null 2>&1 && command -v bluetoothctl >/dev/null 2>&1; then h4_cli=1; fi
+h4_controllers=0
+h4_first=0
+h4_second=0
+if [ "$h4_installed" = 1 ] && [ "$h4_helper" = 1 ] && [ "$h4_cli" = 1 ]; then
+    for controller in /sys/class/bluetooth/hci*; do
+        [ -e "$controller" ] || continue
+        location="$(readlink -f "$controller" 2>/dev/null || true)"
+        case "$location" in /sys/devices/virtual/*) ;; *) continue;; esac
+        info="$(hciconfig "${controller##*/}" 2>/dev/null || true)"
+        if printf '%s\n' "$info" | grep -qi '00:AA:01:00:48:58'; then h4_first=1; fi
+        if printf '%s\n' "$info" | grep -qi '00:AA:01:01:48:59'; then h4_second=1; fi
+    done
+    h4_controllers=$((h4_first + h4_second))
+fi
+printf 'HX_BT_H4_V1 controllers=%s installed=%s helper=%s attach=%s cli=%s\n' "$h4_controllers" "$h4_installed" "$h4_helper" "$((h4_attach0 + h4_attach1))" "$h4_cli"
 '''
 
 # Use only signed official repositories for the *installed* release. Never
@@ -117,7 +153,7 @@ if ! command -v iw >/dev/null 2>&1 || ! modprobe mac80211_hwsim radios=2 >/dev/n
         if [ ! -s "$work/repositories" ]; then
             reason=stock_feeds_unavailable
         else
-            kernel_version="$(apk info -v kernel 2>/dev/null | sed -n 's/^kernel-//p')"
+            kernel_version="$(apk list -I kernel 2>/dev/null | sed -n '/^kernel-[a-zA-Z0-9._+~:-][a-zA-Z0-9._+~:-]* .*\[installed\]$/{s/^kernel-\([^ ]*\) .*$/\1/;p;q;}')"
             case "$kernel_version" in ''|*[!a-zA-Z0-9._+~:-]*) reason=package_install_failed;; esac
             if [ "$reason" = verified ]; then
                 if ! apk --repositories-file "$work/repositories" update > "$work/install.log" 2>&1; then
@@ -246,12 +282,12 @@ def _requested(value: Any) -> dict[str, bool]:
     return {key: raw.get(key) is True for key in ('wifi', 'bluetooth')}
 
 
-def _record(kind: str, requested: bool, *, status: str = 'disabled', reason: str = 'not_requested', count: int = 0, interface_count: int = 0, detail_code: str = 'none') -> dict[str, Any]:
+def _record(kind: str, requested: bool, *, status: str = 'disabled', reason: str = 'not_requested', count: int = 0, interface_count: int = 0, detail_code: str = 'none', backend: str | None = None) -> dict[str, Any]:
     active = status == 'active'
     return {
         'requested': requested, 'enabled': active, 'verified': active,
         'status': status, 'reason': reason,
-        'backend': 'mac80211_hwsim' if kind == 'wifi' else 'bluez_btvirt_vhci',
+        'backend': 'mac80211_hwsim' if kind == 'wifi' else (backend or 'bluez_h4_uart'),
         'source_kind': 'emulated', 'radio_count': count,
         'interface_count': interface_count, 'physical_rf': False,
         'usb_dongle_emulation': False, 'description': _DESCRIPTIONS[kind],
@@ -281,7 +317,11 @@ def public_radio_snapshot(value: Any) -> dict[str, Any]:
             status, reason = 'unavailable', 'interfaces_missing'
         detail = item.get('detail_code')
         detail = detail if isinstance(detail, str) and detail in _DETAIL_CODES else 'unknown'
-        output[kind] = _record(kind, item.get('requested') is True, status=status, reason=reason, count=radios, interface_count=interfaces, detail_code=detail)
+        backend = item.get('backend')
+        backend = backend if backend in ('bluez_h4_uart', 'bluez_btvirt_vhci') else None
+        if kind == 'bluetooth' and backend == 'bluez_h4_uart' and status == 'active' and radios < 2:
+            status, reason = 'unavailable', 'insufficient_controllers'
+        output[kind] = _record(kind, item.get('requested') is True, status=status, reason=reason, count=radios, interface_count=interfaces, detail_code=detail, backend=backend)
     return output
 
 
@@ -289,7 +329,13 @@ def _parse_probe(output: str) -> dict[str, int] | None:
     match = re.search(r'^HX_RADIO_V1 wifi=(\d{1,3}) wifi_interfaces=(\d{1,3}) iw=([01]) bluetooth=(\d{1,3}) vhci=([01]) btvirt=([01]) btvirt_running=([01])$', str(output)[-8192:], re.MULTILINE)
     if not match:
         return None
-    return dict(zip(('wifi', 'wifi_interfaces', 'iw', 'bluetooth', 'vhci', 'btvirt', 'btvirt_running'), map(int, match.groups())))
+    parsed = dict(zip(('wifi', 'wifi_interfaces', 'iw', 'bluetooth', 'vhci', 'btvirt', 'btvirt_running'), map(int, match.groups())))
+    parsed.update(h4_present=0, h4_controllers=0, h4_installed=0, h4_helper=0, h4_attach=0, h4_cli=0)
+    h4 = re.search(r'^HX_BT_H4_V1 controllers=(\d{1,3}) installed=([01]) helper=([01]) attach=([012]) cli=([01])$', str(output)[-8192:], re.MULTILINE)
+    if h4:
+        parsed["h4_present"] = 1
+        parsed.update(zip(('h4_controllers', 'h4_installed', 'h4_helper', 'h4_attach', 'h4_cli'), map(int, h4.groups())))
+    return parsed
 
 
 async def probe_radios(requested: dict[str, Any], run_guest: RunGuest) -> dict[str, Any]:
@@ -306,22 +352,33 @@ async def probe_radios(requested: dict[str, Any], run_guest: RunGuest) -> dict[s
         return result
     for kind in wanted:
         count = min(probe[kind], 256)
+        backend = 'bluez_btvirt_vhci' if kind == 'bluetooth' else None
+        legacy_verified = probe['bluetooth'] >= 1 and bool(probe['vhci'] and probe['btvirt'] and probe['btvirt_running'])
+        h4_verified = probe['h4_controllers'] == 2 and bool(probe['h4_helper'] and probe['h4_attach'] == 2 and probe['h4_cli'])
+        if kind == 'bluetooth' and probe['h4_present'] and (h4_verified or not legacy_verified):
+            count = min(probe['h4_controllers'], 2)
+            backend = 'bluez_h4_uart'
         # Sysfs identifies only hwsim phys / virtual HCI controllers. Real USB
         # adapters or virtio Ethernet can never satisfy this test.
         verified = count >= 1 and (bool(probe['iw'] and probe['wifi_interfaces']) if kind == 'wifi' else bool(probe['vhci'] and probe['btvirt'] and probe['btvirt_running']))
+        if kind == 'bluetooth' and backend == 'bluez_h4_uart':
+            verified = count == 2 and bool(probe['h4_helper'] and probe['h4_attach'] == 2 and probe['h4_cli'])
         if verified:
-            result[kind] = _record(kind, wanted[kind], status='active', reason='verified', count=count, interface_count=min(probe['wifi_interfaces'], 256) if kind == 'wifi' else count)
+            result[kind] = _record(kind, wanted[kind], status='active', reason='verified', count=count, interface_count=min(probe['wifi_interfaces'], 256) if kind == 'wifi' else count, backend=backend)
         elif wanted[kind]:
             reason = 'iw_missing' if kind == 'wifi' and not probe['iw'] else 'not_detected'
             if kind == 'wifi' and count and probe['iw'] and not probe['wifi_interfaces']:
                 reason = 'interfaces_missing'
             if kind == 'bluetooth':
                 reason = 'btvirt_missing' if not probe['btvirt'] else ('vhci_missing' if not probe['vhci'] else 'not_detected')
-            result[kind] = _record(kind, True, status='unavailable', reason=reason, count=count)
+                if backend == 'bluez_h4_uart':
+                    reason = 'helper_unavailable' if not probe['h4_installed'] else 'cli_missing' if not probe['h4_cli'] else 'service_start_failed' if not probe['h4_helper'] else 'controller_attach_failed' if probe['h4_attach'] < 2 else 'insufficient_controllers'
+            result[kind] = _record(kind, True, status='unavailable', reason=reason, count=count, backend=backend)
     return result
 
 
-async def configure_radios(requested: dict[str, Any], run_guest: RunGuest) -> dict[str, Any]:
+async def configure_radios(requested: dict[str, Any], run_guest: RunGuest, *,
+                           arch: str | None = None, on_stage: Callable[[str], None] | None = None) -> dict[str, Any]:
     """Attempt requested optional setup; its failure never invalidates the shell."""
     wanted = _requested(requested)
     reasons = {}
@@ -330,7 +387,37 @@ async def configure_radios(requested: dict[str, Any], run_guest: RunGuest) -> di
         if not wanted[kind]:
             continue
         try:
-            output = await run_guest(script, timeout=180 if kind == 'wifi' else 20)
+            if kind == 'bluetooth' and arch is not None:
+                from .test_bluetooth import (
+                    BLUETOOTH_H4_SETUP_SCRIPT, BLUETOOTH_PACKAGES_SCRIPT,
+                    BluetoothHelperError, helper_install_script,
+                )
+                if on_stage:
+                    on_stage('bluetooth_packages')
+                package_output = await run_guest(BLUETOOTH_PACKAGES_SCRIPT, timeout=600)
+                package_reason = re.search(r'^HX_RADIO_SETUP bluetooth=([a-z_]+)$', str(package_output)[-8192:], re.MULTILINE)
+                package_detail = re.search(r'^HX_RADIO_DETAIL bluetooth=([a-z_]+)$', str(package_output)[-8192:], re.MULTILINE)
+                if not package_reason or package_reason.group(1) != 'verified':
+                    reasons[kind] = package_reason.group(1) if package_reason and package_reason.group(1) in _REASONS else 'package_install_failed'
+                    details[kind] = package_detail.group(1) if package_detail and package_detail.group(1) in _DETAIL_CODES else 'unknown'
+                    continue
+                if on_stage:
+                    on_stage('bluetooth_emulator')
+                try:
+                    install_script = helper_install_script(arch)
+                except BluetoothHelperError as error:
+                    reasons[kind], details[kind] = error.reason, 'none'
+                    continue
+                helper_output = await run_guest(install_script, timeout=30)
+                helper_result = re.search(r'^HX_BT_HELPER ([a-z_]+)$', str(helper_output)[-8192:], re.MULTILINE)
+                if not helper_result or helper_result.group(1) != 'verified':
+                    reasons[kind] = helper_result.group(1) if helper_result and helper_result.group(1) in _REASONS else 'helper_install_failed'
+                    details[kind] = 'none'
+                    continue
+                if on_stage:
+                    on_stage('bluetooth_attach')
+                script = BLUETOOTH_H4_SETUP_SCRIPT
+            output = await run_guest(script, timeout=180 if kind == 'wifi' else 45 if arch is not None else 20)
             match = re.search(r'^HX_RADIO_SETUP ' + kind + r'=([a-z_]+)$', str(output)[-8192:], re.MULTILINE)
             reason = match.group(1) if match else 'setup_failed'
             reasons[kind] = reason if reason in _REASONS else 'setup_failed'
@@ -339,6 +426,8 @@ async def configure_radios(requested: dict[str, Any], run_guest: RunGuest) -> di
         except (OSError, RuntimeError, TimeoutError) as error:
             reasons[kind] = 'setup_failed'
             details[kind] = 'operation_timeout' if isinstance(error, TimeoutError) else 'ssh_command_failed'
+    if wanted['bluetooth'] and arch is not None and on_stage:
+        on_stage('bluetooth_verify')
     result = await probe_radios(wanted, run_guest)
     for kind, reason in reasons.items():
         # An independent probe determines capability. A failed install may
@@ -352,7 +441,7 @@ async def configure_radios(requested: dict[str, Any], run_guest: RunGuest) -> di
             continue
         result[kind]['detail_code'] = details.get(kind, 'none')
         if reason != 'verified':
-            result[kind]['status'] = 'error' if reason in {'setup_failed', 'package_install_failed', 'feed_update_failed', 'module_load_failed', 'service_start_failed', 'interface_create_failed'} else 'unavailable'
+            result[kind]['status'] = 'error' if reason in {'setup_failed', 'package_install_failed', 'feed_update_failed', 'module_load_failed', 'service_start_failed', 'interface_create_failed', 'helper_integrity_failed', 'helper_install_failed', 'controller_attach_failed'} else 'unavailable'
             result[kind]['reason'] = reason
     return public_radio_snapshot(result)
 
@@ -360,6 +449,8 @@ async def configure_radios(requested: dict[str, Any], run_guest: RunGuest) -> di
 async def stop_radios(run_guest: RunGuest) -> None:
     """Stop our procd instance. Never unload Wi-Fi or disturb user processes."""
     await run_guest(BLUETOOTH_STOP_SCRIPT, timeout=15)
+    from .test_bluetooth import BLUETOOTH_H4_STOP_SCRIPT
+    await run_guest(BLUETOOTH_H4_STOP_SCRIPT, timeout=15)
 
 
 def radio_summary(snapshot: Any) -> str:
@@ -381,5 +472,7 @@ def radio_guidance(snapshot: Any) -> str:
         else:
             lines.append('Wi-Fi is not ready. Use Set up / repair radios while this VM is running. Check its per-radio result and Activity output; iw is installed only when the matching signed packages can be fetched.')
     if clean['bluetooth']['requested'] and not clean['bluetooth']['verified']:
-        lines.append('Bluetooth is unavailable in stock OpenWrt images. A custom image must provide btvirt and the Linux VHCI driver; selecting the option cannot add missing kernel support.')
+        lines.append('Bluetooth setup has not verified both software controllers. Use Set up / repair radios on this running VM to install the matching signed packages and bundled emulator, then check hciconfig -a and bluetoothctl list. No custom image is required.')
+    elif clean['bluetooth']['verified']:
+        lines.append('Bluetooth: run hciconfig -a and bluetoothctl list in this target Shell. Both controllers are software emulations sharing virtual air inside this VM; they cannot discover nearby physical devices.')
     return '\n'.join(lines)

@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.6.87
+
+- Enable **Emulated Bluetooth controllers** when creating an OpenWrt target. Checking it installs matching signed guest packages and sets up two software Bluetooth controllers automatically. Existing targets can use **Set up / repair radios**; no custom guest image or VM rebuild is required.
+- Bundle verified static BlueZ controller helpers for ARM64, x86-64 and all supported MIPS variants. Keep both controllers in one emulator so they can communicate, and verify owned H4 transports and registered guest adapters before reporting activation. Include the helper source, build recipe and upstream source/licences. This is software emulation with no physical RF, nearby devices or USB dongle identity.
+- Document the stock OpenWrt 25.12.5 BlueZ 5.83 `btmgmt` CLI failure and big-endian MIPS daemon management/scan-ioctl limitations, including an explicit HCI scan workaround in model guidance. Check HCI registration independently; do not equate it with complete daemon/profile compatibility.
+- Show an animated loading indicator and indeterminate progress during VM startup, alongside the current stage and elapsed time. Stop animation on success, failure or cancellation, and respect reduced-motion preferences. Include Bluetooth package, emulator, attach and verification stages in progress and diagnostics.
+- Automatically install a verified private Lima 2.2.1 distribution and matching guest agents on Linux ARM64/x86-64 hosts when `python3 run.py` or VM Create/Start finds it missing. Reuse the verified cache offline and restore its path for the app, keeping existing usable PATH installations and shell profiles intact. Preserve normal host-package privilege checks; Lima requires a normal user account.
+- Preserve REA as an ordinary VM CLI, existing guest disks, network configuration, workspace data and the public updater. Leave README unchanged and keep the existing 11 Markdown resources. QA files stay outside the application package.
+
 ## v0.6.86
 
 - Run REA as the ordinary `rea` CLI inside reverse-engineering workspace VMs. The LLM discovers installed commands through shell tools and CLI help; Shell commands and Long-running processes permissions apply. Remove the dedicated host MCP tools, permission and Settings panel, and stop host REA downloads in `python3 run.py`. Preserve inactive host settings and caches for rollback.

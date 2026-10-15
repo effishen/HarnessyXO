@@ -1,4 +1,4 @@
-# HarnessyXO v0.6.86 Features
+# HarnessyXO v0.6.87 Features
 
 ## Workspace test-target tabs
 
@@ -11,9 +11,15 @@
 ## OpenWrt radio emulation
 
 - Request two guest mac80211_hwsim Wi-Fi radios, installing matching signed official packages and verifying both PHYs and usable virtual interfaces before claiming activation. Create missing hwsim interfaces without replacing existing wireless or LAN configuration.
-- Support Bluetooth simulation when a custom image provides Linux VHCI and BlueZ btvirt. Disable Bluetooth selection when creating a stock OpenWrt image. Existing customized targets can request it, but missing prerequisites remain explicitly unavailable; a selected checkbox cannot supply them.
+- Select **Emulated Bluetooth controllers** to install matching official guest packages and start two software controllers automatically. A bundled static BlueZ helper connects through private H4 pseudo-terminals and OpenWrt’s HCI UART driver, without replacing the guest kernel or rebuilding the VM. The helper runs on ARM64, x86-64 and the available MIPS variants. Verify actual controller registration and owned transports before claiming activation. OpenWrt 25.12.5’s stock BlueZ 5.83 daemon has big-endian MIPS management serialization bugs (malformed controller-capability and blocked-key messages). The Linux 6.12 big-endian scan ioctl can also silently disable scanning despite a successful hciconfig piscan; use a byte-sized HCI Write Scan Enable command and inspect the result. Controller registration does not establish full daemon or profile compatibility; verify the intended operation and report any daemon isolation used for raw HCI tests.
 - Tell the model which capabilities are requested, last observed or currently verified, and label virtual radios as emulated with no physical RF or USB chipset coverage.
-- Use **Set up / repair radios** on a running target to retry its saved selection. Probe live capabilities after an application restart. Show setup progress, package/network/kernel failure categories, and per-radio results in the UI and support diagnostics. Incomplete requested setup reports failure while leaving the VM shell available.
+- Show a live spinner, indeterminate progress and the current stage while a test VM starts or sets up radios; stop the animation when the operation finishes. Use **Set up / repair radios** on a running target to retry its saved selection. Probe live capabilities after an application restart. Show setup progress, package/network/kernel failure categories, and per-radio results in the UI and support diagnostics. Incomplete requested setup reports failure while leaving the VM shell available.
+
+## Automatic Linux Lima setup
+
+- On Linux ARM64 and x86-64 hosts, install a verified private Lima 2.2.1 distribution with matching additional guest agents when `python3 run.py` or VM Create/Start finds Lima missing. Keep an existing usable Lima on your PATH in preference to the managed copy.
+- Verify official release checksums, stage the complete tool bundle before activating it, and reuse a verified cache offline. Restore the managed tool path inside the application process without changing shell profiles or system PATH settings.
+- Keep ordinary host package installation and privilege checks for QEMU and other required tools. Run HarnessyXO with your normal account; official Lima refuses root operation.
 
 ## Public GitHub startup updates
 

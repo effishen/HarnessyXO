@@ -1,0 +1,11 @@
+HarnessyXO software Bluetooth controllers
+
+The helper uses official BlueZ 5.83 emulator and shared-library sources, with the HarnessyXO H4 transport wrapper in harnessy-test-bt.c and the included bluez-5.83-hci-endian.patch. The patch corrects HCI little-endian handle decoding/encoding, peer handle forwarding, and one-octet response fields on big-endian guests. BlueZ copyright and LGPL notices remain in the included official bluez-5.83.tar.xz source archive. The complete selected sources and build recipe are supplied for rebuilding or relinking with your own modifications.
+
+Upstream: https://www.bluez.org/
+Source: https://www.kernel.org/pub/linux/bluetooth/bluez-5.83.tar.xz
+SHA256: 108522d909d220581399bfec93daab62035539ceef3dda3e79970785c63bd24c
+
+The distributed helpers are statically linked with musl through Zig 0.13.0. Musl and Zig notices are included beside this file. The compiler is not installed by HarnessyXO or required at runtime.
+
+Rebuild: extract bluez-5.83.tar.xz, then run build-helper.py --bluez PATH --compiler PATH_TO_ZIG --target TARGET-linux-musl --output FILE. Use x86_64, aarch64, mips, mipsel, mips64 or mips64el for TARGET. Native builds can use --compiler cc without --target. The source archive and this recipe are application build inputs, not support logs or QA files.

@@ -175,11 +175,21 @@ def check_registered_host_prerequisites() -> None:
     import asyncio
     from harnessy.core.machine import MachineStore
     from harnessy.environment.base import load_environment_config
-    from harnessy.environment.host_prerequisites import ensure_host_prerequisites
+    from harnessy.environment.host_prerequisites import (
+        ensure_host_prerequisites, ensure_lima_controller, restore_host_tool_path,
+    )
     from harnessy.environment.presets import execution_mode
     import platform
+    restore_host_tool_path()
 
     async def check() -> None:
+        def startup_progress(phase, message, **meta):
+            print(message + (' ' + str(meta['detail']) if meta.get('detail') else ''), flush=True)
+        try:
+            await ensure_lima_controller(progress=startup_progress)
+        except Exception as exc:
+            print(f'Linux Lima setup: {exc}', file=sys.stderr)
+            print('The app will still open. VM Create/Start will retry automatic setup.', file=sys.stderr)
         seen = set()
         for registration in MachineStore().list_workspaces():
             path = Path(registration.path).expanduser()

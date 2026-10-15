@@ -1,0 +1,78 @@
+{
+  "build": {
+    "compiler": "Zig 0.13.0",
+    "mips_float_abi": "soft",
+    "patches": [
+      {
+        "file": "bluez-5.83-hci-endian.patch",
+        "sha256": "9732be0aef9ddc96ba3bc53a3a639c64ed7d920d28787fe84fe3deec0aa764d8"
+      }
+    ],
+    "recipe_sha256": "d497f9eb62ec492b814694e8fbaddf69720353b3bf692012cfe7a8575a797bbe",
+    "toolchain": {
+      "shasum": "d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea",
+      "size": "47082308",
+      "tarball": "https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz"
+    },
+    "wrapper_sha256": "3aefa3dbcd5486da6a8f7b4dffe956af24fe30e042ae33d685ff8c7f73a32b58"
+  },
+  "files": {
+    "arm64": {
+      "elf_class": 2,
+      "elf_machine": 183,
+      "endianness": "little",
+      "file": "harnessy-test-bt-arm64",
+      "sha256": "ca455ee14603f4661b51a587f0715114b002e38b872199ff20b5024e104cc7e0",
+      "size": 105352
+    },
+    "mips": {
+      "elf_class": 1,
+      "elf_machine": 8,
+      "endianness": "big",
+      "file": "harnessy-test-bt-mips",
+      "sha256": "9005c0a5ac26a05fe54d9c74a8bd54c3133db78ce196ababe50b39ef87c78333",
+      "size": 146552
+    },
+    "mips64": {
+      "elf_class": 2,
+      "elf_machine": 8,
+      "endianness": "big",
+      "file": "harnessy-test-bt-mips64",
+      "sha256": "53ed28bbab16709973ff52152490469d2735030aa0a7b3358b65c2c82bed2d9f",
+      "size": 158648
+    },
+    "mips64el": {
+      "elf_class": 2,
+      "elf_machine": 8,
+      "endianness": "little",
+      "file": "harnessy-test-bt-mips64el",
+      "sha256": "614121a344aa9c7619e4b5003e81c98dee0c66f0e1b095d39406d5a89ecf0894",
+      "size": 158168
+    },
+    "mipsel": {
+      "elf_class": 1,
+      "elf_machine": 8,
+      "endianness": "little",
+      "file": "harnessy-test-bt-mipsel",
+      "sha256": "ec59334e84b71b954bbbbebe1a2aadc09c26865ba47922c3b9c937e58bfbb3c9",
+      "size": 145960
+    },
+    "x86_64": {
+      "elf_class": 2,
+      "elf_machine": 62,
+      "endianness": "little",
+      "file": "harnessy-test-bt-x86_64",
+      "sha256": "5136a2bdc0d086ce6f71aa0d3581afc44eb08b57de116badb9a9d6f7b9b12b5b",
+      "size": 96872
+    }
+  },
+  "helper_version": "1",
+  "schema_version": 1,
+  "upstream": {
+    "name": "BlueZ",
+    "sha256": "108522d909d220581399bfec93daab62035539ceef3dda3e79970785c63bd24c",
+    "source_archive": "bluez-5.83.tar.xz",
+    "url": "https://www.kernel.org/pub/linux/bluetooth/bluez-5.83.tar.xz",
+    "version": "5.83"
+  }
+}

@@ -997,6 +997,8 @@ html[data-hy-events-mode="compact"] .hy-activity-card.hy-activity-failed:not(.hy
 }
 @media (prefers-reduced-motion:reduce) {
   .hy-sidebar-sort-item, .hy-sidebar-section-chevron, .hy-tab, .hy-file-row { transition:none !important; }
+  .hy-vm-busy-spinner, .hy-vm-busy-spinner *, .hy-vm-busy-progress .q-linear-progress__model,
+  .hy-vm-busy-action .q-spinner, .hy-vm-busy-action .q-spinner * { animation:none !important; transition:none !important; }
 }
 
 .hy-settings-card { width:min(1040px, 95vw); height:min(800px, 92vh); max-height:92vh; padding:0 !important; overflow:hidden; display:flex !important; flex-direction:column !important; }
@@ -18048,12 +18050,12 @@ window.harnessyTerminalFocus = function(terminalId) {
                                     ui.label('Files/ and private chat worktrees are live; Factory Reset/Rebuild preserves them.').classes('text-xs hy-muted')
 
                             with ui.row().classes('hy-env-status-banner w-full items-start gap-3 p-3') as operation_banner:
-                                operation_spinner = ui.spinner(size='20px')
+                                operation_spinner = ui.spinner(size='20px').classes('hy-vm-busy-spinner')
                                 operation_icon = ui.icon('info', size='20px')
                                 with ui.column().classes('gap-1').style('flex:1;min-width:0'):
                                     operation_message = ui.label('Checking environment…').classes('text-sm font-semibold')
                                     operation_detail = ui.label('').classes('text-xs hy-muted').style('white-space:pre-wrap;overflow-wrap:anywhere')
-                                    operation_progress = ui.linear_progress(value=0).classes('w-full').props('rounded size=6px')
+                                    operation_progress = ui.linear_progress(value=0).classes('hy-vm-busy-progress w-full').props('rounded size=6px')
                                     operation_timing = ui.label('').classes('text-xs hy-muted').style('font-variant-numeric:tabular-nums')
                                     operation_error = ui.label('').classes('text-xs hy-muted').style('white-space:pre-wrap;max-height:180px;overflow:auto')
 
@@ -18502,6 +18504,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                         'snapshot': take_snapshot_button,
                     }
                     for button in (start_button, stop_button, reset_button, rebuild_button, take_snapshot_button, *restore_buttons):
+                        button.classes(add='hy-vm-busy-action')
                         button.props(remove='loading')
                         button.disable() if busy else button.enable()
                     active_button = action_buttons.get(op.action) if busy else None

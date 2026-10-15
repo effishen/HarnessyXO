@@ -249,11 +249,11 @@ class ExternalTargetBroker:
             # race a stopped-VM snapshot or restore.
             if manager.busy and manager.operation.action != 'start':
                 operation = manager.operation
-                # Radio repair uses this transport from its one owning task.
-                # Unrelated model commands cannot acquire the same exception.
-                owned_radio_setup = (operation.action == 'radios'
-                                     and operation.task is asyncio.current_task())
-                if not owned_radio_setup:
+                # Radio setup and shutdown cleanup use this transport only
+                # from their owning lifecycle task. Other commands stay blocked.
+                owned_lifecycle_task = (operation.action in {'radios', 'stop'}
+                                        and operation.task is asyncio.current_task())
+                if not owned_lifecycle_task:
                     raise ExternalTargetError('A test VM lifecycle operation is running.')
             argv, env = manager.command(command)
             release = manager.acquire()
