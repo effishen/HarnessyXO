@@ -6,12 +6,14 @@ not merely to the network check, and remains held across launcher exec calls.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import re
 import secrets
 import signal
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -28,6 +30,8 @@ PENDING_FILENAME = ".harnessy-update-pending.json"
 MAX_TREE_FILES = 4096
 MAX_TREE_BYTES = 64 * 1024 * 1024
 MAX_COMMAND_OUTPUT = 2 * 1024 * 1024
+MAX_ARCHIVE_MISMATCHES = 8
+MAX_ARCHIVE_MODE_REPAIRS = 128
 _HELD_LOCKS: dict[str, "InstallLock"] = {}
 _SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\Z")
@@ -306,38 +310,133 @@ def _tree(root: Path, commit: str) -> list[tuple[str, str, str, int]]:
     return entries
 
 
-def _matches_installed(root: Path, entries: list[tuple[str, str, str, int]]) -> bool:
+def _open_installed_file(root: Path, name: str) -> int:
+    """Pin every directory component; never follow archive-provided symlinks."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    parent = os.open(root, flags | getattr(os, "O_DIRECTORY", 0))
     try:
-        for name, mode, oid, size in entries:
-            path = root
-            parts = PurePosixPath(name).parts
-            for part in parts[:-1]:
-                path /= part
-                if not stat.S_ISDIR(path.lstat().st_mode):
-                    return False
-            path /= parts[-1]
-            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-            try:
-                info = os.fstat(descriptor)
-                if (not stat.S_ISREG(info.st_mode) or info.st_size != size
-                        or bool(info.st_mode & stat.S_IXUSR) != (mode == "100755")):
-                    return False
-                digest = hashlib.sha1() if len(oid) == 40 else hashlib.sha256()
-                digest.update(f"blob {size}\0".encode("ascii"))
-                remaining = size
-                while remaining:
-                    chunk = os.read(descriptor, min(65536, remaining))
-                    if not chunk:
-                        return False
-                    digest.update(chunk)
-                    remaining -= len(chunk)
-                if os.read(descriptor, 1) or digest.hexdigest() != oid:
-                    return False
-            finally:
+        parts = PurePosixPath(name).parts
+        for part in parts[:-1]:
+            child = os.open(part, flags | getattr(os, "O_DIRECTORY", 0), dir_fd=parent)
+            os.close(parent)
+            parent = child
+        return os.open(parts[-1], flags | getattr(os, "O_NONBLOCK", 0), dir_fd=parent)
+    finally:
+        os.close(parent)
+
+
+def _blob_matches(descriptor: int, oid: str, size: int) -> bool:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha1() if len(oid) == 40 else hashlib.sha256()
+    digest.update(f"blob {size}\0".encode("ascii"))
+    remaining = size
+    while remaining:
+        chunk = os.read(descriptor, min(65536, remaining))
+        if not chunk:
+            return False
+        digest.update(chunk)
+        remaining -= len(chunk)
+    return not os.read(descriptor, 1) and digest.hexdigest() == oid
+
+
+def _archive_version(root: Path) -> str:
+    try:
+        descriptor = _open_installed_file(root, "VERSION")
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 64:
+                return "invalid"
+            value = os.read(descriptor, 65).decode("ascii").strip()
+            return value if _VERSION.fullmatch(value) else "invalid"
+        finally:
+            os.close(descriptor)
+    except FileNotFoundError:
+        return "missing"
+    except (OSError, UnicodeError):
+        return "unreadable"
+
+
+def _archive_mismatch(report: dict, name: str, reason: str) -> None:
+    report["mismatch_count"] += 1
+    if len(report["mismatches"]) < MAX_ARCHIVE_MISMATCHES:
+        safe_name = re.sub(r"[^A-Za-z0-9_./+@ -]", "?", name)[:180]
+        report["mismatches"].append({"path": safe_name, "reason": reason})
+
+
+def _inspect_archive(root: Path, entries: list[tuple[str, str, str, int]]) -> tuple[dict, list]:
+    report = {"mismatch_count": 0, "mismatches": [], "executable_repairs": 0,
+              "only_executable_metadata": False}
+    repairs = []
+    mode_mismatches = 0
+    for name, mode, oid, size in entries:
+        descriptor = -1
+        try:
+            descriptor = _open_installed_file(root, name)
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                _archive_mismatch(report, name, "not_regular_file")
+            elif info.st_size != size:
+                _archive_mismatch(report, name, "content_size")
+            elif not _blob_matches(descriptor, oid, size):
+                _archive_mismatch(report, name, "content_hash")
+            elif bool(info.st_mode & stat.S_IXUSR) != (mode == "100755"):
+                _archive_mismatch(report, name, "executable_mode")
+                mode_mismatches += 1
+                # Only restore lost archive execute flags. Extra executable
+                # flags remain an explicit local difference.
+                if mode == "100755":
+                    repairs.append((name, oid, size))
+        except FileNotFoundError:
+            _archive_mismatch(report, name, "missing")
+        except OSError as exc:
+            reason = "unsafe_path" if exc.errno in {errno.ELOOP, errno.ENOTDIR} else "unreadable"
+            _archive_mismatch(report, name, reason)
+        finally:
+            if descriptor >= 0:
                 os.close(descriptor)
+    report["only_executable_metadata"] = bool(mode_mismatches and mode_mismatches == report["mismatch_count"])
+    return report, repairs
+
+
+def _restore_archive_execute_bits(root: Path, repairs: list) -> bool:
+    if len(repairs) > MAX_ARCHIVE_MODE_REPAIRS:
+        return False
+    opened = []
+    changed = []
+    try:
+        # Verify every candidate again before changing any file metadata. Each
+        # descriptor stays pinned, so rename/symlink races cannot redirect chmod.
+        for name, oid, size in repairs:
+            descriptor = _open_installed_file(root, name)
+            opened.append((descriptor, name))
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid != os.geteuid() or info.st_size != size
+                    or not _blob_matches(descriptor, oid, size)):
+                return False
+        for descriptor, _name in opened:
+            mode = stat.S_IMODE(os.fstat(descriptor).st_mode)
+            # Preserve read/write restrictions: private 0600 becomes 0700;
+            # ordinary extracted 0644 becomes 0755.
+            desired = mode | stat.S_IXUSR | ((mode & 0o044) >> 2)
+            os.fchmod(descriptor, desired)
+            changed.append((descriptor, mode))
         return True
     except OSError:
+        for descriptor, mode in changed:
+            try:
+                os.fchmod(descriptor, mode)
+            except OSError:
+                pass
         return False
+    finally:
+        for descriptor, _name in opened:
+            os.close(descriptor)
+
+
+def _matches_installed(root: Path, entries: list[tuple[str, str, str, int]]) -> bool:
+    report, _repairs = _inspect_archive(root, entries)
+    return report["mismatch_count"] == 0
 
 
 def _result(outcome: str, *, changed: bool = False, fatal: bool = False,
@@ -406,25 +505,76 @@ def _public_transport_url(repository: str) -> str:
     return f"https::{repository}"
 
 
-def _bootstrap(root: Path, version: str, repository: str, *, anonymous: bool = True) -> dict | None:
+def _bootstrap(root: Path, version: str, repository: str, *, anonymous: bool = True,
+               archive_check: dict | None = None) -> dict | None:
     if not _VERSION.fullmatch(version):
         return _result("zip_version_unrecognized")
     tag = f"v{version}"
+    report = archive_check if archive_check is not None else {}
+    report.update(expected_version=version, installed_version=_archive_version(root))
+
+    def inspect(staged: Path, commit: str, comparison: str) -> bool:
+        entries = _tree(staged, commit)
+        details, repairs = _inspect_archive(root, entries)
+        report.update(details, comparison=comparison, verified_commit=commit)
+        if report["mismatch_count"] == 0:
+            return True
+        if (report["only_executable_metadata"]
+                and len(repairs) == report["mismatch_count"]):
+            if _restore_archive_execute_bits(root, repairs):
+                report["executable_repairs"] = len(repairs)
+                return True
+            _archive_mismatch(report, repairs[0][0], "mode_repair_failed")
+            report["only_executable_metadata"] = False
+        return False
+
+    def mismatch_result() -> dict:
+        result = _result("zip_local_changes")
+        result["archive_check"] = dict(report)
+        return result
+
     try:
         with tempfile.TemporaryDirectory(prefix=".harnessy-update-stage-", dir=root) as temp:
             staged = Path(temp) / "repository"
-            _git(root, "clone", "--no-checkout", "--no-hardlinks", "--single-branch",
-                 "--branch", tag, "--",
-                 _public_transport_url(repository) if anonymous else repository,
-                 str(staged), anonymous=anonymous)
+            source = _public_transport_url(repository) if anonymous else repository
+            comparison = "release_tag"
+            try:
+                _git(root, "clone", "--no-checkout", "--no-hardlinks", "--single-branch",
+                     "--branch", tag, "--", source, str(staged), anonymous=anonymous)
+            except _GitFailure:
+                # A Code ZIP may be newer than the latest released tag. Verify
+                # it against current main instead of guessing at edited files.
+                if staged.exists():
+                    shutil.rmtree(staged)
+                _git(root, "clone", "--no-checkout", "--no-hardlinks", "--single-branch",
+                     "--branch", UPDATE_BRANCH, "--", source, str(staged), anonymous=anonymous)
+                comparison = "current_main"
             if anonymous:
                 # This is newly created metadata. Existing checkout remotes are
                 # left intact; only network operations use the helper syntax.
                 _git(staged, "config", "remote.origin.url", repository)
             baseline = _head(staged)
-            entries = _tree(staged, baseline)
-            if not _matches_installed(root, entries):
-                return _result("zip_local_changes")
+            if comparison == "release_tag":
+                release_baseline = baseline
+                target_ref = f"refs/remotes/origin/{UPDATE_BRANCH}"
+                try:
+                    _git(staged, "fetch", "--no-tags", "--no-recurse-submodules", source,
+                         f"+refs/heads/{UPDATE_BRANCH}:{target_ref}", anonymous=anonymous)
+                    current = _git_text(staged, "rev-parse", "--verify", target_ref)
+                    if not _SHA.fullmatch(current):
+                        raise _GitFailure()
+                except _GitFailure:
+                    current = release_baseline
+                if current != release_baseline and inspect(staged, current, "current_main"):
+                    baseline = current
+                else:
+                    current_report = dict(report)
+                    if not inspect(staged, release_baseline, "release_tag"):
+                        if current != release_baseline:
+                            report.update(current_report)
+                        return mismatch_result()
+            elif not inspect(staged, baseline, comparison):
+                return mismatch_result()
             _git(staged, "update-ref", f"refs/heads/{UPDATE_BRANCH}", baseline)
             _git(staged, "symbolic-ref", "HEAD", f"refs/heads/{UPDATE_BRANCH}")
             _git(staged, "read-tree", baseline)
@@ -469,50 +619,59 @@ def _check_for_updates(app_dir: Path, release_version: str, *, repository_url: s
                        allow_local_transport: bool = False) -> dict:
     """Private injection point for real local-Git tests, never CLI configuration."""
     root = Path(app_dir).resolve()
+    archive_check: dict = {}
+
+    def finish(outcome: str, **kwargs) -> dict:
+        result = _result(outcome, **kwargs)
+        if archive_check:
+            result["archive_check"] = dict(archive_check)
+        return result
     lock = _HELD_LOCKS.get(str(root))
     if lock is None or lock.fd < 0:
-        return _result("installation_lock_required", fatal=True)
+        return finish("installation_lock_required", fatal=True)
     if not _updates_supported():
-        return _result("windows_updates_unsupported")
+        return finish("windows_updates_unsupported")
     if not allow_local_transport and _github_identity(repository_url) is None:
-        return _result("repository_configuration_invalid")
+        return finish("repository_configuration_invalid")
     marker = root / ".git"
     if marker.is_symlink():
-        return _result("repository_metadata_unsafe")
+        return finish("repository_metadata_unsafe")
     try:
         pending = _read_pending(root)
     except (OSError, ValueError):
-        return _result("update_state_unsafe", fatal=True)
+        return finish("update_state_unsafe", fatal=True)
     if not marker.exists():
         if pending is not None:
-            return _result("update_state_unsafe", fatal=True)
+            return finish("update_state_unsafe", fatal=True)
         result = _bootstrap(root, release_version, repository_url,
-                            anonymous=not allow_local_transport)
+                            anonymous=not allow_local_transport, archive_check=archive_check)
         if result is not None:
+            if archive_check:
+                result["archive_check"] = dict(archive_check)
             return result
     try:
         if Path(_git_text(root, "rev-parse", "--show-toplevel")).resolve() != root:
-            return _result("repository_root_mismatch", fatal=pending is not None)
+            return finish("repository_root_mismatch", fatal=pending is not None)
         if _git_text(root, "symbolic-ref", "--quiet", "--short", "HEAD") != UPDATE_BRANCH:
-            return _result("branch_not_managed", fatal=pending is not None)
+            return finish("branch_not_managed", fatal=pending is not None)
         if not _remote_matches(_git_text(root, "config", "--get", "remote.origin.url"),
                                repository_url, allow_local_transport):
-            return _result("repository_remote_mismatch", fatal=pending is not None)
+            return finish("repository_remote_mismatch", fatal=pending is not None)
         if pending is not None:
             actual, clean = _head(root), _clean(root)
             if actual == pending["target"] and clean:
                 _tree(root, actual)
                 _clear_pending(root)
-                return _result("updated", changed=True, old=pending["old"], new=actual)
+                return finish("updated", changed=True, old=pending["old"], new=actual)
             if actual != pending["old"] or not clean:
-                return _result("update_incomplete", fatal=True,
+                return finish("update_incomplete", fatal=True,
                                old=pending["old"], new=pending["target"])
             _clear_pending(root)
             pending = None
         old = _head(root)
         _tree(root, old)
         if not _clean(root):
-            return _result("local_changes", old=old)
+            return finish("local_changes", old=old)
         target_ref = f"refs/remotes/origin/{UPDATE_BRANCH}"
         # Validate the saved origin above, then use HTTPS directly even for an
         # SSH checkout. Never rewrite the user's stored origin or require login
@@ -526,22 +685,22 @@ def _check_for_updates(app_dir: Path, release_version: str, *, repository_url: s
             raise _GitFailure()
         _tree(root, target)
         if old == target:
-            return _result("up_to_date", old=old, new=target)
+            return finish("up_to_date", old=old, new=target)
         try:
             _git(root, "merge-base", "--is-ancestor", old, target)
         except _GitFailure:
-            return _result("history_not_fast_forward", old=old, new=target)
+            return finish("history_not_fast_forward", old=old, new=target)
         # Recheck after the network request: a user may have edited meanwhile.
         if _head(root) != old or not _clean(root):
-            return _result("installation_changed", old=old, new=target)
+            return finish("installation_changed", old=old, new=target)
     except _UnsupportedTree:
-        return _result("unsupported_source_tree", fatal=pending is not None)
+        return finish("unsupported_source_tree", fatal=pending is not None)
     except _GitFailure:
-        return _result("check_unavailable", fatal=pending is not None)
+        return finish("check_unavailable", fatal=pending is not None)
     try:
         _write_pending(root, old, target)
     except OSError:
-        return _result("update_state_unavailable", old=old, new=target)
+        return finish("update_state_unavailable", old=old, new=target)
     try:
         _git(root, "merge", "--ff-only", "--no-overwrite-ignore", "--no-stat", target)
     except _GitFailure:
@@ -553,13 +712,13 @@ def _check_for_updates(app_dir: Path, release_version: str, *, repository_url: s
         actual, clean = _head(root), _clean(root)
         if actual == target and clean:
             _clear_pending(root)
-            return _result("updated", changed=True, old=old, new=target)
+            return finish("updated", changed=True, old=old, new=target)
         if actual == old and clean:
             _clear_pending(root)
-            return _result("update_not_applied", old=old, new=target)
+            return finish("update_not_applied", old=old, new=target)
     except _GitFailure:
         pass
-    return _result("update_incomplete", fatal=True, old=old, new=target)
+    return finish("update_incomplete", fatal=True, old=old, new=target)
 
 
 def make_update_handoff(app_dir: Path) -> None:

@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.85
+
+- Verify ZIP contents before restoring executable metadata lost during extraction, so an unchanged archive can join startup updates. Also verify untouched current-main ZIPs against their exact main commit; leave genuine source edits intact.
+- Show which application file differs and why when a ZIP cannot be adopted. Keep bounded update evidence in `STARTUP.json` and the support summary instead of reporting only a generic skipped update.
+- Fix REA setup on Linux systems using umask 0002. Create and publish managed runtime folders with safe permissions, and repair installer-owned cache permissions only beneath a private, owned REA root. Keep wrong-owner paths and unsafe redirects blocked.
+- Report the specific REA storage component and reason in setup output and diagnostics. Preserve reviewed startup evidence across the launcher-to-app restart. Keep REA pinned to 6.4.0 and reuse healthy cached setup; app updates can change that supported pin.
+- Preserve the public HTTPS updater, live target permissions, existing VMs and workspace data. Leave the user README unchanged and keep the existing 11 Markdown resources.
+
 ## v0.6.84
 
 - Fetch startup updates on macOS and Linux from the now-public `effishen/HarnessyXO` repository over HTTPS without GitHub login, including existing installations whose saved origin uses SSH. Keep local edits, settings and workspace data intact.

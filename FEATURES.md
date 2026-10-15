@@ -1,4 +1,4 @@
-# HarnessyXO v0.6.84 Features
+# HarnessyXO v0.6.85 Features
 
 ## Workspace test-target tabs
 
@@ -19,8 +19,9 @@
 
 - Check `effishen/HarnessyXO` before application imports when starting `python3 run.py` on macOS or Linux.
 - Apply clean `main` updates through fast-forward Git history and restart the launcher before setup.
-- Verify a ZIP installation against its matching version tag before adding Git metadata. The first public check needs Git and internet access, without a GitHub account.
+- Verify every application byte before adding Git metadata to a ZIP installation. Restore executable metadata lost during extraction only after content matches; accept an untouched current-main ZIP against its exact current commit. Keep genuine source edits untouched and report the app-relative mismatch and reason. The first public check needs Git and internet access, without a GitHub account.
 - Download updates from the public repository over HTTPS without GitHub login. Existing SSH checkouts keep their saved remote; the updater reads the matching public HTTPS source.
+- Include reviewed source-check and REA storage evidence in `STARTUP.json` and the support summary, retaining bounded launcher receipts when the app starts.
 - Preserve settings, dependencies, runtime caches, workspaces and local code edits. Keep the current app available when a check fails.
 - Hold an installation lock for the lifetime of the app and detect incomplete source updates across restarts.
 - Publish versioned GitHub Release notes and verified downloads from committed application files, with the same 11 Markdown resources and no QA payload.
@@ -30,7 +31,7 @@
 - Use the local Reverse Engineer Anything server through the normal agent tool catalogue with any configured model backend.
 - Analyze native binaries with an existing Hopper, Ghidra or IDA engine; inspect JavaScript/Electron structure and static .NET metadata/CIL.
 - Trace functions, strings, calls and references, then follow retained evidence with bounded queries. Keep upstream coverage, limitations and actionable errors in the result.
-- First launch automatically sets up REA 6.4.0 and a private supported Node.js runtime when needed. Later launches reuse the local installation; Settings offers Repair REA, engine selection, timeout and an existing local command override.
+- First launch automatically sets up the REA version pinned by HarnessyXO (currently 6.4.0); it does not independently track the newest upstream REA release. A private supported Node.js runtime is installed when needed. Setup repairs installer-owned cache permissions under a private REA root and names the component and reason when storage cannot be used. Later launches reuse the local installation; Settings offers Repair REA, engine selection, timeout and an existing local command override.
 - Default to Ask, respect filesystem read permission, confine follow-up queries to the authorized target, and close run-owned sessions on Stop or completion.
 - Retain the lean package: three living documents and eight functional skill files.
 

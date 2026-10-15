@@ -279,6 +279,8 @@ def _safe_event_field(key: str, value: Any) -> Any:
     """Keep reviewed structured evidence intact, without widening raw limits."""
     if _is_sensitive_log_key(key):
         return '<redacted>'
+    if key in {'archive_check', 'storage_issue'}:
+        return _privacy_safe_value(value, key=key)
     if key in {
         'permission_decision', 'permission_states', 'required_permissions',
         'permission_source', 'permission_reason', 'permission_target_mode',
@@ -815,6 +817,12 @@ class DiagnosticsManager:
             # hot path. The precise operation evidence has already been stored.
             return
         logger = self.logger(channel)
+        from .startup import STARTUP_EVENTS, validate_startup_event
+        if event in STARTUP_EVENTS:
+            payload = validate_startup_event(event, fields)
+            if payload is not None:
+                logger.log(level, json.dumps(payload, ensure_ascii=False, separators=(',', ':')))
+            return
         if event in {'tool_permission_decision', 'tool_approval_policy_resolved'}:
             from .permissions import validate_permission_event
 
@@ -1060,6 +1068,10 @@ def _zip_snapshot_file(zf: zipfile.ZipFile, source: Path, arcname: str, *, tail_
     payload = _read_snapshot_bytes(source, tail_bytes=tail_bytes)
     if payload is None:
         return
+    if re.fullmatch(r'.+\.log(?:\.\d+)?', source.name):
+        # Launcher/storage receipts are reviewed metadata in both export modes;
+        # content-rich mode does not turn those records into raw error exports.
+        payload = _sanitize_startup_log_bytes(payload)
     try:
         zf.writestr(arcname, payload)
     except OSError:
@@ -1221,6 +1233,14 @@ def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
     lowered = key.lower()
     if _is_sensitive_log_key(lowered):
         return '<redacted>'
+    from .startup import (STARTUP_EVENTS, validate_archive_check,
+                          validate_startup_event, validate_storage_issue)
+    if isinstance(value, dict) and isinstance(value.get('event'), str) and value['event'] in STARTUP_EVENTS:
+        return validate_startup_event(value['event'], value) or {'event': value['event']}
+    if lowered == 'archive_check':
+        return validate_archive_check(value)
+    if lowered == 'storage_issue':
+        return validate_storage_issue(value)
     if isinstance(value, dict) and isinstance(value.get('event'), str) and value['event'] in {'tool_permission_decision', 'tool_approval_policy_resolved'}:
         from .permissions import validate_permission_event
 
@@ -1372,6 +1392,30 @@ def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
     if lowered == 'reason' and len(text) <= 128 and re.fullmatch(r'[A-Za-z0-9_.:/-]+', text):
         return text
     return _privacy_marker(text, label=lowered or 'string')
+
+
+def _sanitize_startup_log_bytes(payload: bytes) -> bytes:
+    """Validate only launcher receipts while retaining other opted-in content."""
+    from .startup import STARTUP_EVENTS, validate_startup_event
+    out: list[bytes] = []
+    for line in payload.splitlines(keepends=True):
+        parts = line.split(b' ', 3)
+        if len(parts) != 4:
+            out.append(line)
+            continue
+        try:
+            decoded = json.loads(parts[3])
+            event = decoded.get('event') if isinstance(decoded, dict) else None
+            safe = validate_startup_event(event, decoded) if isinstance(event, str) and event in STARTUP_EVENTS else None
+        except (ValueError, TypeError, RecursionError):
+            safe = None
+        if safe is None:
+            out.append(line)
+        else:
+            out.append(b' '.join(parts[:3]) + b' ' + json.dumps(
+                safe, ensure_ascii=False, separators=(',', ':'), allow_nan=False,
+            ).encode('utf-8') + (b'\n' if line.endswith(b'\n') else b''))
+    return b''.join(out)
 
 
 def _sanitize_structured_log_bytes(payload: bytes) -> bytes:
@@ -1698,6 +1742,11 @@ def _privacy_manifest(*, include_content: bool = False) -> str:
         'families/states, decision source and reason, argument-validation labels, and approval wait '
         'separately from execution and coordination time. It never reads saved settings or exports '
         'commands, target names or credentials. Missing receipts leave the reason for a dialog unverified.\n\n'
+        'STARTUP.json contains bounded launcher update outcomes, reviewed application-relative archive '
+        'mismatches, executable metadata repairs, and REA storage-validation facts. Storage descendants '
+        'outside known runtime components use fixed parent labels. File contents, home paths, raw errors '
+        'and credentials are excluded from these receipts in both export modes. The collector reads logs '
+        'only and does not check Git, run an installer, or open an application database.\n\n'
         'VM_LOGS.json records bounded Lima serial/hostagent source coverage, missing/unsafe/unreadable sources, '
         'and truncation limits. The default vm-logs/ members contain reviewed technical signal records only; '
         'arbitrary guest lines, paths, names and message bodies are omitted. These tails can contain observations '
@@ -1858,6 +1907,9 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
             zf.writestr('SUMMARY.txt', summary)
             zf.writestr('INCIDENTS.json', json.dumps(incidents, ensure_ascii=False, indent=2))
             zf.writestr('PERMISSIONS.json', json.dumps(incidents.get('permission_audit', {
+                'schema_version': 1, 'status': 'unavailable', 'reason': 'summary_generation_failed',
+            }), ensure_ascii=False, indent=2, allow_nan=False))
+            zf.writestr('STARTUP.json', json.dumps(incidents.get('startup_audit', {
                 'schema_version': 1, 'status': 'unavailable', 'reason': 'summary_generation_failed',
             }), ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('VM_LOGS.json', json.dumps(vm_report, ensure_ascii=False, indent=2, allow_nan=False))

@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 from typing import Any
 from .permissions import PERMISSION_EVENTS
+from .startup import STARTUP_EVENTS
 
 _CHANNELS = ('harnessy', 'runtime', 'database', 'tools', 'backend', 'targets')
 _TAIL_BYTES = 2 * 1024 * 1024
@@ -35,8 +36,9 @@ def _bounded_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     permissions = [row for row in rows if row.get('event') in PERMISSION_EVENTS
                    or (row.get('event') == 'tool_execution_complete'
                        and ('permission_decision' in row or 'target_validation' in row))][-600:]
-    recent = rows[-(_MAX_ROWS - len(targets) - len(permissions)):]
-    retained = {id(row): row for row in targets + permissions + recent}
+    startup = [row for row in rows if row.get('event') in STARTUP_EVENTS][-120:]
+    recent = rows[-(_MAX_ROWS - len(targets) - len(permissions) - len(startup)):]
+    retained = {id(row): row for row in targets + permissions + startup + recent}
     return sorted(retained.values(), key=lambda row: row['timestamp'])
 
 
@@ -86,6 +88,13 @@ def _permission_failure_classification(row: dict[str, Any]) -> str | None:
         return 'tool_target_validation_failed'
     if row.get('error_code') == 'PERMISSION_POLICY_UNAVAILABLE':
         return 'tool_permission_policy_unavailable'
+    return None
+
+
+def _startup_failure_classification(row: dict[str, Any]) -> str | None:
+    if row.get('event') == 'launcher_rea_setup_failed':
+        from .startup import validate_storage_issue
+        return 'rea_storage_validation_failed' if validate_storage_issue(row.get('storage_issue')) else 'rea_setup_failed'
     return None
 
 
@@ -139,6 +148,48 @@ def _rows(latest: Path, *, session_scope: str = 'current', tail_bytes: int = _TA
         rows.extend(channel_rows)
     rows.sort(key=lambda row: row['timestamp'])
     return _bounded_rows(rows), coverage
+
+
+def _launcher_startup_rows(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Recover reviewed startup receipts discarded by the launcher's exec."""
+    from .logging import _read_snapshot_bytes
+    from .startup import validate_startup_event
+
+    limit = 512 * 1024
+    payload = _read_snapshot_bytes(path / 'harnessy.log', tail_bytes=limit)
+    rows: list[dict[str, Any]] = []
+    launcher_handoff = False
+    application_started = False
+    for line in (payload.decode('utf-8', errors='replace').splitlines() if payload else []):
+        parts = line.split(' ', 3)
+        if len(parts) != 4 or parts[2] not in {'INFO', 'WARNING', 'ERROR', 'DEBUG', 'CRITICAL'}:
+            continue
+        try:
+            stamp = f'{parts[0]} {parts[1]}'
+            datetime.strptime(stamp, '%Y-%m-%d %H:%M:%S,%f')
+            body = json.loads(parts[3])
+            if isinstance(body, dict):
+                launcher_handoff = launcher_handoff or body.get('event') == 'launcher_exec_application'
+                application_started = application_started or body.get('event') in {
+                    'controller_password_login_enabled', 'controller_access_token_enabled',
+                }
+            safe = validate_startup_event(body.get('event'), body) if isinstance(body, dict) else None
+        except (ValueError, TypeError, RecursionError):
+            continue
+        if safe is not None:
+            rows.append({**safe, 'timestamp': stamp, 'channel': 'harnessy',
+                         'level': parts[2], 'session_scope': 'launcher'})
+    rows = sorted(rows, key=lambda row: row['timestamp'])[-120:]
+    if not rows or not launcher_handoff or application_started:
+        return [], []
+    try:
+        limited = (path / 'harnessy.log').stat().st_size > limit
+    except OSError:
+        limited = True
+    return rows, [{'channel': 'harnessy', 'session_scope': 'launcher',
+                   'first_timestamp': rows[0]['timestamp'], 'last_timestamp': rows[-1]['timestamp'],
+                   'records_examined': len(rows), 'log_tail_limited': limited,
+                   'startup_receipts_only': True}]
 
 
 def _seconds(left: str, right: str) -> float:
@@ -199,11 +250,70 @@ def _evidence(row: dict[str, Any]) -> dict[str, Any]:
         'permission_target_state', 'permission_changed', 'permission_states',
         'required_permissions', 'phase', 'approval_required', 'approved',
         'approval_wait_seconds', 'execution_duration_seconds', 'coordination_wait_seconds',
+        'state', 'changed', 'archive_check', 'storage_issue', 'version', 'status',
+        'exception_class',
     )
     evidence = {key: row[key] for key in keys if key in row}
     if _is_lock(row):
         evidence['error_code'] = 'sqlite_database_locked'
     return evidence
+
+
+def _startup_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
+    from .startup import UPDATE_STATES, UPDATE_SUCCESS_STATES, validate_startup_event
+
+    receipts: list[dict[str, Any]] = []
+    for row in rows:
+        safe = validate_startup_event(row.get('event'), row)
+        if safe is None:
+            continue
+        for key in ('timestamp', 'channel', 'session_scope'):
+            safe[key] = row[key]
+        receipts.append(safe)
+    checks = [row for row in receipts if row['event'] == 'launcher_source_update']
+    failures = [row for row in receipts if row['event'] == 'launcher_rea_setup_failed']
+    storage = [row for row in failures if row.get('storage_issue')]
+    outcomes = Counter(row['state'] for row in checks if row.get('state') in UPDATE_STATES)
+    audit = {
+        'schema_version': 1, 'status': 'observed' if receipts else 'unrecorded',
+        'scope': 'bounded_current_previous_and_recent_launcher_log_tails',
+        'source_checks_recorded': len(checks), 'source_outcome_counts': dict(outcomes),
+        'source_update_skip_records': sum(count for state, count in outcomes.items()
+                                           if state not in UPDATE_SUCCESS_STATES),
+        'rea_setup_failure_records': len(failures),
+        'rea_storage_failure_records': len(storage),
+        'recent_receipts': receipts[-120:],
+        'counts_are_retained_records': True,
+    }
+    lines = ['Startup evidence: STARTUP.json retains launcher update and REA setup receipts.']
+    if not receipts:
+        lines.append('  No startup receipts were recorded in the examined logs; updater decisions and REA setup checks cannot be reconstructed.')
+    else:
+        lines.append(f'  Source checks recorded: {len(checks)}; skipped/uncompleted update outcome records: {audit["source_update_skip_records"]}.')
+        if outcomes:
+            lines.append('  Update outcomes: ' + '; '.join(f'{key} {count}' for key, count in sorted(outcomes.items())) + '.')
+        for row in checks[-3:]:
+            lines.append(f'  {row["timestamp"]} [{row["session_scope"]}] source update: {row.get("state", "unrecorded")}.')
+            check = row.get('archive_check', {})
+            if check:
+                lines.append(f'    Archive expected version: {check.get("expected_version", "unrecorded")}; installed version: {check.get("installed_version", "unrecorded")}; comparison: {check.get("comparison", "unrecorded")}.')
+                if 'verified_commit' in check:
+                    lines.append(f'    Verified baseline commit: {check["verified_commit"]}.')
+                lines.append(f'    Initial archive mismatches: {check.get("mismatch_count", "unrecorded")}; executable metadata repairs: {check.get("executable_repairs", "unrecorded")}; only executable metadata differed: {check.get("only_executable_metadata", "unrecorded")}.')
+                for item in check.get('mismatches', []):
+                    lines.append(f'      {item["path"]}: {item["reason"]}.')
+        lines.append(f'  REA setup failures recorded: {len(failures)}; with storage component facts: {len(storage)}.')
+        for row in failures[-3:]:
+            if not row.get('storage_issue'):
+                lines.append(f'  {row["timestamp"]} [{row["session_scope"]}] REA setup failed: code {row.get("error_code", "unrecorded")}; status {row.get("status", "unrecorded")}; exception class {row.get("exception_class", "unrecorded")}.')
+        for row in storage[-3:]:
+            issue = row['storage_issue']
+            owner = 'yes' if issue.get('owned_by_current_user') is True else 'no' if issue.get('owned_by_current_user') is False else 'unrecorded'
+            lines.append(f'  {row["timestamp"]} [{row["session_scope"]}] REA storage component {issue["component"]}: {issue["reason"]}; mode {issue.get("mode", "unrecorded")}; owned by current user: {owner}.')
+        if failures:
+            lines.append('  These are recorded setup checks; they do not establish what created the storage state or why an earlier install failed.')
+    lines.append('')
+    return audit, lines
 
 
 def _permission_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
@@ -383,6 +493,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
     from .logging import _session_is_launcher_only, _read_snapshot_bytes
     current_name = (_read_snapshot_bytes(Path(latest) / 'CURRENT_SESSION.txt') or b'').decode('utf-8', errors='ignore').strip()
     sessions = Path(latest).parent / 'sessions'
+    candidates: list[Path] = []
     try:
         candidates = sorted((path for path in sessions.iterdir()
                              if path.is_dir() and not path.is_symlink() and path.name != current_name),
@@ -394,11 +505,23 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         older_rows, older_coverage = _rows(previous, session_scope='previous', tail_bytes=512 * 1024, rotations=False)
         rows = _bounded_rows(sorted(rows + older_rows, key=lambda row: row['timestamp']))
         coverage.extend(older_coverage)
+    launcher_sources = 0
+    for launcher in candidates[:4]:
+        if launcher == previous:
+            continue
+        launcher_rows, launcher_coverage = _launcher_startup_rows(launcher)
+        rows.extend(launcher_rows)
+        coverage.extend(launcher_coverage)
+        launcher_sources += bool(launcher_rows)
+        if launcher_sources >= 2:
+            break
+    rows = _bounded_rows(sorted(rows, key=lambda row: row['timestamp']))
     observation_keys = {(row.get('session_scope'), row.get('command_id')) for row in rows
                         if row.get('event') == 'vm_startup_observation' and isinstance(row.get('command_id'), str)
                         and _vm_failure_classification(row)}
     failures = [row for row in rows if (row.get('event') in _ERROR_EVENTS or _vm_failure_classification(row)
-                                       or _target_failure_classification(row) or _permission_failure_classification(row) or _is_lock(row))
+                                       or _target_failure_classification(row) or _permission_failure_classification(row)
+                                       or _startup_failure_classification(row) or _is_lock(row))
                 and not (row.get('event') in {'environment_command_finished', 'environment_command_timeout'}
                          and isinstance(row.get('command_id'), str)
                          and (row.get('session_scope'), row.get('command_id')) in observation_keys)]
@@ -411,6 +534,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         vm_classification = _vm_failure_classification(failure)
         target_classification = _target_failure_classification(failure)
         permission_classification = _permission_failure_classification(failure)
+        startup_classification = _startup_failure_classification(failure)
         if vm_classification == 'vm_controller_interrupted' and not isinstance(failure.get('controller_signal'), str):
             code = failure.get('controller_returncode', failure.get('returncode'))
             failure = {**failure, 'controller_signal': {-2: 'SIGINT', -9: 'SIGKILL', -15: 'SIGTERM'}.get(code, 'other')}
@@ -441,7 +565,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         stalls = [row for row in before if row.get('event') in {'event_loop_stall', 'event_loop_stall_sample'}]
         transcript_deferrals = [row for row in related if row.get('event') == 'transcript_refresh_deferred']
         missing: list[str] = []
-        if not permission_classification and not _has_frames(failure) and not any(_has_frames(row) for row in database_errors):
+        if not permission_classification and not startup_classification and not _has_frames(failure) and not any(_has_frames(row) for row in database_errors):
             missing.append('exception_traceback_unavailable')
         if lock and not database_errors:
             missing.append('database_operation_not_recorded')
@@ -450,7 +574,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         identity = json.dumps(_evidence(failure), sort_keys=True)
         incidents.append({
             'incident_id': hashlib.sha256(identity.encode()).hexdigest()[:24],
-            'classification': 'sqlite_lock_contention' if lock else permission_classification or target_classification or vm_classification or 'operation_error',
+            'classification': 'sqlite_lock_contention' if lock else startup_classification or permission_classification or target_classification or vm_classification or 'operation_error',
             'failure': _evidence(failure),
             'nearby_database_errors': [_evidence(row) for row in database_errors[-3:]],
             'last_successful_tool': successful_tool,
@@ -469,7 +593,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
     durations = [row['drift_seconds'] for row in rows
                  if row.get('event') == 'event_loop_stall' and isinstance(row.get('drift_seconds'), (int, float))]
     index: dict[str, Any] = {
-        'schema_version': 1, 'scope': 'bounded_current_and_previous_session_log_tails',
+        'schema_version': 1, 'scope': 'bounded_current_previous_and_recent_launcher_log_tails',
         'records_examined': len(rows), 'coverage': coverage,
         'incidents_available': len(failures), 'incidents_retained': len(incidents),
         'event_loop_stalls': counts['event_loop_stall'],
@@ -481,6 +605,8 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
     }
     permission_audit, permission_lines = _permission_audit(rows)
     index['permission_audit'] = permission_audit
+    startup_audit, startup_lines = _startup_audit(rows)
+    index['startup_audit'] = startup_audit
     safe_vm_report, vm_lines = _vm_log_coverage(vm_report)
     if safe_vm_report is not None:
         index['vm_log_evidence'] = safe_vm_report
@@ -510,7 +636,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         'HarnessyXO support summary', '==========================', '',
         'Start here; machine-readable evidence is in INCIDENTS.json.',
         f'Session application version: {version}; capture time: {metadata.get("captured_at", "unrecorded")}.',
-        'This summary examines bounded current/previous-session log tails. Counts are not whole-session totals.',
+        'This summary examines bounded current/previous-session log tails and startup receipts from up to two recent launcher sessions. Counts are not whole-session totals.',
         'Nearby events and tracked transactions are evidence for investigation, not proven lock ownership.', '',
         f'Recorded failures in examined logs: {len(failures)} (latest {len(incidents)} shown)',
         f'Event-loop stalls: {counts["event_loop_stall"]}; maximum recorded delay: {max(durations, default=0):.3f}s',
@@ -521,6 +647,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         *vm_lines,
         *target_lines,
         *permission_lines,
+        *startup_lines,
     ]
     if not incidents:
         lines.append('No recorded failure event was found in the examined logs; this does not establish that no failure occurred.')
@@ -535,6 +662,12 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
             lines.append(f'  Target argument validation: {failure.get("target_validation", "unrecorded")}; no target name or command is included.')
         if classification == 'tool_permission_policy_unavailable':
             lines.append('  The saved permission policy was unavailable; execution was blocked rather than using a stale policy.')
+        if classification == 'rea_storage_validation_failed':
+            issue = failure['storage_issue']
+            lines.append(f'  REA rejected settings-relative component {issue["component"]}: {issue["reason"]}.')
+            lines.append('  The recorded component check does not identify what created its current permissions or ownership.')
+        elif classification == 'rea_setup_failed':
+            lines.append(f'  REA setup did not complete; recorded code: {failure.get("error_code", "unrecorded")}.')
         if classification.startswith('test_target_'):
             for key in ('target_id', 'target_backend', 'target_action', 'target_stage', 'target_failure_code',
                         'target_interface', 'target_view_failure_code', 'elapsed_seconds', 'attempt', 'timeout_seconds'):

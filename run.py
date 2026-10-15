@@ -203,6 +203,38 @@ def check_registered_host_prerequisites() -> None:
     asyncio.run(check())
 
 
+def show_source_update_details(result: dict) -> None:
+    """Explain a reviewed archive comparison without dumping source or paths."""
+    check = result.get('archive_check')
+    if not isinstance(check, dict):
+        return
+    repairs = check.get('executable_repairs', 0)
+    if isinstance(repairs, int) and not isinstance(repairs, bool) and repairs > 0:
+        print(f'Restored executable permissions on {repairs} verified application file(s).', flush=True)
+    if result.get('outcome') != 'zip_local_changes':
+        return
+    labels = {
+        'missing': 'missing file',
+        'unsafe_path': 'symlink or unexpected directory',
+        'not_regular_file': 'not a regular file',
+        'content_size': 'file contents differ',
+        'content_hash': 'file contents differ',
+        'unreadable': 'file could not be read',
+        'executable_mode': 'executable permissions differ',
+        'mode_repair_failed': 'executable permissions could not be restored',
+    }
+    for item in check.get('mismatches', [])[:8]:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get('path') or '')
+        reason = labels.get(item.get('reason'))
+        if (reason and name and len(name) <= 180 and not name.startswith('/')
+                and all(char.isascii() and (char.isalnum() or char in '_./+@ -') for char in name)
+                and '..' not in name.split('/')):
+            print(f'  {name}: {reason}.', flush=True)
+    print('Keep this folder to preserve local edits; use a clean release folder for automatic updates.', flush=True)
+
+
 def ensure_rea_setup(diagnostic_event=None) -> bool:
     """Prepare the optional local analysis service before opening the app.
 
@@ -236,7 +268,7 @@ def ensure_rea_setup(diagnostic_event=None) -> bool:
             if diagnostic_event:
                 diagnostic_event('harnessy', 'launcher_rea_ready', cached=True, version=REA_VERSION)
             return True
-        print(f'Setting up REA {REA_VERSION} for HarnessyXO…', flush=True)
+        print(f'Setting up REA {REA_VERSION} (version pinned by HarnessyXO)…', flush=True)
         print('The first setup downloads REA and, if needed, a private Node.js runtime. Later launches reuse them.', flush=True)
         if diagnostic_event:
             diagnostic_event('harnessy', 'launcher_rea_setup_start', version=REA_VERSION)
@@ -250,7 +282,9 @@ def ensure_rea_setup(diagnostic_event=None) -> bool:
         if status.get('remediation'):
             print(str(status['remediation']), file=sys.stderr, flush=True)
         if diagnostic_event:
-            diagnostic_event('harnessy', 'launcher_rea_setup_failed', version=REA_VERSION)
+            diagnostic_event('harnessy', 'launcher_rea_setup_failed', version=REA_VERSION,
+                             error_code=status.get('code'), status=status.get('status'),
+                             storage_issue=status.get('storage_issue'))
         return False
 
     try:
@@ -291,6 +325,7 @@ def main() -> None:
         print("Checking HarnessyXO updates ...", flush=True)
         update_result = check_for_updates(app_dir, RELEASE_VERSION)
         outcome = update_result["outcome"]
+        show_source_update_details(update_result)
         if update_result["fatal"]:
             fail("HarnessyXO found an incomplete or unsafe source update and stopped. "
                  "Keep your .settings and workspaces, and restore the application files from a verified release.")
@@ -302,7 +337,7 @@ def main() -> None:
         messages = {
             "up_to_date": "HarnessyXO source: up to date.",
             "local_changes": "Source update skipped: local code changes are present. Starting the installed version.",
-            "zip_local_changes": "Source update skipped: this folder differs from its release tag. Starting the installed version.",
+            "zip_local_changes": "Source update skipped: application files differ from verified source. Starting the installed version.",
             "history_not_fast_forward": "Source update skipped: local Git history needs review. Starting the installed version.",
             "windows_updates_unsupported": "Automatic source updates currently support macOS and Linux. Starting the installed version.",
             "branch_not_managed": "Source update skipped: this checkout is not on main. Starting the installed version.",
@@ -343,7 +378,7 @@ def main() -> None:
     diagnostic_event, diagnostic_bundle = configure_launcher_diagnostics(app_dir, layout)
     if diagnostic_event:
         diagnostic_event("harnessy", "launcher_source_update", state=update_result["outcome"],
-                         changed=update_result["changed"])
+                         changed=update_result["changed"], archive_check=update_result.get('archive_check'))
 
     print(f"Using Python {sys.version.split()[0]}")
     print(f"Interpreter: {sys.executable}")

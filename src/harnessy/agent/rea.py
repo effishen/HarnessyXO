@@ -13,7 +13,6 @@ import os
 import re
 import shutil
 import signal
-import stat
 import subprocess
 import threading
 import uuid
@@ -62,9 +61,13 @@ _MESSAGES = {
 class ReaError(RuntimeError):
     """Safe fixed failure text; arbitrary server text is never interpolated."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, *, storage_issue: dict[str, Any] | None = None,
+                 detail: str = '') -> None:
         self.code = code if code in _MESSAGES else 'REA_PROTOCOL_ERROR'
         self.remediation = _MESSAGES[self.code]
+        self.storage_issue = storage_issue
+        if detail:
+            self.remediation += ' ' + detail
         super().__init__(self.remediation)
 
 
@@ -95,6 +98,7 @@ def _runtime_directory() -> Path:
 
 def _validate_rea_storage() -> None:
     from ..core.auth_users import UserStore, UserStoreError
+    from ..core.rea_bootstrap import ReaStorageValidationError, validate_storage_component
     try:
         root = settings_dir()
         UserStore(root)  # Directory validation only; creates no account files.
@@ -112,16 +116,21 @@ def _validate_rea_storage() -> None:
                          f'rea/runtime/node_modules/{REA_PACKAGE}/scripts/rea.mjs',
                          f'rea/runtime/node_modules/{REA_PACKAGE}/package.json', f'rea/runtime/{RUNTIME_MARKER}'):
             path = root / relative
-            try:
-                info = path.lstat()
-            except FileNotFoundError:
-                continue
-            expected_kind = stat.S_ISREG if relative in files else stat.S_ISDIR
-            if not expected_kind(info.st_mode) or (os.name != 'nt' and
-                    (info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022)):
-                raise ReaError('REA_STORAGE_UNSAFE')
-    except (OSError, UserStoreError):
+            validate_storage_component(root, path, directory=relative not in files)
+    except ReaStorageValidationError as exc:
+        raise ReaError('REA_STORAGE_UNSAFE', storage_issue=exc.storage_issue,
+                       detail=exc.remediation) from None
+    except UserStoreError:
+        try:
+            validate_storage_component(root, root, directory=True, allow_missing=False)
+        except ReaStorageValidationError as exc:
+            raise ReaError('REA_STORAGE_UNSAFE', storage_issue=exc.storage_issue,
+                           detail=exc.remediation) from None
         raise ReaError('REA_STORAGE_UNSAFE') from None
+    except OSError:
+        raise ReaError('REA_STORAGE_UNSAFE', storage_issue={
+            'component': 'settings_root', 'reason': 'unreadable',
+        }, detail='Check settings_root: unreadable.') from None
 
 
 def _runtime_identity() -> dict[str, str]:
@@ -682,7 +691,7 @@ async def rea_status(settings: dict[str, Any]) -> dict[str, Any]:
     except ReaError as exc:
         return {'ok': False, 'status': 'storage_unsafe', 'version': None, 'expected_version': REA_VERSION,
                 'node_supported': False, 'node_version': None, 'runtime_installed': False,
-                'code': exc.code, 'remediation': exc.remediation}
+                'code': exc.code, 'remediation': exc.remediation, 'storage_issue': exc.storage_issue}
     node, node_version = await _find_node()
     root = _runtime_directory() / 'node_modules' / REA_PACKAGE
     version = _package_version(root)
@@ -822,6 +831,21 @@ async def _installation_lock():
 
 async def _install_rea() -> dict[str, Any]:
     """Install into a verified staged tree, then publish without editing live files."""
+    from ..core.rea_bootstrap import prepare_rea_storage, ReaStorageValidationError
+    try:
+        prepare_rea_storage(settings_dir())
+    except OSError:
+        error = ReaError('REA_STORAGE_UNSAFE', storage_issue={
+            'component': 'settings_root', 'reason': 'cannot_prepare_storage',
+        }, detail='Check settings_root: cannot prepare storage.')
+        return {'ok': False, 'status': 'storage_unsafe', 'version': None, 'expected_version': REA_VERSION,
+                'node_supported': False, 'node_version': None, 'runtime_installed': False,
+                'code': error.code, 'remediation': error.remediation, 'storage_issue': error.storage_issue}
+    except ReaStorageValidationError as exc:
+        error = ReaError('REA_STORAGE_UNSAFE', storage_issue=exc.storage_issue, detail=exc.remediation)
+        return {'ok': False, 'status': 'storage_unsafe', 'version': None, 'expected_version': REA_VERSION,
+                'node_supported': False, 'node_version': None, 'runtime_installed': False,
+                'code': error.code, 'remediation': error.remediation, 'storage_issue': error.storage_issue}
     existing = await rea_status({})
     if existing['status'] == 'storage_unsafe':
         return existing
@@ -836,7 +860,8 @@ async def _install_rea() -> dict[str, Any]:
             node, version = prepared['node_path'], prepared['node_version']
             npm_cli = Path(prepared['npm_cli_path'])
         except ReaBootstrapError as exc:
-            existing.update(ok=False, status='install_failed', code=exc.code, remediation=exc.remediation)
+            existing.update(ok=False, status='install_failed', code=exc.code, remediation=exc.remediation,
+                            storage_issue=exc.storage_issue)
             return existing
         # Node preparation can make an existing marked runtime usable; npm is
         # unnecessary when its package was already cached for this host.
@@ -852,14 +877,17 @@ async def _install_rea() -> dict[str, Any]:
                 return existing
             return await _install_package(node, version, npm_cli)
     except ReaBootstrapError as exc:
-        existing.update(ok=False, status='install_failed', code=exc.code, remediation=exc.remediation)
+        existing.update(ok=False, status='install_failed', code=exc.code, remediation=exc.remediation,
+                        storage_issue=exc.storage_issue)
         return existing
     except ReaError as exc:
-        existing.update(ok=False, status='storage_unsafe', code=exc.code, remediation=exc.remediation)
+        existing.update(ok=False, status='storage_unsafe', code=exc.code, remediation=exc.remediation,
+                        storage_issue=exc.storage_issue)
         return existing
 
 
 async def _install_package(node: str, version: str | None, npm_cli: Path) -> dict[str, Any]:
+    from ..core.rea_bootstrap import secure_owned_tree, ReaStorageValidationError
     runtime = _runtime_directory()
     cache = runtime.parent / 'npm-cache'
     staging = runtime.parent / ('runtime-install-' + uuid.uuid4().hex)
@@ -893,10 +921,12 @@ async def _install_package(node: str, version: str | None, npm_cli: Path) -> dic
         await asyncio.wait_for(wait_root_exit(), INSTALL_TIMEOUT)
         await _await_owned_cleanup(asyncio.create_task(_stop_process(process)))
         await asyncio.wait_for(drain, 2.0)
+        secure_owned_tree(settings_dir(), staging)
         package = staging / 'node_modules' / REA_PACKAGE
         verified = _package_version(package) == REA_VERSION and (package / 'scripts' / 'rea.mjs').is_file()
         if process.returncode == 0 and verified:
             (staging / RUNTIME_MARKER).write_text(json.dumps(_runtime_identity(), sort_keys=True), encoding='utf-8')
+            (staging / RUNTIME_MARKER).chmod(0o600)
             # If another process installed a valid runtime while npm ran, leave
             # that live installation unchanged. Only publish a verified tree.
             if not _managed_runtime_installed(runtime):
@@ -919,6 +949,11 @@ async def _install_package(node: str, version: str | None, npm_cli: Path) -> dic
             result.update(ok=False, status='install_failed', remediation=_MESSAGES['REA_INSTALL_FAILED'])
         _event('rea_install_finished', returncode=process.returncode, version=REA_VERSION, ok=result['ok'])
         return result
+    except ReaStorageValidationError as exc:
+        error = ReaError('REA_STORAGE_UNSAFE', storage_issue=exc.storage_issue, detail=exc.remediation)
+        return {'ok': False, 'status': 'storage_unsafe', 'version': None, 'expected_version': REA_VERSION,
+                'node_supported': True, 'node_version': version, 'runtime_installed': False,
+                'code': error.code, 'remediation': error.remediation, 'storage_issue': error.storage_issue}
     except asyncio.CancelledError:
         if process is not None:
             cleanup = asyncio.create_task(_stop_process(process))

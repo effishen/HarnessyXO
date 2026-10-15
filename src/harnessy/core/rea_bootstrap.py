@@ -41,6 +41,133 @@ MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024
 MAX_EXTRACTED_BYTES = 1024 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 100_000
 DOWNLOAD_TIMEOUT_SECONDS = 180.0
+
+
+class ReaStorageValidationError(ValueError):
+    """Content-free evidence for a rejected component inside REA settings."""
+
+    def __init__(self, root: Path, path: Path, reason: str, info: os.stat_result | None = None) -> None:
+        try:
+            component = path.relative_to(root).as_posix()
+            if component in {'', '.'}:
+                component = 'settings_root'
+        except ValueError:
+            component = 'settings_root'
+        component = re.sub(r'[^A-Za-z0-9@._/+-]', '_', component)[:240]
+        self.storage_issue: dict[str, Any] = {'component': component, 'reason': reason}
+        if info is not None:
+            self.storage_issue.update(
+                mode=f'{stat.S_IMODE(info.st_mode):04o}',
+                owned_by_current_user=os.name == 'nt' or info.st_uid == os.geteuid(),
+            )
+        self.remediation = f'Check {component}: {reason.replace("_", " ")}.'
+        if info is not None:
+            self.remediation += (f' Mode {stat.S_IMODE(info.st_mode):04o}; '
+                                 f'owned by current user: {"yes" if os.name == "nt" or info.st_uid == os.geteuid() else "no"}.')
+        super().__init__(self.remediation)
+
+
+def validate_storage_component(
+    root: Path, path: Path, *, directory: bool, allow_missing: bool = True,
+    check_mode: bool = True,
+) -> os.stat_result | None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        if allow_missing:
+            return None
+        raise ReaStorageValidationError(root, path, 'missing') from None
+    except OSError:
+        raise ReaStorageValidationError(root, path, 'unreadable') from None
+    reason = (
+        'symlink_redirect' if stat.S_ISLNK(info.st_mode) else
+        'wrong_type' if not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)) else
+        'wrong_owner' if os.name != 'nt' and info.st_uid != os.geteuid() else
+        'writable_by_others' if check_mode and os.name != 'nt' and stat.S_IMODE(info.st_mode) & 0o022 else
+        ''
+    )
+    if reason:
+        raise ReaStorageValidationError(root, path, reason, info)
+    return info
+
+
+def _tighten_owned_component(root: Path, path: Path, *, directory: bool) -> None:
+    before = validate_storage_component(root, path, directory=directory, allow_missing=False, check_mode=False)
+    if os.name == 'nt':
+        return
+    assert before is not None
+    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
+    if directory:
+        flags |= getattr(os, 'O_DIRECTORY', 0)
+    descriptor = None
+    try:
+        descriptor = os.open(path, flags)
+        info = os.fstat(descriptor)
+        if (info.st_dev, info.st_ino) != (before.st_dev, before.st_ino):
+            raise ReaStorageValidationError(root, path, 'changed_during_validation', info)
+        if info.st_uid != os.geteuid() or (not directory and info.st_nlink != 1):
+            raise ReaStorageValidationError(root, path, 'wrong_owner' if info.st_uid != os.geteuid() else 'hard_link', info)
+        os.fchmod(descriptor, (stat.S_IMODE(info.st_mode) & 0o755) | (0o700 if directory else 0o600))
+    except OSError:
+        raise ReaStorageValidationError(root, path, 'cannot_secure_permissions', before) from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def secure_owned_tree(root: Path, tree: Path) -> None:
+    """Tighten an installer's private owned tree without following symlinks."""
+    _tighten_owned_component(root, tree, directory=True)
+    def walk_failed(_error: OSError) -> None:
+        raise ReaStorageValidationError(root, tree, 'unreadable') from None
+
+    for directory, dirs, files in os.walk(tree, followlinks=False, onerror=walk_failed):
+        parent = Path(directory)
+        for name in [*dirs, *files]:
+            path = parent / name
+            try:
+                info = path.lstat()
+            except OSError:
+                raise ReaStorageValidationError(root, path, 'unreadable') from None
+            if stat.S_ISLNK(info.st_mode):
+                try:
+                    contained = path.resolve(strict=True).is_relative_to(tree.resolve())
+                except (OSError, RuntimeError):
+                    contained = False
+                if not contained or (os.name != 'nt' and info.st_uid != os.geteuid()):
+                    raise ReaStorageValidationError(root, path, 'symlink_redirect', info)
+                # npm's .bin and official Node's bin/npm are contained links.
+                # Their target is checked independently; never chmod a link.
+                continue
+            _tighten_owned_component(root, path, directory=stat.S_ISDIR(info.st_mode))
+
+
+def prepare_rea_storage(root: Path) -> Path:
+    """Prepare known caches only beneath an already private REA parent."""
+    try:
+        UserStore(root)
+    except UserStoreError:
+        validate_storage_component(root, root, directory=True, allow_missing=False)
+        raise ReaStorageValidationError(root, root, 'cannot_prepare_storage') from None
+    parent = root / 'rea'
+    validate_storage_component(root, parent, directory=True)
+    try:
+        parent.mkdir(mode=0o700, exist_ok=True)
+    except OSError:
+        raise ReaStorageValidationError(root, parent, 'cannot_prepare_storage') from None
+    info = validate_storage_component(root, parent, directory=True, allow_missing=False)
+    # Older installers created children with the caller's umask, although the
+    # REA parent was 700. Such children were never reachable by other users.
+    # Do not repair a cache that lacked that enclosing private boundary.
+    private_parent = os.name == 'nt' or info is not None and not stat.S_IMODE(info.st_mode) & 0o077
+    if private_parent:
+        for name in ('node', 'runtime', 'npm-cache'):
+            tree = parent / name
+            if tree.exists() or tree.is_symlink():
+                secure_owned_tree(root, tree)
+    return parent
+
+
 _MESSAGES = {
     'REA_NODE_UNSUPPORTED_PLATFORM': 'Automatic Node setup supports macOS, glibc Linux and Windows on x64 or arm64. Install a supported Node.js and npm manually on this platform.',
     'REA_NODE_SETTINGS_UNSAFE': 'Node.js setup requires settings and runtime directories owned by you, not symlinks or writable by other users.',
@@ -56,9 +183,13 @@ _MESSAGES = {
 
 
 class ReaBootstrapError(RuntimeError):
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, *, storage_issue: dict[str, Any] | None = None,
+                 detail: str = '') -> None:
         self.code = code if code in _MESSAGES else 'REA_NODE_INSTALL_FAILED'
         self.remediation = _MESSAGES[self.code]
+        self.storage_issue = storage_issue
+        if detail:
+            self.remediation += ' ' + detail
         super().__init__(self.remediation)
 
 
@@ -104,9 +235,8 @@ def host_identity() -> dict[str, str]:
 
 def _settings_parent() -> Path:
     try:
-        root = UserStore(settings_dir()).root
-        parent = root / 'rea'
-        parent.mkdir(mode=0o700, exist_ok=True)
+        root = settings_dir()
+        parent = prepare_rea_storage(root)
         for directory in (parent, parent / 'node'):
             try:
                 info = directory.lstat()
@@ -114,10 +244,15 @@ def _settings_parent() -> Path:
                 continue
             if not stat.S_ISDIR(info.st_mode) or (os.name != 'nt' and
                     (info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022)):
-                raise ReaBootstrapError('REA_NODE_SETTINGS_UNSAFE')
+                validate_storage_component(root, directory, directory=True, allow_missing=False)
         return parent
+    except ReaStorageValidationError as exc:
+        raise ReaBootstrapError('REA_NODE_SETTINGS_UNSAFE', storage_issue=exc.storage_issue,
+                                detail=exc.remediation) from None
     except (OSError, UserStoreError):
-        raise ReaBootstrapError('REA_NODE_SETTINGS_UNSAFE') from None
+        raise ReaBootstrapError('REA_NODE_SETTINGS_UNSAFE', storage_issue={
+            'component': 'settings_root', 'reason': 'cannot_prepare_storage',
+        }, detail='Check settings_root: cannot prepare storage.') from None
 
 
 def _supported_version(value: str) -> bool:
@@ -399,9 +534,9 @@ def _extract_archive(archive: Path, destination: Path, prefix: str,
                 _check_cancel(cancel_event)
                 target = destination / relative
                 if kind == 'directory':
-                    target.mkdir(parents=True, exist_ok=True)
+                    target.mkdir(parents=True, exist_ok=True, mode=0o700)
                 elif kind == 'file':
-                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                     source = container.open(member) if isinstance(container, zipfile.ZipFile) else container.extractfile(member)
                     if source is None:
                         raise ReaBootstrapError('REA_NODE_ARCHIVE_INVALID')
@@ -412,13 +547,14 @@ def _extract_archive(archive: Path, destination: Path, prefix: str,
                             if not chunk:
                                 break
                             output.write(chunk)
-                    target.chmod(mode & 0o777 or 0o644)
+                    target.chmod((mode & 0o755) | 0o600)
             for _, relative, kind, _, link in entries:
                 _check_cancel(cancel_event)
                 if kind == 'symlink':
                     target = destination / relative
-                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                     target.symlink_to(link)
+            secure_owned_tree(destination.parent, destination)
     except ReaBootstrapError:
         raise
     except (OSError, ValueError, UnicodeError, tarfile.TarError, zipfile.BadZipFile):
@@ -483,6 +619,7 @@ def ensure_node_runtime(progress: Callable[[str], Any] | None = None, *,
                 (extracted / 'harnessy-node.json').write_text(json.dumps({
                     'version': NODE_VERSION, 'platform': host[0], 'architecture': host[1], 'archive_sha256': checksum,
                 }), encoding='utf-8')
+                (extracted / 'harnessy-node.json').chmod(0o600)
                 backup = root.parent / ('node-replaced-' + uuid.uuid4().hex)
                 moved = False
                 _check_cancel(cancel_event)
