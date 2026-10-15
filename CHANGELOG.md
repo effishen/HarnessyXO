@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.6.98
+
+- Keep the full current-run elapsed time visible in the chat status bar during model waits, prompt processing, generation, tools, approvals and automatic continuations. Show the current model request's elapsed time separately instead of replacing the run clock.
+- Keep the run timer visible on narrow chat panes and phone screens. Wrap the status details when space is tight and freeze completed, stopped and failed run clocks at their actual end.
+- Preserve per-card tokens/s summaries, backend cache counters and existing model requests. Leave README unchanged and keep the same 11 Markdown resources; private QA stays outside the application package.
+
 ## v0.6.97
 
 - Restore the saved tokens/s summary on completed Thinking and HarnessyXO answer cards, including compact Thinking rows. Keep each card's observed duration beside its originating model call's decode speed.

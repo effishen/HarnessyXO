@@ -826,10 +826,11 @@ html[data-hy-events-mode="compact"] .hy-activity-card.hy-activity-failed:not(.hy
 .hy-health-label {min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
 .hy-statusbar { position:relative; flex:0 0 auto !important; min-height:40px; width:100%; min-width:0; border-top:1px solid var(--hy-border); font-size:11.5px; overflow:hidden; white-space:nowrap; padding:5px 12px max(6px, env(safe-area-inset-bottom)) !important; box-sizing:border-box; gap:10px !important; align-items:center !important; background:var(--hy-page-surface); z-index:3; container-type:inline-size; }
 .hy-status-content {flex:1 1 0%; min-width:0; display:flex; flex-direction:column; align-items:stretch; gap:2px; overflow:hidden;}
-.hy-status-current {width:100%; min-width:0; display:flex; align-items:center; gap:12px; overflow:hidden;}
+.hy-status-current {width:100%; min-width:0; display:flex; align-items:center; flex-wrap:wrap; gap:2px 12px; overflow:hidden;}
 .hy-status-previous {font-size:10.5px; white-space:normal; overflow-wrap:anywhere;}
 .hy-status-phase {flex:0 1 auto; min-width:36px; overflow:hidden; text-overflow:ellipsis;}
-.hy-status-tps, .hy-status-elapsed {flex:0 0 auto;}
+.hy-status-tps, .hy-status-elapsed, .hy-status-request-elapsed {flex:0 0 auto;}
+.hy-status-elapsed {font-variant-numeric:tabular-nums;}
 .hy-status-agents {flex:0 0 auto; min-height:24px !important; padding:0 5px !important; font-size:11.5px !important; color:inherit !important;}
 .hy-status-root {flex:0 1 auto; min-width:0; max-width:210px; overflow:hidden; text-overflow:ellipsis;}
 .hy-status-context {margin-left:auto; flex:0 0 auto;}
@@ -838,9 +839,17 @@ html[data-hy-events-mode="compact"] .hy-activity-card.hy-activity-failed:not(.hy
 /* Query the actual chat footer width, not the browser (sidebar/tools consume space).
    The monitor remains a separate fixed-width flex child, never in clipped text. */
 @container (max-width:680px) { .hy-status-agents {display:none !important;} }
-@container (max-width:600px) { .hy-status-elapsed {display:none !important;} }
+@container (max-width:600px) {
+ .hy-status-phase {order:1; flex:1 1 36px;}
+ .hy-status-elapsed {order:2;}
+ .hy-status-tps {order:3;}
+ .hy-status-request-elapsed {order:4;}
+ .hy-status-agents {order:5;}
+ .hy-status-root {order:6;}
+ .hy-status-context-group {order:7; flex:1 1 100%; margin-left:0; flex-direction:row; align-items:center; gap:10px;}
+}
 @container (max-width:560px) { .hy-status-root {display:none !important;} }
-@container (max-width:480px) { .hy-status-tps {display:none !important;} }
+@container (max-width:480px) { .hy-status-tps, .hy-status-request-elapsed {display:none !important;} }
 @container (max-width:320px) { .hy-status-context {display:none !important;} }
 .hy-status-dot { width: 7px; height: 7px; border-radius: 50%; background: #10a37f; display:inline-block; }
 .hy-status-dot.offline { background: #d14b4b; }
@@ -11334,6 +11343,7 @@ class HarnessyPage:
                 process_live_state['persisted_revision'] = int(process_live_state.get('persisted_revision') or 0) + 1
                 publish_live_state(
                     active=False, finished=True, phase_active=False,
+                    run_finished_perf=time.perf_counter(),
                     current_tool=None, assistant_persisted=True,
                 )
             phase_clock_task.cancel()
@@ -11475,6 +11485,7 @@ class HarnessyPage:
                         phase_tooltip = ui.tooltip('Current Project / Chat activity.').classes('hy-status-tooltip')
                     rate = ui.label('').classes('hy-muted hy-status-tps')
                     elapsed = ui.label('').classes('hy-muted hy-status-elapsed')
+                    request_elapsed = ui.label('').classes('hy-muted hy-status-request-elapsed')
                     agents = ui.button('Agents: 0 / 1', on_click=self.open_run_queue_dialog).props(
                         'flat dense no-caps aria-label="Open active agents and run queue"'
                     ).classes('hy-muted hy-status-agents')
@@ -11520,7 +11531,8 @@ class HarnessyPage:
                 performance_button.on('click', lambda: self.open_metrics_dialog(ws, chat_id, profile))
                 performance_button.tooltip('Performance details').classes('hy-status-tooltip')
         self._status_refs = dict(
-            phase=phase, rate=rate, elapsed=elapsed, agents=agents, context=context_label,
+            phase=phase, rate=rate, elapsed=elapsed, request_elapsed=request_elapsed,
+            agents=agents, context=context_label,
             previous=previous, previous_tooltip=previous_tooltip,
             phase_tooltip=phase_tooltip, agents_tooltip=agents_tooltip,
             context_tooltip=context_tooltip,
@@ -11584,6 +11596,7 @@ class HarnessyPage:
                 detail = detail + '\n' + ' · '.join(cache_bits)
             for name, value in {
                 'phase': values['phase'], 'rate': values['rate'], 'elapsed': values['elapsed'],
+                'request_elapsed': values['request_elapsed'],
                 'previous': values['previous'], 'previous_tooltip': values['previous_detail'],
                 'agents': f"Agents: {len(active_agents)} / {slot_limit}",
                 'agents_tooltip': agent_detail,
@@ -11594,7 +11607,7 @@ class HarnessyPage:
                 if getattr(element, '_hy_status_text', None) != value:
                     element.set_text(value)
                     element._hy_status_text = value
-                    if name in {'rate', 'elapsed', 'previous'}:
+                    if name in {'rate', 'elapsed', 'request_elapsed', 'previous'}:
                         element.set_visibility(bool(value))
         except RuntimeError as exc:
             if not _is_stale_ui_error(exc):
@@ -20857,6 +20870,7 @@ async def _run_headless_turn(
             state.update({
                 'active': False,
                 'finished': True,
+                'run_finished_perf': time.perf_counter(),
                 'phase_active': False,
                 'current_tool': None,
                 'assistant_persisted': True,

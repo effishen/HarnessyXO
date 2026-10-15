@@ -43,6 +43,14 @@ def request_elapsed_seconds(live: dict[str, Any], now: float) -> float | None:
     return max(0.0, now - started) if started and started <= now else None
 
 
+def run_elapsed_seconds(live: dict[str, Any], now: float) -> float | None:
+    """Whole-run monotonic time, frozen at the recorded terminal snapshot."""
+    started = positive_number(live.get('run_started'))
+    running = bool(live.get('active') and not live.get('finished'))
+    ended = now if running else positive_number(live.get('run_finished_perf'))
+    return max(0.0, ended - started) if started and ended and started <= ended else None
+
+
 def previous_call_presentation(latest: dict[str, Any]) -> tuple[str, str]:
     """Completed-call measurements stay separate from all live request rates."""
     parts = []
@@ -213,13 +221,18 @@ def auto_context_presentation(
 def run_presentation(live: dict[str, Any] | None, latest: dict[str, Any], now: float) -> dict[str, str]:
     live = live or {}
     previous, previous_detail = previous_call_presentation(latest)
+    run_age = run_elapsed_seconds(live, now)
     if not live.get('active') or live.get('finished'):
         outcome = str(live.get('outcome') or '')
         phase = {'stopped': 'Stopped', 'error': 'Error'}.get(outcome, 'Ready')
         duration = positive_number(latest.get('duration_seconds'))
         return {'phase': phase, 'rate': '', 'previous': previous, 'previous_detail': previous_detail,
-                'elapsed': 'Last ' + elapsed_text(duration) if duration else '',
-                'detail': 'Last completed model generation; not live throughput. Open Stats for full timings.'}
+                'elapsed': ('Last run ' + elapsed_text(run_age) if run_age is not None else
+                            'Last call ' + elapsed_text(duration) if duration else ''),
+                'request_elapsed': '',
+                'detail': ('Elapsed is the whole last run, including model requests, tools and waits.'
+                           if run_age is not None else
+                           'Last completed model generation; whole-run timing was not recorded. Open Stats for full timings.')}
     phase = str(live.get('phase') or '')
     status = str(live.get('status') or '')
     status_lower = status.casefold()
@@ -264,17 +277,17 @@ def run_presentation(live: dict[str, Any] | None, latest: dict[str, Any], now: f
         if prefill:
             rate = f'{prefill:.1f} tok/s PP'
     request_age = request_elapsed_seconds(live, now)
-    start = positive_number(live.get('run_started'))
-    elapsed = ('Request ' + elapsed_text(request_age) if request_age is not None
-               and label in {'Waiting for model · progress unavailable', 'Prompt Processing'} else
-               'Run ' + elapsed_text(max(0, now - start)) if start else '')
+    elapsed = 'Run ' + elapsed_text(run_age) if run_age is not None else ''
+    request_elapsed = ('Request ' + elapsed_text(request_age) if request_age is not None
+                       and label in {'Waiting for model · progress unavailable', 'Prompt Processing'} else '')
     detail = f'{label}: {tool.get("name") or status or phase}. '
-    detail += ('Elapsed is this model request.' if elapsed.startswith('Request ')
-               else 'Elapsed is the whole current run.')
+    detail += 'Run is the whole current run, including model requests, tools and waits.'
+    if request_elapsed:
+        detail += ' Request is the current model request only.'
     if label in {'Generating', 'Generating tool'} and not rate:
         detail += ' Live speed is not available yet or is stale.'
     wait_detail = stream_wait_detail(live, now)
     if wait_detail:
         detail += '\n' + wait_detail
-    return {'phase': label, 'rate': rate, 'elapsed': elapsed, 'detail': detail,
+    return {'phase': label, 'rate': rate, 'elapsed': elapsed, 'request_elapsed': request_elapsed, 'detail': detail,
             'previous': previous, 'previous_detail': previous_detail}
