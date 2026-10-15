@@ -15,6 +15,7 @@ import secrets
 import shlex
 import shutil
 import socket
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -27,6 +28,8 @@ from .test_targets import TestTargetManager, TestTargetFailure
 
 OPENWRT_READINESS_SECONDS = 240.0
 OPENWRT_POLL_SECONDS = 2.0
+OPENWRT_LAUNCH_SECONDS = 30.0
+_LAUNCH_REAPERS: set[asyncio.Task] = set()
 
 
 def qemu_binary(architecture: str) -> str:
@@ -127,6 +130,100 @@ class OpenWrtTargetManager(TestTargetManager):
         if proc.returncode not in allowed:
             raise RuntimeError(text[-2000:] or 'Host VM preparation command failed.')
         return text
+
+    @staticmethod
+    def _reap_launcher_later(proc):
+        # A wrapper can remain alive even after its VM monitor is ready. Its
+        # subprocess handle is not proof that it is safe to stop the guest.
+        task = asyncio.create_task(proc.wait())
+        _LAUNCH_REAPERS.add(task)
+        task.add_done_callback(_LAUNCH_REAPERS.discard)
+
+    async def _stop_launcher(self, proc):
+        # Only this invocation's child handle is eligible for cleanup. Never
+        # signal a PID read from the runtime directory or a process group.
+        if proc.returncode is not None:
+            return
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), 2)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), 2)
+            except asyncio.TimeoutError:
+                self._reap_launcher_later(proc)
+
+    async def _owned_launch_running(self):
+        try:
+            # qmp() checks query-uuid before issuing query-status. A live PID,
+            # occupied port, or unrelated monitor never proves this VM is up.
+            result = await asyncio.wait_for(self.qmp('query-status'), 5)
+            return isinstance(result, dict) and result.get('running') is True
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError, asyncio.TimeoutError):
+            return False
+
+    async def _launch_qemu(self, argv, *, timeout=OPENWRT_LAUNCH_SECONDS):
+        # QEMU -daemonize (or a launcher wrapper) can leave a descendant holding
+        # stdout/stderr open after the parent exits. Waiting for pipe EOF then
+        # mistakes a running guest for a launch timeout. A private regular file
+        # captures errors without making daemon FD lifetime part of readiness.
+        with tempfile.TemporaryFile(mode='w+b', dir=self.runtime_dir()) as capture:
+            proc = await asyncio.create_subprocess_exec(
+                *map(str, argv), cwd=self.root, env=self._env(),
+                stdin=asyncio.subprocess.DEVNULL, stdout=capture,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            try:
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout)
+                except asyncio.TimeoutError:
+                    self.stage('launch_reconcile', failure_code='controller_timeout',
+                               timeout_seconds=timeout)
+                    if await self._owned_launch_running():
+                        if proc.returncode is None:
+                            self._reap_launcher_later(proc)
+                        self.stage('launch_recovered', returncode=proc.returncode,
+                                   timeout_seconds=timeout)
+                        if self.operation:
+                            self.operation.note(
+                                'QEMU launch handoff exceeded its deadline, but this '
+                                'target\'s running VM was verified. Checking its shell '
+                                'and first-boot configuration with the existing ports.\n')
+                        return
+                    await self._stop_launcher(proc)
+                    raise TestTargetFailure(
+                        f'QEMU launch handoff did not finish within {timeout:g} seconds, '
+                        'and this target\'s running VM could not be verified. '
+                        'No replacement VM was launched. Download diagnostics for '
+                        'the launch stage and boot log, then inspect the VM state '
+                        'before retrying Start.', 'controller_timeout',
+                    ) from None
+            except asyncio.CancelledError:
+                # Cancellation can arrive after QEMU has booted. Preserve a
+                # UUID-verified running VM even when the spawned handle lingers.
+                if await self._owned_launch_running():
+                    if proc.returncode is None:
+                        self._reap_launcher_later(proc)
+                else:
+                    await self._stop_launcher(proc)
+                raise
+            self.stage('launch', returncode=proc.returncode,
+                       timeout_seconds=timeout)
+            if proc.returncode:
+                size = os.fstat(capture.fileno()).st_size
+                detail = os.pread(capture.fileno(), 2000, max(0, size - 2000)).decode(errors='replace').strip()
+                raise TestTargetFailure(
+                    f'QEMU launcher exited with status {proc.returncode}. '
+                    + (detail or 'Download diagnostics for the launch stage and VM boot log.'),
+                    'launch_failed', returncode=proc.returncode,
+                )
 
     async def prerequisites(self):
         names = ['ssh', 'ssh-keygen', qemu_binary(self.config['architecture'])]
@@ -304,8 +401,9 @@ class OpenWrtTargetManager(TestTargetManager):
             state = self.instance_dir / 'ports.json'
             state.write_text(json.dumps({'ssh': ssh_port, 'web': web_port}))
             state.chmod(0o600)
-            self.stage('launch', timeout_seconds=30)
-            await self.host_command(self.qemu_argv(ssh_port, web_port), timeout=30)
+            self.stage('launch', timeout_seconds=OPENWRT_LAUNCH_SECONDS)
+            await self._launch_qemu(self.qemu_argv(ssh_port, web_port),
+                                    timeout=OPENWRT_LAUNCH_SECONDS)
         from harnessy.agent.external_targets import ExternalTargetBroker
         from harnessy.diagnostics.test_target_logs import classify_target_failure
         broker = ExternalTargetBroker(self.workspace)

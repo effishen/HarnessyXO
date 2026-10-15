@@ -1,4 +1,4 @@
-# HarnessyXO v0.6.87 Features
+# HarnessyXO v0.6.88 Features
 
 ## Workspace test-target tabs
 
@@ -7,6 +7,8 @@
 - Keep guest pages isolated from HarnessyXO's browser origin; scope display access to the signed-in session and selected target, and revoke it on close or VM changes.
 - Verify OpenWrt readiness without requiring a hostname utility. Separate boot, shell and optional radio setup stages, with a bounded readiness deadline.
 - Retain target lifecycle evidence separately from busy model logs and include bounded QEMU/Lima boot evidence in diagnostics.
+- If QEMU’s launch handoff times out, verify this target’s live monitor and identity before continuing shell/bootstrap checks on the same disk and ports. Capture launcher output without waiting for a daemon to close inherited output handles.
+- Show stage, time limit and code for start errors, including empty timeout exceptions. Offer **Retry Start** and distinguish a running guest with incomplete setup. Correlate later successful guest probes with earlier launch failures in diagnostics.
 
 ## OpenWrt radio emulation
 

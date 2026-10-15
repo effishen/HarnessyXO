@@ -38,7 +38,7 @@ TARGET_ENUMS = {
         'network_unreachable', 'connection_failed', 'kernel_abi_mismatch', 'signature_failed', 'disk_full',
         'package_unavailable', 'operation_timeout', 'ssh_command_failed', 'interface_create_failed',
         'network_permission_denied'}),
-    'target_stage': frozenset({'prerequisites', 'download', 'prepare_disk', 'launch', 'wait_ssh', 'probe_shell', 'radio_setup', 'bluetooth_packages', 'bluetooth_emulator', 'bluetooth_attach', 'bluetooth_verify', 'connection_test', 'web_transport', 'vnc_transport', 'ready', 'stopped', 'failed', 'cancelled', 'snapshot', 'restore', 'delete'}),
+    'target_stage': frozenset({'prerequisites', 'download', 'prepare_disk', 'launch', 'launch_reconcile', 'launch_recovered', 'wait_ssh', 'probe_shell', 'radio_setup', 'bluetooth_packages', 'bluetooth_emulator', 'bluetooth_attach', 'bluetooth_verify', 'connection_test', 'web_transport', 'vnc_transport', 'ready', 'stopped', 'failed', 'cancelled', 'snapshot', 'restore', 'delete'}),
     'target_outcome': frozenset({'running', 'completed', 'failed', 'cancelled', 'timeout'}),
     'target_interface': frozenset({'web', 'vnc'}),
     'target_view_failure_code': frozenset({'compressed_response_rejected', 'response_size_limit', 'request_size_limit',

@@ -171,6 +171,10 @@ lists_dir ext $work/lists
 option overlay_root /overlay
 option check_signature
 CONFIG
+        # Isolating opkg's conf directory also hides its architecture list.
+        # Retain the installed image's accepted package architectures without
+        # importing other configuration or custom package repositories.
+        opkg print-architecture | awk 'NF == 3 && $1 == "arch" && $2 ~ /^[A-Za-z0-9_+-]+$/ && $3 ~ /^[0-9]+$/ { print }' >> "$work/opkg.conf"
         awk -v prefix="$prefix" 'NF == 3 && $1 == "src/gz" && index($3, prefix) == 1 { print }' /etc/opkg/distfeeds.conf > "$work/feeds"
         if [ ! -s "$work/feeds" ]; then
             reason=stock_feeds_unavailable

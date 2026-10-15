@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.88
+
+- Finish OpenWrt startup when QEMU has booted but its launcher output remains open. If the launch handoff times out, verify this target’s QMP identity and running state before continuing shell/bootstrap checks with the same ports and disk. Leave unverified state explicit instead of launching a replacement VM.
+- Show a useful error for empty timeout exceptions: include the failed stage, time limit and diagnostic code. Show **Guest running · Start setup incomplete** when a live VM still needs setup, and offer **Retry Start** on its existing disk.
+- Keep the installed OpenWrt package architecture priorities when installing Wi-Fi through isolated official feeds. This preserves image-specific priorities while keeping custom feeds isolated and normal signature and kernel checks in place.
+- Explain launch timeouts and later successful guest probes together in diagnostics. Distinguish radio setup that was never reached from a failed package installation, and record verified launch recovery separately.
+- Preserve existing guests, settings, radio helpers, automatic Linux Lima setup and public startup updates. Leave README unchanged and keep the same 11 Markdown resources.
+
 ## v0.6.87
 
 - Enable **Emulated Bluetooth controllers** when creating an OpenWrt target. Checking it installs matching signed guest packages and sets up two software Bluetooth controllers automatically. Existing targets can use **Set up / repair radios**; no custom guest image or VM rebuild is required.

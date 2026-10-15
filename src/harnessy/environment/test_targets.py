@@ -78,11 +78,43 @@ class TargetOperation:
     task: asyncio.Task | None = None
     started: float = field(default_factory=time.monotonic)
     stage: str = 'prerequisites'
+    stage_timeout_seconds: float = 0.0
     failure_code: str = 'none'
     operation_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     def note(self, text: str) -> None:
         self.output = (self.output + str(text))[-60000:]
+
+
+def target_operation_error(operation: TargetOperation, error: BaseException | None = None) -> str:
+    """Always provide an actionable failure, including for empty TimeoutError."""
+    text = str(error if error is not None else operation.error or '').strip()
+    code = str(operation.failure_code or 'controller_failed')
+    if code == 'none':
+        code = 'controller_failed'
+    stage = {
+        'prerequisites': 'checking host requirements', 'download': 'downloading the guest image',
+        'prepare_disk': 'preparing the guest disk', 'launch': 'launching the guest',
+        'launch_reconcile': 'checking the VM after the launcher timed out',
+        'wait_ssh': 'waiting for guest SSH', 'probe_shell': 'checking the guest shell',
+        'radio_setup': 'setting up emulated radios',
+    }.get(operation.stage, str(operation.stage or 'setup').replace('_', ' '))
+    action = 'Start setup' if operation.action == 'start' else (
+        'Radio setup' if operation.action == 'radios' else operation.action.capitalize())
+    fallback = not text
+    timeout_error = isinstance(error, (TimeoutError, asyncio.TimeoutError)) or (fallback and code.endswith('timeout'))
+    if timeout_error:
+        timeout = max(0.0, float(getattr(operation, 'stage_timeout_seconds', 0) or 0))
+        duration = f' after {timeout:g} seconds' if timeout else ' at its configured time limit'
+        text = f'{action} timed out{duration} while {stage} [{code}].' + (f' {text}' if text else '')
+    elif not text:
+        kind = type(error).__name__ if error is not None else 'controller error'
+        text = f'{action} failed while {stage} [{code}; {kind}].'
+    if operation.action == 'start' and (timeout_error or fallback):
+        if operation.stage in {'launch', 'launch_reconcile', 'wait_ssh', 'probe_shell'}:
+            text += ' The guest may still be booting or running.'
+        text += ' Retry Start to check the existing VM and finish setup without replacing its disk.'
+    return text
 
 
 _OPERATIONS: dict[str, TargetOperation] = {}
@@ -130,6 +162,7 @@ class TestTargetManager:
         op = self.operation
         if op:
             op.stage = stage
+            op.stage_timeout_seconds = max(0.0, float(timeout_seconds or 0))
         fields = dict(target_id=self.target.id, target_backend=self.backend,
                       operation_id=op.operation_id if op else '',
                       target_action=op.action if op else 'connection_test',
@@ -467,10 +500,12 @@ systemctl restart lightdm
                 op.state, op.error = 'cancelled', 'Operation cancelled; check VM status before retrying.'
                 op.failure_code = 'cancelled'
             except Exception as exc:
-                op.state, op.error = 'failed', str(exc)
-                op.failure_code = getattr(exc, 'failure_code', None) or classify_target_failure(exc)
+                op.state = 'failed'
+                op.failure_code = getattr(exc, 'failure_code', None) or (
+                    'controller_timeout' if isinstance(exc, (TimeoutError, asyncio.TimeoutError)) else classify_target_failure(exc))
                 if op.stage == 'prerequisites' and op.failure_code == 'controller_failed':
                     op.failure_code = 'host_dependency_missing'
+                op.error = target_operation_error(op, exc)
                 op.note('\n' + op.error)
             finally:
                 log_event('runtime', 'test_target_operation_finished', target_id=self.target.id,
@@ -478,6 +513,7 @@ systemctl restart lightdm
                           target_backend=self.backend, target_action=action, target_stage=op.stage,
                           target_outcome={'succeeded': 'completed', 'failed': 'failed', 'cancelled': 'cancelled'}.get(op.state, 'failed'),
                           target_failure_code=op.failure_code,
+                          timeout_seconds=op.stage_timeout_seconds,
                           elapsed_seconds=max(0, time.monotonic() - started))
                 # Durable diagnostics must survive an unavailable workspace DB.
                 try:

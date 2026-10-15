@@ -19,6 +19,7 @@ _TAIL_BYTES = 2 * 1024 * 1024
 _MAX_ROWS = 20000
 _MAX_INCIDENTS = 20
 _CONTEXT_SECONDS = 30.0
+_TARGET_FOLLOWUP_SECONDS = 300.0
 _PERMISSION_RECEIPTS = 120
 _ERROR_EVENTS = frozenset({
     'agent_run_error', 'headless_run_error', 'uncaught_exception',
@@ -79,6 +80,102 @@ def _target_failure_classification(row: dict[str, Any]) -> str | None:
     if code in {'boot_timeout', 'shell_probe_timeout', 'controller_timeout'} or row.get('target_outcome') == 'timeout':
         return 'test_target_startup_timeout'
     return 'test_target_operation_failed'
+
+
+def _target_operation_rows(rows: list[dict[str, Any]], failure: dict[str, Any]) -> list[dict[str, Any]]:
+    """Match explicit identities; absent/redacted IDs cannot join operations."""
+    identifiers = (failure.get('target_id'), failure.get('operation_id'))
+    if not all(isinstance(value, str) and len(value) == 32
+               and all(char in '0123456789abcdef' for char in value) for value in identifiers):
+        return []
+    return [row for row in rows
+            if row.get('session_scope') == failure.get('session_scope')
+            and row.get('target_id') == failure['target_id']
+            and row.get('operation_id') == failure['operation_id']
+            and row['timestamp'] <= failure['timestamp']
+            and (not failure.get('target_backend')
+                 or row.get('target_backend') == failure['target_backend'])
+            and (str(row.get('event')).startswith('test_target_operation_')
+                 or row.get('event') == 'test_target_radio_result')]
+
+
+def _target_startup_analysis(rows: list[dict[str, Any]], failure: dict[str, Any],
+                             operation: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Explain controlled stage boundaries, keeping later evidence separate.
+
+    A parsed radio probe establishes a successful guest command at its own
+    timestamp. It cannot establish guest readiness at the earlier deadline.
+    """
+    if failure.get('target_action') != 'start' or failure.get('event') != 'test_target_operation_finished':
+        return None
+    from .permissions import safe_timing
+
+    radio_stages = {'radio_setup', 'bluetooth_packages', 'bluetooth_emulator',
+                    'bluetooth_attach', 'bluetooth_verify'}
+    stages = {row.get('target_stage') for row in operation}
+    start_recorded = any(row.get('event') == 'test_target_operation_started' for row in operation)
+    stage = failure.get('target_stage')
+    before_radios = {'prerequisites', 'download', 'prepare_disk', 'launch',
+                     'launch_reconcile', 'launch_recovered', 'wait_ssh', 'probe_shell'}
+    reached = ('reached' if stages & radio_stages else
+               'not_reached' if start_recorded and stage in before_radios else 'unrecorded')
+    launches = [row for row in operation if row.get('target_stage') in
+                {'launch', 'launch_reconcile', 'launch_recovered'}]
+    recovered = any(row.get('target_stage') == 'launch_recovered' for row in launches)
+    timed_out = (any(row.get('target_stage') == 'launch_reconcile' for row in launches)
+                 or (stage in {'launch', 'launch_reconcile'}
+                     and failure.get('target_failure_code') == 'controller_timeout'))
+    exit_rows = [row for row in launches if type(row.get('returncode')) is int]
+    limit = next((safe_timing(row.get('timeout_seconds')) for row in reversed(launches)
+                  if safe_timing(row.get('timeout_seconds')) not in (None, 0)), None)
+    analysis: dict[str, Any] = {
+        'schema_version': 1,
+        'launch_wait': 'timeout_recovered' if recovered else 'timeout' if timed_out else
+                       'exited' if exit_rows else 'unrecorded',
+        'launcher_returncode': exit_rows[-1]['returncode'] if exit_rows else None,
+        'launch_timeout_seconds': limit,
+        'radio_setup': reached,
+        'operation_start_recorded': start_recorded,
+        'later_guest_observation': 'unrecorded',
+        'later_guest_probe_delay_seconds': None,
+        'later_guest_probe_evidence': [],
+    }
+    if not operation:
+        return analysis
+    # Do not associate evidence across another start/stop/repair or a session
+    # change. The observation may have no operation ID because it is a UI probe.
+    later: list[dict[str, Any]] = []
+    for row in rows:
+        if (row.get('session_scope') != failure.get('session_scope')
+                or row.get('target_id') != failure.get('target_id')
+                or row.get('target_backend') != failure.get('target_backend')):
+            continue
+        delay = _seconds(row['timestamp'], failure['timestamp'])
+        if not 0 < delay <= _TARGET_FOLLOWUP_SECONDS:
+            continue
+        later.append(row)
+    boundary = min((row['timestamp'] for row in later
+                    if row.get('event') == 'test_target_operation_started'), default=None)
+    for row in sorted(later, key=lambda item: item['timestamp']):
+        if boundary is not None and row['timestamp'] >= boundary:
+            break
+        if (row.get('event') != 'test_target_radio_result'
+                or row.get('target_radio_observation') != 'probe'
+                or row.get('target_radio_status') not in {'active', 'unavailable'}):
+            continue
+        from .test_target_logs import TARGET_ENUMS
+        reason = row.get('target_radio_reason')
+        if reason not in TARGET_ENUMS['target_radio_reason'] or reason in {
+                'probe_failed', 'setup_failed', 'not_requested'}:
+            continue
+        analysis['later_guest_observation'] = 'live_radio_probe_returned'
+        if analysis['later_guest_probe_delay_seconds'] is None:
+            analysis['later_guest_probe_delay_seconds'] = round(
+                _seconds(row['timestamp'], failure['timestamp']), 3)
+        analysis['later_guest_probe_evidence'].append(_evidence(row))
+        if len(analysis['later_guest_probe_evidence']) >= 4:
+            break
+    return analysis
 
 
 def _permission_failure_classification(row: dict[str, Any]) -> str | None:
@@ -245,7 +342,7 @@ def _evidence(row: dict[str, Any]) -> dict[str, Any]:
         'target_id', 'target_backend', 'target_action', 'target_stage', 'target_outcome',
         'target_failure_code', 'operation_id', 'attempt', 'attempts', 'probe_attempts',
         'target_view_failure_code', 'target_interface',
-        'target_radio_kind', 'target_radio_observation', 'target_radio_status', 'target_radio_reason',
+        'target_radio_kind', 'target_radio_backend', 'target_radio_observation', 'target_radio_status', 'target_radio_reason',
         'target_radio_detail', 'target_radio_requested', 'target_radio_verified',
         'target_radio_count', 'target_radio_interface_count',
         'error_code', 'target_validation', 'permission', 'permission_decision',
@@ -538,6 +635,8 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         target_classification = _target_failure_classification(failure)
         permission_classification = _permission_failure_classification(failure)
         startup_classification = _startup_failure_classification(failure)
+        target_operation = _target_operation_rows(rows, failure) if target_classification else []
+        target_analysis = _target_startup_analysis(rows, failure, target_operation) if target_classification else None
         if vm_classification == 'vm_controller_interrupted' and not isinstance(failure.get('controller_signal'), str):
             code = failure.get('controller_returncode', failure.get('returncode'))
             failure = {**failure, 'controller_signal': {-2: 'SIGINT', -9: 'SIGKILL', -15: 'SIGTERM'}.get(code, 'other')}
@@ -568,8 +667,13 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         stalls = [row for row in before if row.get('event') in {'event_loop_stall', 'event_loop_stall_sample'}]
         transcript_deferrals = [row for row in related if row.get('event') == 'transcript_refresh_deferred']
         missing: list[str] = []
-        if not permission_classification and not startup_classification and not _has_frames(failure) and not any(_has_frames(row) for row in database_errors):
+        if not target_classification and not permission_classification and not startup_classification and not _has_frames(failure) and not any(_has_frames(row) for row in database_errors):
             missing.append('exception_traceback_unavailable')
+        if target_analysis and target_analysis['launch_wait'] == 'timeout':
+            if target_analysis['launcher_returncode'] is None:
+                missing.append('target_launcher_exit_status_not_recorded')
+            if failure.get('target_stage') == 'launch':
+                missing.append('target_launch_reconciliation_not_recorded')
         if lock and not database_errors:
             missing.append('database_operation_not_recorded')
         if lock:
@@ -586,12 +690,8 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
             'missing_evidence': missing,
             'correlation_is_not_proof_of_lock_ownership': True,
             'controller_evidence': controller_evidence[-8:],
-            'target_operation_evidence': [_evidence(row) for row in rows if target_classification
-                                         and row.get('session_scope') == failure.get('session_scope')
-                                         and row.get('target_id') == failure.get('target_id')
-                                         and row.get('operation_id') == failure.get('operation_id')
-                                         and (str(row.get('event')).startswith('test_target_operation_')
-                                              or row.get('event') == 'test_target_radio_result')][-16:],
+            'target_operation_evidence': [_evidence(row) for row in target_operation][-16:],
+            'target_startup_analysis': target_analysis,
         })
     counts = Counter(str(row.get('event', '')) for row in rows)
     durations = [row['drift_seconds'] for row in rows
@@ -630,6 +730,11 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         target_lines.append('  No test-target lifecycle observations in examined logs. Target creation/startup timing and failures cannot be reconstructed from their absence.')
     else:
         target_lines.append(f'  Test-target lifecycle records examined: {len(target_rows)}; failure observations: {sum(bool(_target_failure_classification(row)) for row in target_rows)}.')
+    recoveries = [row for row in target_rows if row.get('event') == 'test_target_operation_stage'
+                  and row.get('target_action') == 'start' and row.get('target_stage') == 'launch_recovered']
+    index['test_target_launch_recoveries'] = [_evidence(row) for row in recoveries[-8:]]
+    for row in recoveries[-3:]:
+        target_lines.append(f'  {row["timestamp"]} launcher wait timed out; identity-checked QMP confirmed the target was running, so startup continued to SSH readiness checks.')
     for row in [item for item in target_rows if item.get('event') == 'test_target_radio_result'][-4:]:
         target_lines.append(f'  {row["timestamp"]} radio {row.get("target_radio_kind", "unrecorded")}: '
                             f'{row.get("target_radio_status", "unrecorded")} / {row.get("target_radio_reason", "unrecorded")}; '
@@ -686,7 +791,23 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
             if classification == 'test_target_view_unavailable':
                 lines.append('  The browser display transport failed or rejected a bounded request/response. Check the fixed failure code and target boot evidence; VM running state alone does not establish display readiness.')
             else:
-                lines.append('  Inspect target_operation_evidence and TARGET_LOGS.json; a shell probe failure does not establish that the VM failed to boot.')
+                analysis = incident['target_startup_analysis']
+                if analysis and analysis['launch_wait'] in {'timeout', 'timeout_recovered'}:
+                    limit = analysis['launch_timeout_seconds']
+                    duration = f' after {limit:g}s' if limit is not None else ''
+                    lines.append(f'  The host launcher wait reached its deadline{duration}; this is separate from the guest SSH readiness deadline.')
+                    if analysis['launch_wait'] == 'timeout_recovered':
+                        lines.append('  Identity-checked QMP confirmed a running target after that deadline; startup continued to the recorded later failure stage.')
+                    elif failure.get('target_stage') == 'launch_reconcile':
+                        lines.append('  Launch reconciliation did not verify a running target. Guest boot failure is not established by this timeout alone.')
+                if analysis and analysis['radio_setup'] == 'not_reached':
+                    lines.append('  This start ended before optional radio setup; the radio installer was not reached in this operation.')
+                if analysis and analysis['later_guest_observation'] == 'live_radio_probe_returned':
+                    delay = analysis['later_guest_probe_delay_seconds']
+                    lines.append(f'  A later live radio probe returned guest data {delay:g}s after the failure; SSH was reachable then. This does not establish when SSH first became ready.')
+                    if analysis['radio_setup'] == 'not_reached':
+                        lines.append('  Its missing-radio results describe guest capabilities after the interrupted start; they are not radio installation failures.')
+                lines.append('  Inspect target_operation_evidence, target_startup_analysis and TARGET_LOGS.json; a shell probe failure does not establish that the VM failed to boot.')
         if classification.startswith('vm_'):
             if classification == 'vm_controller_timeout':
                 lines.append('  HarnessyXO reached its controller wait deadline; this does not by itself establish an SSH failure.')

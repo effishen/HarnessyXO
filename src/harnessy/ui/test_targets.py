@@ -14,7 +14,7 @@ from nicegui import ui
 from harnessy.agent.external_targets import ExternalTargetBroker
 from harnessy.core.terminal import TerminalSession
 from harnessy.environment.presets import canonical_arch
-from harnessy.environment.test_targets import TestTargetManager
+from harnessy.environment.test_targets import TestTargetManager, target_operation_error
 
 
 def open_vm_creator(ws, refresh, os_name='ubuntu-24.04'):
@@ -460,6 +460,7 @@ def render_managed_target(page, ws, target, refresh):
                     await manager.request_stop()
                 else:
                     manager.begin(action, tag=tag)
+                observed_status['error'] = ''
                 update_operation_state()
                 await poll()
             except Exception as exc:
@@ -514,9 +515,9 @@ def render_managed_target(page, ws, target, refresh):
             delete_button = ui.button(icon='delete_outline', on_click=delete_dialog).props('flat round color=negative aria-label="Delete test VM"').tooltip('Delete test VM')
         with ui.expansion('Activity and setup output', icon='receipt_long').classes('w-full'):
             output = ui.label('').classes('text-xs w-full font-mono').style('white-space:pre-wrap;max-height:260px;overflow:auto')
-        error_label = ui.label('').classes('text-negative text-sm whitespace-pre-wrap')
+        error_label = ui.label('').classes('text-negative text-sm whitespace-pre-wrap').props('role=alert data-hy-target-error=1')
         radio_probe_busy = {'value': False}
-        observed_status = {'state': 'checking_status', 'running': False}
+        observed_status = {'state': 'checking_status', 'running': False, 'error': ''}
 
         def update_operation_state():
             if panel.is_deleted:
@@ -532,6 +533,7 @@ def render_managed_target(page, ws, target, refresh):
                        'snapshot': 'Creating snapshot', 'restore': 'Restoring snapshot', 'delete': 'Deleting VM'}
             stages = {'prerequisites': 'Checking requirements', 'download': 'Downloading guest image',
                       'prepare_disk': 'Preparing guest disk', 'launch': 'Booting guest',
+                      'launch_reconcile': 'Checking VM after launcher timeout',
                       'wait_ssh': 'Waiting for guest SSH', 'probe_shell': 'Checking guest shell',
                       'radio_setup': 'Preparing and checking emulated radios',
                       'bluetooth_packages': 'Downloading matching Bluetooth packages',
@@ -547,9 +549,12 @@ def render_managed_target(page, ws, target, refresh):
                 minutes, seconds = divmod(elapsed, 60)
                 operation_timing.set_text(f'Elapsed {minutes}m {seconds:02d}s' if minutes else f'Elapsed {seconds}s')
             elif op and op.state in {'failed', 'cancelled'}:
-                state_label.set_text(('Radio setup' if op.action == 'radios' else op.action.capitalize())
-                                     + (' failed' if op.state == 'failed' else ' cancelled'))
-                error_label.set_text(op.error)
+                if (op.action == 'start' and op.state == 'failed' and observed_status['running']
+                        and not observed_status['error']):
+                    state_label.set_text('Guest running · Start setup incomplete')
+                else:
+                    state_label.set_text(('Radio setup' if op.action == 'radios' else op.action.capitalize())
+                                         + (' failed' if op.state == 'failed' else ' cancelled'))
             elif op and op.state == 'succeeded' and op.action == 'start':
                 state_label.set_text('Ready')
             else:
@@ -557,8 +562,13 @@ def render_managed_target(page, ws, target, refresh):
             for action, button in (('start', start_button), ('stop', stop_button)):
                 button.props(add='loading' if active and op.action == action else '',
                              remove='' if active and op.action == action else 'loading')
-            start_button.set_text('Starting…' if active and op.action == 'start' else 'Start')
+            retry_start = bool(op and op.action == 'start' and op.state in {'failed', 'cancelled'})
+            start_button.set_text('Starting…' if active and op.action == 'start' else 'Retry Start' if retry_start else 'Start')
             stop_button.set_text('Stopping…' if active and op.action == 'stop' else 'Stop')
+            operation_error = (str(op.error or '').strip() or target_operation_error(op)) if op and op.state == 'failed' else (
+                str(op.error or '').strip() if op and op.state == 'cancelled' else '')
+            status_error = str(observed_status['error'] or '')
+            error_label.set_text('\n'.join(value for value in (operation_error, status_error) if value))
 
         async def poll():
             if panel.is_deleted:
@@ -578,7 +588,7 @@ def render_managed_target(page, ws, target, refresh):
                 status = await manager.status()
                 if panel.is_deleted:
                     return
-                observed_status.update(state=status['state'], running=status['running'])
+                observed_status.update(state=status['state'], running=status['running'], error='')
                 update_operation_state()
                 running = status['running']
                 if radio_status is not None:
@@ -612,8 +622,8 @@ def render_managed_target(page, ws, target, refresh):
             except Exception as exc:
                 if not panel.is_deleted:
                     observed_status['state'] = 'status_unavailable'
+                    observed_status['error'] = str(exc).strip() or 'VM status could not be checked. Retry the status check before changing VM data.'
                     update_operation_state()
-                    error_label.set_text(str(exc))
         for button in (start_button, stop_button, shell_button, desktop_button, snapshot_button, restore_button, delete_button):
             button.set_enabled(False)
         timer = ui.timer(5.0, poll)
