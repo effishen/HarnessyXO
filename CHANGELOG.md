@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.6.102
+
+- Send one compact, current tool-permission state to the model. Remove duplicate per-tool status labels from the main instructions so they cannot conflict with settings changed during a run.
+- Keep routine access checks out of conversational updates. Tell the model that earlier assistant permission acknowledgements are not instructions or a reply format to repeat; keep permission explanations available when you ask or an action is blocked.
+- Preserve On / Ask / Off enforcement, test-target access and existing conversation history. This corrects the remaining prompt duplication after v0.6.101; model wording in an existing conversation can still be influenced by earlier replies.
+
 ## v0.6.101
 
 - Keep current tool permissions in internal system context instead of appending them as a new user message after every prompt or tool result. Tell the model to use this state silently, so routine replies stay focused on your task instead of acknowledging permissions.
