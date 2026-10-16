@@ -1,4 +1,4 @@
-# HarnessyXO v0.6.98 Features
+# HarnessyXO v0.6.99 Features
 
 ## Model progress across backends
 
@@ -48,7 +48,9 @@
 - Include reviewed source-check and historical host REA storage evidence in `STARTUP.json` and the support summary, retaining bounded launcher receipts when the app starts.
 - Preserve settings, dependencies, runtime caches, workspaces and local code edits. Keep the current app available when a check fails.
 - Hold an installation lock for the lifetime of the app and detect incomplete source updates across restarts. Keep it through launcher exec handoffs, then prevent native VM children and forked workers from retaining the app's lock. A stopped server releases its own descriptor.
-- If startup reports a held lock, identify processes using it with the printed fuser/lsof command. A child left by an older release can still hold an inherited lock after Ctrl+C. Other OS lock failures show their error code instead of claiming another server is running.
+- Starting `python3 run.py` on macOS or Linux automatically stops this folder's existing launch-lock holders and continues startup. No restart flag or confirmation is needed. This also covers VM children left holding an inherited lock by older releases.
+- Try normal termination first, then force-stop verified original holders that remain. Other installations and model servers are outside the cleanup target set. Force-stopping a VM can lose unsaved guest work. Keep the lock file intact.
+- Automatic cleanup needs `lsof` and `ps`, and refuses to stop processes whose ownership, identity or lock-file identity cannot be verified. Windows keeps manual shutdown behavior. Other OS lock failures show their error code.
 - Publish versioned GitHub Release notes and verified downloads from committed application files, with the same 11 Markdown resources and no QA payload.
 
 ## REA in the workspace VM

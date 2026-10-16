@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.6.99
+
+- Starting `python3 run.py` on macOS or Linux now automatically stops this folder's existing launch-lock holders and continues startup. No restart flag or confirmation is needed, including when a VM child from an older release retained the lock after Ctrl+C.
+- Try normal termination first, then force-stop only verified original holders that remain. Keep other installations and model servers outside the cleanup target set. Keep the lock file intact and stop startup if process or lock identity cannot be verified. Force-stopping a VM can lose unsaved guest work.
+- Keep Windows startup behavior unchanged. Automatic cleanup needs `lsof` and `ps`; Linux environments whose process IDs cannot be matched are refused safely.
+
 ## v0.6.98
 
 - Keep the full current-run elapsed time visible in the chat status bar during model waits, prompt processing, generation, tools, approvals and automatic continuations. Show the current model request's elapsed time separately instead of replacing the run clock.

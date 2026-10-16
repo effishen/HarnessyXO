@@ -4,6 +4,8 @@
 Run with:
     python3 run.py
 
+An existing instance from this folder is stopped automatically before restart.
+
 No executable bit, virtual environment, or system-wide pip install is required.
 Dependencies are installed into this release's local ``.vendor/`` directory.
 """
@@ -338,6 +340,215 @@ def show_source_update_details(result: dict) -> None:
     print('Keep this folder to preserve local edits; use a clean release folder for automatic updates.', flush=True)
 
 
+def stop_installation_lock_holders(app_dir: Path) -> None:
+    """Stop this account's original holders of this exact installation lock.
+
+    The lock is pinned and never unlinked. Process start times and open-file
+    membership are checked again before every signal; unrelated or newly
+    appearing processes are never added to the termination set.
+    """
+    import signal
+    import shutil
+    import time
+    from harnessy_update import LOCK_FILENAME, StartupLockUnsafe, _lock_file_safe
+
+    if os.name == 'nt' or not hasattr(os, 'geteuid'):
+        raise StartupLockUnsafe('Automatic restart currently supports macOS and Linux only.')
+    lsof = shutil.which('lsof')
+    ps = shutil.which('ps')
+    if not lsof or not ps:
+        raise StartupLockUnsafe('Automatic restart needs lsof and ps; no process was stopped.')
+    if sys.platform.startswith('linux'):
+        try:
+            visible_pid = Path('/proc/self/stat').read_text('ascii').split(' ', 1)[0]
+        except OSError as exc:
+            raise StartupLockUnsafe('Automatic restart could not verify this environment\'s process IDs.') from exc
+        if visible_pid != str(os.getpid()):
+            raise StartupLockUnsafe('Process IDs do not match in this environment; automatic restart is unavailable.')
+    root = Path(app_dir).resolve()
+    path = root / LOCK_FILENAME
+    fd = -1
+    operation_deadline = time.monotonic() + 25.0
+    command_env = dict(os.environ, LC_ALL='C', LANG='C')
+
+    def command(args: list[str]) -> subprocess.CompletedProcess:
+        remaining = operation_deadline - time.monotonic()
+        if remaining <= 0:
+            raise StartupLockUnsafe('Automatic restart exceeded its time limit.')
+        try:
+            result = subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, env=command_env,
+                                    timeout=min(2.0, remaining), check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise StartupLockUnsafe('Automatic restart could not inspect running processes safely.') from exc
+        if len(result.stdout) + len(result.stderr) > 1024 * 1024:
+            raise StartupLockUnsafe('Automatic restart received excessive process inspection output.')
+        return result
+
+    def process_identity(pid: int) -> tuple[int, int, str] | None:
+        result = command([ps, '-p', str(pid), '-o', 'uid=', '-o', 'ppid=', '-o', 'lstart='])
+        if result.returncode == 1 and not result.stdout.strip():
+            return None  # It exited between discovery and inspection.
+        try:
+            fields = result.stdout.decode('ascii').strip().split(None, 2)
+            if result.returncode != 0 or len(fields) != 3:
+                raise ValueError()
+            uid, parent, started = int(fields[0]), int(fields[1]), fields[2]
+            if uid < 0 or parent < 0 or len(started.split()) != 5:
+                raise ValueError()
+            # Linux exposes a higher-resolution kernel birth token. macOS ps
+            # supplies lstart; exact inode membership is checked as well.
+            if sys.platform.startswith('linux'):
+                try:
+                    stat_text = Path(f'/proc/{pid}/stat').read_text('ascii')
+                    kernel_fields = stat_text[stat_text.rfind(')') + 2:].split()
+                    started += ':' + str(int(kernel_fields[19]))
+                except FileNotFoundError:
+                    return None
+                except (OSError, ValueError, IndexError) as exc:
+                    raise StartupLockUnsafe('Automatic restart could not verify a process start time.') from exc
+            return uid, parent, started
+        except (UnicodeError, ValueError) as exc:
+            raise StartupLockUnsafe('Automatic restart could not identify a running process safely.') from exc
+
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
+                     | getattr(os, 'O_NONBLOCK', 0))
+        pinned = os.fstat(fd)
+        target = (pinned.st_dev, pinned.st_ino)
+
+        def validate_lock() -> None:
+            try:
+                info = path.lstat()
+                if (not _lock_file_safe(pinned) or not _lock_file_safe(info)
+                        or (info.st_dev, info.st_ino) != target):
+                    raise StartupLockUnsafe('The launch lock changed; automatic restart stopped.')
+            except OSError as exc:
+                raise StartupLockUnsafe('The launch lock could not be revalidated.') from exc
+
+        validate_lock()
+        protected = {os.getpid()}
+        ancestor = os.getppid()
+        while ancestor > 1 and ancestor not in protected:
+            protected.add(ancestor)
+            identity = process_identity(ancestor)
+            if identity is None:
+                raise StartupLockUnsafe('Automatic restart could not verify its parent processes.')
+            ancestor = identity[1]
+        protected.add(1)
+        protected.add(0)
+
+        def holders() -> dict[int, int]:
+            validate_lock()
+            result = command([lsof, '-nP', '-F0pufDi', '--', str(path)])
+            validate_lock()
+            if result.returncode == 1 and not result.stdout.strip():
+                return {}
+            if result.returncode != 0:
+                raise StartupLockUnsafe('lsof could not inspect this installation lock safely.')
+            try:
+                rows = result.stdout.decode('ascii').replace('\n', '').split('\0')
+                found: dict[int, int] = {}
+                pid = uid = device = inode = None
+
+                def record() -> None:
+                    if device is None and inode is None:
+                        return
+                    if None in (pid, uid, device, inode):
+                        raise ValueError()
+                    if (device, inode) == target and pid != os.getpid():
+                        found[pid] = uid
+
+                for row in rows:
+                    if not row:
+                        continue
+                    field, value = row[0], row[1:]
+                    if field == 'p':
+                        record()
+                        pid, uid, device, inode = int(value), None, None, None
+                        if pid <= 0:
+                            raise ValueError()
+                    elif field == 'u':
+                        uid = int(value)
+                        if uid < 0:
+                            raise ValueError()
+                    elif field == 'f':
+                        record()
+                        device = inode = None
+                    elif field == 'D':
+                        device = int(value, 16)
+                    elif field == 'i':
+                        inode = int(value)
+                    else:
+                        raise ValueError()
+                record()
+                if len(found) > 64:
+                    raise ValueError()
+                return found
+            except (UnicodeError, ValueError) as exc:
+                raise StartupLockUnsafe('lsof returned an unrecognized lock-holder listing.') from exc
+
+        original: dict[int, tuple[int, int, str]] = {}
+        for pid, uid in holders().items():
+            if pid in protected or uid != os.geteuid():
+                raise StartupLockUnsafe('A protected or different-account process holds this launch lock.')
+            identity = process_identity(pid)
+            if identity is None:
+                if pid in holders():
+                    raise StartupLockUnsafe('A launch-lock holder could not be identified; no processes were stopped.')
+                continue
+            if identity[0] != os.geteuid():
+                raise StartupLockUnsafe('A lock holder changed account; automatic restart stopped.')
+            original[pid] = identity
+
+        def remaining_originals() -> list[int]:
+            current = holders()
+            remaining = []
+            for pid, identity in original.items():
+                if current.get(pid) != os.geteuid():
+                    continue
+                actual = process_identity(pid)
+                # A VM child can be reparented when its launcher exits. Its
+                # parent is not part of its identity; UID and birth token are.
+                if actual is not None and (actual[0], actual[2]) == (identity[0], identity[2]):
+                    remaining.append(pid)
+            return remaining
+
+        def send(pid: int, sig: int) -> None:
+            # Recheck membership immediately before each signal, including KILL.
+            if pid not in remaining_originals():
+                return
+            validate_lock()
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                raise StartupLockUnsafe(f'Automatic restart could not stop process {pid}.') from exc
+
+        for sig, grace in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 3.0)):
+            pending = remaining_originals()
+            if not pending:
+                return
+            print(('Stopping existing HarnessyXO lock holders: ' if sig == signal.SIGTERM
+                   else 'Force-stopping remaining HarnessyXO lock holders: ')
+                  + ', '.join(map(str, pending)), flush=True)
+            for pid in pending:
+                send(pid, sig)
+            deadline = time.monotonic() + grace
+            while time.monotonic() < deadline:
+                if not remaining_originals():
+                    return
+                time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+        if remaining_originals():
+            raise StartupLockUnsafe('Some original lock holders could not be stopped. HarnessyXO was not started.')
+    except OSError as exc:
+        raise StartupLockUnsafe('Automatic restart could not open this installation lock safely.') from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def main() -> None:
     if sys.version_info < MIN_PYTHON:
         fail(
@@ -347,6 +558,8 @@ def main() -> None:
             "  python3.12 run.py"
         )
 
+    # Accept the earlier launcher-only flag as an optional compatibility alias.
+    sys.argv[:] = [sys.argv[0], *(arg for arg in sys.argv[1:] if arg != '--restart')]
     refresh_uid = os.environ.get(KVM_REFRESH_ENV)
     if refresh_uid is not None and not valid_kvm_refresh_identity(refresh_uid):
         # Check before source/dependency/diagnostic writes as well as before
@@ -363,20 +576,28 @@ def main() -> None:
         check_for_updates, consume_update_handoff, make_update_handoff,
     )
     try:
-        install_lock = acquire_install_lock(app_dir)
+        try:
+            install_lock = acquire_install_lock(app_dir)
+        except StartupAlreadyRunning:
+            if os.name == 'nt':
+                raise
+            print("Stopping this folder's existing HarnessyXO processes ...", flush=True)
+            print("This includes leftover VM lock holders; unsaved VM work may be lost.", flush=True)
+            stop_installation_lock_holders(app_dir)
+            install_lock = acquire_install_lock(app_dir)
+            print("Launch lock released. Starting HarnessyXO again.", flush=True)
     except StartupAlreadyRunning:
         message = "A process still holds this folder's HarnessyXO launch lock."
         if os.name != 'nt':
             command = ('fuser -v .harnessy-update.lock' if sys.platform.startswith('linux')
                        else 'lsof .harnessy-update.lock')
             message += ("\nA child process may still hold it after the app stops."
-                        "\nFrom the HarnessyXO folder, inspect it with:\n  " + command)
+                        "\nOr inspect the lock holders with:\n  " + command)
         fail(message)
     except StartupLockUnsafe as exc:
         code = getattr(exc.__cause__, 'errno', None)
         detail = f" (OS error {code})" if type(code) is int else ""
-        fail("HarnessyXO cannot safely lock this installation" + detail +
-             ". Check the folder permissions and update lock file.")
+        fail("HarnessyXO could not finish startup" + detail + ": " + str(exc))
     update_result = {"outcome": "restart_handoff", "changed": False, "fatal": False}
     if not consume_update_handoff(app_dir):
         print("Checking HarnessyXO updates ...", flush=True)
@@ -511,3 +732,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
