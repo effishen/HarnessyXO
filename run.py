@@ -623,6 +623,7 @@ def main() -> None:
             "zip_bootstrap_unavailable": "Source update unavailable. Check Git and internet access to the public GitHub repository; starting the installed version.",
         }
         print(messages.get(outcome, f"Source update skipped ({outcome}). Starting the installed version."), flush=True)
+    print(f"HarnessyXO version: {RELEASE_VERSION}", flush=True)
     app_entry = app_dir / "harnessy_app.py"
     requirements = app_dir / "requirements.txt"
     vendor_dir = app_dir / ".vendor"

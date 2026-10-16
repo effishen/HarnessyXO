@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.6.100
+
+- Print the installed HarnessyXO version in the CLI after the startup update check and before dependency setup.
+- After an automatic update, let the relaunched launcher print the new version. If the update check is unavailable or local edits keep the current installation, print the installed version that will start.
+
 ## v0.6.99
 
 - Starting `python3 run.py` on macOS or Linux now automatically stops this folder's existing launch-lock holders and continues startup. No restart flag or confirmation is needed, including when a VM child from an older release retained the lock after Ctrl+C.

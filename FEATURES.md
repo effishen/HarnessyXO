@@ -1,4 +1,4 @@
-# HarnessyXO v0.6.99 Features
+# HarnessyXO v0.6.100 Features
 
 ## Model progress across backends
 
@@ -41,6 +41,7 @@
 
 ## Public GitHub startup updates
 
+- See `HarnessyXO version: X.Y.Z` in the CLI after the update check. An update relaunch reports the new installed version; an unavailable check or skipped update reports the installed version being started.
 - Check `effishen/HarnessyXO` before application imports when starting `python3 run.py` on macOS or Linux.
 - Apply clean `main` updates through fast-forward Git history and restart the launcher before setup.
 - Verify every application byte before adding Git metadata to a ZIP installation. Restore executable metadata lost during extraction only after content matches; accept an untouched current-main ZIP against its exact current commit. Keep genuine source edits untouched and report the app-relative mismatch and reason. The first public check needs Git and internet access, without a GitHub account.
