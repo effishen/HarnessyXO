@@ -333,7 +333,9 @@ async def _probe_target_binary(name: str, binary: str) -> str:
     elif name in ('debugfs', 'e2fsck'):
         args, allowed, identity = ['-V'], {0}, re.escape(name) + r'\s+\d+\.\d+'
     elif name == 'swtpm':
-        args, allowed, identity = ['socket', '--version'], {0}, r'(?:swtpm\b|TPM emulator version)[^\n]*\d+\.\d+'
+        # --version is a top-level option. The socket parser treats it as an
+        # unknown option on Ubuntu's swtpm and exits with usage help instead.
+        args, allowed, identity = ['--version'], {0}, r'(?:swtpm\b|TPM emulator version)[^\n]*\d+\.\d+'
     else:
         args, allowed, identity = ['--version'], {0}, r'(?:QEMU|qemu-img)\b[^\n]*\d+\.\d+'
     try:
@@ -709,9 +711,6 @@ async def _ensure_test_target_prerequisites(architecture: str | None = None, *, 
             report = await inspect_test_target_prerequisites(architecture, windows=windows)
             _record_host_setup('test_targets', architecture, 'checking',
                                required=test_target_required_binaries(architecture, windows=windows), missing=report['missing'])
-            if report['broken']:
-                raise HostPrerequisiteError('Installed test-target host tools failed verification: '
-                                            + '\n'.join(report['broken'].values()), code='binary_verification_failed')
             if report['missing']:
                 if not allow_install:
                     raise HostPrerequisiteError('Missing test-target host prerequisites: ' + ', '.join(report['missing'])
@@ -729,6 +728,12 @@ async def _ensure_test_target_prerequisites(architecture: str | None = None, *, 
                     raise HostPrerequisiteError('Host package installation completed, but test-target verification failed. '
                                                 + '\n'.join(details) + ' Check the installation output and host PATH, then retry.',
                                                 code='post_install_verification_failed')
+            # A failed optional-tool check must not prevent adding independent
+            # missing dependencies. Keep the final failure visible and never
+            # reinstall or accept a broken executable merely to report Ready.
+            if report['broken']:
+                raise HostPrerequisiteError('Installed test-target host tools failed verification: '
+                                            + '\n'.join(report['broken'].values()), code='binary_verification_failed')
             await _progress(progress, 'host_dependencies_ready', f'{scope.capitalize()} host prerequisites verified.',
                             verified_binaries=len(report['versions']))
             return report

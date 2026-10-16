@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.6.106
+
+- Fix the swtpm startup check to use the top-level --version option. Ubuntu's socket subcommand rejects the old probe and prints help, which incorrectly marked a working installation as broken.
+- Continue installing independent missing host tools before reporting another tool's verification failure. A failed TPM check no longer prevents missing MIPS packages from being prepared. Keep genuine failures visible and leave installed tools outside the repair transaction.
+- Verify the corrected probe against Ubuntu 24.04's actual swtpm 0.7.3 executable without starting a TPM instance. Guest VM boot was not exercised for this fix.
+
 ## v0.6.105
 
 - Prepare host prerequisites for the full supported test-target catalogue when you run python3 run.py, even with no saved workspace. Include ARM64, x86-64 and all four MIPS QEMU emulators, SSH, OpenWrt filesystem tools and Windows TPM support. Check both QEMU backend architectures and their UEFI firmware before declaring startup setup ready.
