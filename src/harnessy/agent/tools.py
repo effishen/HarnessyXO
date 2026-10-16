@@ -3183,6 +3183,52 @@ class WorkspaceToolbox:
             ),
         }, ensure_ascii=False)
 
+    @staticmethod
+    def _target_operation_result(result: dict[str, Any]) -> str:
+        """Return execution facts without repeating the target access settings.
+
+        The broker's public target document is also used by host/UI callers and
+        explicit target discovery. Ordinary operation results only need target
+        identity and guest facts; authorization remains the executor's job.
+        Preserve the operation payload, including errors and literal output.
+        """
+        target = result.get('target')
+        if isinstance(target, dict):
+            result = {
+                **result,
+                'target': {
+                    key: target[key]
+                    for key in (
+                        'id', 'name', 'host', 'port', 'username', 'remote_root',
+                        'kind', 'guest_os', 'architecture', 'shell',
+                        'hardware_emulation',
+                    )
+                    if key in target
+                },
+            }
+        return json.dumps(result, ensure_ascii=False)
+
+    @staticmethod
+    def model_target_operation_content(name: str, content: Any) -> Any:
+        """Project a saved target result for model context, never its source.
+
+        This applies the same operation boundary to results saved by older
+        versions. Explicit discovery/history reads, non-JSON output and strings
+        inside stdout/stderr are deliberately left alone.
+        """
+        if name not in {
+            'target_status', 'target_list_files', 'target_exec',
+            'target_copy_to', 'target_copy_from',
+        } or not isinstance(content, str):
+            return content
+        try:
+            result = json.loads(content)
+            if not isinstance(result, dict) or not isinstance(result.get('target'), dict):
+                return content
+            return WorkspaceToolbox._target_operation_result(result)
+        except (TypeError, ValueError, RecursionError):
+            return content
+
     async def target_status(self, a: dict[str, Any]) -> str:
         broker = self._external_target_broker()
         try:
@@ -3194,7 +3240,7 @@ class WorkspaceToolbox:
             result = {'ok': False, 'error_code': 'TARGET_POLICY', 'error': str(exc)}
         except Exception as exc:
             result = {'ok': False, 'error_code': 'TARGET_EXECUTION_FAILED', 'error': str(exc)}
-        return json.dumps(result, ensure_ascii=False)
+        return self._target_operation_result(result)
 
     async def target_list_files(self, a: dict[str, Any]) -> str:
         broker = self._external_target_broker()
@@ -3212,7 +3258,7 @@ class WorkspaceToolbox:
             result = {'ok': False, 'error_code': 'TARGET_POLICY', 'error': str(exc)}
         except Exception as exc:
             result = {'ok': False, 'error_code': 'TARGET_EXECUTION_FAILED', 'error': str(exc)}
-        return json.dumps(result, ensure_ascii=False)
+        return self._target_operation_result(result)
 
     async def target_exec(self, a: dict[str, Any]) -> str:
         broker = self._external_target_broker()
@@ -3230,7 +3276,7 @@ class WorkspaceToolbox:
             result = {'ok': False, 'error_code': 'TARGET_POLICY', 'error': str(exc)}
         except Exception as exc:
             result = {'ok': False, 'error_code': 'TARGET_EXECUTION_FAILED', 'error': str(exc)}
-        return json.dumps(result, ensure_ascii=False)
+        return self._target_operation_result(result)
 
     async def target_copy_to(self, a: dict[str, Any]) -> str:
         broker = self._external_target_broker()
@@ -3256,7 +3302,7 @@ class WorkspaceToolbox:
             result = {'ok': False, 'error_code': 'TARGET_POLICY', 'error': str(exc)}
         except Exception as exc:
             result = {'ok': False, 'error_code': 'TARGET_EXECUTION_FAILED', 'error': str(exc)}
-        return json.dumps(result, ensure_ascii=False)
+        return self._target_operation_result(result)
 
     async def target_copy_from(self, a: dict[str, Any]) -> str:
         broker = self._external_target_broker()
@@ -3282,7 +3328,7 @@ class WorkspaceToolbox:
             result = {'ok': False, 'error_code': 'TARGET_POLICY', 'error': str(exc)}
         except Exception as exc:
             result = {'ok': False, 'error_code': 'TARGET_EXECUTION_FAILED', 'error': str(exc)}
-        return json.dumps(result, ensure_ascii=False)
+        return self._target_operation_result(result)
 
     async def run_command(self, a: dict[str, Any]) -> str:
         agent = self.settings.get('agent', {})

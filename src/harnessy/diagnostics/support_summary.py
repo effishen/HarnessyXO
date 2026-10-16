@@ -15,6 +15,8 @@ import re
 from typing import Any
 from .permissions import PERMISSION_EVENTS
 from .startup import STARTUP_EVENTS
+from harnessy.agent.permission_provenance import (PERMISSION_ACKNOWLEDGEMENT_EVENTS,
+                                                build_permission_acknowledgement_audit)
 
 _CHANNELS = ('harnessy', 'runtime', 'database', 'tools', 'backend', 'targets')
 _TAIL_BYTES = 2 * 1024 * 1024
@@ -41,6 +43,8 @@ def _bounded_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     permissions = [row for row in rows if row.get('event') in PERMISSION_EVENTS
                    or (row.get('event') == 'tool_execution_complete'
                        and ('permission_decision' in row or 'target_validation' in row))][-600:]
+    permission_acknowledgements = [row for row in rows
+                                  if row.get('event') in PERMISSION_ACKNOWLEDGEMENT_EVENTS][-240:]
     startup = [row for row in rows if row.get('event') in STARTUP_EVENTS][-120:]
     from .model_requests import MODEL_EVENTS
     models = [row for row in rows if row.get('event') in MODEL_EVENTS][-600:]
@@ -48,8 +52,10 @@ def _bounded_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     controllers = [row for row in rows if row.get('event') in CONTROLLER_OBSERVATION_EVENTS][-120:]
     from .queue_observations import QUEUE_EVENTS
     queues = [row for row in rows if row.get('event') in QUEUE_EVENTS][-160:]
-    recent = rows[-(_MAX_ROWS - len(targets) - len(permissions) - len(startup) - len(models) - len(controllers) - len(queues)):]
-    retained = {id(row): row for row in targets + permissions + startup + models + controllers + queues + recent}
+    recent = rows[-(_MAX_ROWS - len(targets) - len(permissions) - len(permission_acknowledgements)
+                    - len(startup) - len(models) - len(controllers) - len(queues)):]
+    retained = {id(row): row for row in targets + permissions + permission_acknowledgements
+                + startup + models + controllers + queues + recent}
     return sorted(retained.values(), key=lambda row: row['timestamp'])
 
 
@@ -1045,6 +1051,8 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
     from .model_requests import build_model_audit
     model_audit, model_lines = build_model_audit(rows, coverage, Path(latest), metadata.get('captured_at'))
     index['model_request_audit'] = model_audit
+    permission_acknowledgement_audit, permission_acknowledgement_lines = build_permission_acknowledgement_audit(rows)
+    index['permission_acknowledgement_audit'] = permission_acknowledgement_audit
     controller_audit, controller_lines = _controller_observation_audit(rows)
     index['controller_observation_audit'] = controller_audit
     from .queue_observations import QUEUE_EVENTS, build_queue_audit
@@ -1077,6 +1085,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         *primary_setup, *primary_cause,
         *queue_lines,
         *model_lines,
+        *permission_acknowledgement_lines,
         *controller_lines,
         f'Recorded failures in examined logs: {len(failures)} (latest {len(incidents)} shown)',
         f'Event-loop stalls: {counts["event_loop_stall"]}; maximum recorded delay: {max(durations, default=0):.3f}s',

@@ -877,6 +877,18 @@ class DiagnosticsManager:
             # hot path. The precise operation evidence has already been stored.
             return
         logger = self.logger(channel)
+        from harnessy.agent.permission_provenance import (PERMISSION_ACKNOWLEDGEMENT_EVENTS,
+                                                        validate_permission_acknowledgement_event)
+        if event in PERMISSION_ACKNOWLEDGEMENT_EVENTS:
+            payload = validate_permission_acknowledgement_event(event, fields)
+            if payload is None:
+                payload = validate_permission_acknowledgement_event('permission_acknowledgement_trace_failed', {
+                    **fields, 'phase': 'request' if event == 'permission_acknowledgement_input' else 'response',
+                    'failure_kind': 'invalid_receipt',
+                })
+            if payload is not None:
+                logger.log(level, json.dumps(payload, ensure_ascii=False, separators=(',', ':')))
+            return
         from .queue_observations import QUEUE_EVENTS, validate_queue_event
         if event in QUEUE_EVENTS:
             payload = validate_queue_event(event, fields)
@@ -1362,6 +1374,15 @@ def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
     if _is_sensitive_log_key(lowered):
         return '<redacted>'
     if not key and isinstance(value, dict):
+        from harnessy.agent.permission_provenance import (PERMISSION_ACKNOWLEDGEMENT_EVENTS,
+                                                        validate_permission_acknowledgement_event)
+        if isinstance(value.get('event'), str) and value['event'] in PERMISSION_ACKNOWLEDGEMENT_EVENTS:
+            safe = validate_permission_acknowledgement_event(value['event'], value)
+            return safe if safe is not None else validate_permission_acknowledgement_event(
+                'permission_acknowledgement_trace_failed', {
+                    **value, 'phase': 'request' if value['event'] == 'permission_acknowledgement_input' else 'response',
+                    'failure_kind': 'invalid_receipt',
+                })
         from .queue_observations import QUEUE_EVENTS, validate_queue_event
         if isinstance(value.get('event'), str) and value['event'] in QUEUE_EVENTS:
             return validate_queue_event(value['event'], value)
@@ -2243,6 +2264,9 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
             zf.writestr('SUMMARY.txt', summary)
             zf.writestr('INCIDENTS.json', json.dumps(incidents, ensure_ascii=False, indent=2))
             zf.writestr('PERMISSIONS.json', json.dumps(incidents.get('permission_audit', {
+                'schema_version': 1, 'status': 'unavailable', 'reason': 'summary_generation_failed',
+            }), ensure_ascii=False, indent=2, allow_nan=False))
+            zf.writestr('PERMISSION_ACKNOWLEDGEMENTS.json', json.dumps(incidents.get('permission_acknowledgement_audit', {
                 'schema_version': 1, 'status': 'unavailable', 'reason': 'summary_generation_failed',
             }), ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('STARTUP.json', json.dumps(incidents.get('startup_audit', {

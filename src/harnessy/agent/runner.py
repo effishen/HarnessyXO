@@ -40,6 +40,7 @@ from .completion_check import (
 from .advice import answer_replays_reasoning, output_tuning_advice
 from .stream_watchdog import StreamStallError
 from .telemetry import number
+from .permission_provenance import permission_input_provenance, permission_output_provenance
 from .timing import StreamPhaseTimings, timed_stream_segments
 from .tools import ToolApprovalCallback, WorkspaceToolbox
 from .processes import PROCESS_JOBS
@@ -970,6 +971,55 @@ class AgentRunner:
             **diagnostics,
         )
         return diagnostics
+
+    def _permission_trace_failed(self, *, step: int, phase: str) -> None:
+        # Diagnostics must never prevent inference or persistence of a reply.
+        # Do not log the exception: a parser error can contain private input.
+        try:
+            log_event(
+                'runtime', 'permission_acknowledgement_trace_failed',
+                workspace_id=getattr(self.workspace, 'id', None), chat_id=self.chat_id,
+                run_id=self.run_id, step=step + 1, phase=phase,
+            )
+        except Exception:
+            pass
+
+    def _record_permission_input_provenance(
+        self, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]],
+        step: int, transport_reason: str,
+    ) -> None:
+        # Inspect the prepared request after budgeting. Only fixed labels and
+        # counts leave the scanner; neither request text nor excerpts are logged.
+        try:
+            log_event(
+                'runtime', 'permission_acknowledgement_input',
+                workspace_id=getattr(self.workspace, 'id', None), chat_id=self.chat_id,
+                run_id=self.run_id, step=step + 1,
+                transport_reason=transport_reason,
+                request_kind=('completion_check' if any(
+                    row.get('_harnessy_region') == 'completion_check' for row in messages
+                ) else 'response'),
+                provenance=permission_input_provenance(
+                    messages, getattr(self, '_run_system_components_snapshot', {}) or {}, tools=tools,
+                ),
+            )
+        except Exception:
+            self._permission_trace_failed(step=step, phase='request')
+
+    def _record_permission_output_provenance(
+        self, answer: str, reasoning: str, *, step: int, phase: str,
+        client_request_id: str = '',
+    ) -> None:
+        try:
+            log_event(
+                'runtime', 'permission_acknowledgement_output',
+                workspace_id=getattr(self.workspace, 'id', None), chat_id=self.chat_id,
+                run_id=self.run_id, step=step + 1, phase=phase,
+                client_request_id=client_request_id,
+                provenance=permission_output_provenance(answer, reasoning),
+            )
+        except Exception:
+            self._permission_trace_failed(step=step, phase=phase)
 
     def _system_prompt(self) -> str:
         context, _ = effective_context(self.profile, int(getattr(self.client, '_last_runtime_context_window', 0) or 0))
@@ -1945,10 +1995,10 @@ Rules:
     ) -> dict[str, Any]:
         """Render one persisted message without changing the persisted source.
 
-        Historical tool payloads may be represented by their stable compact
-        form when an epoch is first established. Messages appended after the
-        epoch anchor are always rendered exactly so the active tool tail stays
-        lossless until a deliberate epoch transition is required.
+        Historical tool payloads may use their stable compact form when an
+        epoch is first established. The active tail keeps operation output
+        without compaction. Target access metadata uses the current operation
+        view in both cases; the persisted original is never rewritten.
         """
         protected_source_ids = protected_source_ids or set()
         if msg.role == 'user':
@@ -1961,6 +2011,11 @@ Rules:
                 ) + 1
         else:
             content = msg.content
+        if msg.role == 'tool':
+            # Older releases saved access settings inside every target result.
+            # Use the same operation projection during replay; leave the saved
+            # original and literal stdout/stderr available without alteration.
+            content = WorkspaceToolbox.model_target_operation_content(str(msg.name or ''), content)
         item: dict[str, Any] = {
             'role': msg.role, 'content': content,
             '_harnessy_region': 'history_hot' if historical else 'active_tail',
@@ -2717,7 +2772,7 @@ Rules:
     async def _stream_chat_with_backend_hang_retry(
         self, api_messages: list[dict[str, Any]], *, tools: list[dict[str, Any]],
         on_status: StatusCallback, emit_event: Callable[..., Awaitable[None]],
-        request_options: dict[str, Any],
+        request_options: dict[str, Any], step: int = 0,
     ):
         """Retry one rejected GPU request within the already-held model slot.
 
@@ -2820,6 +2875,9 @@ Rules:
             self.client.request_budget_callback = None
             terminal_signal_seen = False
             try:
+                self._record_permission_input_provenance(
+                    retry_messages, tools=retry_tools, step=step, transport_reason='backend_gpu_retry',
+                )
                 async with aclosing(self.client.stream_chat(retry_messages, tools=retry_tools, **request_options)) as stream:
                     async for event in stream:
                         raw = event.get('raw') if isinstance(event.get('raw'), dict) else {}
@@ -3130,6 +3188,11 @@ Rules:
                     self._record_prompt_attachment_delivery(api_messages)
                     delivery_recorded = True
                     record_prepared_request()
+                    self._record_permission_input_provenance(
+                        api_messages, tools=tools, step=step,
+                        transport_reason=('prefill_recovery' if recovery_attempts else
+                                          'runtime_budget' if self._budget_changed_request(report) else 'model_call'),
+                    )
 
                 self.client.request_budget_callback = prepare_transport
                 self._budget_request(api_messages, tools, hot_target_override=recovery_hot_target)
@@ -3141,7 +3204,7 @@ Rules:
                     request_options = {'max_output_tokens': max_output_tokens} if max_output_tokens is not None else {}
                     async with aclosing(self._stream_chat_with_backend_hang_retry(
                         api_messages, tools=tools, on_status=on_status, emit_event=emit_event,
-                        request_options=request_options,
+                        request_options=request_options, step=step,
                     )) as client_stream:
                         async for event in client_stream:
                             if event.get('type') == 'preflight_status':
@@ -3155,6 +3218,10 @@ Rules:
                                 # Alternate/test transports may not expose the native hook.
                                 self._record_prompt_attachment_delivery(api_messages)
                                 delivery_recorded = True
+                                self._record_permission_input_provenance(
+                                    api_messages, tools=tools, step=step,
+                                    transport_reason='prefill_recovery' if recovery_attempts else 'model_call',
+                                )
                             output = event.get('delta') or event.get('message')
                             if isinstance(output, dict):
                                 model_output_fields.update(field for field in (
@@ -4375,6 +4442,10 @@ Rules:
             failure_details.update(failure_origin='application', exception_class=type(exc).__name__)
             raise
         finally:
+            self._record_permission_output_provenance(
+                answer, reasoning, step=step, phase='completion_check',
+                client_request_id=str(request_debug.get('client_request_id') or ''),
+            )
             status = 'cancelled' if cancelled else ('failed' if decision.status == 'INVALID' else 'success')
             summary = {
                 'COMPLETE': 'The model reported that its previous reply completes the latest request.',
@@ -4946,6 +5017,10 @@ Rules:
                     answer_text=partial_content,
                     backend=str(step_request_debug.get('backend') or ''),
                 )
+                self._record_permission_output_provenance(
+                    partial_content, partial_reasoning, step=step, phase='stalled_partial',
+                    client_request_id=str(step_request_debug.get('client_request_id') or ''),
+                )
                 partial_tools = [tool_acc[i] for i in sorted(tool_acc)]
                 generated = partial_reasoning + partial_content
                 partial_metric = self._record_model_step_metric(
@@ -5436,7 +5511,11 @@ Rules:
             log_event(
                 'runtime', 'model_output_provenance',
                 workspace_id=getattr(self.workspace, 'id', None), chat_id=self.chat_id,
-                step=step + 1, provenance=output_provenance,
+                run_id=self.run_id, step=step + 1, provenance=output_provenance,
+            )
+            self._record_permission_output_provenance(
+                content_text, reasoning_text, step=step, phase='response',
+                client_request_id=str(step_request_debug.get('client_request_id') or ''),
             )
             await emit_event('model_phase_timing', step=step, spans=phase_clock.snapshot())
             if step_backend_timings:

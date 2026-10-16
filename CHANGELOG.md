@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.6.104
+
+- Stop repeating a test target's approval mode and full access policy in ordinary status, command and file-operation results. Keep target identity, guest and emulated-radio facts, command output and actionable errors. Explicit target discovery still provides access details, and the executor still enforces saved permissions.
+- Use the same result view when replaying target-operation results saved by older versions. Preserve their saved originals, user and assistant messages, and explicit history reads without filtering phrases from replies.
+- Add PERMISSION_ACKNOWLEDGEMENTS.json to standard diagnostics. Record bounded occurrence counts by actual prepared request role and frozen system component, plus separate answer and reasoning counts. Cover completion checks, context recovery and backend retries without collecting prompt or reply text.
+- This removes another verified recurring access cue. The exact model wording has not been verified away on the Mac or Spark backends; the new trace identifies remaining input sources without requiring a private transcript.
+
 ## v0.6.103
 
 - Stop automatically adding the full permission map to every model request. Use current tool schemas and on-demand discovery for available tools and access details instead of repeatedly broadcasting access settings during tool loops.
