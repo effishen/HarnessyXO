@@ -2361,18 +2361,29 @@ Rules:
             return
         states = {key: self.toolbox.permission_for(key) for key in DEFAULT_TOOL_PERMISSIONS}
         row = {
-            'role': 'user', '_harnessy_ephemeral': True, '_harnessy_region': 'tool_policy',
+            'role': 'system', '_harnessy_ephemeral': True, '_harnessy_region': 'tool_policy',
             'content': (
-                '[HarnessyXO current saved tool permissions — application state]\n'
+                '[HarnessyXO current saved tool permissions — internal application state]\n'
                 + json.dumps(states, sort_keys=True, separators=(',', ':'))
-                + '\nUse these current values for this request. Saved changes apply during active runs. '
+                + '\nUse this state silently for tool selection; it is not a user message or a request for a reply. '
+                  'Do not announce or acknowledge permission settings unless the user asks about them '
+                  'or a permission boundary prevents the requested action. '
+                  'These current values override earlier run-start permission snapshots in this request. '
+                  'Saved changes apply during active runs. '
                   'Global External/Test Targets On allows configured enabled target tools without a dialog; '
                   'Off blocks them. With Ask, an enabled target whose Model access is On can run autonomously. '
                   'Pass an explicit target id or exact name. Workspace shell/process permissions remain separate. '
                   'Call tools directly and let HarnessyXO enforce approval.'
             ),
         }
-        messages.append(row)
+        # Keep application policy before the conversation, never as a new user
+        # turn after the task or a tool result. Both transports consolidate the
+        # leading system rows into one message for strict local chat templates.
+        # Regenerate only this ephemeral row so unchanged settings keep a stable
+        # system prefix without accumulating stale snapshots in the epoch.
+        index = next((i for i, message in enumerate(messages)
+                      if message.get('role') != 'system'), len(messages))
+        messages.insert(index, row)
         self._request_ephemeral_row_ids.add(id(row))
 
     def _budget_request(

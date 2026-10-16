@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.6.101
+
+- Keep current tool permissions in internal system context instead of appending them as a new user message after every prompt or tool result. Tell the model to use this state silently, so routine replies stay focused on your task instead of acknowledging permissions.
+- Preserve live permission changes, On / Ask / Off enforcement and test-target access. Send one leading system message to OpenAI-compatible and Ollama backends, and keep unchanged permission state stable across model steps.
+
 ## v0.6.100
 
 - Print the installed HarnessyXO version in the CLI after the startup update check and before dependency setup.
