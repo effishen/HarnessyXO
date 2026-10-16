@@ -261,50 +261,104 @@ def prepare_launcher_kvm_access(app_dir: Path, install_lock, diagnostic_event=No
              'Sign out and back in, then run python3 run.py again. HarnessyXO was not started.')
 
 
-def check_registered_host_prerequisites() -> None:
-    """Use the same selected-backend checks as VM Create/Start.
+def check_registered_host_prerequisites(diagnostic_event=None) -> None:
+    """Prepare all supported host tools, then verify workspace backends.
 
-    Failure does not prevent opening the app to repair settings. New workspaces
-    are checked on their first Create/Start, not guessed by this launcher.
+    The target catalogue is independent of saved workspaces. First launch
+    prepares MIPS/OpenWrt and Windows tools too; images still download on Start.
+    Failures keep the app available and are reported as incomplete setup.
     """
     import asyncio
+    import platform
     from harnessy.core.machine import MachineStore
-    from harnessy.environment.base import load_environment_config
+    from harnessy.environment.base import EnvironmentConfig, load_environment_config
     from harnessy.environment.host_prerequisites import (
-        ensure_host_prerequisites, ensure_lima_controller, restore_host_tool_path,
+        ensure_host_prerequisites, ensure_lima_controller,
+        ensure_test_target_prerequisites, restore_host_tool_path,
     )
     from harnessy.environment.presets import execution_mode
-    import platform
     restore_host_tool_path()
 
+    def receipt(status, checks_failed=0):
+        if diagnostic_event:
+            try:
+                diagnostic_event('harnessy', 'host_prerequisite_setup', scope='launcher',
+                                 architecture='all', status=status, checks_failed=checks_failed)
+            except Exception:
+                pass
+
     async def check() -> None:
-        def startup_progress(phase, message, **meta):
+        failures = 0
+        receipt('checking')
+
+        def progress(phase, message, **meta):
             print(message + (' ' + str(meta['detail']) if meta.get('detail') else ''), flush=True)
+
+        # Do not limit setup to targets or workspaces that already exist.
         try:
-            await ensure_lima_controller(progress=startup_progress)
+            await ensure_test_target_prerequisites(progress=progress, interactive=True)
         except Exception as exc:
-            print(f'Linux Lima setup: {exc}', file=sys.stderr)
-            print('The app will still open. VM Create/Start will retry automatic setup.', file=sys.stderr)
-        seen = set()
+            failures += 1
+            print(f'Test-target host setup did not complete: {exc}', file=sys.stderr, flush=True)
+        try:
+            await ensure_lima_controller(progress=progress)
+        except Exception as exc:
+            # The architecture checks below retry and verify the controller.
+            # An initial bootstrap failure need not outlive a successful retry.
+            print(f'Initial Lima setup did not complete: {exc}. Retrying in the backend checks.',
+                  file=sys.stderr, flush=True)
+
+        # Both supported Lima architectures need a controller/guest-agent pair,
+        # including on the first launch before a workspace has been registered.
+        selections = [(f'{architecture} QEMU backend', EnvironmentConfig(architecture=architecture), 'qemu')
+                      for architecture in ('arm64', 'x86_64')]
         for registration in MachineStore().list_workspaces():
             path = Path(registration.path).expanduser()
             if not path.is_dir():
                 continue
             config = load_environment_config(path)
-            if config is None:
-                continue
-            vm_type = execution_mode(config.architecture, host_arch=platform.machine(), host_os=platform.system())[0]
+            if config is not None:
+                selections.append((registration.name, config, None))
+        seen = set()
+        for label, config, selected_type in selections:
+            # Test targets use QEMU even on a Mac whose workspace uses VZ.
+            vm_type = selected_type or execution_mode(
+                config.architecture, host_arch=platform.machine(), host_os=platform.system(),
+            )[0]
             key = (config.provider, config.architecture, vm_type)
             if key in seen:
                 continue
             seen.add(key)
-            def progress(phase, message, **meta):
-                print(message + (' ' + str(meta['detail']) if meta.get('detail') else ''), flush=True)
             try:
-                await ensure_host_prerequisites(config, vm_type=vm_type, progress=progress)
+                report = await ensure_host_prerequisites(
+                    config, vm_type=vm_type, progress=progress, interactive=True,
+                )
+                version = str(report.get('lima_version') or '')
+                if version and tuple(map(int, version.split('.'))) < (2, 2, 0):
+                    if diagnostic_event:
+                        try:
+                            diagnostic_event(
+                                'harnessy', 'host_prerequisite_setup', scope='workspace_backend',
+                                architecture=config.architecture, status='failed',
+                                error_code='controller_version_unsupported', controller_version=version,
+                                required_binaries=['limactl'],
+                            )
+                        except Exception:
+                            pass
+                    raise RuntimeError(
+                        f'Lima {version} supports some guests, but the full test-target catalogue needs Lima 2.2.0 or later. '
+                        'This existing controller was not upgraded while checking prerequisites.'
+                    )
             except Exception as exc:
-                print(f'Host prerequisite check for {registration.name}: {exc}', file=sys.stderr)
-                print('The app will still open. VM Create/Start will recheck; no guest rebuild or network change was made.', file=sys.stderr)
+                failures += 1
+                print(f'Host prerequisite check for {label}: {exc}', file=sys.stderr, flush=True)
+        receipt('failed' if failures else 'ready', failures)
+        if failures:
+            print(f'Host prerequisite setup is incomplete ({failures} failed check(s)); see the setup errors above. '
+                  'The app will still open. VM Start will retry setup; if administrator access is needed, '
+                  'restart python3 run.py in the host terminal.', file=sys.stderr, flush=True)
+        else:
+            print('Host prerequisite setup: ready for workspace VMs and all supported test-target architectures.', flush=True)
     asyncio.run(check())
 
 
@@ -717,7 +771,7 @@ def main() -> None:
     prepend_import_path(vendor_dir)
     prepare_launcher_kvm_access(app_dir, install_lock, diagnostic_event)
     try:
-        check_registered_host_prerequisites()
+        check_registered_host_prerequisites(diagnostic_event)
     except Exception as exc:
         print(f'Host prerequisite checks could not run: {exc}. VM Create/Start will retry.', file=sys.stderr)
 

@@ -430,6 +430,12 @@ systemctl restart lightdm
     def minimum_lima_version(self):
         return '2.0.0' if self.config['os'] in {'ubuntu-24.04', 'kali-2026.2'} else '2.2.0'
 
+    def _prerequisite_progress(self, phase: str, message: str, **metadata) -> None:
+        operation = self.operation
+        if operation:
+            detail = str(metadata.get('detail') or '').strip()
+            operation.note(message + (' ' + detail if detail else '') + '\n')
+
     async def prerequisites(self):
         _, out, err = await self._run('--version')
         match = re.search(r'(\d+)\.(\d+)\.(\d+)', out + err)
@@ -554,9 +560,15 @@ systemctl restart lightdm
         # Use the same prerequisite installer as workspace VMs for Lima/QEMU.
         self.invalidate_views()
         from .base import EnvironmentConfig
-        from .host_prerequisites import ensure_host_prerequisites
+        from .host_prerequisites import ensure_host_prerequisites, ensure_test_target_prerequisites
         self.stage('prerequisites')
-        await ensure_host_prerequisites(EnvironmentConfig(architecture=self.config['architecture']), vm_type='qemu')
+        await ensure_test_target_prerequisites(
+            self.config['architecture'], windows=self.windows, progress=self._prerequisite_progress,
+        )
+        await ensure_host_prerequisites(
+            EnvironmentConfig(architecture=self.config['architecture']), vm_type='qemu',
+            progress=self._prerequisite_progress,
+        )
         await self.prerequisites()
         if not self.instance_dir.exists():
             if self.windows and not Path(self.config['iso_path']).expanduser().is_file():

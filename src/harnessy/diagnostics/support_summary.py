@@ -336,6 +336,11 @@ def _permission_failure_classification(row: dict[str, Any]) -> str | None:
 
 
 def _startup_failure_classification(row: dict[str, Any]) -> str | None:
+    if row.get('event') == 'host_prerequisite_setup':
+        from .startup import validate_startup_event
+        receipt = validate_startup_event('host_prerequisite_setup', row)
+        if receipt and receipt.get('status') in {'failed', 'action_required'}:
+            return 'host_prerequisite_setup_failed' if receipt['status'] == 'failed' else 'host_prerequisite_action_required'
     if row.get('event') == 'launcher_rea_setup_failed':
         from .startup import validate_storage_issue
         return 'rea_storage_validation_failed' if validate_storage_issue(row.get('storage_issue')) else 'rea_setup_failed'
@@ -429,8 +434,8 @@ def _launcher_startup_rows(path: Path) -> tuple[list[dict[str, Any]], list[dict[
                          'level': parts[2], 'session_scope': 'launcher'})
     if not launcher_handoff or application_started:
         return [], []
-    # MachineStore initialization can retire settled orphan holds in run.py,
-    # before the application exec. Its fixed receipt uses runtime.log.
+    # Queue repair and prerequisite installation happen before application
+    # exec. Their reviewed runtime receipts must survive that session handoff.
     runtime = _read_snapshot_bytes(path / 'runtime.log', tail_bytes=limit)
     for line in (runtime.decode('utf-8', errors='replace').splitlines() if runtime else []):
         parts = line.split(' ', 3)
@@ -440,9 +445,14 @@ def _launcher_startup_rows(path: Path) -> tuple[list[dict[str, Any]], list[dict[
             stamp = f'{parts[0]} {parts[1]}'
             datetime.strptime(stamp, '%Y-%m-%d %H:%M:%S,%f')
             body = json.loads(parts[3])
-            if not isinstance(body, dict) or body.get('event') != 'run_queue_holds_retired':
+            if not isinstance(body, dict):
                 continue
-            safe = validate_queue_event('run_queue_holds_retired', body)
+            if body.get('event') == 'host_prerequisite_setup':
+                safe = validate_startup_event('host_prerequisite_setup', body)
+            elif body.get('event') == 'run_queue_holds_retired':
+                safe = validate_queue_event('run_queue_holds_retired', body)
+            else:
+                continue
         except (ValueError, TypeError, RecursionError):
             continue
         if safe is not None:
@@ -537,6 +547,9 @@ def _evidence(row: dict[str, Any]) -> dict[str, Any]:
         'capture_scope', 'pending_progress', 'post_exit_output_not_collected',
     )
     evidence = {key: row[key] for key in keys if key in row}
+    if row.get('event') == 'host_prerequisite_setup':
+        from .startup import validate_startup_event
+        evidence.update(validate_startup_event('host_prerequisite_setup', row) or {})
     if _is_lock(row):
         evidence['error_code'] = 'sqlite_database_locked'
     return evidence
@@ -642,6 +655,10 @@ def _startup_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str
         receipts.append(safe)
     checks = [row for row in receipts if row['event'] == 'launcher_source_update']
     kvm_checks = [row for row in receipts if row['event'] == 'launcher_kvm_setup']
+    host_checks = [row for row in receipts if row['event'] == 'host_prerequisite_setup']
+    latest_host_checks = {}
+    for row in host_checks:
+        latest_host_checks[(row['scope'], row['architecture'])] = row
     failures = [row for row in receipts if row['event'] == 'launcher_rea_setup_failed']
     storage = [row for row in failures if row.get('storage_issue')]
     outcomes = Counter(row['state'] for row in checks if row.get('state') in UPDATE_STATES)
@@ -656,13 +673,33 @@ def _startup_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str
         'kvm_setup_records': len(kvm_checks),
         'kvm_setup_reason_counts': dict(Counter(row['reason_code'] for row in kvm_checks if 'reason_code' in row)),
         'latest_kvm_setup': kvm_checks[-1] if kvm_checks else None,
+        'host_prerequisite_records': len(host_checks),
+        'host_prerequisite_status_counts': dict(Counter(row['status'] for row in host_checks)),
+        'host_prerequisite_error_counts': dict(Counter(row['error_code'] for row in host_checks if 'error_code' in row)),
+        'latest_host_prerequisite_setup': host_checks[-1] if host_checks else None,
+        'latest_host_prerequisite_checks': sorted(latest_host_checks.values(), key=lambda row: row['timestamp']),
         'recent_receipts': receipts[-120:],
         'counts_are_retained_records': True,
     }
-    lines = ['Startup evidence: STARTUP.json retains launcher update and KVM setup receipts, plus historical host REA setup receipts. REA now runs as a workspace VM tool.']
+    lines = ['Startup evidence: STARTUP.json retains host prerequisite checks, launcher updates and KVM setup receipts, plus historical host REA setup receipts. REA now runs as a workspace VM tool.']
     if not receipts:
-        lines.append('  No startup receipts were recorded in the examined logs; updater, KVM setup and REA setup decisions cannot be reconstructed.')
+        lines.append('  No startup receipts were recorded in the examined logs; host prerequisite, updater, KVM setup and REA setup decisions cannot be reconstructed.')
     else:
+        lines.append(f'  Host prerequisite records: {len(host_checks)}. Counts are retained checks and installation stages, not package transactions.')
+        if not host_checks:
+            lines.append('  No host prerequisite receipts were recorded; missing tools and automatic installation outcomes cannot be reconstructed.')
+        for row in audit['latest_host_prerequisite_checks']:
+            lines.append(f'  {row["timestamp"]} [{row["session_scope"]}] {row["scope"]} / {row["architecture"]}: {row["status"]}; failure code: {row.get("error_code", "none_recorded")}.')
+            if 'missing_binaries' in row:
+                lines.append('    Missing host tools: ' + (', '.join(row['missing_binaries']) or 'none recorded') + '.')
+            if 'broken_binaries' in row:
+                lines.append('    Host tools that failed verification: ' + (', '.join(row['broken_binaries']) or 'none recorded') + '.')
+            if 'manager' in row:
+                lines.append('    Package manager: ' + row['manager'] + '; packages: ' + (', '.join(row.get('packages', [])) or 'none recorded') + '.')
+            if 'returncode' in row:
+                lines.append(f'    Recorded package-manager return code: {row["returncode"]}.')
+            if 'checks_failed' in row:
+                lines.append(f'    Failed launcher checks: {row["checks_failed"]}.')
         lines.append(f'  Source checks recorded: {len(checks)}; skipped/uncompleted update outcome records: {audit["source_update_skip_records"]}.')
         if outcomes:
             lines.append('  Update outcomes: ' + '; '.join(f'{key} {count}' for key, count in sorted(outcomes.items())) + '.')
@@ -1060,6 +1097,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
     index['queue_audit'] = queue_audit
     control_rows = [row for row in rows if row.get('level') in {'WARNING', 'ERROR', 'CRITICAL'}
                     or str(row.get('event')).startswith(('vm_', 'environment_', 'workspace_mapping_', 'test_target_'))
+                    or row.get('event') in STARTUP_EVENTS
                     or row.get('event') in QUEUE_EVENTS
                     or row.get('event') in {'headless_run_error', 'agent_run_error', 'run_blocked_by_infrastructure'}]
     index['control_plane_timeline'] = control_rows[-1200:]

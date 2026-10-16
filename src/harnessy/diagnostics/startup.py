@@ -7,7 +7,31 @@ from typing import Any
 
 STARTUP_EVENTS = frozenset({
     'launcher_source_update', 'launcher_rea_setup_start', 'launcher_rea_ready',
-    'launcher_rea_setup_failed', 'launcher_kvm_setup',
+    'launcher_rea_setup_failed', 'launcher_kvm_setup', 'host_prerequisite_setup',
+})
+HOST_SETUP_SCOPES = frozenset({'launcher', 'test_targets', 'workspace_backend'})
+HOST_SETUP_ARCHITECTURES = frozenset({'all', 'arm64', 'x86_64', 'mips', 'mipsel', 'mips64', 'mips64el'})
+HOST_SETUP_STATUSES = frozenset({'checking', 'installing', 'ready', 'failed', 'action_required'})
+HOST_SETUP_BINARIES = frozenset({
+    'limactl', 'lima-additional-guestagents', 'ssh', 'ssh-keygen', 'qemu-img',
+    'qemu-system-aarch64', 'qemu-system-x86_64', 'qemu-system-mips',
+    'qemu-system-mipsel', 'qemu-system-mips64', 'qemu-system-mips64el',
+    'debugfs', 'e2fsck', 'resize2fs', 'swtpm',
+    'qemu-firmware-aarch64', 'qemu-firmware-x86_64',
+})
+HOST_SETUP_PACKAGES = frozenset({
+    'lima', 'lima-additional-guestagents', 'openssh', 'openssh-client', 'openssh-clients',
+    'qemu', 'qemu-system-x86', 'qemu-system-arm', 'qemu-system-mips', 'qemu-utils',
+    'qemu-system-x86-core', 'qemu-system-aarch64-core', 'qemu-system-mips-core',
+    'qemu-img', 'e2fsprogs', 'swtpm',
+    'qemu-efi-aarch64', 'ovmf', 'edk2-aarch64', 'edk2-ovmf',
+})
+HOST_SETUP_ERROR_CODES = frozenset({
+    'setup_failed', 'binary_verification_failed', 'installation_disabled',
+    'administrator_authentication_required', 'package_preflight_failed',
+    'non_additive_transaction', 'post_install_verification_failed',
+    'package_install_failed', 'package_manager_unavailable', 'KVM_ACCESS_DENIED',
+    'controller_version_unsupported',
 })
 KVM_SETUP_STATUSES = frozenset({'skipped', 'ready', 'relaunch', 'action_required', 'cancelled'})
 KVM_SETUP_REASONS = frozenset({
@@ -170,7 +194,37 @@ def validate_startup_event(event: Any, value: Any) -> dict[str, Any] | None:
     if not isinstance(event, str) or event not in STARTUP_EVENTS or not isinstance(value, dict):
         return None
     safe: dict[str, Any] = {'event': event}
-    if event == 'launcher_kvm_setup':
+    if event == 'host_prerequisite_setup':
+        # These receipts can be exported without content. Retain only fixed
+        # tool/package identifiers, never process output or installer commands.
+        for key, allowed in (('scope', HOST_SETUP_SCOPES),
+                             ('architecture', HOST_SETUP_ARCHITECTURES),
+                             ('status', HOST_SETUP_STATUSES)):
+            item = value.get(key)
+            if not isinstance(item, str) or item not in allowed:
+                return None
+            safe[key] = item
+        for key, allowed in (('required_binaries', HOST_SETUP_BINARIES),
+                             ('missing_binaries', HOST_SETUP_BINARIES),
+                             ('broken_binaries', HOST_SETUP_BINARIES),
+                             ('packages', HOST_SETUP_PACKAGES)):
+            items = value.get(key)
+            if isinstance(items, (list, tuple)):
+                safe[key] = list(dict.fromkeys(item for item in items[:32]
+                                               if isinstance(item, str) and item in allowed))
+        for key, allowed in (('manager', {'apt-get', 'dnf', 'brew'}),
+                             ('error_code', HOST_SETUP_ERROR_CODES)):
+            item = value.get(key)
+            if isinstance(item, str) and item in allowed:
+                safe[key] = item
+        if type(value.get('returncode')) is int and -(2**31) <= value['returncode'] < 2**31:
+            safe['returncode'] = value['returncode']
+        if type(value.get('checks_failed')) is int and 0 <= value['checks_failed'] <= 4096:
+            safe['checks_failed'] = value['checks_failed']
+        controller_version = value.get('controller_version')
+        if isinstance(controller_version, str) and _VERSION.fullmatch(controller_version):
+            safe['controller_version'] = controller_version
+    elif event == 'launcher_kvm_setup':
         for key, allowed in (('status', KVM_SETUP_STATUSES), ('reason_code', KVM_SETUP_REASONS)):
             if isinstance(value.get(key), str) and value[key] in allowed:
                 safe[key] = value[key]

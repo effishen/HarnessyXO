@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.6.105
+
+- Prepare host prerequisites for the full supported test-target catalogue when you run python3 run.py, even with no saved workspace. Include ARM64, x86-64 and all four MIPS QEMU emulators, SSH, OpenWrt filesystem tools and Windows TPM support. Check both QEMU backend architectures and their UEFI firmware before declaring startup setup ready.
+- Let the launcher use sudo's normal password prompt in its foreground terminal when administrator access is needed. Keep authentication and package commands in the same terminal session, and avoid prompting from the browser or a background launch. Install missing packages, then verify the tools and firmware again.
+- Use the same automatic prerequisite installer when starting OpenWrt and other test targets. Keep guest images on demand and show package setup progress in the target operation log. Adding missing packages can proceed with running VMs when the checked transaction does not change installed packages.
+- Include missing or broken tools, package selections, verification failures and startup results in standard diagnostics, including launcher receipts after the app starts. Report incomplete setup clearly; existing controller versions or package plans that need upgrades/removals still require host maintenance. No Spark/Mac VM boot or real administrator package transaction was tested in this development environment.
+
 ## v0.6.104
 
 - Stop repeating a test target's approval mode and full access policy in ordinary status, command and file-operation results. Keep target identity, guest and emulated-radio facts, command output and actionable errors. Explicit target discovery still provides access details, and the executor still enforces saved permissions.

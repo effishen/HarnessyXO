@@ -20,7 +20,8 @@ import time
 import uuid
 from pathlib import Path
 
-from .host_prerequisites import discover_binary, repaired_path
+from .host_prerequisites import (discover_binary, repaired_path, ensure_test_target_prerequisites,
+                                 test_target_qemu_binary)
 from .presets import canonical_arch
 from .test_catalog import OPENWRT_RELEASE_IMAGES
 from .test_images import download_verified, expand_gzip, finish_thread
@@ -33,11 +34,7 @@ _LAUNCH_REAPERS: set[asyncio.Task] = set()
 
 
 def qemu_binary(architecture: str) -> str:
-    return {
-        'arm64': 'qemu-system-aarch64', 'x86_64': 'qemu-system-x86_64',
-        'mips': 'qemu-system-mips', 'mipsel': 'qemu-system-mipsel',
-        'mips64': 'qemu-system-mips64', 'mips64el': 'qemu-system-mips64el',
-    }[architecture]
+    return test_target_qemu_binary(architecture)
 
 
 def e2fs_binary(name: str) -> str | None:
@@ -262,13 +259,11 @@ class OpenWrtTargetManager(TestTargetManager):
                     pass
 
     async def prerequisites(self):
-        names = ['ssh', 'ssh-keygen', qemu_binary(self.config['architecture'])]
-        missing = [name for name in names if not discover_binary(name)]
-        missing += [name for name in ('debugfs', 'e2fsck', 'resize2fs') if not e2fs_binary(name)]
-        if missing:
-            qemu_package = 'qemu-system-mips' if self.config['architecture'].startswith('mips') else ('qemu-system-arm' if self.config['architecture'] == 'arm64' else 'qemu-system-x86')
-            command = 'brew install qemu e2fsprogs' if platform.system() == 'Darwin' else f'sudo apt-get install {qemu_package} e2fsprogs openssh-client'
-            raise RuntimeError('OpenWrt needs ' + ', '.join(missing) + ' on the HarnessyXO host. Install the missing packages and retry Start. Example: ' + command)
+        # OpenWrt starts QEMU directly, but shares host setup with the launcher
+        # and Lima-backed targets instead of requiring a manual package command.
+        await ensure_test_target_prerequisites(
+            self.config['architecture'], progress=self._prerequisite_progress,
+        )
 
     async def _prepare(self):
         note = self.operation.note if self.operation else lambda _: None
