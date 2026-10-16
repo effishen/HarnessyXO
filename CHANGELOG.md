@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.6.103
+
+- Stop automatically adding the full permission map to every model request. Use current tool schemas and on-demand discovery for available tools and access details instead of repeatedly broadcasting access settings during tool loops.
+- Keep permission enforcement in the executor: saved changes, Off blocking, Ask approvals and target access rules remain active. Keep genuine access errors and permission explanations available when needed.
+- Preserve existing chat history and model output without phrase filters. This removes a remaining permission cue from the prompt; the exact repeated wording has not been verified away on the Mac or Spark model backends.
+
 ## v0.6.102
 
 - Send one compact, current tool-permission state to the model. Remove duplicate per-tool status labels from the main instructions so they cannot conflict with settings changed during a run.
