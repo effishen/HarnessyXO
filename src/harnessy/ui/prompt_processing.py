@@ -36,6 +36,53 @@ def _rate(value: Any, estimated: Any = False) -> str:
     return ('~' if estimated is True else '') + f'{rate:,.1f} tok/s' if rate is not None else '—'
 
 
+def _native_count(value: Any) -> int | None:
+    count = _number(value)
+    return int(count) if count is not None and count.is_integer() and count <= 2**53 else None
+
+
+def _percent(value: Any) -> str:
+    percent = _number(value)
+    if percent is None or percent > 100:
+        return '—'
+    return f'{percent:.1f}'.rstrip('0').rstrip('.') + '%'
+
+
+def prompt_progress_text(details: dict[str, Any]) -> tuple[str, str, str]:
+    """Show cache accounting and genuinely measured fresh prompt work inline.
+
+    Older receipts synthesized a completed processed count from input minus
+    cache, even while waiting. Their count cannot prove processing progress.
+    """
+    prompt = _native_count(details.get('prompt_tokens')) if details.get('prompt_tokens_estimated') is not True else None
+    cached = _native_count(details.get('cached_tokens'))
+    cache_flag = details.get('cache_accounting_available')
+    if cache_flag is False:
+        cached = None
+    fresh = _native_count(details.get('uncached_total'))
+    cache_percent = None
+    consistent = prompt is None or cached is None or cached <= prompt
+    if consistent and prompt is not None and cached is not None:
+        if fresh is None:
+            fresh = prompt - cached
+        if prompt > 0:
+            cache_percent = cached * 100.0 / prompt
+    if cache_percent is None and cache_flag is not False and consistent:
+        reported = _number(details.get('cache_hit_rate'))
+        if reported is not None and reported <= 100:
+            cache_percent = reported
+    cache_text = f'Cache hit {_percent(cache_percent)}'
+    cached_text = f'{_count(cached)} cached'
+    # Presence marks the new receipt schema; None still means an unknown total.
+    processed = _native_count(details.get('processed_tokens')) if 'uncached_total' in details else None
+    if fresh == 0 and cached is not None and cached > 0 and consistent:
+        progress_text = 'Fully cached · 100%'
+    else:
+        percent = processed * 100.0 / fresh if fresh is not None and fresh > 0 and processed is not None and processed <= fresh else None
+        progress_text = f'Processed {_count(processed)}/{_count(fresh)} tok ({_percent(percent)})'
+    return cache_text, cached_text, progress_text
+
+
 def request_duration(details: dict[str, Any], status: str, *, now: datetime | None = None) -> float | None:
     """Tick only a running request, retaining the measured terminal duration."""
     duration = _number(details.get('duration_seconds'))
@@ -77,8 +124,9 @@ def prompt_processing_text(
     if generation_time != '—' and details.get('generation_seconds_estimated') is True:
         generation_time = '~' + generation_time
     duration = _seconds(request_duration(details, status, now=now))
+    cache_text, cached_text, progress_text = prompt_progress_text(details)
     line = ' · '.join((
-        short_time, title, state, f'Input {input_tokens} tok',
+        short_time, title, state, cache_text, cached_text, progress_text, f'Input {input_tokens} tok',
         f'PP {prefill_time} / {prefill_rate}', f'Gen {generated} tok / {generation_rate}', f'{duration} total',
     ))
     tooltip = '\n'.join((
@@ -86,7 +134,8 @@ def prompt_processing_text(
         f'Model: {str(details.get("model") or "—")}',
         f'Backend: {str(details.get("backend") or "—")}',
         f'Step: {_count(details.get("step"))} · {state}',
-        f'Input: {input_tokens} tokens · Processed: {_count(details.get("processed_tokens"))} · Cached: {_count(details.get("cached_tokens"))}',
+        f'Input: {input_tokens} tokens · {cache_text} · {cached_text}',
+        progress_text,
         f'Prompt processing: {prefill_time} · {prefill_rate}',
         f'Time to first token: {_seconds(details.get("ttft_seconds"))}',
         f'Generated: {generated} tokens · {generation_rate} · {generation_time}',

@@ -48,6 +48,9 @@ class PromptProcessingObservation:
         self._first_output: float | None = None
         self._last_output: float | None = None
         self._output_samples = 0
+        self._terminal_usage_seen = False
+        self._completion_evidence = False
+        self._progress_total: int | None = None
         self._output_bytes = {'answer': 0, 'reasoning': 0}
         self._tool_bytes: dict[int, dict[str, int]] = {}
         self._runtime_fields: set[str] = set()
@@ -70,6 +73,9 @@ class PromptProcessingObservation:
             'prompt_tokens_estimated': False,
             'processed_tokens': None,
             'cached_tokens': None,
+            'uncached_total': None,
+            'cache_hit_rate': None,
+            'cache_accounting_available': False,
             'generated_tokens': None,
             'generated_tokens_estimated': False,
             'generation_tps': None,
@@ -80,7 +86,9 @@ class PromptProcessingObservation:
         }
 
     def _set(self, key: str, value: Any, *, runtime: bool = False, estimated: bool = False) -> None:
-        parsed = _count(value) if key.endswith('_tokens') else number(value)
+        parsed = _count(value) if key.endswith('_tokens') or key == 'uncached_total' else number(value)
+        if key == 'cache_hit_rate' and parsed is not None and parsed > 100:
+            return
         if parsed is None or (runtime and key in self._native_fields):
             return
         self._values[key] = parsed
@@ -164,7 +172,9 @@ class PromptProcessingObservation:
             self._values['phase'] = 'generating'
         for source, target in (('prompt_eval_count', 'prompt_tokens'), ('eval_count', 'generated_tokens')):
             self._set(target, raw.get(source))
-        self._set('processed_tokens', raw.get('prompt_eval_count'))
+        # Ollama's count is the logical whole prompt. Its eval duration covers
+        # only uncached work; absent cache accounting cannot be treated as zero.
+        self._set('cached_tokens', raw.get('prompt_eval_cached_count'))
         for source, target in (('prompt_eval_duration', 'prefill_seconds'), ('eval_duration', 'generation_seconds')):
             value = number(raw.get(source))
             if value is not None:
@@ -173,10 +183,15 @@ class PromptProcessingObservation:
     def _timings(self, timings: dict[str, Any]) -> None:
         self._set('cached_tokens', timings.get('cache_n'))
         processed, cached = _count(timings.get('prompt_n')), _count(timings.get('cache_n'))
+        generating = (_count(timings.get('predicted_n')) or 0) > 0 or self._first_output is not None
         if processed is not None:
-            self._set('processed_tokens', processed)
-            if cached is not None:
+            if self._progress_total is None or generating:
+                self._set('processed_tokens', processed)
+            # Early timing counters can describe the work done so far. Native
+            # prompt_progress carries the full denominator independently.
+            if cached is not None and generating:
                 self._set('prompt_tokens', processed + cached)
+                self._set('uncached_total', processed)
         self._set('generated_tokens', timings.get('predicted_n'))
         if (_count(timings.get('predicted_n')) or 0) > 0:
             self._values['phase'] = 'generating'
@@ -192,11 +207,15 @@ class PromptProcessingObservation:
                 self._set(target, value / 1000.0)
 
     def _progress(self, progress: dict[str, Any]) -> None:
+        if self._values['phase'] == 'generating':
+            return  # delayed prefill samples cannot rewind accepted decode data
         validated = llama_cpp_prompt_progress({'prompt_progress': progress})
         if validated is None:
             return
         self._set('prompt_tokens', validated['total'])
+        self._progress_total = int(validated['total'])
         self._set('cached_tokens', validated['cache'])
+        self._set('uncached_total', int(validated['total']) - int(validated['cache']))
         processed = int(validated['processed']) - int(validated['cache'])
         self._set('processed_tokens', processed)
         elapsed = float(validated['time_ms']) / 1000.0
@@ -208,6 +227,16 @@ class PromptProcessingObservation:
         if self._finished is not None or not isinstance(event, dict):
             return
         kind = str(event.get('type') or '')
+        raw = event.get('raw') if isinstance(event.get('raw'), dict) else {}
+        finish_reason = event.get('finish_reason') or raw.get('finish_reason') or raw.get('done_reason')
+        choices = raw.get('choices')
+        if not finish_reason and isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            finish_reason = choices[0].get('finish_reason')
+        if raw.get('done') is True or finish_reason in {
+            'stop', 'tool_calls', 'function_call', 'completed', 'complete', 'length',
+            'max_tokens', 'max_output_tokens', 'token_limit', 'max_completion_tokens', 'output_limit',
+        }:
+            self._completion_evidence = True
         if kind in {'delta', 'message'}:
             payload = event.get(kind)
             if isinstance(payload, dict):
@@ -235,7 +264,14 @@ class PromptProcessingObservation:
                     # Generating activity rows can omit total. Context-used is
                     # prompt plus output, so it cannot stand in for prompt size.
                     for source_key, target in (('total', 'prompt_tokens'), ('processed', 'processed_tokens'),
-                                               ('cached_tokens', 'cached_tokens'), ('generated', 'generated_tokens')):
+                                               ('cached_tokens', 'cached_tokens'), ('generated', 'generated_tokens'),
+                                               ('uncached_total', 'uncached_total'), ('cache_hit_rate', 'cache_hit_rate')):
+                        if source == 'omlx_usage' and source_key == 'processed':
+                            continue  # the normalizer defaults unknown cache to zero
+                        if (source == 'llama.cpp_stream' and source_key == 'total'
+                                and phase in {'prompt_processing', 'prefill'}
+                                and not isinstance(status.get('native_prompt_progress'), dict)):
+                            continue
                         self._set(target, status.get(source_key), runtime=True)
                     self._set('prefill_tps', status.get('prefill_tps'), runtime=True,
                               estimated=status.get('prefill_tps_estimated') is True)
@@ -248,12 +284,18 @@ class PromptProcessingObservation:
                     timings = status.get('backend_timings')
                     if isinstance(timings, dict):
                         self._timings(timings)
-        raw = event.get('raw') if isinstance(event.get('raw'), dict) else {}
         usage = event.get('usage') if isinstance(event.get('usage'), dict) else {}
         if isinstance(raw.get('usage'), dict):
             self._usage(raw['usage'], {})
         if kind == 'usage' or usage:
             self._usage(usage, raw)
+            # A terminal usage event is generated from the response's usage
+            # chunk, independently of client-side text estimates. Positive
+            # completion accounting is itself evidence that prefill finished.
+            if kind == 'usage' and _count(usage.get('prompt_tokens')) is not None and _count(usage.get('completion_tokens')) is not None:
+                self._terminal_usage_seen = True
+                if (_count(usage.get('completion_tokens')) or 0) > 0:
+                    self._completion_evidence = True
         timings = raw.get('timings')
         if isinstance(timings, dict):
             self._timings(timings)
@@ -293,8 +335,29 @@ class PromptProcessingObservation:
             if elapsed and elapsed > 0 and ('generation_seconds' in self._native_fields or meaningful_stream):
                 result['generation_tps'] = number(result['generated_tokens'] / elapsed)
                 result['generation_tps_estimated'] = 'generation_seconds' not in self._native_fields or result['generated_tokens_estimated']
-        if result['processed_tokens'] is None and result['prompt_tokens'] is not None and result['cached_tokens'] is not None:
-            result['processed_tokens'] = max(0, result['prompt_tokens'] - result['cached_tokens'])
+        prompt, cached = _count(result['prompt_tokens']), _count(result['cached_tokens'])
+        valid_cache = cached is not None and (prompt is None or cached <= prompt)
+        result['cache_accounting_available'] = valid_cache or result['cache_hit_rate'] is not None
+        if prompt is not None and cached is not None:
+            if valid_cache:
+                result['uncached_total'] = prompt - cached
+                result['cache_hit_rate'] = cached * 100.0 / prompt if prompt > 0 else None
+            else:
+                # Asynchronous or malformed counters must not become 100% cache
+                # hits, negative remaining work, or a false completed progress.
+                result['uncached_total'] = None
+                result['cache_hit_rate'] = None
+                result['cache_accounting_available'] = False
+        completed_usage = (self._finished is not None and not result['failure_kind']
+                           and self._terminal_usage_seen and self._completion_evidence)
+        # Actual output from this transport proves that its prompt has finished
+        # processing. A phase label alone is insufficient evidence. A later
+        # generation error does not undo prefill work that already completed.
+        if (completed_usage or self._first_output is not None) and result['uncached_total'] is not None:
+            result['processed_tokens'] = result['uncached_total']
+        if (result['processed_tokens'] is not None and result['uncached_total'] is not None
+                and result['processed_tokens'] > result['uncached_total']):
+            result['processed_tokens'] = None
         if result['prefill_tps'] is None and result['processed_tokens'] is not None:
             elapsed = number(result['prefill_seconds'])
             if elapsed and elapsed > 0:

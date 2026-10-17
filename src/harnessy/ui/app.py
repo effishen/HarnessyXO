@@ -762,8 +762,13 @@ html[data-hy-bookmark-action="remove"] .hy-bookmark-menu-separator { display:blo
 .hy-compact-rule { flex:1 1 36px; min-width:20px; height:1px; background:currentColor; opacity:.16; }
 .hy-prompt-processing-message { margin-top:-5px !important; margin-bottom:-5px !important; }
 .hy-prompt-processing-card { width:100%; min-width:0; max-width:100%; box-sizing:border-box; }
-.hy-prompt-processing-summary { display:flex !important; cursor:help; user-select:text; }
-.hy-prompt-processing-summary .hy-compact-summary-label { flex:0 1 auto; font-variant-numeric:tabular-nums; }
+.hy-prompt-processing-summary { display:flex !important; max-width:100%; cursor:text; user-select:text; overflow-x:auto; overflow-y:hidden; overscroll-behavior-x:contain; touch-action:pan-x pan-y; scrollbar-width:thin; scrollbar-color:rgba(127,127,127,.65) rgba(127,127,127,.13); padding-bottom:3px; }
+.hy-prompt-processing-summary:focus-visible { outline:2px solid rgba(16,163,127,.5); outline-offset:-2px; }
+.hy-prompt-processing-summary::-webkit-scrollbar { height:7px; }
+.hy-prompt-processing-summary::-webkit-scrollbar-track { background:rgba(127,127,127,.13); border-radius:4px; }
+.hy-prompt-processing-summary::-webkit-scrollbar-thumb { background:rgba(127,127,127,.65); border-radius:4px; }
+.hy-prompt-processing-summary .hy-compact-summary-label { flex:0 0 auto; overflow:visible; text-overflow:clip; font-variant-numeric:tabular-nums; }
+.hy-prompt-processing-summary .hy-compact-rule { flex:1 0 36px; }
 .hy-prompt-processing-card.hy-prompt-processing-failed .hy-compact-summary-label { color:#dc2626; opacity:1; }
 .hy-prompt-processing-card.hy-prompt-processing-failed .hy-compact-rule { background:#dc2626; opacity:.34; }
 .hy-running-dots { display:inline-block; width:1.7em; min-width:1.7em; line-height:20px; text-align:left; }
@@ -8155,7 +8160,7 @@ class HarnessyPage:
                 f'data-hy-bubble-id={bubble_id} data-hy-bubble-kind=event {bookmark_props}'
             ) as card:
                 with ui.row().classes('hy-compact-summary hy-prompt-processing-summary items-center no-wrap gap-2').props(
-                    'tabindex=0 role=group aria-label="Prompt processing statistics"'
+                    'tabindex=0 role=region aria-label="Prompt processing statistics; scroll horizontally for all statistics"'
                 ) as summary:
                     label = ui.label('').classes('hy-compact-summary-label')
                     dots = ui.element('span').classes('hy-running-dots')

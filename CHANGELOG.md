@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.6.108
+
+- Put cache-hit percentage, cached tokens and processed/total prompt progress directly on the Prompt processing line, alongside its existing timestamp, PP time and speed, generated tokens and speed, and request duration. Update these counters live and retain them with the saved request.
+- Measure processing progress against the uncached work, so a large reused prefix does not distort the percentage. Show fully cached prompts explicitly and keep unavailable counters as —. Preserve reported zero cache hits without treating missing cache information as zero.
+- Let the single line scroll horizontally on narrow panes instead of cutting off statistics. Read cache and progress figures without opening a tooltip. Keep README unchanged.
+
 ## v0.6.107
 
 - Keep a compact Prompt processing line at each model request's position in the chat, including requests after tools, retries and completion checks. Update it live and retain the completed line when reopening the chat.
