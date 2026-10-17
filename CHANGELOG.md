@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.6.107
+
+- Keep a compact Prompt processing line at each model request's position in the chat, including requests after tools, retries and completion checks. Update it live and retain the completed line when reopening the chat.
+- Show the request timestamp, input tokens, prompt-processing time and speed, generated tokens and speed, and total request time. Hover or focus the line for cached and newly processed tokens, first-token latency, backend and model details. Mark estimates with ~ and unavailable measurements with —; waiting for a backend is kept separate from measured prompt processing.
+- Keep the line compact with either Events display setting and preserve its identity during progress updates. The rows stay outside model context and ordinary transcript exports. Earlier chats are not backfilled, and detailed counters depend on what the backend reports.
+
 ## v0.6.106
 
 - Fix the swtpm startup check to use the top-level --version option. Ubuntu's socket subcommand rejects the old probe and prints help, which incorrectly marked a working installation as broken.

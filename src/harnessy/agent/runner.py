@@ -41,6 +41,7 @@ from .advice import answer_replays_reasoning, output_tuning_advice
 from .stream_watchdog import StreamStallError
 from .telemetry import number
 from .permission_provenance import permission_input_provenance, permission_output_provenance
+from .prompt_processing import PromptProcessingObservation
 from .timing import StreamPhaseTimings, timed_stream_segments
 from .tools import ToolApprovalCallback, WorkspaceToolbox
 from .processes import PROCESS_JOBS
@@ -2769,10 +2770,115 @@ Rules:
             'usage_estimated': usage_estimated,
         }
 
+    async def _observed_model_transport(
+        self, api_messages: list[dict[str, Any]], *, tools: list[dict[str, Any]],
+        emit_event: Callable[..., Awaitable[None]], request_options: dict[str, Any],
+        step: int = 0, purpose: str = 'model_call',
+    ):
+        """Keep one UI-only processing line for each actual transport attempt.
+
+        This sits inside recovery and outside the provider stream, so retries
+        and completion checks have their own identity. It never adds a model
+        message or changes the events received by the existing runner.
+        """
+        observation = None
+        row = None
+        last_saved = 0.0
+        last_phase = ''
+        disabled = False
+        notifications_disabled = False
+        status = 'interrupted'
+        failure_kind = 'interrupted'
+
+        def disable(exc: Exception, *, tracking: bool = True) -> None:
+            nonlocal disabled
+            if tracking:
+                disabled = True
+            try:
+                log_event('runtime', 'prompt_processing_timeline_failed',
+                          chat_id=self.chat_id, run_id=self.run_id,
+                          error_class=type(exc).__name__)
+            except Exception:
+                pass
+
+        async def publish(*, force: bool = False) -> None:
+            nonlocal row, last_saved, last_phase, notifications_disabled
+            if observation is None or disabled:
+                return
+            try:
+                details = observation.details()
+                now = time.perf_counter()
+                phase = str(details.get('phase') or 'waiting')
+                if not force and row is not None and phase == last_phase and now - last_saved < 2.0:
+                    return
+                existing = row is not None
+                patch = {
+                    'title': 'Prompt processing', 'status': status,
+                    'tone': 'red' if status == 'failed' else 'neutral',
+                    'details': details,
+                }
+                if existing:
+                    row = self.workspace.update_activity_event(row.id, patch) or row
+                else:
+                    row = self.workspace.add_activity_event(
+                        self.chat_id, 'prompt_processing', run_id=self.run_id, **patch,
+                    )
+                last_saved, last_phase = now, phase
+                if not notifications_disabled:
+                    try:
+                        await emit_event(
+                            'timeline_activity_updated' if existing else 'timeline_activity',
+                            message_id=row.id, activity_type='prompt_processing', status=status,
+                            activity=dict((row.metadata or {}).get('activity') or {}),
+                            created_at=row.created_at,
+                        )
+                    except Exception as exc:
+                        notifications_disabled = True
+                        disable(exc, tracking=False)
+            except Exception as exc:
+                # An optional timing line must never abort/replay inference or
+                # leak a provider body through an exception message.
+                disable(exc)
+
+        try:
+            async with aclosing(self.client.stream_chat(api_messages, tools=tools, **request_options)) as stream:
+                async for event in stream:
+                    if not disabled:
+                        try:
+                            if event.get('type') == 'request':
+                                observation = PromptProcessingObservation(
+                                    dict(event.get('request') or {}), step=step, purpose=purpose,
+                                )
+                                status, failure_kind = 'running', ''
+                                await publish(force=True)
+                            elif observation is not None:
+                                observation.observe(event)
+                                await publish()
+                        except Exception as exc:
+                            disable(exc)
+                    yield event
+            status, failure_kind = 'success', ''
+        except asyncio.CancelledError:
+            status, failure_kind = 'cancelled', 'cancelled'
+            raise
+        except GeneratorExit:
+            status, failure_kind = 'interrupted', 'interrupted'
+            raise
+        except BaseException:
+            status, failure_kind = 'failed', 'error'
+            raise
+        finally:
+            if observation is not None and not disabled:
+                try:
+                    observation.finish(failure_kind=failure_kind)
+                    await publish(force=True)
+                except Exception as exc:
+                    disable(exc)
+
     async def _stream_chat_with_backend_hang_retry(
         self, api_messages: list[dict[str, Any]], *, tools: list[dict[str, Any]],
         on_status: StatusCallback, emit_event: Callable[..., Awaitable[None]],
-        request_options: dict[str, Any], step: int = 0,
+        request_options: dict[str, Any], step: int = 0, purpose: str = 'model_call',
     ):
         """Retry one rejected GPU request within the already-held model slot.
 
@@ -2836,7 +2942,10 @@ Rules:
 
         try:
             try:
-                async with aclosing(self.client.stream_chat(api_messages, tools=tools, **request_options)) as stream:
+                async with aclosing(self._observed_model_transport(
+                    api_messages, tools=tools, emit_event=emit_event,
+                    request_options=request_options, step=step, purpose=purpose,
+                )) as stream:
                     async for event in stream:
                         output = event.get('delta') or event.get('message')
                         if isinstance(output, dict):
@@ -2878,7 +2987,10 @@ Rules:
                 self._record_permission_input_provenance(
                     retry_messages, tools=retry_tools, step=step, transport_reason='backend_gpu_retry',
                 )
-                async with aclosing(self.client.stream_chat(retry_messages, tools=retry_tools, **request_options)) as stream:
+                async with aclosing(self._observed_model_transport(
+                    retry_messages, tools=retry_tools, emit_event=emit_event,
+                    request_options=request_options, step=step, purpose=purpose,
+                )) as stream:
                     async for event in stream:
                         raw = event.get('raw') if isinstance(event.get('raw'), dict) else {}
                         finish_reason = str(event.get('finish_reason') or raw.get('done_reason')
@@ -2921,6 +3033,7 @@ Rules:
         emit_event: Callable[..., Awaitable[None]],
         step: int,
         max_output_tokens: int | None = None,
+        purpose: str = 'model_call',
     ):
         agent_cfg = self.settings.get('agent', {}) if isinstance(self.settings.get('agent'), dict) else {}
         try:
@@ -3204,7 +3317,7 @@ Rules:
                     request_options = {'max_output_tokens': max_output_tokens} if max_output_tokens is not None else {}
                     async with aclosing(self._stream_chat_with_backend_hang_retry(
                         api_messages, tools=tools, on_status=on_status, emit_event=emit_event,
-                        request_options=request_options, step=step,
+                        request_options=request_options, step=step, purpose=purpose,
                     )) as client_stream:
                         async for event in client_stream:
                             if event.get('type') == 'preflight_status':
@@ -4351,6 +4464,7 @@ Rules:
             stream = self._scheduled_stream_chat(
                 api_messages, tools=self.toolbox.schemas, on_status=on_status,
                 emit_event=emit_event, step=step, max_output_tokens=COMPLETION_CHECK_MAX_TOKENS,
+                purpose='completion_check',
             )
             async with aclosing(stream):
                 async for event in stream:

@@ -39,6 +39,7 @@ from harnessy.agent.browsers import BROWSER_SESSIONS  # noqa: E402
 from harnessy.agent.processes import PROCESS_JOBS
 from harnessy.agent.timing import timed_stream_segments
 from harnessy.ui.activity import TAB_ACTIVITY
+from harnessy.ui.prompt_processing import older_activity, prompt_processing_text, remember_prompt_processing_event
 from harnessy.agent.telemetry import RATE_TTL, number
 from harnessy.agent.client import OpenAICompatibleClient  # noqa: E402
 from harnessy.agent.instruction_builder import (next_question as instruction_next_question, draft_instructions as instruction_draft,
@@ -759,6 +760,12 @@ html[data-hy-bookmark-action="remove"] .hy-bookmark-menu-separator { display:blo
 .hy-compact-summary:focus-visible { outline:2px solid rgba(16,163,127,.5); outline-offset:-2px; }
 .hy-compact-summary-label { flex:0 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11.5px; line-height:20px; font-weight:600; opacity:.78; }
 .hy-compact-rule { flex:1 1 36px; min-width:20px; height:1px; background:currentColor; opacity:.16; }
+.hy-prompt-processing-message { margin-top:-5px !important; margin-bottom:-5px !important; }
+.hy-prompt-processing-card { width:100%; min-width:0; max-width:100%; box-sizing:border-box; }
+.hy-prompt-processing-summary { display:flex !important; cursor:help; user-select:text; }
+.hy-prompt-processing-summary .hy-compact-summary-label { flex:0 1 auto; font-variant-numeric:tabular-nums; }
+.hy-prompt-processing-card.hy-prompt-processing-failed .hy-compact-summary-label { color:#dc2626; opacity:1; }
+.hy-prompt-processing-card.hy-prompt-processing-failed .hy-compact-rule { background:#dc2626; opacity:.34; }
 .hy-running-dots { display:inline-block; width:1.7em; min-width:1.7em; line-height:20px; text-align:left; }
 .hy-prompt-reference { color:var(--q-primary); border:1px solid var(--hy-border); border-radius:6px; font-size:11px; }
 .hy-prompt-action-host:empty { display:none; }
@@ -1264,6 +1271,19 @@ class UserMessageView:
     strategy_label: Any | None
 
 
+@dataclass
+class PromptProcessingView:
+    root: Any
+    card: Any
+    label: Any
+    dots: Any
+    tooltip: Any
+    copy_state: dict[str, str]
+    activity: dict[str, Any]
+    created_at: str
+    live: bool
+
+
 class HarnessyPage:
     def __init__(self, machine: MachineStore) -> None:
         self._page_id = uuid.uuid4().hex
@@ -1354,6 +1374,7 @@ class HarnessyPage:
         self._history_top = None
         self._history_bottom = None
         self._history_notice = None
+        self._prompt_processing_views: dict[str, PromptProcessingView] = {}
         self.send_button = None
         self.send_menu_button = None
         self.stop_button = None
@@ -4923,6 +4944,7 @@ class HarnessyPage:
                 return
             raise
 
+        self._sync_prompt_processing_lines(state)
         checkpoint_revision = int(state.get('checkpoint_revision') or 0)
         checkpoint_signature = (str(state.get('run_id') or ''), checkpoint_revision)
         if (checkpoint_revision and self._checkpoint_event_seen.get(key) != checkpoint_signature
@@ -7613,6 +7635,18 @@ class HarnessyPage:
         changed_checkpoint_inputs = False
         for msg in visible:
             old = self._history_rows.get(msg.id)
+            processing_view = self._prompt_processing_views.get(msg.id)
+            activity = (msg.metadata or {}).get('activity') if isinstance(msg.metadata, dict) else None
+            if (old is not None and processing_view is not None and isinstance(activity, dict)
+                    and activity.get('type') == 'prompt_processing'
+                    and self._ui_elements_alive(old[0], processing_view.root)):
+                # The request line is a stable DOM row. Updating statistics or
+                # completing the request must not replace its selectable text.
+                live = _AGENT_LIVE_STATES.get((ws.id, chat_id)) or {}
+                processing_view.live = bool(live.get('active') and msg.id in (live.get('prompt_processing_rows') or {}))
+                self._update_prompt_processing_view(processing_view, activity, created_at=msg.created_at)
+                new_rows[msg.id] = (old[0], old[1], msg)
+                continue
             if old is not None and old[2] == msg and self._ui_elements_alive(old[0]):
                 new_rows[msg.id] = old
                 continue
@@ -7663,6 +7697,10 @@ class HarnessyPage:
             if child.id not in keep_ids:
                 child.delete()
         self._history_rows = new_rows
+        self._prompt_processing_views = {
+            message_id: view for message_id, view in self._prompt_processing_views.items()
+            if message_id in new_rows and self._ui_elements_alive(view.root)
+        }
         if changed_checkpoint_inputs:
             self._invalidate_checkpoint_status_cache()
         self._history_top.move(area, 0)
@@ -8049,10 +8087,93 @@ class HarnessyPage:
         expansion.on_value_change(sync_contents)
         reasoning_expansion.on_value_change(sync_contents)
 
-    def _render_activity_message(self, msg: Any, *, prompt_reference_id: str = '') -> None:
+    def _update_prompt_processing_view(
+        self, view: PromptProcessingView, activity: dict[str, Any], *,
+        created_at: str | None = None, tick: bool = False,
+    ) -> None:
+        if older_activity(activity, view.activity):
+            activity = view.activity
+        view.activity = activity
+        if created_at:
+            view.created_at = created_at
+        display_activity = activity
+        orphaned = str(activity.get('status') or '') == 'running' and not view.live
+        if orphaned:
+            display_activity = {**activity, 'status': 'interrupted'}
+        details = activity.get('details') if isinstance(activity.get('details'), dict) else {}
+        timestamp = str(details.get('request_started_at') or view.created_at)
+        short_time, full_time, _ = self._message_time_labels(timestamp)
+        line, tooltip = prompt_processing_text(
+            display_activity, short_time=short_time, full_time=full_time,
+            now=datetime.now().astimezone() if tick and view.live else None,
+        )
+        if orphaned:
+            tooltip += '\nNo active request owns this saved running row in the current HarnessyXO process.'
+        if view.copy_state.get('line') != line:
+            view.label.set_text(line)
+        if view.copy_state.get('tooltip') != tooltip:
+            view.tooltip.set_text(tooltip)
+        status = str(display_activity.get('status') or '')
+        if view.copy_state.get('status') != status:
+            view.dots.set_visibility(status == 'running')
+            view.card.classes(
+                add='hy-prompt-processing-failed' if status in {'failed', 'interrupted'} else '',
+                remove='' if status in {'failed', 'interrupted'} else 'hy-prompt-processing-failed',
+            )
+        view.copy_state.update(line=line, tooltip=tooltip, status=status)
+
+    def _sync_prompt_processing_lines(self, state: dict[str, Any]) -> None:
+        """Patch mounted rows at the existing live poll cadence, never redraw."""
+        rows = state.get('prompt_processing_rows')
+        rows = rows if isinstance(rows, dict) else {}
+        for message_id, view in list(self._prompt_processing_views.items()):
+            if not self._ui_elements_alive(view.root):
+                self._prompt_processing_views.pop(message_id, None)
+                continue
+            row = rows.get(message_id)
+            if not isinstance(row, dict) or not isinstance(row.get('activity'), dict):
+                continue
+            view.live = bool(state.get('active'))
+            self._update_prompt_processing_view(
+                view, row['activity'], created_at=str(row.get('created_at') or ''), tick=True,
+            )
+
+    def _render_prompt_processing_message(self, msg: Any, activity: dict[str, Any], *, live: bool) -> None:
+        bubble_id = self._bubble_dom_id('event', msg.id)
+        bookmark_class, bookmark_props = self._bubble_bookmark_presentation(msg.id, 'event')
+        copy_state: dict[str, str] = {}
+        self._register_bubble_copy(
+            bubble_id,
+            provider=lambda state=copy_state: 'HarnessyXO event:\n\n' + state.get('line', '') + '\n' + state.get('tooltip', ''),
+            content_provider=lambda state=copy_state: state.get('line', '') + '\n' + state.get('tooltip', ''),
+            owner_message_id=msg.id, kind='event',
+        )
+        with ui.column().classes('hy-message hy-prompt-processing-message w-full gap-0').props(
+            f'id=hy-msg-{msg.id} data-message-id={msg.id}'
+        ) as root:
+            with ui.column().classes('hy-prompt-processing-card hy-selectable-bubble gap-0' + bookmark_class).props(
+                f'data-hy-bubble-id={bubble_id} data-hy-bubble-kind=event {bookmark_props}'
+            ) as card:
+                with ui.row().classes('hy-compact-summary hy-prompt-processing-summary items-center no-wrap gap-2').props(
+                    'tabindex=0 role=group aria-label="Prompt processing statistics"'
+                ) as summary:
+                    label = ui.label('').classes('hy-compact-summary-label')
+                    dots = ui.element('span').classes('hy-running-dots')
+                    ui.element('span').classes('hy-compact-rule')
+                    tooltip = ui.tooltip('').classes('whitespace-pre-line max-w-xl')
+                summary.on('focus', lambda: tooltip.run_method('show'))
+                summary.on('blur', lambda: tooltip.run_method('hide'))
+        view = PromptProcessingView(root, card, label, dots, tooltip, copy_state, activity, str(msg.created_at or ''), live)
+        self._prompt_processing_views[msg.id] = view
+        self._update_prompt_processing_view(view, activity)
+
+    def _render_activity_message(self, msg: Any, *, prompt_reference_id: str = '', prompt_processing_live: bool = False) -> None:
         metadata = msg.metadata if isinstance(msg.metadata, dict) else {}
         activity = metadata.get('activity') if isinstance(metadata.get('activity'), dict) else {}
         event_type = str(activity.get('type') or msg.name or 'activity')
+        if event_type == 'prompt_processing':
+            self._render_prompt_processing_message(msg, activity, live=prompt_processing_live)
+            return
         title = str(activity.get('title') or 'HarnessyXO activity')
         summary = str(activity.get('summary') or '')
         status = str(activity.get('status') or 'complete').lower()
@@ -8139,7 +8260,11 @@ class HarnessyPage:
         origin_id = (resolve_run_origin_message(self.machine, ws, chat_id, str(metadata.get('run_id') or ''))
                      if needs_origin else '')
         if msg.role == 'activity':
-            self._render_activity_message(msg, prompt_reference_id=origin_id)
+            live = _AGENT_LIVE_STATES.get((ws.id, chat_id)) or {}
+            self._render_activity_message(
+                msg, prompt_reference_id=origin_id,
+                prompt_processing_live=bool(live.get('active') and msg.id in (live.get('prompt_processing_rows') or {})),
+            )
             return
         if msg.role == 'tool':
             arguments = metadata.get('arguments') if isinstance(metadata.get('arguments'), dict) else tool_arguments.get(str(msg.tool_call_id or ''), {})
@@ -10507,6 +10632,18 @@ class HarnessyPage:
                 publish_live_state(context_budget=dict(event))
                 self._refresh_status_metrics()
                 return
+            if (event_type in {'timeline_activity', 'timeline_activity_updated'}
+                    and event.get('activity_type') == 'prompt_processing'):
+                if _AGENT_LIVE_STATES.get(live_state_key) is not process_live_state:
+                    return
+                remember_prompt_processing_event(process_live_state, event)
+                publish_live_state()
+                if event_type == 'timeline_activity_updated':
+                    # High-frequency statistics update an existing line. They
+                    # are not a transcript persistence/paging boundary.
+                    if live_render_available():
+                        self._sync_prompt_processing_lines(process_live_state)
+                    return
             if event_type in {'timeline_activity', 'timeline_activity_updated'}:
                 revision_event = str(event.get('activity_type') or '') == 'project_revision'
                 if (
@@ -20589,6 +20726,12 @@ async def _run_headless_turn(
             if event_type == 'context_budget':
                 publish(context_budget=dict(event))
                 return
+            if (event_type in {'timeline_activity', 'timeline_activity_updated'}
+                    and event.get('activity_type') == 'prompt_processing'):
+                remember_prompt_processing_event(state, event)
+                publish()
+                if event_type == 'timeline_activity_updated':
+                    return
             if event_type in {'timeline_activity', 'timeline_activity_updated'}:
                 state['persisted_revision'] = int(state.get('persisted_revision') or 0) + 1
                 publish()
