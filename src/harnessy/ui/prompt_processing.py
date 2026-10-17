@@ -1,4 +1,4 @@
-"""Compact, content-free presentation for an individual model request."""
+"""Compact, content-free receipts for completed prompt processing."""
 from __future__ import annotations
 
 import math
@@ -96,11 +96,60 @@ def request_duration(details: dict[str, Any], status: str, *, now: datetime | No
     return duration
 
 
+def completed_prefill_snapshot(activity: dict[str, Any]) -> dict[str, Any] | None:
+    """Select a measured completion receipt without treating waiting as prefill.
+
+    New requests carry an explicit pending marker. Older saved requests can
+    prove completion through output or native final counters, but did not save
+    the final prompt-only clock separately from subsequent decode updates.
+    """
+    details = activity.get('details') if isinstance(activity.get('details'), dict) else {}
+    if 'prefill_snapshot' in details:
+        snapshot = details.get('prefill_snapshot')
+        return snapshot if isinstance(snapshot, dict) and snapshot.get('completed_at') else None
+    first_output = str(details.get('first_token_at') or '')
+    try:
+        datetime.fromisoformat(first_output.replace('Z', '+00:00'))
+    except (TypeError, ValueError, OverflowError):
+        first_output = ''
+    generated = _native_count(details.get('generated_tokens'))
+    fresh = _native_count(details.get('uncached_total'))
+    processed = _native_count(details.get('processed_tokens'))
+    prompt = (_native_count(details.get('prompt_tokens'))
+              if details.get('prompt_tokens_estimated') is not True else None)
+    cached = _native_count(details.get('cached_tokens'))
+    if details.get('cache_accounting_available') is False or (prompt is not None and cached is not None and cached > prompt):
+        cached = None
+    native_complete = (str(activity.get('status') or '') == 'success'
+                       and fresh is not None and processed == fresh
+                       and (fresh > 0 or (prompt is not None and prompt > 0 and cached == prompt)))
+    if not (first_output or (generated is not None and generated > 0) or native_complete):
+        return None
+    if fresh is None and prompt is not None and cached is not None:
+        fresh = prompt - cached
+    reported_hit = _number(details.get('cache_hit_rate'))
+    hit = cached * 100.0 / prompt if prompt and cached is not None else (
+        reported_hit if details.get('cache_accounting_available') is not False and reported_hit is not None and reported_hit <= 100 else None)
+    return {
+        'completed_at': first_output,
+        'prompt_tokens': prompt, 'cached_tokens': cached, 'cache_hit_rate': hit,
+        'processed_tokens': fresh, 'prefill_seconds': None, 'prefill_tps': None,
+        'legacy_receipt': True,
+    }
+
+
+def prompt_processing_timestamp(activity: dict[str, Any], fallback: str = '') -> str:
+    """Use the same completion time for the line and its history date group."""
+    snapshot = completed_prefill_snapshot(activity)
+    details = activity.get('details') if isinstance(activity.get('details'), dict) else {}
+    return str((snapshot or {}).get('completed_at') or details.get('request_started_at') or fallback)
+
+
 def prompt_processing_text(
     activity: dict[str, Any], *, short_time: str, full_time: str,
     now: datetime | None = None,
 ) -> tuple[str, str]:
-    """Render the same line for live output and reopened durable history.
+    """Render one frozen prefill line; request details remain in the tooltip.
 
     Prompt processing time is never inferred from first-token latency: a
     backend may spend that interval queuing, loading a model, or buffering.
@@ -122,9 +171,18 @@ def prompt_processing_text(
         generation_time = '~' + generation_time
     duration = _seconds(request_duration(details, status, now=now))
     cache_text, cached_text, progress_text = prompt_progress_text(details)
-    line = ' · '.join((
-        short_time, 'PP', state, cache_text, progress_text, f'{prefill_time} / {prefill_rate}',
-    ))
+    snapshot = completed_prefill_snapshot(activity)
+    line = ''
+    if snapshot is not None:
+        prefill_time = _seconds(snapshot.get('prefill_seconds'))
+        prefill_rate = _rate(snapshot.get('prefill_tps'), snapshot.get('prefill_estimated'))
+        final_hit = _number(snapshot.get('cache_hit_rate'))
+        hit_text = f'{math.floor(final_hit + 0.5)}%' if final_hit is not None and final_hit <= 100 else '—'
+        line = ' . '.join((
+            short_time, 'PP', f'{_count(_native_count(snapshot.get("cached_tokens")))} cached',
+            f'Hit {hit_text}', f'{_count(_native_count(snapshot.get("processed_tokens")))} tok',
+            prefill_time, prefill_rate + ' (avg)',
+        ))
     tooltip = '\n'.join((
         f'Request started: {full_time}',
         f'Model: {str(details.get("model") or "—")}',
@@ -137,6 +195,10 @@ def prompt_processing_text(
         f'Time to first token: {_seconds(details.get("ttft_seconds"))}',
         f'Generated: {generated} tokens · {generation_rate} · {generation_time}',
         f'Total request time: {duration}',
+        ('Prefill completed: ' + str(snapshot.get('completed_at') or 'unavailable') if snapshot is not None else ''),
+        ('Saved line: fresh tokens exclude cached tokens; speed averages fresh tokens over the complete prompt-processing duration.' if snapshot is not None else ''),
+        ('Legacy receipt: output or native counters prove completion; final prompt-processing duration and average speed were not saved separately.' if snapshot is not None and snapshot.get('legacy_receipt') else ''),
+        ('Legacy receipt: no prompt-completion timestamp was saved; the line shows the request-start time.' if snapshot is not None and snapshot.get('legacy_receipt') and not snapshot.get('completed_at') else ''),
         ('Waiting for backend activity; prompt processing has not been reported.' if status == 'running' and phase == 'waiting' else ''),
         ('Failure: ' + str(details['failure_kind']).replace('_', ' ') if details.get('failure_kind') else ''),
         '~ marks an estimate. — means unavailable. First-token wait is separate from prompt processing.',
@@ -170,8 +232,11 @@ def remember_prompt_processing_event(state: dict[str, Any], event: dict[str, Any
             and older_activity(activity, previous['activity'])):
         return True
     details = activity.get('details') if isinstance(activity.get('details'), dict) else {}
+    remembered_details = dict(details)
+    if isinstance(details.get('prefill_snapshot'), dict):
+        remembered_details['prefill_snapshot'] = dict(details['prefill_snapshot'])
     rows[message_id] = {
-        'activity': {**activity, 'details': dict(details)},
+        'activity': {**activity, 'details': remembered_details},
         'created_at': str(event.get('created_at') or ''),
     }
     # Older history is canonical in SQLite. Only the mounted transcript window

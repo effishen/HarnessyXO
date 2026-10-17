@@ -39,7 +39,7 @@ from harnessy.agent.browsers import BROWSER_SESSIONS  # noqa: E402
 from harnessy.agent.processes import PROCESS_JOBS
 from harnessy.agent.timing import timed_stream_segments
 from harnessy.ui.activity import TAB_ACTIVITY
-from harnessy.ui.prompt_processing import older_activity, prompt_processing_text, remember_prompt_processing_event
+from harnessy.ui.prompt_processing import completed_prefill_snapshot, older_activity, prompt_processing_text, prompt_processing_timestamp, remember_prompt_processing_event
 from harnessy.agent.telemetry import RATE_TTL, number
 from harnessy.agent.client import OpenAICompatibleClient  # noqa: E402
 from harnessy.agent.instruction_builder import (next_question as instruction_next_question, draft_instructions as instruction_draft,
@@ -1285,6 +1285,7 @@ class PromptProcessingView:
     activity: dict[str, Any]
     created_at: str
     live: bool
+    visible: bool = False
 
 
 class HarnessyPage:
@@ -7855,9 +7856,18 @@ class HarnessyPage:
         last_day = None
         for index, msg in enumerate(visible, 1):
             row, date_label, _ = new_rows[msg.id]
-            day = self._message_time_labels(msg.created_at)[2]
-            date_label.set_visibility(day != last_day)
-            last_day = day
+            processing_view = self._prompt_processing_views.get(msg.id)
+            timestamp = (prompt_processing_timestamp(processing_view.activity, msg.created_at)
+                         if processing_view is not None else msg.created_at)
+            day = self._message_time_labels(timestamp)[2]
+            if processing_view is not None:
+                date = self._message_datetime(timestamp)
+                date_label.set_text(date.strftime('%A, %B %d, %Y').replace(' 0', ' '))
+            row_visible = processing_view is None or processing_view.visible
+            row.set_visibility(row_visible)
+            date_label.set_visibility(row_visible and day != last_day)
+            if row_visible:
+                last_day = day
             # Do not shuffle an already correctly positioned row on every tick.
             if area.default_slot.children[index] is not row:
                 row.move(area, index)
@@ -8249,8 +8259,11 @@ class HarnessyPage:
         if orphaned:
             display_activity = {**activity, 'status': 'interrupted'}
         details = activity.get('details') if isinstance(activity.get('details'), dict) else {}
-        timestamp = str(details.get('request_started_at') or view.created_at)
-        short_time, full_time, _ = self._message_time_labels(timestamp)
+        snapshot = completed_prefill_snapshot(display_activity)
+        request_timestamp = str(details.get('request_started_at') or view.created_at)
+        timestamp = prompt_processing_timestamp(display_activity, view.created_at)
+        short_time, _, _ = self._message_time_labels(timestamp)
+        _, full_time, _ = self._message_time_labels(request_timestamp)
         line, tooltip = prompt_processing_text(
             display_activity, short_time=short_time, full_time=full_time,
             now=datetime.now().astimezone() if tick and view.live else None,
@@ -8261,14 +8274,35 @@ class HarnessyPage:
             view.label.set_text(line)
         if view.copy_state.get('tooltip') != tooltip:
             view.tooltip.set_text(tooltip)
+        # Live prefill belongs to the green live indicator. The transcript
+        # anchor occupies no space until actual completion evidence arrives.
+        # A later decode failure does not turn a completed prefill into failure.
         status = str(display_activity.get('status') or '')
-        if view.copy_state.get('status') != status:
-            view.dots.set_visibility(status == 'running')
-            view.card.classes(
-                add='hy-prompt-processing-failed' if status in {'failed', 'interrupted'} else '',
-                remove='' if status in {'failed', 'interrupted'} else 'hy-prompt-processing-failed',
-            )
-        view.copy_state.update(line=line, tooltip=tooltip, status=status)
+        view.visible = snapshot is not None
+        visibility = 'shown' if view.visible else 'hidden'
+        if view.copy_state.get('visibility') != visibility:
+            view.root.set_visibility(view.visible)
+            view.dots.set_visibility(False)
+            view.card.classes(remove='hy-prompt-processing-failed')
+        view.copy_state.update(line=line, tooltip=tooltip, status=status, visibility=visibility)
+
+    def _sync_prompt_processing_history_visibility(self) -> None:
+        """Hide pending anchors and their date separators without moving rows."""
+        last_day = None
+        for message_id, (row, date_label, msg) in getattr(self, '_history_rows', {}).items():
+            if not self._ui_elements_alive(row, date_label):
+                continue
+            view = self._prompt_processing_views.get(message_id)
+            visible = view is None or view.visible
+            row.set_visibility(visible)
+            timestamp = prompt_processing_timestamp(view.activity, msg.created_at) if view is not None else msg.created_at
+            day = self._message_time_labels(timestamp)[2]
+            if view is not None:
+                date = self._message_datetime(timestamp)
+                date_label.set_text(date.strftime('%A, %B %d, %Y').replace(' 0', ' '))
+            date_label.set_visibility(visible and day != last_day)
+            if visible:
+                last_day = day
 
     def _sync_prompt_processing_lines(self, state: dict[str, Any]) -> None:
         """Patch mounted rows at the existing live poll cadence, never redraw."""
@@ -8285,6 +8319,7 @@ class HarnessyPage:
             self._update_prompt_processing_view(
                 view, row['activity'], created_at=str(row.get('created_at') or ''), tick=True,
             )
+        self._sync_prompt_processing_history_visibility()
 
     def _render_prompt_processing_message(self, msg: Any, activity: dict[str, Any], *, live: bool) -> None:
         bubble_id = self._bubble_dom_id('event', msg.id)

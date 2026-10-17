@@ -2789,6 +2789,7 @@ Rules:
         row = None
         last_saved = 0.0
         last_phase = ''
+        last_prefill_snapshot: dict[str, Any] | None = None
         disabled = False
         notifications_disabled = False
         status = 'interrupted'
@@ -2806,14 +2807,16 @@ Rules:
                 pass
 
         async def publish(*, force: bool = False) -> None:
-            nonlocal row, last_saved, last_phase, notifications_disabled
+            nonlocal row, last_saved, last_phase, last_prefill_snapshot, notifications_disabled
             if observation is None or disabled:
                 return
             try:
                 details = observation.details()
                 now = time.perf_counter()
                 phase = str(details.get('phase') or 'waiting')
-                if not force and row is not None and phase == last_phase and now - last_saved < 2.0:
+                snapshot = details.get('prefill_snapshot')
+                prefill_changed = isinstance(snapshot, dict) and snapshot != last_prefill_snapshot
+                if not force and not prefill_changed and row is not None and phase == last_phase and now - last_saved < 2.0:
                     return
                 existing = row is not None
                 patch = {
@@ -2828,6 +2831,7 @@ Rules:
                         self.chat_id, 'prompt_processing', run_id=self.run_id, **patch,
                     )
                 last_saved, last_phase = now, phase
+                last_prefill_snapshot = dict(snapshot) if isinstance(snapshot, dict) else None
                 if not notifications_disabled:
                     try:
                         await emit_event(

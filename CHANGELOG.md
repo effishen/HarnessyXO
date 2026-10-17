@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.6.111
+
+- Keep the green pulsing Prompt Processing indicator during live prefill. Add a saved chat entry once that prefill completes, including each request after tools, retries and completion checks.
+- Use the compact completed-entry format: time . PP . cached count . Hit percentage . fresh token count . prefill duration . token speed (avg). Calculate the average from fresh tokens and the full measured prefill duration. Keep completed prefill figures separate from ongoing generation statistics.
+- Hide unfinished prefill entries in the chat. Preserve completed prefill work even if generation later fails or stops. Show unavailable counters as —; later authoritative prefill measurements can fill fields that were initially unavailable. Older receipts cannot recover their final prefill-only duration or average, so those fields remain —. Keep detailed request statistics in hover/focus details, retain wrapping without horizontal scrolling, and leave README unchanged.
+
 ## v0.6.110
 
 - Shorten each prompt-processing row to timestamp · PP · state · Hit percentage · processed / uncached total (percentage) · processing time / token speed.
