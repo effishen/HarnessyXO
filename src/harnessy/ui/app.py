@@ -11448,10 +11448,12 @@ class HarnessyPage:
                 run_lane_position=0, completion_wait_reason='',
                 status=f'Agent slot {int(agent_slot_lease.slot)} · preparing request…',
             )
+            run_settings = self.machine.load_settings()
+            completion_gate['check_enabled'] = bool(run_settings['agent'].get('completion_check_enabled', True))
             self.machine.begin_completion_run(completion_details)
             completion_gate["started"] = True
             runner = AgentRunner(
-                ws, chat_id, self.machine.load_settings(), profile=profile,
+                ws, chat_id, run_settings, profile=profile,
                 thinking=requested_thinking, skill=selected_skill,
                 run_id=str(process_live_state["run_id"]),
                 agent_slot_lease=agent_slot_lease,
@@ -19365,14 +19367,19 @@ window.harnessyTerminalFocus = function(terminalId) {
                                     'Enable this only when you want a finite safety guardrail.'
                                 ).classes('text-xs hy-muted mb-2')
                                 auto_memory = ui.switch('Allow model to maintain Workspace Memory', value=bool(agent.get('auto_memory', True)))
-                                ui.label('Completion verification · required').classes('font-semibold mt-2')
+                                completion_check = ui.switch(
+                                    'Completion Check',
+                                    value=bool(agent.get('completion_check_enabled', True)),
+                                ).classes('mt-2')
                                 ui.label(
-                                    'Every apparent final reply is checked with the chat’s own model before the queue advances. '
+                                    'On by default. Applies to new runs. When enabled, every apparent final reply is checked '
+                                    'with the chat’s own model before the queue advances. '
                                     'An unreadable decision allows up to three attempts for that reply. '
                                     'Two automatic resumes without new successful tool work pause for your review; '
                                     'productive work renews that allowance. Exhausted verification attempts leave the project '
                                     'unconfirmed and let other queued projects proceed automatically. '
-                                    'Stop always cancels the run. View each check and its counts in the timeline event.'
+                                    'Stop always cancels the run. View each check and its counts in the timeline event. '
+                                    'When off, replies finish without this extra check.'
                                 ).classes('text-xs hy-muted mb-2')
                                 timeout = ui.number('Shell timeout (seconds)', value=int(agent.get('shell_timeout_seconds', 180)), min=1, max=7200).classes('w-full')
                                 global_agent_slots = ui.number(
@@ -19449,7 +19456,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                                     'Install or update them in Workspace Environment → Manage Optional Tools.'
                                 ).classes('text-xs hy-muted mt-2')
 
-                        watch(limit_steps, steps, auto_memory, timeout, global_agent_slots, *permission_inputs.values())
+                        watch(limit_steps, steps, auto_memory, completion_check, timeout, global_agent_slots, *permission_inputs.values())
 
                         def collect_agent_settings() -> None:
                             permissions = {
@@ -19461,7 +19468,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                                 'max_steps': max(1, int(steps.value or 200)),
                                 'shell_enabled': permissions.get('shell') == 'on',  # rollback compatibility
                                 'auto_memory': bool(auto_memory.value),
-                                'completion_check_enabled': True,
+                                'completion_check_enabled': bool(completion_check.value),
                                 'shell_timeout_seconds': int(timeout.value or 180),
                                 'global_agent_slots': max(1, min(int(global_agent_slots.value or 1), 32)),
                                 'tool_permissions': permissions,
@@ -21167,6 +21174,7 @@ async def _run_headless_turn(
         completion_details = {'run_id': str(state['run_id']), 'workspace_id': ws.id, 'chat_id': chat_id,
                               'model': str(profile.get('model') or ''), 'model_profile_id': str(profile.get('id') or ''),
                               'thinking': str(requested_thinking), 'project_label': f'{ws.name} / {chat.title}'}
+        completion_gate['check_enabled'] = bool(settings['agent'].get('completion_check_enabled', True))
         machine.begin_completion_run(completion_details)
         completion_gate['started'] = True
         runner = AgentRunner(
@@ -21582,6 +21590,13 @@ def _settle_completion_gate(
             'completion_check_failed': True, 'completion_exhausted': True,
             'completion_error_code': outcome.get('completion_error_code') or '',
             'completion_backend_recovery_exhausted': outcome.get('completion_backend_recovery_exhausted') is True,
+        })
+    elif successful and not interrupted and outcome.get('check_enabled') is False:
+        # An unchecked successful run can hand off the queue without inventing
+        # a model verdict. Keep stale-run ownership checks in MachineStore.
+        machine.record_completion_gate('complete', {
+            **details, 'completion_check_enabled': False,
+            'reason': 'Completion Check was off for this run.',
         })
     elif not outcome.get('verified') or not successful:
         if outcome.get('verified') and not successful:

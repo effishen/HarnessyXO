@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.6.113
+
+- Add the Completion Check toggle in Settings → Agent / Tools → Agent Settings, alongside its existing explanation. Keep it on by default and save your choice when you turn it off.
+- Apply the saved choice to new runs. When enabled, keep the existing completion verification and queue behaviour; when disabled, finish replies without the extra verification request. Leave README unchanged.
+
 ## v0.6.112
 
 - Move completed Prompt Processing details to the ⓘ icon after the statistics. Hover or focus the icon to see the details; hovering the rest of the line no longer opens a tooltip.

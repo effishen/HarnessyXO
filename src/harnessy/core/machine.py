@@ -893,7 +893,6 @@ class MachineStore:
             migrated, changed = _migrate_settings(data)
             merged = _deep_merge(deepcopy(DEFAULT_SETTINGS), migrated)
             merged = _normalize_settings(merged)
-            merged.setdefault('agent', {})['completion_check_enabled'] = True
             if changed or merged != data:
                 self.save_settings(merged)
             return merged
@@ -902,7 +901,6 @@ class MachineStore:
         with self._settings_lock:
             migrated, _ = _migrate_settings(data)
             merged = _normalize_settings(_deep_merge(deepcopy(DEFAULT_SETTINGS), migrated))
-            merged.setdefault('agent', {})['completion_check_enabled'] = True
             with tempfile.NamedTemporaryFile(
                 mode='w', encoding='utf-8', prefix='.settings-', suffix='.tmp',
                 dir=self.root, delete=False,
