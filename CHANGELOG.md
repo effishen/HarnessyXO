@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.6.112
+
+- Move completed Prompt Processing details to the ⓘ icon after the statistics. Hover or focus the icon to see the details; hovering the rest of the line no longer opens a tooltip.
+- Keep the live green pulse, saved statistics, copied details and wrapping layout unchanged. Leave README unchanged.
+
 ## v0.6.111
 
 - Keep the green pulsing Prompt Processing indicator during live prefill. Add a saved chat entry once that prefill completes, including each request after tools, retries and completion checks.

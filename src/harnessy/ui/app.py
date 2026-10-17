@@ -763,7 +763,8 @@ html[data-hy-bookmark-action="remove"] .hy-bookmark-menu-separator { display:blo
 .hy-prompt-processing-message { margin-top:-5px !important; margin-bottom:-5px !important; }
 .hy-prompt-processing-card { width:100%; min-width:0; max-width:100%; box-sizing:border-box; }
 .hy-prompt-processing-summary { display:flex !important; max-width:100%; cursor:text; user-select:text; flex-wrap:nowrap; align-items:flex-start; }
-.hy-prompt-processing-summary:focus-visible { outline:2px solid rgba(16,163,127,.5); outline-offset:-2px; }
+.hy-prompt-processing-info { flex:0 0 auto; line-height:20px; cursor:help; user-select:none; opacity:.65; }
+.hy-prompt-processing-info:focus-visible { outline:2px solid rgba(16,163,127,.5); outline-offset:2px; border-radius:50%; }
 .hy-prompt-processing-summary .hy-compact-summary-label { flex:0 1 auto; max-width:100%; overflow:visible; text-overflow:clip; white-space:normal; overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
 .hy-prompt-processing-summary .hy-compact-rule { flex:1 1 24px; min-width:0; align-self:center; }
 .hy-prompt-processing-card.hy-prompt-processing-failed .hy-compact-summary-label { color:#dc2626; opacity:1; }
@@ -8338,14 +8339,17 @@ class HarnessyPage:
                 f'data-hy-bubble-id={bubble_id} data-hy-bubble-kind=event {bookmark_props}'
             ) as card:
                 with ui.row().classes('hy-compact-summary hy-prompt-processing-summary items-start gap-2').props(
-                    'tabindex=0 role=region aria-label="Prompt processing statistics; focus or hover for details"'
-                ) as summary:
+                    'role=region aria-label="Prompt processing statistics"'
+                ):
                     label = ui.label('').classes('hy-compact-summary-label')
                     dots = ui.element('span').classes('hy-running-dots')
+                    with ui.icon('info_outline', size='14px').classes('hy-prompt-processing-info').props(
+                        'tabindex=0 role=img aria-label="Prompt processing details"'
+                    ) as info:
+                        tooltip = ui.tooltip('').classes('whitespace-pre-line max-w-xl')
                     ui.element('span').classes('hy-compact-rule')
-                    tooltip = ui.tooltip('').classes('whitespace-pre-line max-w-xl')
-                summary.on('focus', lambda: tooltip.run_method('show'))
-                summary.on('blur', lambda: tooltip.run_method('hide'))
+                info.on('focus', lambda: tooltip.run_method('show'))
+                info.on('blur', lambda: tooltip.run_method('hide'))
         view = PromptProcessingView(root, card, label, dots, tooltip, copy_state, activity, str(msg.created_at or ''), live)
         self._prompt_processing_views[msg.id] = view
         self._update_prompt_processing_view(view, activity)
