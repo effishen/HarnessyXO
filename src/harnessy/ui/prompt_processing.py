@@ -71,15 +71,15 @@ def prompt_progress_text(details: dict[str, Any]) -> tuple[str, str, str]:
         reported = _number(details.get('cache_hit_rate'))
         if reported is not None and reported <= 100:
             cache_percent = reported
-    cache_text = f'Cache hit {_percent(cache_percent)}'
+    cache_text = f'Hit {_percent(cache_percent)}'
     cached_text = f'{_count(cached)} cached'
     # Presence marks the new receipt schema; None still means an unknown total.
     processed = _native_count(details.get('processed_tokens')) if 'uncached_total' in details else None
     if fresh == 0 and cached is not None and cached > 0 and consistent:
-        progress_text = 'Fully cached · 100%'
+        progress_text = 'Fully cached (100%)'
     else:
         percent = processed * 100.0 / fresh if fresh is not None and fresh > 0 and processed is not None and processed <= fresh else None
-        progress_text = f'Processed {_count(processed)}/{_count(fresh)} tok ({_percent(percent)})'
+        progress_text = f'{_count(processed)} / {_count(fresh)} ({_percent(percent)})'
     return cache_text, cached_text, progress_text
 
 
@@ -112,9 +112,6 @@ def prompt_processing_text(
         state = {'waiting': 'Waiting', 'prompt_processing': 'Prefilling', 'generating': 'Generating'}.get(phase, 'Waiting')
     else:
         state = {'success': 'Done', 'failed': 'Failed', 'cancelled': 'Cancelled', 'interrupted': 'Interrupted'}.get(status, status.replace('_', ' ').capitalize())
-    title = 'Prompt processing'
-    if details.get('purpose') == 'completion_check':
-        title += ' (completion check)'
     input_tokens = _count(details.get('prompt_tokens'), details.get('prompt_tokens_estimated'))
     prefill_time = _seconds(details.get('prefill_seconds'))
     prefill_rate = _rate(details.get('prefill_tps'), details.get('prefill_estimated'))
@@ -126,16 +123,16 @@ def prompt_processing_text(
     duration = _seconds(request_duration(details, status, now=now))
     cache_text, cached_text, progress_text = prompt_progress_text(details)
     line = ' · '.join((
-        short_time, title, state, cache_text, cached_text, progress_text, f'Input {input_tokens} tok',
-        f'PP {prefill_time} / {prefill_rate}', f'Gen {generated} tok / {generation_rate}', f'{duration} total',
+        short_time, 'PP', state, cache_text, progress_text, f'{prefill_time} / {prefill_rate}',
     ))
     tooltip = '\n'.join((
         f'Request started: {full_time}',
         f'Model: {str(details.get("model") or "—")}',
         f'Backend: {str(details.get("backend") or "—")}',
+        'Purpose: ' + ('Completion check' if details.get('purpose') == 'completion_check' else 'Model call'),
         f'Step: {_count(details.get("step"))} · {state}',
-        f'Input: {input_tokens} tokens · {cache_text} · {cached_text}',
-        progress_text,
+        f'Input: {input_tokens} tokens · Cache {cache_text.lower()} · {cached_text}',
+        f'Prompt progress (fresh tokens): {progress_text}',
         f'Prompt processing: {prefill_time} · {prefill_rate}',
         f'Time to first token: {_seconds(details.get("ttft_seconds"))}',
         f'Generated: {generated} tokens · {generation_rate} · {generation_time}',

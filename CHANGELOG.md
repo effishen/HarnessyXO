@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.6.110
+
+- Shorten each prompt-processing row to timestamp · PP · state · Hit percentage · processed / uncached total (percentage) · processing time / token speed.
+- Remove horizontal scrolling from these rows. Keep the text on one line where it fits and wrap it inside narrow panes so the counters remain readable.
+- Keep input and cached token counts, generated tokens and speed, request duration, backend, model and other detailed statistics in the hover/focus details and copied record. Preserve live counters and saved rows. Leave README unchanged.
+
 ## v0.6.109
 
 - Show the Tool card when the first tool-call data arrives. Keep the card in place as it moves from Building arguments… to Awaiting execution, Running and the final result, instead of streaming a command over the temporary Generating line.
