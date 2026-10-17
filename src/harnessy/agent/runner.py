@@ -369,7 +369,7 @@ def _merge_streamed_tool_call(
         acc['function']['arguments'] += _tool_call_arguments_text(fn.get('arguments'))
 
 
-def _tool_call_progress(call: dict[str, Any]) -> dict[str, Any]:
+def _tool_call_progress(call: dict[str, Any], *, index: int = 0) -> dict[str, Any]:
     """Return a small, safe progress description for an in-flight tool call.
 
     Tool arguments can contain entire source files, so live UI/diagnostics must
@@ -404,6 +404,10 @@ def _tool_call_progress(call: dict[str, Any]) -> dict[str, Any]:
         if target:
             break
     return {
+        # The provider can deliver its ID after the first argument fragments.
+        # A step and stream index identify the display draft until that happens.
+        'index': index,
+        'call_id': str(call.get('id') or ''),
         'name': name or 'tool',
         'target': target,
         'argument_chars': len(raw_arguments),
@@ -5040,9 +5044,18 @@ Rules:
             output_provenance = _new_output_provenance(self.thinking)
             active_stream_kind: str | None = None
             tool_acc: dict[int, dict[str, Any]] = {}
-            last_tool_progress_signature = ''
+            last_tool_progress: dict[int, dict[str, Any]] = {}
             phase_clock = StreamPhaseTimings()
             observable_event = True
+
+            async def emit_tool_progress() -> None:
+                # Parallel calls may arrive interleaved. Update each changed
+                # display draft without changing the accumulated model payload.
+                for index in sorted(tool_acc):
+                    progress = _tool_call_progress(tool_acc[index], index=index)
+                    if progress != last_tool_progress.get(index):
+                        last_tool_progress[index] = progress
+                        await emit_event('tool_call_building', step=step, **progress)
 
             async def touch_output_phase(kind: str) -> float:
                 now, changed = phase_clock.touch(kind, observable=observable_event)
@@ -5529,11 +5542,7 @@ Rules:
                             complete_call.setdefault('index', idx)
                             _merge_streamed_tool_call(tool_acc, complete_call, mode='snapshot')
                         if message_tool_calls and tool_acc:
-                            progress = _tool_call_progress(tool_acc[min(tool_acc)])
-                            signature = f"{progress['name']}\0{progress['target']}"
-                            if signature != last_tool_progress_signature:
-                                last_tool_progress_signature = signature
-                                await emit_event('tool_call_building', step=step, **progress)
+                            await emit_tool_progress()
                         continue
 
                     delta = event.get('delta') or {}
@@ -5604,11 +5613,7 @@ Rules:
                             'tools', 'tool_stream_normalized', step=step + 1, mode=tool_call_mode,
                             calls=[tool_acc[i] for i in sorted(tool_acc)],
                         )
-                        progress = _tool_call_progress(tool_acc[min(tool_acc)])
-                        signature = f"{progress['name']}\0{progress['target']}"
-                        if signature != last_tool_progress_signature:
-                            last_tool_progress_signature = signature
-                            await emit_event('tool_call_building', step=step, **progress)
+                        await emit_tool_progress()
 
             content_text = ''.join(content_parts)
             reasoning_text = ''.join(reasoning_parts)
@@ -5760,6 +5765,11 @@ Rules:
                     step=step,
                     message_id=assistant_message.id,
                     has_tool_calls=True,
+                    tool_calls=[
+                        {'index': index, 'call_id': str(call.get('id') or ''),
+                         'name': str((call.get('function') or {}).get('name') or '')}
+                        for index, call in zip(sorted(tool_acc), tool_calls)
+                    ],
                     has_visible_output=bool(str(content_text or '').strip() or str(reasoning_text or '').strip()),
                     performance=step_metric, stream_segments=stream_segments,
                     output_provenance=output_provenance,
@@ -5768,7 +5778,7 @@ Rules:
                 infrastructure_failure_tool = ''
                 infrastructure_failure_call = ''
                 skipped_tool_count = 0
-                for call in tool_calls:
+                for call_index, call in zip(sorted(tool_acc), tool_calls):
                     fn = call.get('function') or {}
                     name = fn.get('name', '')
                     raw_args = fn.get('arguments') or '{}'
@@ -5788,14 +5798,14 @@ Rules:
                         tool_started = time.perf_counter()
                         tool_started_at = datetime.now().astimezone().isoformat(timespec='seconds')
                         await emit_event(
-                            'tool_start', step=step, call_id=call['id'], name=name, arguments=args, created_at=tool_started_at,
+                            'tool_start', step=step, index=call_index, call_id=call['id'], name=name, arguments=args, created_at=tool_started_at,
                             requested_by_model=getattr(self.client, 'model', self.profile.get('model')),
                         )
                     else:
                         tool_started = time.perf_counter()
                         tool_started_at = datetime.now().astimezone().isoformat(timespec='seconds')
                         await emit_event(
-                            'tool_start', step=step, call_id=call['id'], name=name, arguments=args, created_at=tool_started_at,
+                            'tool_start', step=step, index=call_index, call_id=call['id'], name=name, arguments=args, created_at=tool_started_at,
                             requested_by_model=getattr(self.client, 'model', self.profile.get('model')),
                         )
                         if infrastructure_failure is None:

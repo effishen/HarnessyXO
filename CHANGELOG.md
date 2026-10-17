@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.6.109
+
+- Show the Tool card when the first tool-call data arrives. Keep the card in place as it moves from Building arguments… to Awaiting execution, Running and the final result, instead of streaming a command over the temporary Generating line.
+- Use the same display in full and compact Tools views and when returning to an active chat. Keep separate cards for multiple tool calls and remove unfinished previews when generation stops or the model discards a partial call. Building arguments does not mean the tool has started; saved approval settings still apply before execution.
+- Keep prompt-processing statistics and conversation content unchanged. Backends that buffer tool calls can show argument progress only after sending that data. Leave README unchanged.
+
 ## v0.6.108
 
 - Put cache-hit percentage, cached tokens and processed/total prompt progress directly on the Prompt processing line, alongside its existing timestamp, PP time and speed, generated tokens and speed, and request duration. Update these counters live and retain them with the saved request.

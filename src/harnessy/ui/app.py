@@ -1268,6 +1268,7 @@ class ToolView:
     ref_label: Any
     compact_label: Any
     compact_dots: Any
+    header_label: Any = None
 
 
 @dataclass
@@ -4814,8 +4815,7 @@ class HarnessyPage:
         tool_building = state.get('tool_building') if isinstance(state.get('tool_building'), dict) else {}
         if tool_building:
             name = str(tool_building.get('name') or 'tool')
-            target = str(tool_building.get('target') or '')
-            label = f'Generating Tool · {name}' + (f' · {target}' if target else '')
+            label = f'Building arguments… · {name}'
         else:
             label = {
                 'waiting': 'Waiting for model…',
@@ -5039,12 +5039,11 @@ class HarnessyPage:
             except (TypeError, ValueError):
                 last_visible = 0.0
             silent_for = max(0.0, time.perf_counter() - last_visible) if last_visible else 0.0
-            if view.copy_state.get('model_step_finished'):
-                view.waiting_label.set_text(phase_text)
-                view.waiting_row.set_visibility(True)
-            elif isinstance(state.get('tool_building'), dict):
+            if state.get('building_tools'):
                 view.reasoning_status_label.set_visibility(False)
                 view.answer_status_label.set_visibility(False)
+                view.waiting_row.set_visibility(False)
+            elif view.copy_state.get('model_step_finished'):
                 view.waiting_label.set_text(phase_text)
                 view.waiting_row.set_visibility(True)
             elif str(state.get('phase') or '') == 'generating' and active_output and silent_for >= 1.25:
@@ -7096,6 +7095,7 @@ class HarnessyPage:
         thinking: str = '',
         model_settings: dict[str, Any] | None = None,
         lazy_history: bool = False,
+        building: dict[str, Any] | None = None,
     ) -> ToolView:
         settings_tip = message_settings_tooltip(
             model_settings, model=model_name, thinking=thinking, role='tool',
@@ -7106,6 +7106,7 @@ class HarnessyPage:
             'name': name or 'unknown', 'arguments': dict(arguments or {}), 'result': str(result or ''),
             'ok': ok, 'execution_status': execution_status, 'message_id': message_id or '',
             '_ready': ok is not None or result is not None,
+            'duration_seconds': duration_seconds, 'timing': timing,
         }
         bubble_id = self._bubble_dom_id('tool', message_id)
         bookmark_class, bookmark_props = self._bubble_bookmark_presentation(message_id, 'tool')
@@ -7183,25 +7184,129 @@ class HarnessyPage:
                     )
                     with ui.expansion(tail, icon='build', value=False).classes('hy-thinking') as expansion:
                         details_text = lambda: self._tool_details(
-                            name, arguments, result, ok=ok, duration_seconds=duration_seconds,
-                            execution_status=execution_status, timing=timing,
+                            str(copy_state.get('name') or 'unknown'), copy_state.get('arguments'),
+                            copy_state.get('result'), ok=copy_state.get('ok'),
+                            duration_seconds=copy_state.get('duration_seconds'),
+                            execution_status=copy_state.get('execution_status'), timing=copy_state.get('timing'),
                         )
                         details = ui.markdown('' if lazy_history else details_text()).classes('hy-tool-call-details')
                         if lazy_history:
                             expansion.on_value_change(lambda e: details.set_content(details_text() if e.value else ''))
                         with ui.expansion('View raw result', icon='data_object', value=False).classes('hy-tool-raw') as raw_expansion:
-                            raw_text = lambda: self._markdown_code_block(self._tool_raw_result(result), 'text')
+                            raw_text = lambda: self._markdown_code_block(self._tool_raw_result(copy_state.get('result')), 'text')
                             raw_markdown = ui.markdown('' if lazy_history else raw_text()).classes('hy-tool-call-details')
                             if lazy_history:
                                 raw_expansion.on_value_change(lambda e: raw_markdown.set_content(raw_text() if e.value else ''))
                         raw_expansion.set_visibility(bool(result))
         self._register_checkpoint_surface(bubble_id, tool_card, [compact_saved, header_saved])
-        return ToolView(
+        view = ToolView(
             root=root, card=tool_card, expansion=expansion, details_markdown=details, raw_expansion=raw_expansion,
             raw_markdown=raw_markdown, duration_label=duration_label, time_label=time_label,
             copy_state=copy_state, copy_button=copy_button, bubble_id=bubble_id, ref_label=ref_label,
-            compact_label=compact_label, compact_dots=compact_dots,
+            compact_label=compact_label, compact_dots=compact_dots, header_label=tool_header,
         )
+        if building is not None:
+            self._refresh_building_tool(view, building, {})
+        return view
+
+    def _refresh_building_tool(self, view: ToolView, progress: dict[str, Any], state: dict[str, Any]) -> None:
+        """Project incomplete arguments as activity, never as executable input."""
+        name = str(progress.get('name') or 'tool')
+        chars = max(0, int(progress.get('argument_chars') or 0))
+        finalized = bool(progress.get('finalized'))
+        stage = 'queued_arguments' if finalized else 'building_arguments'
+        signature = (name, chars, str(progress.get('target') or ''), finalized)
+        now = time.perf_counter()
+        if (getattr(view, '_harnessy_build_signature', None) == signature
+                or (getattr(view, '_harnessy_live_stage', None) == stage
+                    and now - float(getattr(view, '_harnessy_build_painted_at', 0.0)) < 0.125)):
+            return
+        view._harnessy_build_signature = signature
+        view._harnessy_build_painted_at = now
+        label = 'Awaiting execution' if finalized else 'Building arguments…'
+        detail = f'{chars:,} argument chars received' if chars else 'Waiting for argument data'
+        view.copy_state.update(name=name, arguments={}, result='', ok=None,
+                               execution_status=stage, _ready=False)
+        view._harnessy_live_stage = stage
+        view._harnessy_is_draft = True
+        view._harnessy_draft_index = int(progress.get('index') or 0)
+        view.compact_label.set_text(f'Tool · {name} · {label} · {detail}')
+        view.compact_dots.set_visibility(not finalized)
+        if view.header_label is not None:
+            view.header_label.set_text(f'Tool · {name}')
+        view.duration_label.set_text(label)
+        view.duration_label.set_visibility(True)
+        view.copy_button.set_visibility(False)
+        self._set_expansion_label(view.expansion, f'{label} · {detail}')
+        preview = str(progress.get('target') or '')
+        text = f'**{label}**\n\n{detail}. The tool has not started.'
+        if preview:
+            text += '\n\nPreview:\n\n' + self._markdown_code_block(preview, 'text')
+        view.details_markdown.set_content(text)
+        view.raw_expansion.set_visibility(False)
+
+    def _promote_tool_view(self, view: ToolView, tool: dict[str, Any], state: dict[str, Any]) -> None:
+        """Keep the mounted draft card while replacing its data with final input."""
+        name = str(tool.get('name') or 'unknown')
+        view.copy_state.update(name=name, arguments=dict(tool.get('arguments') or {}), result='',
+                               ok=None, execution_status='awaiting_execution', _ready=False)
+        if view.header_label is not None:
+            view.header_label.set_text(f'Tool · {name}')
+        short_time, full_time, _ = self._message_time_labels(str(tool.get('created_at') or ''))
+        view.time_label.set_text(short_time)
+        view.time_label.tooltip(full_time)
+        view._harnessy_live_stage = None
+        view._harnessy_is_draft = False
+        view._harnessy_call_id = str(tool.get('call_id') or '')
+        self._refresh_live_tool_status(view, tool, state)
+
+    def _complete_tool_view(self, view: ToolView, event: dict[str, Any]) -> None:
+        """Finish a live card in place; also used when an observer adopts its saved row."""
+        name = str(event.get('name') or 'unknown')
+        arguments = event.get('arguments') if isinstance(event.get('arguments'), dict) else {}
+        result = str(event.get('result') or '')
+        ok = bool(event.get('ok'))
+        duration = float(event.get('duration_seconds') or 0.0)
+        durable_id = str(event.get('message_id') or '')
+        view._harnessy_is_draft = False
+        view._harnessy_live_stage = 'completed' if ok else 'failed'
+        started_at = str(event.get('started_at') or event.get('created_at') or '')
+        if started_at:
+            short_time, full_time, _ = self._message_time_labels(started_at)
+            view.time_label.set_text(short_time)
+            view.time_label.tooltip(full_time)
+        if durable_id:
+            view.root.props(f'id=hy-msg-{durable_id} data-message-id={durable_id}')
+            view.ref_label.set_text(self._bubble_ref('T', durable_id))
+            view.ref_label.set_visibility(True)
+            self._bind_saved_bubble_bookmark(view.card, view.bubble_id, durable_id, 'tool')
+        view.copy_state.update({
+            'name': name, 'arguments': dict(arguments), 'result': result, 'ok': ok,
+            'execution_status': str(event.get('execution_status') or '') or None,
+            'message_id': durable_id, '_ready': True,
+            'duration_seconds': duration, 'timing': dict(event),
+        })
+        if view.header_label is not None:
+            view.header_label.set_text(f'Tool · {name}')
+        view.copy_button.set_visibility(True)
+        view.card.classes(remove='hy-bubble-copy-pending hy-activity-running')
+        if not ok:
+            view.card.classes(add='hy-tool-failed')
+        view.duration_label.set_text(self._tool_duration_text(event))
+        view.duration_label.set_visibility(True)
+        compact_state = 'Completed' if ok else 'Failed'
+        compact_duration = self._compact_elapsed_text(event.get('execution_duration_seconds', duration))
+        text = f'Tool · {name} · {compact_state}' + (f' · {compact_duration}' if compact_duration else '')
+        view.compact_label.set_text(text)
+        view.compact_dots.set_visibility(False)
+        self._set_expansion_label(view.expansion, self._tool_tail(
+            name, arguments, result, ok=ok, duration_seconds=duration,
+            execution_status=str(event.get('execution_status') or '') or None))
+        view.details_markdown.set_content(self._tool_details(
+            name, arguments, result, ok=ok, duration_seconds=duration,
+            execution_status=str(event.get('execution_status') or '') or None, timing=event))
+        view.raw_markdown.set_content(self._markdown_code_block(self._tool_raw_result(result), 'text'))
+        view.raw_expansion.set_visibility(bool(result))
 
     @staticmethod
     def _assistant_status_notice(metadata: dict[str, Any]) -> str:
@@ -7511,7 +7616,9 @@ class HarnessyPage:
                 if not isinstance(view, AssistantView) or not self._ui_elements_alive(view.root):
                     continue
                 keep.add(view.root.id)
-                view.root.set_visibility(tail)
+                visible_text = bool(str(group['answer']).strip() or
+                                    (thinking.lower() != 'off' and str(group['reasoning']).strip()))
+                view.root.set_visibility(tail and (visible_text or not bool(state.get('building_tools'))))
                 if detached and tail:
                     reasoning, answer = group['reasoning'], group['answer']
                     view.reasoning_container.set_visibility(bool(reasoning) and thinking.lower() != 'off')
@@ -7529,12 +7636,37 @@ class HarnessyPage:
                 self._apply_group_timing(view, group)
                 self._apply_output_provenance(view, group)
                 self._live_sync_view = view
+        drafts = state.get('building_tools') if isinstance(state.get('building_tools'), dict) else {}
+        if active:
+            for index, progress in sorted(drafts.items(), key=lambda item: int(item[0])):
+                live_id = self._live_dom_id(state, 'tool-draft', index)
+                child = by_id.get(live_id)
+                view = getattr(child, '_harnessy_live_view', None) if child is not None else None
+                if view is None and tail:
+                    with area:
+                        view = self._render_tool_message(
+                            str(progress.get('name') or 'tool'), {}, None,
+                            created_at=str(progress.get('created_at') or ''),
+                            model_name=str(state.get('model') or '') or None,
+                            thinking=thinking, model_settings=state.get('model_settings'), building=progress)
+                    self._tag_live_view(view, state, 'tool-draft', index)
+                if isinstance(view, ToolView) and self._ui_elements_alive(view.root):
+                    keep.add(view.root.id)
+                    view.root.set_visibility(tail)
+                    self._refresh_building_tool(view, progress, state)
         tool = state.get('current_tool') if isinstance(state.get('current_tool'), dict) else None
         if active and tool:
             call_id = str(tool.get('call_id') or '')
             live_id = self._live_dom_id(state, 'tool', call_id)
             child = by_id.get(live_id)
             view = getattr(child, '_harnessy_live_view', None) if child is not None else None
+            if view is None:
+                draft_id = self._live_dom_id(state, 'tool-draft', str(int(tool.get('index') or 0)))
+                draft_child = by_id.get(draft_id)
+                view = getattr(draft_child, '_harnessy_live_view', None) if draft_child is not None else None
+                if isinstance(view, ToolView):
+                    self._promote_tool_view(view, tool, state)
+                    self._tag_live_view(view, state, 'tool', call_id)
             if view is None and detached and tail:
                 with area:
                     view = self._render_tool_message(str(tool.get('name') or 'unknown'), tool.get('arguments') or {}, None,
@@ -7547,6 +7679,10 @@ class HarnessyPage:
                 self._refresh_live_tool_status(view, tool, state)
                 setattr(view, '_harnessy_call_id', call_id)
                 self._live_sync_tool_view = view
+        for child in list(area.default_slot.children):
+            view = getattr(child, '_harnessy_live_view', None)
+            if isinstance(view, ToolView) and getattr(view, '_harnessy_is_draft', False) and child.id not in keep:
+                child.delete()
         return keep
 
     def _refresh_live_tool_status(self, view: ToolView, tool: dict[str, Any], state: dict[str, Any]) -> None:
@@ -7559,6 +7695,7 @@ class HarnessyPage:
                   'awaiting_execution': 'Awaiting execution', 'running': 'Running'}
         if getattr(view, '_harnessy_live_stage', None) != stage:
             view._harnessy_live_stage = stage
+            view.copy_state.update(name=name, arguments=dict(arguments), execution_status=stage)
             view.compact_label.set_text(f'Tool · {name} · {labels[stage]}')
             view.compact_dots.set_visibility(stage == 'running')
             self._set_expansion_label(view.expansion, self._tool_tail(name, arguments, ok=None, execution_status=stage))
@@ -7657,10 +7794,17 @@ class HarnessyPage:
                 continue
             if old is not None and old[2] != msg:
                 changed_checkpoint_inputs = True
+            adopted = self._saved_live_tool_view(ws, chat_id, msg.id) if msg.role == 'tool' else None
             with area:
-                with ui.column().classes('hy-history-row gap-0') as row:
+                # Keep the live root at the same parent: Vue would remount a
+                # card reparented into a fresh history wrapper even if its
+                # NiceGUI element id stayed the same.
+                row = adopted.root if adopted is not None else ui.column().classes('gap-0')
+                row.classes(add='hy-history-row')
+                with row:
                     date = self._message_datetime(msg.created_at)
-                    date_label = ui.label(date.strftime('%A, %B %d, %Y').replace(' 0', ' ')).classes('hy-date-separator')
+                    date_label = (old[1] if old is not None and old[0] is row else
+                                  ui.label(date.strftime('%A, %B %d, %Y').replace(' 0', ' ')).classes('hy-date-separator'))
                     try:
                         self._render_stored_message(ws, chat_id, msg, tool_arguments)
                     except Exception as exc:
@@ -7673,6 +7817,8 @@ class HarnessyPage:
                             ui.label(str(msg.content or (msg.metadata.get('reasoning') if isinstance(msg.metadata, dict) else '') or '[No text content]')).classes('hy-user-bubble')
                         log_event('harnessy', 'transcript_row_render_recovered', workspace_id=ws.id,
                                   chat_id=chat_id, message_id=msg.id, error=f'{type(exc).__name__}: {exc}')
+            if adopted is not None:
+                date_label.move(row, 0)
             self._restore_transcript_disclosures(row, disclosures)
             new_rows[msg.id] = (row, date_label, msg)
 
@@ -8256,6 +8402,18 @@ class HarnessyPage:
                     if event_type == 'completion_check':
                         self._render_completion_check_conversation(details, running=status == 'running')
 
+    def _saved_live_tool_view(self, ws: WorkspaceStore, chat_id: str, message_id: str) -> ToolView | None:
+        live_state = _AGENT_LIVE_STATES.get((ws.id, chat_id)) or {}
+        aliases = live_state.get('anchor_aliases') or {}
+        if self.message_area is not None:
+            for child in list(self.message_area.default_slot.children):
+                candidate = getattr(child, '_harnessy_live_view', None)
+                live_id = str(child._props.get('data-live-id') or '')
+                if (isinstance(candidate, ToolView) and self._ui_elements_alive(child)
+                        and (candidate.copy_state.get('message_id') == message_id or aliases.get(live_id) == message_id)):
+                    return candidate
+        return None
+
     def _render_stored_message(self, ws: WorkspaceStore, chat_id: str, msg: Any,
                                tool_arguments: dict[str, dict[str, Any]]) -> None:
         """Use the same bubble renderers as live chat, with lazy disclosures."""
@@ -8288,14 +8446,27 @@ class HarnessyPage:
                     duration = None
             except (ValueError, TypeError):
                 duration = None
-            stored_view = self._render_tool_message(
-                msg.name or 'unknown', arguments, msg.content or '',
-                created_at=str(metadata.get('started_at') or msg.created_at), ok=stored_ok,
-                duration_seconds=duration, timing=metadata, execution_status=str(metadata.get('execution_status') or '') or None,
-                message_id=msg.id, model_name=str(metadata.get('requested_by_model') or '') or None,
-                thinking=str(metadata.get('thinking') or ''), model_settings=metadata.get('model_settings'),
-                lazy_history=True,
-            )
+            # A persisted refresh must adopt the completed live card, including
+            # open disclosures and text selection, rather than replace its DOM.
+            stored_view = self._saved_live_tool_view(ws, chat_id, msg.id)
+            if stored_view is not None:
+                self._complete_tool_view(stored_view, {
+                    **metadata, 'name': msg.name or 'unknown', 'arguments': arguments,
+                    'result': msg.content or '', 'ok': stored_ok, 'message_id': msg.id,
+                    'duration_seconds': duration})
+                if stored_view.root is not ui.context.slot.parent:
+                    stored_view.root.move(ui.context.slot.parent)
+                stored_view.root.props(remove='data-live-id')
+                stored_view.root.set_visibility(True)
+            else:
+                stored_view = self._render_tool_message(
+                    msg.name or 'unknown', arguments, msg.content or '',
+                    created_at=str(metadata.get('started_at') or msg.created_at), ok=stored_ok,
+                    duration_seconds=duration, timing=metadata, execution_status=str(metadata.get('execution_status') or '') or None,
+                    message_id=msg.id, model_name=str(metadata.get('requested_by_model') or '') or None,
+                    thinking=str(metadata.get('thinking') or ''), model_settings=metadata.get('model_settings'),
+                    lazy_history=True,
+                )
             self._render_memory_notice(stored_view.root, ws, msg.id)
             if msg.name == 'attach_file':
                 self._render_attached_artifact(stored_view.root, ws, msg.chat_id, msg.content or '')
@@ -10189,6 +10360,7 @@ class HarnessyPage:
             'generated': 0,
             'tps': 0.0, 'prefill_tps': 0.0, 'tps_kind': 'unavailable', 'tps_source': '', 'tps_observed_at': 0.0,
             'tool_building': None,
+            'building_tools': {},
             'last_visible_output_at': time.perf_counter(),
             'durable_since_compact': 0,
             'current_tool': None,
@@ -10303,6 +10475,17 @@ class HarnessyPage:
             'processed': 0, 'total': 0, 'generated': 0, 'cached_tokens': None, 'uncached_total': None, 'cache_hit_rate': None, 'cache_hit_source': '', 'tps': 0.0, 'prefill_tps': 0.0, 'tps_kind': 'unavailable', 'tps_source': '', 'tps_observed_at': 0.0, 'tool_building': None,
         }
 
+        def discard_building_tools() -> None:
+            # Cleanup is presentation-only and must not replace the model's
+            # original exception or prevent Stop/finally persistence.
+            publish_live_state(building_tools={}, tool_building=None)
+            phase_state['tool_building'] = None
+            try:
+                if live_render_available():
+                    self._reconcile_live_views(ws, chat_id, process_live_state)
+            except Exception:
+                pass
+
         async def compact_durable_live_tail(increment: int = 1) -> None:
             # A single uninterrupted agent can otherwise accumulate hundreds of
             # completed Thinking/tool rows even though chat-open rendering is
@@ -10339,6 +10522,11 @@ class HarnessyPage:
             if not phase_state.get('active'):
                 return
             text_value = live_phase_text()
+            if process_live_state.get('building_tools'):
+                view.reasoning_status_label.set_visibility(False)
+                view.answer_status_label.set_visibility(False)
+                view.waiting_row.set_visibility(False)
+                return
             if view.copy_state.get('model_step_finished'):
                 view.waiting_label.set_text(text_value)
                 view.waiting_row.set_visibility(True)
@@ -10348,15 +10536,7 @@ class HarnessyPage:
                 0.0,
                 time.perf_counter() - float(current.get('last_visible_output_at') or time.perf_counter()),
             )
-            if isinstance(phase_state.get('tool_building'), dict):
-                # A tool call can take a long time to generate because its JSON
-                # arguments may contain an entire file.  Keep that silent work
-                # visible without creating a fake/blank HarnessyXO answer card.
-                view.reasoning_status_label.set_visibility(False)
-                view.answer_status_label.set_visibility(False)
-                view.waiting_label.set_text(text_value)
-                view.waiting_row.set_visibility(True)
-            elif str(phase_state.get('phase') or '') == 'generating' and target and silent_for >= 1.25:
+            if str(phase_state.get('phase') or '') == 'generating' and target and silent_for >= 1.25:
                 # Some backends buffer a structured tool call until its JSON is
                 # complete. Ollama can therefore be decoding for many seconds
                 # with no reasoning/text/tool delta to render. Promote that
@@ -10391,6 +10571,8 @@ class HarnessyPage:
                     await asyncio.sleep(1.0)
                     if phase_state.get('active'):
                         try:
+                            if process_live_state.get('building_tools') and live_render_available():
+                                self._reconcile_live_views(ws, chat_id, process_live_state)
                             refresh_phase_display()
                         except Exception:
                             pass
@@ -10503,6 +10685,7 @@ class HarnessyPage:
                 if selected_thinking.lower() == 'off':
                     view.waiting_label.set_text('Model is responding… waiting for answer')
                 elif reasoning_visible:
+                    view.root.set_visibility(True)
                     view.waiting_row.set_visibility(False)
                     view.reasoning_container.set_visibility(True)
                     view.reasoning_markdown.set_content(self._transcript_markdown(reasoning_text))
@@ -10525,6 +10708,7 @@ class HarnessyPage:
                     view.answer_time_tooltip.set_text(full)
                     current['answer_timestamp_set'] = True
                 if answer_visible:
+                    view.root.set_visibility(True)
                     view.waiting_row.set_visibility(False)
                 view.answer_container.set_visibility(answer_visible)
                 view.markdown.set_visibility(answer_visible)
@@ -10750,10 +10934,12 @@ class HarnessyPage:
                     reasoning='', answer='', stream_segments=[], output_provenance={}, created_at=str(event.get('created_at') or ''), active_output='', current_tool=None,
                     assistant_persisted=False,
                     phase_active=True, phase='waiting', backend='', phase_started=time.perf_counter(),
-                    status='Waiting for model…', processed=0, total=0, generated=0, tps=0.0, prefill_tps=0.0, tps_kind='unavailable', tps_source='', tps_observed_at=0.0, tool_building=None,
+                    status='Waiting for model…', processed=0, total=0, generated=0, tps=0.0, prefill_tps=0.0, tps_kind='unavailable', tps_source='', tps_observed_at=0.0, tool_building=None, building_tools={},
                     request_started_perf=0.0, request_started_at='', stream_watchdog=None,
                     last_visible_output_at=float(current['last_visible_output_at']),
                 )
+                if live_render_available():
+                    self._reconcile_live_views(ws, chat_id, process_live_state)
                 start_model_segment(str(event.get('created_at') or ''))
                 return
             if event_type == 'model_output_segment_start':
@@ -10807,6 +10993,10 @@ class HarnessyPage:
                         )
                 return
             if event_type == 'model_request':
+                process_live_state.update(building_tools={}, tool_building=None)
+                phase_state['tool_building'] = None
+                if live_render_available():
+                    self._reconcile_live_views(ws, chat_id, process_live_state)
                 started = number(event.get('request_started_perf')) or time.perf_counter()
                 publish_live_state(
                     request_started_perf=min(started, time.perf_counter()),
@@ -10932,18 +11122,13 @@ class HarnessyPage:
                 # period spent constructing tool JSON. Flush that final fragment
                 # immediately before switching the activity row to tool-building.
                 flush_live_output(force=True)
-                progress = {
-                    'name': str(event.get('name') or 'tool'),
-                    'target': str(event.get('target') or ''),
-                    'argument_chars': int(event.get('argument_chars') or 0),
-                }
+                progress = _record_building_tool(process_live_state, event)
                 phase_state['active'] = True
                 phase_state['phase'] = 'generating'
                 phase_state['tool_building'] = progress
-                publish_live_state(
-                    phase_active=True, phase='generating',
-                    tool_building=dict(progress),
-                )
+                publish_live_state(phase_active=True, phase='generating')
+                if live_render_available():
+                    self._reconcile_live_views(ws, chat_id, process_live_state)
                 refresh_phase_display()
                 return
             if event_type == 'model_step_complete':
@@ -10979,6 +11164,9 @@ class HarnessyPage:
                                 )
                 phase_state['active'] = False
                 phase_state['tool_building'] = None
+                _finalize_building_tools(process_live_state, event)
+                if live_render_available():
+                    self._reconcile_live_views(ws, chat_id, process_live_state)
                 current['model_persisted'] = True
                 process_live_state['persisted_revision'] = int(process_live_state.get('persisted_revision') or 0) + 1
                 publish_live_state(phase_active=False, assistant_persisted=True)
@@ -11025,6 +11213,7 @@ class HarnessyPage:
                 terminal_notification['outcome'] = 'stopped'
                 publish_live_state(outcome='stopped')
                 phase_state['active'] = False
+                discard_building_tools()
                 message = str(event.get('message') or 'Agent stopped.')
                 reason = str(event.get('reason') or 'runner_stop')
                 view = start_model_segment(str(datetime.now().astimezone().isoformat(timespec='seconds')))
@@ -11064,6 +11253,7 @@ class HarnessyPage:
                     view.waiting_row.set_visibility(False)
                     view.root.set_visibility(False)
                 call_id = str(event.get('call_id') or '')
+                _take_building_tool(process_live_state, event)
                 arguments = event.get('arguments') if isinstance(event.get('arguments'), dict) else {}
                 tool_started_perf = 0.0  # approval/writer wait is not handler execution
                 publish_live_state(
@@ -11071,6 +11261,7 @@ class HarnessyPage:
                     tool_building=None,
                     current_tool={
                         'call_id': call_id,
+                        'index': int(event.get('index') or 0),
                         'name': str(event.get('name') or 'unknown'),
                         'arguments': dict(arguments),
                         'created_at': str(event.get('created_at') or ''),
@@ -11080,18 +11271,20 @@ class HarnessyPage:
                     },
                 )
                 if live_render_available():
-                    with live_message_area:
-                        tool_view = self._render_tool_message(
-                            str(event.get('name') or 'unknown'), arguments, None,
-                            created_at=str(event.get('created_at') or ''), ok=None,
-                            model_name=str(event.get('requested_by_model') or profile.get('model') or '') or None,
-                            thinking=selected_thinking,
-                            model_settings=event.get('model_settings') or process_live_state['model_settings'],
-                        )
+                    draft_id = self._live_dom_id(process_live_state, 'tool-draft', str(int(event.get('index') or 0)))
+                    child = next((row for row in live_message_area.default_slot.children
+                                  if str(row._props.get('data-live-id') or '') == draft_id), None)
+                    tool_view = getattr(child, '_harnessy_live_view', None) if child is not None else None
+                    if not isinstance(tool_view, ToolView):
+                        with live_message_area:
+                            tool_view = self._render_tool_message(
+                                str(event.get('name') or 'unknown'), arguments, None,
+                                created_at=str(event.get('created_at') or ''), ok=None,
+                                model_name=str(event.get('requested_by_model') or profile.get('model') or '') or None,
+                                thinking=selected_thinking,
+                                model_settings=event.get('model_settings') or process_live_state['model_settings'])
+                    self._promote_tool_view(tool_view, process_live_state['current_tool'], process_live_state)
                     self._tag_live_view(tool_view, process_live_state, 'tool', call_id)
-                    tool_view.duration_label.set_text('Awaiting execution')
-                    tool_view.duration_label.set_visibility(True)
-                    self._refresh_live_tool_status(tool_view, process_live_state['current_tool'], process_live_state)
                     tool_views[call_id] = tool_view
                 return
             if event_type == 'tool_execution_start':
@@ -11115,51 +11308,15 @@ class HarnessyPage:
                     current['last_tool_cancelled'] = name
                 process_live_state['persisted_revision'] = int(process_live_state.get('persisted_revision') or 0) + 1
                 publish_anchor_alias('tool', call_id, str(event.get('message_id') or ''))
+                active_tool = process_live_state.get('current_tool') or {}
+                publish_anchor_alias('tool-draft', str(int(active_tool.get('index') or 0)),
+                                     str(event.get('message_id') or ''))
                 publish_live_state(current_tool=None)
                 tool_view = tool_views.get(call_id)
                 if tool_view is None or not live_render_available(tool_view.root):
                     return
                 durable_id = str(event.get('message_id') or '')
-                if durable_id:
-                    tool_view.root.props(f'id=hy-msg-{durable_id} data-message-id={durable_id}')
-                    tool_view.ref_label.set_text(self._bubble_ref('T', durable_id))
-                    tool_view.ref_label.set_visibility(True)
-                    self._bind_saved_bubble_bookmark(
-                        tool_view.card, tool_view.bubble_id, durable_id, 'tool',
-                    )
-                tool_view.copy_state.update({
-                    'name': name, 'arguments': dict(arguments), 'result': result, 'ok': ok,
-                    'execution_status': str(event.get('execution_status') or '') or None,
-                    'message_id': durable_id, '_ready': True,
-                })
-                tool_view.copy_button.set_visibility(True)
-                tool_view.card.classes(remove='hy-bubble-copy-pending hy-activity-running')
-                if not ok:
-                    tool_view.card.classes(add='hy-tool-failed')
-                tool_view.duration_label.set_text(self._tool_duration_text(event))
-                tool_view.duration_label.set_visibility(True)
-                compact_state = 'Completed' if ok else 'Failed'
-                compact_duration = self._compact_elapsed_text(event.get('execution_duration_seconds', duration))
-                compact_text = f'Tool · {name} · {compact_state}'
-                if compact_duration:
-                    compact_text += f' · {compact_duration}'
-                tool_view.compact_label.set_text(compact_text)
-                tool_view.compact_dots.set_visibility(False)
-                self._set_expansion_label(
-                    tool_view.expansion,
-                    self._tool_tail(
-                        name, arguments, result, ok=ok, duration_seconds=duration,
-                        execution_status=str(event.get('execution_status') or '') or None,
-                    ),
-                )
-                tool_view.details_markdown.set_content(
-                    self._tool_details(
-                        name, arguments, result, ok=ok, duration_seconds=duration,
-                        execution_status=str(event.get('execution_status') or '') or None, timing=event,
-                    )
-                )
-                tool_view.raw_markdown.set_content(self._markdown_code_block(self._tool_raw_result(result), 'text'))
-                tool_view.raw_expansion.set_visibility(bool(result))
+                self._complete_tool_view(tool_view, event)
                 if name == 'attach_file':
                     self._render_attached_artifact(tool_view.root, ws, chat_id, result)
                 if durable_id:
@@ -11300,6 +11457,7 @@ class HarnessyPage:
                 view.waiting_row.set_visibility(False)
                 view.root.set_visibility(False)
         except asyncio.CancelledError:
+            discard_building_tools()
             terminal_notification['outcome'] = 'stopped'
             publish_live_state(outcome='stopped')
             phase_state['active'] = False
@@ -11374,6 +11532,7 @@ class HarnessyPage:
             except Exception:
                 pass
         except Exception as exc:
+            discard_building_tools()
             error_text, error_detail, notification_text, terminal_reason = self._friendly_harness_error(exc)
             # Capture the real exception before error recovery touches SQLite.
             log_event(
@@ -11486,8 +11645,9 @@ class HarnessyPage:
                 publish_live_state(
                     active=False, finished=True, phase_active=False,
                     run_finished_perf=time.perf_counter(),
-                    current_tool=None, assistant_persisted=True,
+                    current_tool=None, assistant_persisted=True, building_tools={}, tool_building=None,
                 )
+                discard_building_tools()
             phase_clock_task.cancel()
             try:
                 await phase_clock_task
@@ -20468,6 +20628,48 @@ def _remote_chat_runtime(
     return machine.get_model_profile(profile_id, settings), thinking
 
 
+def _record_building_tool(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+    """Keep presentation-only progress by provider index, including late call IDs."""
+    key = str(int(event.get('index') or 0))
+    rows = dict(state.get('building_tools') or {})
+    previous = rows.get(key) or {}
+    row = {
+        'index': int(key), 'call_id': str(event.get('call_id') or previous.get('call_id') or ''),
+        'name': str(event.get('name') or previous.get('name') or 'tool'),
+        'target': str(event.get('target') or ''),
+        'argument_chars': max(0, int(event.get('argument_chars') or 0)),
+        'created_at': str(previous.get('created_at') or datetime.now().astimezone().isoformat(timespec='seconds')),
+    }
+    rows[key] = row
+    state['building_tools'] = rows
+    state['tool_building'] = row
+    return row
+
+
+def _finalize_building_tools(state: dict[str, Any], event: dict[str, Any]) -> None:
+    """Discard rejected partial calls; accepted calls keep their mounted draft cards."""
+    rows = dict(state.get('building_tools') or {})
+    accepted = event.get('tool_calls')
+    if not event.get('has_tool_calls'):
+        rows = {}
+    elif isinstance(accepted, list):
+        final = {str(int(call.get('index') or 0)): call for call in accepted if isinstance(call, dict)}
+        rows = {key: {**row, 'finalized': True, 'call_id': str(final[key].get('call_id') or row.get('call_id') or ''),
+                      'name': str(final[key].get('name') or row.get('name') or 'tool')}
+                for key, row in rows.items() if key in final}
+    state['building_tools'] = rows
+    state['tool_building'] = None
+
+
+def _take_building_tool(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any] | None:
+    rows = dict(state.get('building_tools') or {})
+    key = str(int(event.get('index') or 0))
+    row = rows.pop(key, None)
+    state['building_tools'] = rows
+    state['tool_building'] = None
+    return row
+
+
 def _new_remote_live_state(
     *, workspace_id: str, chat_id: str, profile: dict[str, Any], thinking: str,
     source: str = 'remote', run_id: str | None = None,
@@ -20518,6 +20720,7 @@ def _new_remote_live_state(
         'tps_source': '',
         'tps_observed_at': 0.0,
         'tool_building': None,
+        'building_tools': {},
         'last_visible_output_at': now,
         'current_tool': None,
     }
@@ -20757,6 +20960,7 @@ async def _run_headless_turn(
                     model=str(event.get('model') or profile.get('model') or ''),
                     reasoning='', answer='', stream_segments=[], output_provenance={}, phase_timings=[],
                     active_output='', assistant_persisted=False, current_tool=None,
+                    tool_building=None, building_tools={},
                     phase_active=True, phase='waiting', phase_started=time.perf_counter(),
                     request_started_perf=0.0, request_started_at='', stream_watchdog=None,
                     processed=0, total=0, generated=0, cached_tokens=None, uncached_total=None,
@@ -20784,6 +20988,7 @@ async def _run_headless_turn(
                 publish(active_output=kind)
             elif event_type == 'model_request':
                 publish(
+                    tool_building=None, building_tools={},
                     request_started_perf=min(number(event.get('request_started_perf')) or time.perf_counter(), time.perf_counter()),
                     request_started_at=str(event.get('request_started_at') or ''), stream_watchdog=None,
                     processed=0, total=0, generated=0, cached_tokens=None, uncached_total=None,
@@ -20825,23 +21030,27 @@ async def _run_headless_turn(
             elif event_type == 'model_phase_timing':
                 publish(phase_timings=list(event.get('spans') or []))
             elif event_type == 'tool_call_building':
-                publish(tool_building=dict(event), phase_active=True)
+                _record_building_tool(state, event)
+                publish(phase_active=True, phase='generating')
             elif event_type == 'model_step_complete':
                 if isinstance(event.get('stream_segments'), list):
                     state['stream_segments'] = [dict(row) for row in event['stream_segments']]
                 if isinstance(event.get('output_provenance'), dict):
                     state['output_provenance'] = dict(event['output_provenance'])
                 state['persisted_revision'] = int(state.get('persisted_revision') or 0) + 1
-                publish(assistant_persisted=True, phase_active=False, tool_building=None)
+                _finalize_building_tools(state, event)
+                publish(assistant_persisted=True, phase_active=False)
             elif event_type == 'completed_group_checkpoint':
                 publish(checkpoint_revision=int(state.get('checkpoint_revision') or 0) + 1,
                         checkpoint_message_id=str(event.get('message_id') or ''))
             elif event_type == 'tool_start':
+                _take_building_tool(state, event)
                 publish(
                     phase_active=False,
                     tool_building=None,
                     current_tool={
                         'call_id': str(event.get('call_id') or ''),
+                        'index': int(event.get('index') or 0),
                         'name': str(event.get('name') or 'unknown'),
                         'arguments': dict(event.get('arguments') or {}),
                         'created_at': str(event.get('created_at') or ''),
@@ -20856,6 +21065,14 @@ async def _run_headless_turn(
                     publish(current_tool=tool)
             elif event_type == 'tool_complete':
                 state['persisted_revision'] = int(state.get('persisted_revision') or 0) + 1
+                durable_id = str(event.get('message_id') or '')
+                if durable_id:
+                    aliases = state.setdefault('anchor_aliases', {})
+                    aliases[HarnessyPage._live_dom_id(state, 'tool', str(event.get('call_id') or ''))] = durable_id
+                    active_tool = state.get('current_tool') or {}
+                    aliases[HarnessyPage._live_dom_id(state, 'tool-draft', str(int(active_tool.get('index') or 0)))] = durable_id
+                    while len(aliases) > 256:
+                        aliases.pop(next(iter(aliases)))
                 publish(current_tool=None)
             elif event_type == 'run_complete':
                 publish(outcome='success')
@@ -21021,6 +21238,7 @@ async def _run_headless_turn(
                 'run_finished_perf': time.perf_counter(),
                 'phase_active': False,
                 'current_tool': None,
+                'tool_building': None, 'building_tools': {},
                 'assistant_persisted': True,
                 'outcome': outcome,
                 'revision': int(state.get('revision') or 0) + 1,
