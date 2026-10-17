@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.6.114
+
+- Show an access summary and expandable action list beside Model access for SSH devices, managed test VMs and VM creation. See which checks run directly, which actions ask, and when global On or Off overrides the target setting. Refresh the breakdown after changing global permissions.
+- List the SSH command filter’s exact blocked command names and protected paths, and explain the separate managed-VM and file-transfer rules. Keep the filter and permission enforcement unchanged. Leave README unchanged.
+
 ## v0.6.113
 
 - Add the Completion Check toggle in Settings → Agent / Tools → Agent Settings, alongside its existing explanation. Keep it on by default and save your choice when you turn it off.

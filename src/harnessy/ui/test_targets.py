@@ -15,9 +15,10 @@ from harnessy.agent.external_targets import ExternalTargetBroker
 from harnessy.core.terminal import TerminalSession
 from harnessy.environment.presets import canonical_arch
 from harnessy.environment.test_targets import TestTargetManager, target_operation_error
+from harnessy.ui.target_access import render_target_access_help
 
 
-def open_vm_creator(ws, refresh, os_name='ubuntu-24.04'):
+def open_vm_creator(ws, refresh, os_name='ubuntu-24.04', *, machine=None):
     from harnessy.environment.test_catalog import GUESTS, guest_os, target_architectures
     initial = guest_os(os_name)
     with ui.dialog() as dialog, ui.card().classes('hy-form-dialog hy-vm-creator'):
@@ -48,6 +49,7 @@ def open_vm_creator(ws, refresh, os_name='ubuntu-24.04'):
                 architecture_hint = ui.label('Matching the host enables acceleration. Other architectures use slower CPU emulation.').classes('text-xs hy-muted')
                 approval = ui.select({'ask': 'Ask before protected target actions', 'on': 'Allow autonomous target tools'},
                     value='on', label='Model access').classes('w-full')
+                render_target_access_help(machine, approval, managed_vm=True, draft=True)
                 ui.label('The model can install software and make system changes in this test VM.').classes('text-xs hy-muted')
             with ui.column().classes('w-full gap-2') as radio_options:
                 ui.label('Guest radio emulation').classes('font-semibold text-sm')
@@ -437,6 +439,8 @@ def render_managed_target(page, ws, target, refresh):
                     remote_root=target.remote_root, enabled=bool(enabled.value), approval_mode=approval.value, managed_vm=current.managed_vm)
             enabled.on_value_change(save_access)
             approval.on_value_change(save_access)
+            render_target_access_help(page.machine, approval, enabled=enabled,
+                                      managed_vm=True, policy=target.policy)
         if manager.guest.family == 'openwrt':
             with ui.expansion('Emulated radios', icon='wifi').classes('w-full hy-target-details'):
                 requested = c.get('emulation') or {}

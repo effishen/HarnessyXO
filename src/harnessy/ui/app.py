@@ -2727,12 +2727,13 @@ class HarnessyPage:
     def _render_test_targets(self, ws: WorkspaceStore) -> None:
         """Render independent targets inside Environment, never a separate window."""
         from harnessy.ui.test_targets import open_vm_creator, render_managed_target
+        from harnessy.ui.target_access import render_target_access_help
         with ui.column().classes('hy-targets-toolbar w-full gap-3'):
             ui.label('Connect a device or create a VM for testing. Each target has its own files and system.').classes('text-sm hy-muted')
             with ui.row().classes('w-full items-center gap-2'):
                 count_label = ui.label('Targets').classes('font-semibold grow')
                 ui.button('Connect device', icon='add_link', on_click=lambda: open_editor()).props('outline no-caps')
-                ui.button('Create VM', icon='add', on_click=lambda: open_vm_creator(ws, render_targets)).props('unelevated no-caps color=primary')
+                ui.button('Create VM', icon='add', on_click=lambda: open_vm_creator(ws, render_targets, machine=self.machine)).props('unelevated no-caps color=primary')
             with ui.row().classes('hy-target-filters w-full gap-2'):
                 search = ui.input('Search targets', placeholder='Name, OS or host').props('outlined dense clearable debounce=200').classes('grow min-w-0')
                 kind = ui.select({'all': 'All targets', 'vm': 'Test VMs', 'device': 'External devices'}, value='all', label='Show').props('outlined dense').classes('w-44')
@@ -2792,9 +2793,8 @@ class HarnessyPage:
                     value=target.approval_mode if target else 'ask',
                     label='Model access',
                 ).classes('w-full')
-                ui.label(
-                    '“Allow autonomously” skips individual approval for brokered target tools. The remote SSH account’s existing OS privileges still apply.'
-                ).classes('text-xs hy-muted')
+                render_target_access_help(self.machine, approval, enabled=enabled,
+                                          policy=target.policy if target else None, draft=True)
                 with ui.row().classes('w-full justify-end gap-2'):
                     ui.button('Cancel', on_click=editor.close).props('flat no-caps')
 

@@ -24,15 +24,29 @@ class ExternalTargetError(RuntimeError):
 
 # This is a best-effort command policy, never an OS isolation boundary. A root
 # SSH target gives every allowed target command root privileges on that host.
+EXTERNAL_TARGET_COMMAND_RULES: tuple[tuple[str, str, str], ...] = (
+    ('Privilege escalation', r'sudo|su|doas|pkexec', 'sudo, su, doas, pkexec'),
+    ('Services and packages', r'systemctl|service|apt(?:-get)?|dpkg|dnf|yum|rpm|apk|pacman',
+     'systemctl, service, apt, apt-get, dpkg, dnf, yum, rpm, apk, pacman'),
+    ('Disks and mounts', r'mount|umount|fdisk|sfdisk|parted|mkfs(?:\.[A-Za-z0-9_-]+)?|dd',
+     'mount, umount, fdisk, sfdisk, parted, mkfs, mkfs.*, dd'),
+    ('Power controls', r'reboot|shutdown|halt|poweroff', 'reboot, shutdown, halt, poweroff'),
+    ('Firewalls', r'iptables|ip6tables|nft|pfctl', 'iptables, ip6tables, nft, pfctl'),
+    ('Users and groups', r'useradd|userdel|usermod|groupadd|groupdel|passwd',
+     'useradd, userdel, usermod, groupadd, groupdel, passwd'),
+    ('Process isolation', r'chroot|nsenter', 'chroot, nsenter'),
+    ('Remote access and network tools', r'ssh|scp|sftp|telnet|nc|netcat|socat|nmap',
+     'ssh, scp, sftp, telnet, nc, netcat, socat, nmap'),
+)
+EXTERNAL_TARGET_PROTECTED_PATHS: tuple[str, ...] = (
+    '/etc', '/root', '/boot', '/sys', '/proc', '/run', '/var/lib', '/var/run', '/home',
+)
 _BLOCKED_COMMAND_RE = re.compile(
-    r"(?:^|[\s;&|()])(?:sudo|su|doas|pkexec|systemctl|service|apt(?:-get)?|dpkg|dnf|yum|rpm|apk|pacman|"
-    r"mount|umount|fdisk|sfdisk|parted|mkfs(?:\.[A-Za-z0-9_-]+)?|dd|reboot|shutdown|halt|poweroff|"
-    r"iptables|ip6tables|nft|pfctl|useradd|userdel|usermod|groupadd|groupdel|passwd|chroot|nsenter|"
-    r"ssh|scp|sftp|telnet|nc|netcat|socat|nmap)(?:\s|$)",
+    r"(?:^|[\s;&|()])(?:" + '|'.join(rule[1] for rule in EXTERNAL_TARGET_COMMAND_RULES) + r")(?:\s|$)",
     re.IGNORECASE,
 )
 _BLOCKED_PATH_RE = re.compile(
-    r"(?:^|[\s'\"=:(])/(?:etc|root|boot|sys|proc|run|var/lib|var/run|home)(?:/|\b)",
+    r"(?:^|[\s'\"=:(])/(?:" + '|'.join(path[1:] for path in EXTERNAL_TARGET_PROTECTED_PATHS) + r")(?:/|\b)",
     re.IGNORECASE,
 )
 
