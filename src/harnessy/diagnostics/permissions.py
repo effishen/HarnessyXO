@@ -13,13 +13,23 @@ PERMISSION_FAMILIES = frozenset({
     'processes', 'git_read', 'git_write', 'browser', 'web', 'code_intelligence',
     'rea', 'diagnostics', 'external_targets',
 })
+# Keep this privacy projection explicit. Action labels, command rules, target
+# identifiers and saved connection settings are never diagnostic fields.
+TARGET_ACTION_PERMISSIONS = frozenset({
+    'allow_status', 'allow_list', 'allow_exec', 'allow_copy_to', 'allow_copy_from',
+    'vm_start', 'vm_stop', 'vm_snapshot', 'vm_restore', 'exec_privilege',
+    'exec_packages', 'exec_services', 'exec_disks_mounts', 'exec_power',
+    'exec_firewall', 'exec_users_groups', 'exec_process_isolation',
+    'exec_remote_network', 'exec_system_paths', 'outside_test_root',
+})
 PERMISSION_ENUMS = {
     'permission_source': frozenset({'run_start', 'saved_settings', 'unavailable'}),
     'permission_reason': frozenset({
         'blocked_off', 'policy_unavailable', 'target_invalid', 'ask', 'global_on',
         'target_on', 'read_only', 'owned_session', 'approved_once', 'target_unavailable',
+        'blocked_target_action', 'selected_on',
     }),
-    'permission_target_mode': frozenset({'ask', 'on', 'not_applicable'}),
+    'permission_target_mode': frozenset({'full', 'selected', 'ask', 'on', 'not_applicable'}),
     'permission_target_state': frozenset({
         'enabled', 'disabled', 'missing', 'invalid', 'not_found', 'not_applicable',
     }),
@@ -77,6 +87,14 @@ def validate_permission_states(value: Any) -> dict[str, str]:
             if key in value and isinstance(value[key], str) and value[key] in PERMISSION_STATES}
 
 
+def validate_target_action_permissions(value: Any) -> dict[str, str]:
+    """Retain only reviewed action IDs and canonical Off/Ask/On states."""
+    if not isinstance(value, dict):
+        return {}
+    return {key: value[key] for key in sorted(TARGET_ACTION_PERMISSIONS)
+            if key in value and isinstance(value[key], str) and value[key] in PERMISSION_STATES}
+
+
 def validate_permission_decision(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
@@ -91,6 +109,8 @@ def validate_permission_decision(value: Any) -> dict[str, Any]:
         safe['changed'] = value['changed']
     if isinstance(value.get('states'), dict):
         safe['states'] = validate_permission_states(value['states'])
+    if isinstance(value.get('target_actions'), dict):
+        safe['target_actions'] = validate_target_action_permissions(value['target_actions'])
     return safe
 
 
@@ -130,6 +150,8 @@ def validate_permission_event(event: Any, value: Any) -> dict[str, Any] | None:
             safe[key] = item
     if isinstance(value.get('permission_states'), dict):
         safe['permission_states'] = validate_permission_states(value['permission_states'])
+    if isinstance(value.get('target_action_permissions'), dict):
+        safe['target_action_permissions'] = validate_target_action_permissions(value['target_action_permissions'])
     if isinstance(value.get('required_permissions'), (list, tuple)):
         safe['required_permissions'] = [item for item in value['required_permissions'][:len(PERMISSION_FAMILIES)]
                                         if isinstance(item, str) and item in PERMISSION_FAMILIES]

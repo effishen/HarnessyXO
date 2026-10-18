@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.121
+
+- Replace target Model access with **Allow Full Unrestricted Access** and **Allow Only Selected Actions**. Selected actions appear in a collapsible card with an individual **Off / Ask / On** control.
+- Set independent permissions for status checks, files, commands, copies, each managed VM control, package and service commands, power, disks, firewalls, users, remote access and paths. Full access enables every target action within the remote account's privileges. Selected command categories are best-effort text checks, not an OS sandbox.
+- Keep global External/Test Targets as a separate access gate. Global On no longer overrides an action set to Ask or Off; global Ask still requires access approval, including fixed checks. Recheck saved permissions before execution and while approval is pending.
+- Retain selected choices when switching modes, and preserve existing target restrictions during upgrades and unrelated edits. Leave README unchanged.
+- Verified browser controls, persistence, action enforcement and live permission changes on Linux. Native Mac/Windows testing was unavailable.
+
 ## v0.6.120
 
 - Keep an opened workspace ready when starting chats, processing queued work or reloading a browser page. Normal database writes no longer trigger another full startup check and initialization for every request.

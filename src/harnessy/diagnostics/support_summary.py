@@ -360,6 +360,10 @@ def _permission_failure_classification(row: dict[str, Any]) -> str | None:
         return 'tool_target_validation_failed'
     if row.get('error_code') == 'PERMISSION_POLICY_UNAVAILABLE':
         return 'tool_permission_policy_unavailable'
+    decision = row.get('permission_decision')
+    if (row.get('error_code') == 'TARGET_ACTION_OFF'
+            or (isinstance(decision, dict) and decision.get('reason') == 'blocked_target_action')):
+        return 'tool_target_action_blocked'
     return None
 
 
@@ -722,7 +726,7 @@ def _evidence(row: dict[str, Any]) -> dict[str, Any]:
         'error_code', 'target_validation', 'permission', 'permission_decision',
         'permission_source', 'permission_reason', 'permission_target_mode',
         'permission_target_state', 'permission_changed', 'permission_states',
-        'required_permissions', 'phase', 'approval_required', 'approved',
+        'required_permissions', 'target_action_permissions', 'phase', 'approval_required', 'approved',
         'approval_wait_seconds', 'execution_duration_seconds', 'coordination_wait_seconds',
         'state', 'changed', 'archive_check', 'storage_issue', 'version', 'status',
         'exception_class',
@@ -1162,6 +1166,7 @@ def _permission_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[
     approved_ids: set[tuple[Any, ...]] = set()
     denied_ids: set[tuple[Any, ...]] = set()
     validation_ids: set[tuple[Any, ...]] = set()
+    blocked_action_ids: set[tuple[Any, ...]] = set()
     changed_ids: set[tuple[Any, ...]] = set()
     sources: Counter[str] = Counter()
     reasons: Counter[str] = Counter()
@@ -1182,6 +1187,8 @@ def _permission_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[
             sources[source] += 1
         if reason == 'ask':
             request_ids.add(key)
+        if reason == 'blocked_target_action':
+            blocked_action_ids.add(key)
         if reason == 'approved_once' or row.get('approved') is True:
             approved_ids.add(key)
         if row.get('execution_status') == 'denied' or row.get('approved') is False:
@@ -1213,7 +1220,7 @@ def _permission_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[
         safe['event'] = row['event']
         for key in ('timestamp', 'session_scope', 'channel'):
             safe[key] = row[key]
-        if row.get('error_code') in {'TARGET_POLICY', 'PERMISSION_POLICY_UNAVAILABLE'}:
+        if row.get('error_code') in {'TARGET_POLICY', 'PERMISSION_POLICY_UNAVAILABLE', 'TARGET_ACTION_OFF'}:
             safe['error_code'] = row['error_code']
         receipts.append(safe)
     waits = [safe_timing(row.get('approval_wait_seconds')) for row in timed]
@@ -1234,6 +1241,7 @@ def _permission_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[
         'approvals_denied': len(denied_ids) if decisions else None,
         'permission_changes_observed': len(changed_ids) if decisions else None,
         'target_validation_failures': len(validation_ids) if decisions or validation_ids else None,
+        'target_actions_blocked': len(blocked_action_ids) if decisions else None,
         'target_policy_failures_without_validation_label': unlabelled_policy,
         'timed_tool_completions': len(timed), 'approval_wait_records': len(waits),
         'approval_wait_seconds': round(sum(waits), 6) if waits else None,
@@ -1265,6 +1273,8 @@ def _permission_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[
         lines.append('  Approval wait timing was not recorded; total tool duration does not establish time spent waiting for permission.')
     if validation_ids:
         lines.append(f'  Target argument validation failures observed: {len(validation_ids)}; fixed labels distinguish missing/invalid/not-found/disabled targets without target names.')
+    if blocked_action_ids:
+        lines.append(f'  Target calls blocked by selected action permissions: {len(blocked_action_ids)}. The required action was Off; this does not indicate a denied approval dialog.')
     if unlabelled_policy:
         lines.append(f'  Target policy failures without a recorded validation label: {unlabelled_policy}; their cause and any approval wait remain unverified.')
     lines.extend(['  Approval counts are unique tool calls, not the number of displayed dialogs; an unavailable approval handler may prevent a dialog from opening.',

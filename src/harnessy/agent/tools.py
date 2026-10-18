@@ -38,7 +38,8 @@ from .code_intelligence import CodeIntelligenceService
 from .client import OpenAICompatibleClient
 from .skills import SkillLibrary, SkillRecord
 from .scheduler import GLOBAL_AGENT_SLOTS, MODEL_GENERATION_SCHEDULER, WORKSPACE_MUTATIONS
-from .external_targets import ExternalTargetBroker, ExternalTargetError
+from .external_targets import ExternalTargetBroker, ExternalTargetError, target_tool_permissions
+from harnessy.core.target_policy import TARGET_ACTION_LABELS
 
 ToolHandler = Callable[[dict[str, Any]], Awaitable[str]]
 
@@ -59,24 +60,58 @@ ToolStatusCallback = Callable[[str], Awaitable[None]]
 VALID_TOOL_PERMISSIONS = {'off', 'ask', 'on'}
 
 
+def target_approval_scope(workspace: WorkspaceStore, target: Any) -> str:
+    """Bind a one-call approval to the saved connection, without logging it."""
+    credential_revision = None
+    if target.auth_method == 'password':
+        from harnessy.core.target_credentials import TargetCredentialStore
+        try:
+            stat = TargetCredentialStore().path.lstat()
+            credential_revision = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+        except OSError as exc:
+            credential_revision = type(exc).__name__
+    identity = {
+        'workspace': workspace.id, 'target': target.id, 'host': target.host, 'port': target.port,
+        'username': target.username, 'remote_root': target.remote_root,
+        'auth_method': target.auth_method, 'identity_file': target.identity_file,
+        'managed_vm': target.managed_vm, 'updated_at': target.updated_at,
+        'credential_revision': credential_revision,
+    }
+    return target.id + '-' + hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+
+
+def _permission_approval_keys(
+    states: dict[str, str], *, approve_when_ask: bool = True,
+    target_permissions: dict[str, str] | None = None, target_scope: str = '',
+) -> set[str]:
+    keys = {key for key, value in states.items()
+            if value == 'ask' and (approve_when_ask or key == 'external_targets')}
+    if 'external_targets' in keys and target_scope:
+        keys.remove('external_targets')
+        keys.add('external_targets@' + target_scope)
+    keys.update('target:' + target_scope + ':' + key
+                for key, value in (target_permissions or {}).items() if value == 'ask')
+    return keys
+
+
 def tool_permission_reason(
     states: dict[str, str], *, approve_when_ask: bool = True,
     target_state: str = 'not_applicable', target_mode: str = 'not_applicable',
     approved_permissions: set[str] | frozenset[str] = frozenset(),
     owned_session: bool = False,
+    target_permissions: dict[str, str] | None = None, target_scope: str = '',
 ) -> str:
     """Shared policy precedence for execution and pending-request reconciliation."""
     if 'off' in states.values():
         return 'blocked_off'
-    ask = {key for key, value in states.items() if value == 'ask'}
+    if any(value != 'on' and value != 'ask' for value in (target_permissions or {}).values()):
+        return 'blocked_target_action'
+    ask = _permission_approval_keys(
+        states, approve_when_ask=approve_when_ask,
+        target_permissions=target_permissions, target_scope=target_scope,
+    )
     if not ask:
-        return 'global_on'
-    if not approve_when_ask:
-        return 'owned_session' if owned_session else 'read_only'
-    if target_state == 'enabled' and target_mode == 'on':
-        ask.discard('external_targets')
-        if not ask:
-            return 'target_on'
+        return ('owned_session' if owned_session else 'read_only') if 'ask' in states.values() else 'global_on'
     if ask <= approved_permissions:
         return 'approved_once'
     return 'ask'
@@ -496,7 +531,7 @@ class WorkspaceToolbox:
                     'target': {'type': 'string', 'description': 'Configured target id or exact target name.'},
                 }, 'required': ['target']
             }, 'external_targets', 'external_targets', read_only=True, approve_when_ask=False),
-            ToolDefinition('target_list_files', 'List files under a configured external target test root. Paths are relative to that root; this tool cannot browse arbitrary remote system paths.', {
+            ToolDefinition('target_list_files', 'List files on a configured target. Relative paths use its test root; absolute paths or parent traversal also require the target action Use paths outside the test root. Selected Off blocks and Ask requires approval.', {
                 'type': 'object', 'properties': {
                     'target': {'type': 'string'},
                     'path': {'type': 'string', 'default': '.'},
@@ -504,23 +539,23 @@ class WorkspaceToolbox:
                     'max_entries': {'type': 'integer', 'minimum': 1, 'maximum': 2000, 'default': 300},
                 }, 'required': ['target']
             }, 'external_targets', 'external_targets', read_only=True, approve_when_ask=False),
-            ToolDefinition('target_exec', 'Run the configured guest shell (ash on OpenWrt, bash on other Linux, PowerShell on Windows). Managed test VMs allow software installation and privileged guest commands. External SSH devices keep their existing command filter; root is not confined by that filter. Check target_status hardware_emulation before hardware claims: software radios do not prove real RF or USB dongle support. Credentials remain on the host.', {
+            ToolDefinition('target_exec', 'Run the configured target shell (ash on OpenWrt, bash on other Linux, PowerShell on Windows). Obey its effective actions: Full permits all target actions within the account privileges; Selected applies Off/Ask/On to commands, matching command categories and paths. Text categories are best effort, not OS isolation. Check target_status hardware_emulation before hardware claims: software radios do not prove real RF or USB dongle support. Credentials remain on the host.', {
                 'type': 'object', 'properties': {
                     'target': {'type': 'string'},
                     'command': {'type': 'string'},
-                    'working_directory': {'type': 'string', 'default': '.', 'description': 'Relative directory under the configured remote test root.'},
+                    'working_directory': {'type': 'string', 'default': '.', 'description': 'Relative to the test root by default. Absolute paths or parent traversal also require Use paths outside the test root.'},
                     'timeout_seconds': {'type': 'integer', 'minimum': 1, 'maximum': 7200, 'default': 180},
                 }, 'required': ['target', 'command']
             }, 'external_targets', 'external_targets'),
-            ToolDefinition('target_copy_to', 'Copy one regular file from the active HarnessyXO workspace root to a path under the configured external target test root. SSH credentials never enter the workspace VM or model context.', {
+            ToolDefinition('target_copy_to', 'Copy one regular file from the active workspace to the target. Relative remote paths use its test root; paths outside it also require Use paths outside the test root. Local paths stay inside the workspace. SSH credentials stay on the host.', {
                 'type': 'object', 'properties': {
                     'target': {'type': 'string'},
                     'local_path': {'type': 'string', 'description': 'Relative path under the active HarnessyXO working root.'},
-                    'remote_path': {'type': 'string', 'description': 'Relative destination path under the target test root.'},
+                    'remote_path': {'type': 'string', 'description': 'Remote destination, relative to the test root unless outside-root access is permitted.'},
                     'timeout_seconds': {'type': 'integer', 'minimum': 1, 'maximum': 7200, 'default': 300},
                 }, 'required': ['target', 'local_path', 'remote_path']
             }, 'external_targets', 'external_targets'),
-            ToolDefinition('target_copy_from', 'Copy one regular file from the configured external target test root into the active HarnessyXO workspace root.', {
+            ToolDefinition('target_copy_from', 'Copy one regular file from the target into the active workspace. Relative remote paths use its test root; paths outside it also require Use paths outside the test root. Local destinations stay inside the workspace.', {
                 'type': 'object', 'properties': {
                     'target': {'type': 'string'},
                     'remote_path': {'type': 'string'},
@@ -927,9 +962,9 @@ class WorkspaceToolbox:
 
     def _permission_target_context(
         self, definition: ToolDefinition, arguments: dict[str, Any],
-    ) -> tuple[str, str, dict[str, Any] | None]:
+    ) -> tuple[str, str, dict[str, str], str, dict[str, Any] | None]:
         if definition.permission != 'external_targets' or 'target' not in definition.parameters.get('required', []):
-            return 'not_applicable', 'not_applicable', None
+            return 'not_applicable', 'not_applicable', {}, '', None
         raw = arguments.get('target')
         if raw is None or (isinstance(raw, str) and not raw.strip()):
             state, error = 'missing', 'Specify a configured target id or exact target name. No target was selected.'
@@ -942,8 +977,9 @@ class WorkspaceToolbox:
             elif not target.enabled:
                 state, error = 'disabled', 'The selected external target is disabled.'
             else:
-                return 'enabled', 'on' if target.approval_mode == 'on' else 'ask', None
-        return state, 'not_applicable', {
+                return ('enabled', str(target.policy.get('access_mode', 'selected')),
+                        target_tool_permissions(target, definition.name, arguments), target_approval_scope(self.workspace, target), None)
+        return state, 'not_applicable', {}, '', {
             'ok': False, 'error_code': 'TARGET_POLICY', 'target_validation': state,
             'error': error, 'write_applied': False,
             'next_model_action': 'Use list_external_targets and pass an explicit enabled target. Do not infer a target.',
@@ -1175,21 +1211,32 @@ class WorkspaceToolbox:
         execution_started: float | None = None
         approved_permissions: set[str] = set()
         previous_permission_states = dict(permission_states)
+        previous_target_permissions: dict[str, str] | None = None
+        previous_target_scope: str | None = None
         policy_changed = False
 
         async def authorize(phase: str, *, allow_prompt: bool = True) -> str | None:
             nonlocal permission_states, permission_state, previous_permission_states, policy_changed
+            nonlocal previous_target_permissions, previous_target_scope
             while True:
                 available = self._refresh_permission_policy()
                 permission_states = self.permission_states_for(definition)
                 permission_state = self.effective_permission_for(definition)
                 policy_changed = policy_changed or permission_states != previous_permission_states
                 previous_permission_states = dict(permission_states)
-                target_state, target_mode, target_error = (
+                target_state, target_mode, target_permissions, target_scope, target_error = (
                     self._permission_target_context(definition, arguments)
                     if available and permission_state != 'off'
-                    else ('not_applicable', 'not_applicable', None)
+                    else ('not_applicable', 'not_applicable', {}, '', None)
                 )
+                if previous_target_permissions is not None:
+                    policy_changed = policy_changed or target_permissions != previous_target_permissions or target_scope != previous_target_scope
+                previous_target_permissions = dict(target_permissions)
+                previous_target_scope = target_scope
+                if 'off' in target_permissions.values():
+                    permission_state = 'off'
+                elif 'ask' in target_permissions.values() and permission_state != 'off':
+                    permission_state = 'ask'
                 approval_required = definition.approve_when_ask
                 owned_session = False
                 if name == 'browser_open' and str(arguments.get('session_id') or '').strip():
@@ -1202,6 +1249,7 @@ class WorkspaceToolbox:
                     permission_states, approve_when_ask=approval_required,
                     target_state=target_state, target_mode=target_mode,
                     approved_permissions=approved_permissions, owned_session=owned_session,
+                    target_permissions=target_permissions, target_scope=target_scope,
                 )
                 if not available:
                     reason = 'policy_unavailable'
@@ -1210,6 +1258,7 @@ class WorkspaceToolbox:
                 decision = {
                     'source': self._permission_source, 'effective': permission_state,
                     'states': dict(permission_states), 'target_mode': target_mode,
+                    'target_actions': dict(target_permissions),
                     'target_state': target_state, 'reason': reason, 'changed': policy_changed,
                 }
                 record.update(permission=permission_state, permission_decision=decision)
@@ -1221,6 +1270,7 @@ class WorkspaceToolbox:
                     permission_reason=reason, permission_target_mode=target_mode,
                     permission_target_state=target_state, permission_changed=policy_changed,
                     permission_states=dict(permission_states),
+                    target_action_permissions=dict(target_permissions),
                     required_permissions=list(definition.required_permissions),
                     permission_decision=decision,
                 )
@@ -1244,6 +1294,15 @@ class WorkspaceToolbox:
                 if target_error:
                     record['status'] = 'blocked'
                     return json.dumps(target_error)
+                if reason == 'blocked_target_action':
+                    record['status'] = 'blocked'
+                    blocked_actions = [key for key, value in target_permissions.items() if value == 'off']
+                    return json.dumps({
+                        'ok': False, 'error_code': 'TARGET_ACTION_OFF', 'write_applied': False,
+                        'blocked_actions': blocked_actions,
+                        'error': 'This target blocks: ' + ', '.join(TARGET_ACTION_LABELS.get(key, key) for key in blocked_actions)
+                                 + '. Change its selected actions in Workspace Environment → Test targets to allow them.',
+                    })
                 if reason != 'ask':
                     return None
                 if not allow_prompt:
@@ -1262,14 +1321,18 @@ class WorkspaceToolbox:
                         'required_permissions': list(definition.required_permissions),
                         'permission_states': permission_states,
                     })
-                ask_permissions = {key for key, state in permission_states.items() if state == 'ask'}
-                if target_state == 'enabled' and target_mode == 'on':
-                    ask_permissions.discard('external_targets')
+                ask_permissions = _permission_approval_keys(
+                    permission_states, approve_when_ask=approval_required,
+                    target_permissions=target_permissions, target_scope=target_scope,
+                )
+                ask_labels = [key for key, value in permission_states.items() if value == 'ask']
+                ask_labels.extend(TARGET_ACTION_LABELS.get(key, key) for key, value in target_permissions.items() if value == 'ask')
                 request = {
                     'name': name, 'category': definition.category,
-                    'permission': ','.join(sorted(ask_permissions)),
+                    'permission': ', '.join(ask_labels),
                     'required_permissions': list(definition.required_permissions),
                     'permission_states': dict(permission_states),
+                    'target_action_permissions': dict(target_permissions),
                     'permission_decision': decision, 'approve_when_ask': approval_required,
                     'read_only': definition.read_only, 'destructive': definition.destructive,
                     'arguments': arguments,
@@ -3152,6 +3215,8 @@ class WorkspaceToolbox:
             action = str(a.get('action') or '')
             if action not in {'start', 'stop', 'snapshot', 'restore'}:
                 raise ValueError('Unsupported VM action.')
+            if 'off' in target_tool_permissions(target, 'test_vm_control', a).values():
+                raise ExternalTargetError('This VM action is Off in the target\'s selected actions.')
             manager = TestTargetManager(self.workspace, target)
             operation = await manager.request_stop() if action == 'stop' else manager.begin(action, tag=str(a.get('tag') or ''))
             result = {'ok': True, 'action': operation.action, 'state': operation.state,
@@ -3165,13 +3230,11 @@ class WorkspaceToolbox:
         targets = broker.list_public()
         global_permission = self.permission_for('external_targets')
         for target in targets:
-            reason = tool_permission_reason(
-                {'external_targets': global_permission}, target_state='enabled',
-                target_mode='on' if target.get('approval_mode') == 'on' else 'ask',
-            )
             target['model_access'] = {
                 'global_permission': global_permission,
-                'effective': 'off' if reason == 'blocked_off' else 'ask' if reason == 'ask' else 'on',
+                'access_mode': target.get('access_mode', 'selected'),
+                'access_gate': global_permission,
+                'actions': target.get('effective_capabilities', {}),
                 'permission_source': self._permission_source,
             }
         return json.dumps({

@@ -2875,7 +2875,7 @@ class HarnessyPage:
     def _render_test_targets(self, ws: WorkspaceStore) -> None:
         """Render independent targets inside Environment, never a separate window."""
         from harnessy.ui.test_targets import open_vm_creator, render_managed_target
-        from harnessy.ui.target_access import render_target_access_help
+        from harnessy.ui.target_access import TargetAccessEditor
         with ui.column().classes('hy-targets-toolbar w-full gap-3'):
             ui.label('Connect a device or create a VM for testing. Each target has its own files and system.').classes('text-sm hy-muted')
             with ui.row().classes('w-full items-center gap-2'):
@@ -2906,8 +2906,8 @@ class HarnessyPage:
                     port = ui.number('SSH port', value=target.port if target else 22, min=1, max=65535, step=1).classes('w-32')
                 username = ui.input('SSH user', value=target.username if target else '').classes('w-full')
                 ui.label(
-                    'Root login runs target commands with root privileges. “Allow autonomously” also permits the agent to run '
-                    'these commands without a separate approval; the command filter cannot confine root code.'
+                    'Root login runs target commands with root privileges. Full unrestricted access permits system changes. '
+                    'Selected command filters cannot confine root code.'
                 ).classes('text-xs text-negative').bind_visibility_from(
                     username, 'value', lambda value: str(value or '').strip().lower() == 'root'
                 )
@@ -2936,13 +2936,9 @@ class HarnessyPage:
                     'Remote test root', value=target.remote_root if target else '/home/harnessy/hx-test'
                 ).classes('w-full')
                 enabled = ui.switch('Enable target for this workspace', value=target.enabled if target else True)
-                approval = ui.select(
-                    options={'ask': 'Ask before protected target actions', 'on': 'Allow autonomous target tools'},
-                    value=target.approval_mode if target else 'ask',
-                    label='Model access',
-                ).classes('w-full')
-                render_target_access_help(self.machine, approval, enabled=enabled,
-                                          policy=target.policy if target else None, draft=True)
+                access = TargetAccessEditor(self.machine, target.policy if target else None,
+                                            approval_mode=target.approval_mode if target else 'ask',
+                                            enabled=enabled, draft=True)
                 with ui.row().classes('w-full justify-end gap-2'):
                     ui.button('Cancel', on_click=editor.close).props('flat no-caps')
 
@@ -2956,7 +2952,8 @@ class HarnessyPage:
                                 auth_method=str(authentication.value or 'key'),
                                 password=str(password.value) if authentication.value == 'password' and password.value else None,
                                 remote_root=str(remote_root.value or ''),
-                                enabled=bool(enabled.value), approval_mode=str(approval.value or 'ask'),
+                                enabled=bool(enabled.value), approval_mode=access.approval_mode,
+                                policy=access.policy(),
                             )
                         except ValueError as exc:
                             ui.notify(str(exc), type='warning')
@@ -3041,7 +3038,7 @@ class HarnessyPage:
                                     )
                                 ).classes('text-xs hy-muted')
                                 ui.label(
-                                    'Autonomous target tools' if target.approval_mode == 'on' else 'Ask before protected target actions'
+                                    'Full unrestricted access' if target.policy.get('access_mode') == 'full' else 'Only selected actions'
                                 ).classes('text-xs hy-muted')
                             with ui.row().classes('gap-1'):
                                 ui.button('Test connection', icon='cable', on_click=lambda _=None, tid=target.id: test_target(tid)).props('flat no-caps dense')
@@ -19787,7 +19784,9 @@ window.harnessyTerminalFocus = function(terminalId) {
                                     'Long-running processes ask when the job starts, and browser automation asks when browser_open creates a new session; '
                                     'navigation and follow-up actions inside that HarnessyXO-owned session do not repeatedly prompt. '
                                     'On allows actions without a confirmation dialog. Saved permission changes apply to active runs. '
-                                    'External Test Targets On also allows targets whose own mode is Ask; global Off always blocks. '
+                                    'External/Test Targets controls access: Off blocks all target tools, Ask requires approval before using them, '
+                                    'and On permits access. Each target separately controls its actions with Off, Ask or On. '
+                                    'Global On never overrides an action set to Off or Ask. '
                                     'Other required tool permissions still apply.'
                                 ).classes('text-xs hy-muted mb-2')
                                 with ui.grid(columns=2).classes('w-full gap-x-3 gap-y-1'):
@@ -21140,6 +21139,8 @@ def _pending_tool_permission_reason(
     if any(value not in {'off', 'ask', 'on'} for value in states.values()):
         raise ValueError('Invalid tool permission policy.')
     target_state = target_mode = 'not_applicable'
+    target_permissions: dict[str, str] = {}
+    target_scope = ''
     if 'external_targets' in states:
         arguments = request.get('arguments')
         target_ref = arguments.get('target') if isinstance(arguments, dict) else None
@@ -21147,10 +21148,14 @@ def _pending_tool_permission_reason(
             target = ws.get_external_target(str(target_ref))
             if target is None or not target.enabled:
                 return 'target_unavailable', states
-            target_state, target_mode = 'enabled', target.approval_mode
+            from harnessy.agent.external_targets import target_tool_permissions
+            target_state, target_mode = 'enabled', str(target.policy.get('access_mode', 'selected'))
+            target_permissions = target_tool_permissions(target, str(request.get('name') or ''), arguments)
+            target_scope = target.id
     return tool_permission_reason(
         states, approve_when_ask=bool(request.get('approve_when_ask', True)),
         target_state=target_state, target_mode=target_mode,
+        target_permissions=target_permissions, target_scope=target_scope,
     ), states
 
 
@@ -21187,7 +21192,7 @@ async def _await_tool_approval(
             chat_id=chat_id, run_id=run_id, tool=request.get('name'),
             permission_states=permission_states, reason=reason,
         )
-        return reason not in {'blocked_off', 'target_unavailable', 'policy_unavailable'}
+        return reason not in {'blocked_off', 'blocked_target_action', 'target_unavailable', 'policy_unavailable'}
 
     try:
         allowed = await TOOL_APPROVALS.request(workspace_id=ws.id, chat_id=chat_id, run_id=run_id,

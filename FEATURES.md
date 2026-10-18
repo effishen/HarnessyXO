@@ -1,4 +1,4 @@
-# HarnessyXO v0.6.120 Features
+# HarnessyXO v0.6.121 Features
 
 ## Workspace startup and VM resources
 
@@ -166,7 +166,8 @@ Workspace and machine databases use WAL so background reads can coexist with mes
 - With a permission set to Ask, queued/retried and direct runs wait for Allow once, Deny or Stop run. The card shows the original prompt, actual held slot and exact tool arguments; the sidebar also says Needs approval.
 - Reloading, switching projects, closing a tab or signing out does not silently decide the request. Reopen the chat or Run queue to act from a valid signed-in session.
 - Allow once applies to one request; an identical later command needs its own approval. Stale controls cannot decide or stop a newer run. Saved permission changes apply during active runs and pending approvals. Off blocks execution even after an earlier Allow; explicit Deny and Stop remain final for that request.
-- External / Test Targets On skips confirmation for an enabled target; global Off blocks it. With global Ask, a target set to On can run without a dialog. Validate the required target before asking, and preserve other required tool permissions.
+- External/Test Targets is an access gate: Off blocks target calls, Ask requires approval and On permits access. Each target independently selects **Allow Full Unrestricted Access** or **Allow Only Selected Actions**. Selected actions each have Off, Ask and On controls; global On never overrides action Off or Ask. Full access enables every target action within the remote account's privileges and still obeys the global gate.
+- Set permissions for status checks, file listing, commands, copies, individual VM controls, command categories and paths. Selected command categories use best-effort text checks, not an OS sandbox. Save and restore selected choices when switching to full access. Existing targets keep their restrictions when upgraded or edited.
 - Expand **Allowed actions and command limits** beside a target’s Model access to see the approval rules, global overrides, exact SSH blocked command names and protected paths. The same breakdown is available when creating a VM. SSH command filtering remains separate from approval; managed test VMs allow privileged guest commands. Refresh the breakdown after changing global permissions.
 - Opening tabs and changing workspace or navigator preferences preserve permission changes saved from another page.
 - Export reviewed permission decisions and separate approval/tool execution timings in `PERMISSIONS.json`; show missing historical measurements as unrecorded.

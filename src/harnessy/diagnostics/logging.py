@@ -469,7 +469,7 @@ def _safe_event_field(key: str, value: Any) -> Any:
                'prefill_throughput_source', 'timing_source', 'tps_source', 'provenance', 'output_provenance'}:
         return _privacy_safe_value(value, key=key)
     if key in {
-        'permission_decision', 'permission_states', 'required_permissions',
+        'permission_decision', 'permission_states', 'required_permissions', 'target_action_permissions',
         'permission_source', 'permission_reason', 'permission_target_mode',
         'permission_target_state', 'target_validation', 'approval_wait_seconds',
         'execution_duration_seconds', 'coordination_wait_seconds',
@@ -1660,13 +1660,16 @@ def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
         from .permissions import validate_permission_event
 
         return validate_permission_event(value['event'], value) or {'event': 'tool_permission_decision'}
-    if lowered in {'permission_decision', 'permission_states', 'required_permissions'}:
-        from .permissions import PERMISSION_FAMILIES, validate_permission_decision, validate_permission_states
+    if lowered in {'permission_decision', 'permission_states', 'required_permissions', 'target_action_permissions'}:
+        from .permissions import (PERMISSION_FAMILIES, validate_permission_decision,
+                                  validate_permission_states, validate_target_action_permissions)
 
         if lowered == 'permission_decision':
             return validate_permission_decision(value)
         if lowered == 'permission_states':
             return validate_permission_states(value)
+        if lowered == 'target_action_permissions':
+            return validate_target_action_permissions(value)
         return [item for item in value[:len(PERMISSION_FAMILIES)]
                 if isinstance(item, str) and item in PERMISSION_FAMILIES] if isinstance(value, (list, tuple)) else []
     if lowered in {'approval_wait_seconds', 'execution_duration_seconds', 'coordination_wait_seconds'}:

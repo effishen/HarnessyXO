@@ -15,7 +15,7 @@ from harnessy.agent.external_targets import ExternalTargetBroker
 from harnessy.core.terminal import TerminalSession
 from harnessy.environment.presets import canonical_arch
 from harnessy.environment.test_targets import TestTargetManager, target_operation_error
-from harnessy.ui.target_access import render_target_access_help
+from harnessy.ui.target_access import TargetAccessEditor
 
 
 def open_vm_creator(ws, refresh, os_name='ubuntu-24.04', *, machine=None):
@@ -47,10 +47,7 @@ def open_vm_creator(ws, refresh, os_name='ubuntu-24.04', *, machine=None):
                 arch = ui.select(target_architectures(initial.id),
                     value=canonical_arch(platform.machine()), label='Architecture').classes('w-full')
                 architecture_hint = ui.label('Matching the host enables acceleration. Other architectures use slower CPU emulation.').classes('text-xs hy-muted')
-                approval = ui.select({'ask': 'Ask before protected target actions', 'on': 'Allow autonomous target tools'},
-                    value='on', label='Model access').classes('w-full')
-                render_target_access_help(machine, approval, managed_vm=True, draft=True)
-                ui.label('The model can install software and make system changes in this test VM.').classes('text-xs hy-muted')
+                access = TargetAccessEditor(machine, approval_mode='on', managed_vm=True, draft=True)
             with ui.column().classes('w-full gap-2') as radio_options:
                 ui.label('Guest radio emulation').classes('font-semibold text-sm')
                 wifi = ui.checkbox('Emulated Wi-Fi radios (mac80211_hwsim)', value=False)
@@ -118,7 +115,7 @@ def open_vm_creator(ws, refresh, os_name='ubuntu-24.04', *, machine=None):
                     target = ws.upsert_external_target(
                         name=name.value, host='managed-local', username='root' if guest.family == 'openwrt' else 'harnessy',
                         remote_root='C:/HarnessyTest' if guest.family == 'windows' else ('/root/hx-test' if guest.family == 'openwrt' else '/home/harnessy/hx-test'),
-                        approval_mode=approval.value,
+                        approval_mode=access.approval_mode, policy=access.policy(),
                         managed_vm={'os': guest.id, 'architecture': arch.value, 'cpu': int(cpu.value),
                                     'memory_mb': int(memory.value), 'disk_gb': int(disk.value),
                                     'desktop': bool(desktop.value), 'iso_path': str(iso.value or ''),
@@ -351,7 +348,7 @@ def _render_target_desktop(page, tab, manager):
                     try:
                         broker = ExternalTargetBroker(manager.workspace)
                         command = "Set-LocalUser -Name 'harnessy' -Password (ConvertTo-SecureString " + broker._ps_literal(value) + ' -AsPlainText -Force)'
-                        result = await broker.exec(manager.target, command)
+                        result = await broker.exec(manager.target, command, model_permissions=False)
                         if not result['ok']:
                             raise RuntimeError(result.get('stderr') or 'Could not set the Windows password.')
                         password.value = ''
@@ -430,17 +427,17 @@ def render_managed_target(page, ws, target, refresh):
         with ui.expansion('Model access and test files', icon='tune').classes('w-full hy-target-details'):
             ui.label(f'Test files: {target.remote_root}').classes('text-xs hy-muted break-all')
             enabled = ui.switch('Available to the model', value=target.enabled)
-            approval = ui.select({'ask': 'Ask before protected actions', 'on': 'Allow autonomous target tools'}, value=target.approval_mode, label='Model access').classes('grow')
             def save_access(_=None):
                 current = ws.get_external_target(target.id)
                 if current is None:
                     return
-                ws.upsert_external_target(target_id=target.id, name=target.name, host=target.host, username=target.username,
-                    remote_root=target.remote_root, enabled=bool(enabled.value), approval_mode=approval.value, managed_vm=current.managed_vm)
+                ws.upsert_external_target(target_id=current.id, name=current.name, host=current.host,
+                    port=current.port, username=current.username, identity_file=current.identity_file,
+                    auth_method=current.auth_method, remote_root=current.remote_root, enabled=bool(enabled.value),
+                    approval_mode=access.approval_mode, policy=access.policy(), managed_vm=current.managed_vm)
+            access = TargetAccessEditor(page.machine, target.policy, approval_mode=target.approval_mode,
+                                        enabled=enabled, managed_vm=True, on_change=save_access, draft=False)
             enabled.on_value_change(save_access)
-            approval.on_value_change(save_access)
-            render_target_access_help(page.machine, approval, enabled=enabled,
-                                      managed_vm=True, policy=target.policy)
         if manager.guest.family == 'openwrt':
             with ui.expansion('Emulated radios', icon='wifi').classes('w-full hy-target-details'):
                 requested = c.get('emulation') or {}
@@ -460,7 +457,7 @@ def render_managed_target(page, ws, target, refresh):
                         config['emulation'] = {'wifi': bool(wifi.value), 'bluetooth': bool(bluetooth.value)}
                         ws.upsert_external_target(target_id=current.id, name=current.name, host=current.host,
                             username=current.username, remote_root=current.remote_root, enabled=current.enabled,
-                            approval_mode=current.approval_mode, managed_vm=config)
+                            approval_mode=current.approval_mode, policy=current.policy, managed_vm=config)
                         manager.forget_radios()
                         refresh()
                     except Exception as exc:

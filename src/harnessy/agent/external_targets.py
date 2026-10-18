@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
+import ntpath
+import posixpath
 import os
 import re
 import shlex
@@ -11,44 +14,98 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Awaitable, Callable
 
 from harnessy.core.workspace import ExternalTarget, WorkspaceStore
 from harnessy.core.target_credentials import TargetCredentialStore
+from harnessy.core.target_policy import (TARGET_ACTIONS, TARGET_ACTION_LABELS, TARGET_COMMAND_RULES,
+    TARGET_PROTECTED_PATHS, normalize_target_policy, target_action_permission)
 
 
 class ExternalTargetError(RuntimeError):
     pass
 
 
-# This is a best-effort command policy, never an OS isolation boundary. A root
-# SSH target gives every allowed target command root privileges on that host.
-EXTERNAL_TARGET_COMMAND_RULES: tuple[tuple[str, str, str], ...] = (
-    ('Privilege escalation', r'sudo|su|doas|pkexec', 'sudo, su, doas, pkexec'),
-    ('Services and packages', r'systemctl|service|apt(?:-get)?|dpkg|dnf|yum|rpm|apk|pacman',
-     'systemctl, service, apt, apt-get, dpkg, dnf, yum, rpm, apk, pacman'),
-    ('Disks and mounts', r'mount|umount|fdisk|sfdisk|parted|mkfs(?:\.[A-Za-z0-9_-]+)?|dd',
-     'mount, umount, fdisk, sfdisk, parted, mkfs, mkfs.*, dd'),
-    ('Power controls', r'reboot|shutdown|halt|poweroff', 'reboot, shutdown, halt, poweroff'),
-    ('Firewalls', r'iptables|ip6tables|nft|pfctl', 'iptables, ip6tables, nft, pfctl'),
-    ('Users and groups', r'useradd|userdel|usermod|groupadd|groupdel|passwd',
-     'useradd, userdel, usermod, groupadd, groupdel, passwd'),
-    ('Process isolation', r'chroot|nsenter', 'chroot, nsenter'),
-    ('Remote access and network tools', r'ssh|scp|sftp|telnet|nc|netcat|socat|nmap',
-     'ssh, scp, sftp, telnet, nc, netcat, socat, nmap'),
-)
-EXTERNAL_TARGET_PROTECTED_PATHS: tuple[str, ...] = (
-    '/etc', '/root', '/boot', '/sys', '/proc', '/run', '/var/lib', '/var/run', '/home',
-)
+# Categories are best-effort text checks, never an OS isolation boundary. An
+# interpreter, uploaded script or SSH account may do more than text reveals.
+EXTERNAL_TARGET_COMMAND_RULES = tuple((label, pattern, names)
+    for _action, label, pattern, names in TARGET_COMMAND_RULES)
+EXTERNAL_TARGET_PROTECTED_PATHS = TARGET_PROTECTED_PATHS
 _BLOCKED_COMMAND_RE = re.compile(
-    r"(?:^|[\s;&|()])(?:" + '|'.join(rule[1] for rule in EXTERNAL_TARGET_COMMAND_RULES) + r")(?:\s|$)",
-    re.IGNORECASE,
-)
+    r"(?:^|[\s;&|()])(?:" + '|'.join(rule[1] for rule in EXTERNAL_TARGET_COMMAND_RULES) + r")(?:\s|$)", re.I)
 _BLOCKED_PATH_RE = re.compile(
-    r"(?:^|[\s'\"=:(])/(?:" + '|'.join(path[1:] for path in EXTERNAL_TARGET_PROTECTED_PATHS) + r")(?:/|\b)",
-    re.IGNORECASE,
-)
+    r"(?:^|[\s'\"=:(])/(?:" + '|'.join(path[1:] for path in TARGET_PROTECTED_PATHS) + r")(?:/|\b)", re.I)
+_PARENT_REFERENCE_RE = re.compile(r"(?:^|[\s/\\'\"=:])\.\.(?:[/\\\s'\";]|$)")
+_WINDOWS_SYSTEM_PATH_RE = re.compile(
+    r"(?:[A-Za-z]:[/\\](?:Windows|Program Files(?: \(x86\))?|ProgramData|Users|Boot|Recovery|System Volume Information)(?:[/\\]|\b)"
+    r"|\$env:(?:WINDIR|SYSTEMROOT|PROGRAMDATA|PROGRAMFILES|USERPROFILE)\b|\b(?:HKLM|HKEY_LOCAL_MACHINE):)", re.I)
+_INVALID_ACTION = 'invalid_target_action'
+
+
+def _permission(target: ExternalTarget, action: str) -> str:
+    return target_action_permission(target.policy, action, approval_mode=target.approval_mode,
+                                    managed_vm=bool(target.managed_vm))
+
+
+def _path_needs_outside(value: Any) -> bool:
+    if not isinstance(value, str):
+        return True
+    text = value.strip().replace('\\', '/')
+    return bool(text.startswith('/') or re.match(r'^[A-Za-z]:', text)
+                or '..' in PurePosixPath(text).parts)
+
+
+def _system_path_reference(command: str, remote_root: str) -> bool:
+    for match in _BLOCKED_PATH_RE.finditer(command):
+        allowed = remote_root if remote_root.startswith('/root/') else ''
+        tail = command[match.start() + match.group().find('/'):]
+        if allowed and match.group().rstrip('/').endswith('/root') and tail.startswith(allowed):
+            after = tail[len(allowed):len(allowed) + 1]
+            if not after or after == '/' or after in ' \t\r\n\'";|&)]':
+                continue
+        return True
+    return bool(_PARENT_REFERENCE_RE.search(command) or _WINDOWS_SYSTEM_PATH_RE.search(command))
+
+
+def target_tool_permissions(target: ExternalTarget, tool_name: str, arguments: dict[str, Any]) -> dict[str, str]:
+    """Resolve exactly the target actions shared by approval and execution.
+
+    This function reads no host/workspace files and performs no SSH. It reports
+    Ask without prompting; the ToolExecutor owns approval before broker entry.
+    """
+    if not isinstance(arguments, dict) or not isinstance(tool_name, str):
+        return {_INVALID_ACTION: 'off'}
+    base = {'target_status': 'allow_status', 'target_list_files': 'allow_list',
+            'target_exec': 'allow_exec', 'target_copy_to': 'allow_copy_to',
+            'target_copy_from': 'allow_copy_from'}.get(tool_name)
+    if tool_name in {'test_vm_control', 'target_vm'}:
+        action = arguments.get('action')
+        if not target.managed_vm or not isinstance(action, str) or action not in {'start', 'stop', 'snapshot', 'restore'}:
+            return {_INVALID_ACTION: 'off'}
+        return {'vm_' + action: _permission(target, 'vm_' + action)}
+    if base is None:
+        return {_INVALID_ACTION: 'off'}
+    required = {base}
+    if tool_name == 'target_exec':
+        command = arguments.get('command', '')
+        if not isinstance(command, str):
+            return {_INVALID_ACTION: 'off'}
+        for action, _label, pattern, _names in TARGET_COMMAND_RULES:
+            if re.search(r"(?:^|[\s;&|()'\"`/\\])(?:" + pattern + r")(?:\.exe)?(?=[\s;&|()'\"`]|$)", command, re.I):
+                required.add(action)
+        if _system_path_reference(command, target.remote_root):
+            required.add('exec_system_paths')
+        remote_path = arguments.get('working_directory', arguments.get('cwd', '.'))
+    elif tool_name == 'target_list_files':
+        remote_path = arguments.get('path', '.')
+    elif tool_name in {'target_copy_to', 'target_copy_from'}:
+        remote_path = arguments.get('remote_path', '')
+    else:
+        remote_path = '.'
+    if _path_needs_outside(remote_path):
+        required.add('outside_test_root')
+    return {action: _permission(target, action) for action in TARGET_ACTIONS if action in required}
 
 
 @dataclass(slots=True)
@@ -66,11 +123,6 @@ class ExternalTargetBroker:
         self.chat_id = str(chat_id or '')
         self.ssh_binary = shutil.which('ssh') or 'ssh'
         self.known_hosts = workspace.meta / 'external_targets_known_hosts'
-        self.known_hosts.touch(exist_ok=True)
-        try:
-            os.chmod(self.known_hosts, 0o600)
-        except OSError:
-            pass
 
     def resolve(self, target_id_or_name: str, *, require_enabled: bool = True) -> ExternalTarget:
         target = self.workspace.get_external_target(target_id_or_name)
@@ -80,8 +132,74 @@ class ExternalTargetBroker:
             raise ExternalTargetError(f'External target is disabled: {target.name}')
         return target
 
+    def _require_target(self, target: ExternalTarget, tool_name: str, arguments: dict[str, Any],
+                        *, unchanged: bool = False) -> ExternalTarget:
+        current = self.resolve(target.id)
+        if unchanged and any(getattr(current, field) != getattr(target, field) for field in
+                ('host', 'port', 'username', 'identity_file', 'auth_method', 'remote_root', 'managed_vm')):
+            raise ExternalTargetError('Target connection settings changed. Resolve the target again before retrying.')
+        permissions = target_tool_permissions(current, tool_name, arguments)
+        previous = target_tool_permissions(target, tool_name, arguments)
+        if any(permission == 'ask' and previous.get(action) == 'on'
+               for action, permission in permissions.items()):
+            raise ExternalTargetError('Target permissions changed to Ask. Retry the action to request approval.')
+        blocked = [TARGET_ACTION_LABELS.get(action, 'Unsupported target action')
+                   for action, permission in permissions.items() if permission == 'off']
+        if blocked:
+            raise ExternalTargetError('Target action is Off: ' + ', '.join(blocked) + '.')
+        return current
+
+    @staticmethod
+    def _command_syntax(command: str) -> str:
+        if not isinstance(command, str) or not command.strip() or len(command) > 20000:
+            raise ExternalTargetError('Target command must contain 1–20000 characters.')
+        if any((ord(char) < 32 and char not in '\t\r\n') or 127 <= ord(char) <= 159 for char in command):
+            raise ExternalTargetError('Target command contains unsupported control characters.')
+        return command
+
+    @staticmethod
+    def _timeout(value: float) -> float:
+        if isinstance(value, bool):
+            raise ExternalTargetError('Target timeout must be a finite number.')
+        try:
+            number = float(value)
+        except (ValueError, TypeError, OverflowError):
+            raise ExternalTargetError('Target timeout must be a finite number.') from None
+        if not math.isfinite(number):
+            raise ExternalTargetError('Target timeout must be a finite number.')
+        return max(1.0, min(number, 7200.0))
+
+    def _remote_path(self, target: ExternalTarget, value: str, *, allow_dot: bool = True) -> tuple[str, str]:
+        if not isinstance(value, str) or len(value) > 4096 or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value):
+            raise ExternalTargetError('Remote paths must be bounded text without control characters.')
+        raw = value.strip().replace('\\', '/') or '.'
+        outside = _permission(target, 'outside_test_root') != 'off'
+        if not outside:
+            relative = self._relative_remote_path(raw, allow_dot=allow_dot)
+            return relative, self._remote_join(target.remote_root, relative)
+        if self._windows(target):
+            path = PureWindowsPath(raw)
+            if (path.drive and not path.is_absolute()) or (path.root and not path.drive):
+                raise ExternalTargetError('Windows absolute remote paths must include a drive letter.')
+            if path.drive and not re.fullmatch(r'[A-Za-z]:', path.drive):
+                raise ExternalTargetError('Remote Windows paths must use a local drive letter.')
+            remainder = raw[2:] if re.match(r'^[A-Za-z]:', raw) else raw
+            if ':' in remainder or any(char in remainder for char in '*?<>|"'):
+                raise ExternalTargetError('Remote Windows paths cannot contain alternate data streams.')
+            joined = raw if path.is_absolute() else ntpath.join(target.remote_root, raw)
+            absolute = ntpath.normpath(joined).replace('\\', '/')
+        else:
+            if re.match(r'^[A-Za-z]:', raw):
+                raise ExternalTargetError('Use POSIX paths for this target.')
+            absolute = posixpath.normpath(raw if raw.startswith('/') else posixpath.join(target.remote_root, raw))
+        if not allow_dot and (raw == '.' or absolute.rstrip('/') == target.remote_root.rstrip('/')):
+            raise ExternalTargetError('A file path is required.')
+        return raw, absolute
+
     @staticmethod
     def public_target(target: ExternalTarget) -> dict[str, Any]:
+        policy = normalize_target_policy(target.policy, approval_mode=target.approval_mode, managed_vm=bool(target.managed_vm))
+        permissions = {action: _permission(target, action) for action in TARGET_ACTIONS}
         result = {
             'id': target.id,
             'name': target.name,
@@ -90,8 +208,13 @@ class ExternalTargetBroker:
             'username': target.username,
             'remote_root': target.remote_root,
             'enabled': target.enabled,
-            'approval_mode': target.approval_mode,
-            'policy': dict(target.policy),
+            # Model-facing data describes active grants; dormant selections
+            # remain in workspace storage for the human policy editor.
+            'policy': {'access_mode': policy['access_mode'], 'actions': dict(permissions)},
+            'access_mode': policy['access_mode'], 'actions': dict(permissions),
+            'effective_capabilities': permissions,
+            'policy_scope': 'target_policy_only; global tool permissions and actual SSH-account privileges also apply',
+            'command_filter_scope': 'best-effort command text categories; interpreters and uploaded programs are not OS-isolated',
             # Credential contents/path are deliberately not exposed to the model.
             'authentication': 'password' if target.auth_method == 'password' else (
                 'identity-file' if target.identity_file else 'ssh-agent/default-keys'
@@ -101,9 +224,8 @@ class ExternalTargetBroker:
             windows = target.managed_vm.get('os') == 'windows-11'
             result.update(kind='managed_test_vm', guest_os=target.managed_vm.get('os'),
                           architecture=target.managed_vm.get('architecture'), shell='PowerShell' if windows else ('ash' if str(target.managed_vm.get('os')).startswith('openwrt-') else 'bash'),
-                          internet=True, software_installation=True, authentication='host-managed Lima',
+                          internet=True, software_installation=(permissions['allow_exec'] != 'off' and permissions['exec_packages'] != 'off'), authentication='host-managed Lima',
                           role='Separate test target. Develop in the workspace; copy files here to install, run and test.')
-            result['policy'].update(mode='managed_test_vm', allow_privileged=True)
             if str(target.managed_vm.get('os')).startswith('openwrt-'):
                 from harnessy.environment.test_radios import public_radio_snapshot
                 requested = target.managed_vm.get('emulation', {})
@@ -135,6 +257,11 @@ class ExternalTargetBroker:
         return results
 
     def _ssh_argv(self, target: ExternalTarget) -> list[str]:
+        self.known_hosts.touch(exist_ok=True)
+        try:
+            os.chmod(self.known_hosts, 0o600)
+        except OSError:
+            pass
         password_auth = target.auth_method == 'password'
         argv = [
             self.ssh_binary,
@@ -226,11 +353,12 @@ class ExternalTargetBroker:
     async def _run_ssh(
         self, target: ExternalTarget, remote_command: str, *, timeout: float = 120.0,
         input_bytes: bytes | None = None, max_output_chars: int = 80_000,
+        policy_guard: tuple[str, dict[str, Any]] | None = None,
     ) -> TargetCommandResult:
         started = time.perf_counter()
         try:
             proc, cleanup = await self._start_ssh(
-                target, remote_command,
+                target, remote_command, policy_guard=policy_guard,
                 stdin=asyncio.subprocess.PIPE if input_bytes is not None else asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -254,8 +382,10 @@ class ExternalTargetBroker:
         return TargetCommandResult(proc.returncode == 0, proc.returncode, stdout, stderr, duration)
 
     async def _start_ssh(
-        self, target: ExternalTarget, command: str, **kwargs: Any,
+        self, target: ExternalTarget, command: str, *, policy_guard: tuple[str, dict[str, Any]] | None = None, **kwargs: Any,
     ) -> tuple[asyncio.subprocess.Process, Callable[[], Awaitable[None]]]:
+        if policy_guard is not None:
+            target = self._require_target(target, *policy_guard, unchanged=True)
         if target.managed_vm:
             from harnessy.environment.test_targets import TestTargetManager
             manager = TestTargetManager(self.workspace, target)
@@ -334,7 +464,7 @@ class ExternalTargetBroker:
 
     @staticmethod
     def _windows(target: ExternalTarget) -> bool:
-        return target.managed_vm.get('os') == 'windows-11'
+        return target.managed_vm.get('os') == 'windows-11' or bool(re.match(r'^[A-Za-z]:[/\\]', target.remote_root))
 
     @staticmethod
     def _ps_literal(value: str) -> str:
@@ -361,7 +491,13 @@ class ExternalTargetBroker:
 
     async def test_connection(self, target: ExternalTarget, *, initialize_root: bool = False,
                               timeout: float = 20, require_bootstrap: bool = False,
-                              audit: bool = True) -> dict[str, Any]:
+                              audit: bool = True, model_permissions: bool = False) -> dict[str, Any]:
+        # This method also serves explicit human connection tests and the VM
+        # controller's own bootstrap readiness, separate from model tools.
+        guard = ('target_status', {}) if model_permissions else None
+        if guard is not None:
+            target = self._require_target(target, *guard, unchanged=True)
+        timeout = self._timeout(timeout)
         root_q = shlex.quote(target.remote_root)
         action = 'mkdir -p -- ' + root_q if initialize_root else 'test -d ' + root_q
         command = (
@@ -380,7 +516,7 @@ class ExternalTargetBroker:
                 f"if (!(Test-Path -LiteralPath {root} -PathType Container)) {{ throw 'Test root does not exist' }}; "
                 "Write-Output 'HX_OK'; Write-Output ('USER=' + $env:USERNAME); Write-Output ('HOST=' + $env:COMPUTERNAME)"
             )
-        result = await self._run_ssh(target, command, timeout=timeout)
+        result = await self._run_ssh(target, command, timeout=timeout, policy_guard=guard)
         if audit:
             self.workspace.record_external_target_event(
                 target.id, chat_id=self.chat_id, action='connection_test',
@@ -397,11 +533,14 @@ class ExternalTargetBroker:
         }
 
     async def status(self, target: ExternalTarget) -> dict[str, Any]:
+        guard = ('target_status', {})
+        target = self._require_target(target, *guard, unchanged=True)
         vm_status = None
         if target.managed_vm:
             from harnessy.environment.test_targets import TestTargetManager
             manager = TestTargetManager(self.workspace, target)
             vm_status = await manager.status()
+            target = self._require_target(target, *guard, unchanged=True)
             operation = manager.operation
             vm_status['operation'] = {'action': operation.action, 'state': operation.state, 'error': operation.error} if operation else None
             vm_status['snapshots'] = manager.snapshots()
@@ -420,13 +559,14 @@ class ExternalTargetBroker:
         if self._windows(target):
             command = self._powershell("Write-Output ('USER=' + $env:USERNAME); Write-Output ('HOST=' + $env:COMPUTERNAME); "
                 f"Write-Output ('ROOT_EXISTS=' + (Test-Path -LiteralPath {self._ps_literal(target.remote_root)} -PathType Container))")
-        result = await self._run_ssh(target, command, timeout=20)
+        result = await self._run_ssh(target, command, timeout=20, policy_guard=guard)
         self.workspace.record_external_target_event(
             target.id, chat_id=self.chat_id, action='status', ok=result.ok,
             returncode=result.returncode, duration_seconds=result.duration_seconds,
         )
         target_public = self.public_target(target)
         if vm_status is not None and manager.guest.family == 'openwrt' and result.ok:
+            target = self._require_target(target, *guard, unchanged=True)
             snapshot = await manager.inspect_radios()
             vm_status['hardware_emulation'] = snapshot
             target_public['hardware_emulation'].update(snapshot)
@@ -439,16 +579,16 @@ class ExternalTargetBroker:
 
     async def exec(
         self, target: ExternalTarget, command: str, *, cwd: str = '.', timeout: float = 180.0,
+        model_permissions: bool = True,
     ) -> dict[str, Any]:
-        if not target.policy.get('allow_exec', True):
-            raise ExternalTargetError('Command execution is disabled for this target.')
-        if target.managed_vm:
-            if not str(command).strip() or len(command) > 20000:
-                raise ExternalTargetError('Target command must contain 1–20000 characters.')
-        else:
-            self.validate_sandbox_command(command, remote_root=target.remote_root)
-        cwd_rel = self._relative_remote_path(cwd)
-        workdir = self._remote_join(target.remote_root, cwd_rel)
+        command = self._command_syntax(command)
+        # Explicit human controls (e.g. setting Windows sign-in credentials)
+        # do not inherit the model's action grants. Model tools use the default.
+        guard = ('target_exec', {'command': command, 'working_directory': cwd}) if model_permissions else None
+        if guard is not None:
+            target = self._require_target(target, *guard, unchanged=True)
+        cwd_rel, workdir = self._remote_path(target, cwd)
+        timeout = self._timeout(timeout)
         remote = (
             f'test -d {shlex.quote(workdir)} || {{ echo "HarnessyXO target cwd does not exist" >&2; exit 72; }}; '
             f'cd -- {shlex.quote(workdir)} && '
@@ -458,7 +598,7 @@ class ExternalTargetBroker:
         )
         if self._windows(target):
             remote = self._powershell(f"Set-Location -LiteralPath {self._ps_literal(workdir)}; " + str(command))
-        result = await self._run_ssh(target, remote, timeout=max(1.0, min(float(timeout), 7200.0)))
+        result = await self._run_ssh(target, remote, timeout=timeout, policy_guard=guard)
         self.workspace.record_external_target_event(
             target.id, chat_id=self.chat_id, action='exec',
             detail=self._command_audit_detail(command, cwd_rel), ok=result.ok,
@@ -471,13 +611,16 @@ class ExternalTargetBroker:
         }
 
     async def list_files(self, target: ExternalTarget, *, path: str = '.', max_depth: int = 2, max_entries: int = 300) -> dict[str, Any]:
-        if not target.policy.get('allow_list', True):
-            raise ExternalTargetError('Remote file listing is disabled for this target.')
-        rel = self._relative_remote_path(path)
-        remote_path = self._remote_join(target.remote_root, rel)
-        depth = max(0, min(int(max_depth), 6))
-        entries = max(1, min(int(max_entries), 2000))
-        # Fixed command: the model cannot escape the configured root through this tool.
+        guard = ('target_list_files', {'path': path})
+        target = self._require_target(target, *guard, unchanged=True)
+        rel, remote_path = self._remote_path(target, path)
+        try:
+            depth = max(0, min(int(max_depth), 6))
+            entries = max(1, min(int(max_entries), 2000))
+        except (ValueError, TypeError, OverflowError):
+            raise ExternalTargetError('List depth and entry limit must be finite integers.') from None
+        # This fixed command uses the selected path. Remote symlinks and the
+        # account's privileges are governed by the target OS, not this filter.
         command = (
             f'test -d {shlex.quote(remote_path)} || exit 72; '
             f'cd -- {shlex.quote(remote_path)} && '
@@ -487,7 +630,7 @@ class ExternalTargetBroker:
             command = self._powershell(
                 f"Get-ChildItem -LiteralPath {self._ps_literal(remote_path)} -Force -Recurse -Depth {depth} | "
                 f"Select-Object -First {entries} -Property FullName,Length,PSIsContainer | ConvertTo-Json -Compress")
-        result = await self._run_ssh(target, command, timeout=60)
+        result = await self._run_ssh(target, command, timeout=60, policy_guard=guard)
         self.workspace.record_external_target_event(
             target.id, chat_id=self.chat_id, action='list_files', detail=f'path={rel}',
             ok=result.ok, returncode=result.returncode, duration_seconds=result.duration_seconds,
@@ -508,20 +651,23 @@ class ExternalTargetBroker:
         return candidate
 
     async def copy_to(self, target: ExternalTarget, *, local_root: Path, local_path: str, remote_path: str, timeout: float = 300.0) -> dict[str, Any]:
-        if not target.policy.get('allow_copy_to', True):
-            raise ExternalTargetError('Copy-to-target is disabled for this target.')
+        guard = ('target_copy_to', {'remote_path': remote_path})
+        target = self._require_target(target, *guard, unchanged=True)
+        rel, dest = self._remote_path(target, remote_path, allow_dot=False)
+        timeout = self._timeout(timeout)
         source = self._local_path_under(local_root, local_path, must_exist=True)
         if source.stat().st_size > 256 * 1024 * 1024:
-            raise ExternalTargetError('External-target copy is limited to 256 MiB per file in v0.4.')
-        rel = self._relative_remote_path(remote_path, allow_dot=False)
-        dest = self._remote_join(target.remote_root, rel)
-        data = source.read_bytes()
+            raise ExternalTargetError('External-target copy is limited to 256 MiB per file.')
+        with source.open('rb') as stream:
+            data = stream.read(256 * 1024 * 1024 + 1)
+        if len(data) > 256 * 1024 * 1024:
+            raise ExternalTargetError('External-target copy is limited to 256 MiB per file.')
         remote = f'mkdir -p -- {shlex.quote(str(PurePosixPath(dest).parent))} && cat > {shlex.quote(dest)}'
         if self._windows(target):
             remote = self._powershell(
                 f"$dest={self._ps_literal(dest)}; [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($dest)) | Out-Null; "
                 "$file=[IO.File]::Create($dest); try { [Console]::OpenStandardInput().CopyTo($file) } finally { $file.Dispose() }")
-        result = await self._run_ssh(target, remote, timeout=max(1.0, min(float(timeout), 7200.0)), input_bytes=data, max_output_chars=20_000)
+        result = await self._run_ssh(target, remote, timeout=timeout, input_bytes=data, max_output_chars=20_000, policy_guard=guard)
         self.workspace.record_external_target_event(
             target.id, chat_id=self.chat_id, action='copy_to', detail=f'{local_path} -> {rel}',
             ok=result.ok, returncode=result.returncode, duration_seconds=result.duration_seconds,
@@ -533,11 +679,12 @@ class ExternalTargetBroker:
         }
 
     async def copy_from(self, target: ExternalTarget, *, local_root: Path, remote_path: str, local_path: str, timeout: float = 300.0) -> dict[str, Any]:
-        if not target.policy.get('allow_copy_from', True):
-            raise ExternalTargetError('Copy-from-target is disabled for this target.')
-        rel = self._relative_remote_path(remote_path, allow_dot=False)
-        source = self._remote_join(target.remote_root, rel)
+        guard = ('target_copy_from', {'remote_path': remote_path})
+        target = self._require_target(target, *guard, unchanged=True)
+        rel, source = self._remote_path(target, remote_path, allow_dot=False)
+        timeout = self._timeout(timeout)
         dest = self._local_path_under(local_root, local_path, must_exist=False)
+        target = self._require_target(target, *guard, unchanged=True)
         dest.parent.mkdir(parents=True, exist_ok=True)
         started = time.perf_counter()
         remote = f'test -f {shlex.quote(source)} && cat -- {shlex.quote(source)}'
@@ -547,43 +694,54 @@ class ExternalTargetBroker:
                 "try { $file.CopyTo([Console]::OpenStandardOutput()) } finally { $file.Dispose() }")
         try:
             proc, cleanup = await self._start_ssh(
-                target, remote,
+                target, remote, policy_guard=guard,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
         except FileNotFoundError as exc:
             raise ExternalTargetError('OpenSSH client was not found on the HarnessyXO host.') from exc
         received = 0
-        tmp = dest.with_name(f'.{dest.name}.hxtmp')
+        tmp: Path | None = None
         try:
+            # A private exclusive temporary file avoids following an existing
+            # destination-side symlink and is always removed on failure/cancel.
+            fd, tmp_name = tempfile.mkstemp(prefix='.hxtarget-', dir=dest.parent)
+            tmp = Path(tmp_name)
+            try:
+                stream = os.fdopen(fd, 'wb')
+            except BaseException:
+                os.close(fd)
+                raise
             async def transfer() -> tuple[int, bytes]:
                 nonlocal received
                 assert proc.stdout is not None
                 assert proc.stderr is not None
-                with tmp.open('wb') as stream:
+                with stream:
                     while True:
                         chunk = await proc.stdout.read(256 * 1024)
                         if not chunk:
                             break
                         received += len(chunk)
                         if received > 256 * 1024 * 1024:
-                            raise ExternalTargetError('External-target copy is limited to 256 MiB per file in v0.4.')
+                            raise ExternalTargetError('External-target copy is limited to 256 MiB per file.')
                         stream.write(chunk)
                 stderr_b = await proc.stderr.read()
                 return await proc.wait(), stderr_b
             try:
-                returncode, stderr_b = await asyncio.wait_for(transfer(), timeout=max(1.0, min(float(timeout), 7200.0)))
-            except Exception:
-                proc.kill()
-                await proc.wait()
-                raise
+                returncode, stderr_b = await asyncio.wait_for(transfer(), timeout=timeout)
+            finally:
+                # wait_for can be cancelled before transfer first runs.
+                stream.close()
             stderr = stderr_b.decode('utf-8', errors='replace')
             ok = returncode == 0
             if ok:
+                self._require_target(target, *guard, unchanged=True)
+                if self._local_path_under(local_root, local_path, must_exist=False) != dest:
+                    raise ExternalTargetError('Local destination changed during target transfer. Retry the copy.')
                 tmp.replace(dest)
-            else:
-                tmp.unlink(missing_ok=True)
         finally:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
             if proc.returncode is None:
                 proc.kill()
                 await proc.wait()

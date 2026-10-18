@@ -21,6 +21,7 @@ from typing import Any
 
 from ..diagnostics.sqlite import connect_database
 from .sqlite_store import enable_store_wal
+from .target_policy import normalize_target_policy, target_action_permission
 from .workspace_access import WorkspaceConnection, workspace_generation, workspace_shared_access
 from .workspace_health import (
     probe_workspace_database, require_workspace_database_admitted,
@@ -1390,17 +1391,10 @@ class WorkspaceStore:
     # External SSH targets
     # ------------------------------------------------------------------
     @staticmethod
-    def _normalize_external_target_policy(policy: dict[str, Any] | None) -> dict[str, Any]:
-        source = policy if isinstance(policy, dict) else {}
-        return {
-            'mode': 'test_sandbox',
-            'allow_exec': bool(source.get('allow_exec', True)),
-            'allow_copy_to': bool(source.get('allow_copy_to', True)),
-            'allow_copy_from': bool(source.get('allow_copy_from', True)),
-            'allow_list': bool(source.get('allow_list', True)),
-            # v0.4 intentionally does not expose privileged remote actions.
-            'allow_privileged': False,
-        }
+    def _normalize_external_target_policy(
+        policy: dict[str, Any] | None, *, approval_mode: str = 'ask', managed_vm: bool = False,
+    ) -> dict[str, Any]:
+        return normalize_target_policy(policy, approval_mode=approval_mode, managed_vm=managed_vm)
 
     @staticmethod
     def _external_target_from_row(row: sqlite3.Row) -> ExternalTarget:
@@ -1409,15 +1403,18 @@ class WorkspaceStore:
         except json.JSONDecodeError:
             policy = {}
         managed_vm = json.loads(row['managed_vm_json'] or '{}') if 'managed_vm_json' in row.keys() else {}
+        managed_vm = managed_vm if isinstance(managed_vm, dict) else {}
         return ExternalTarget(
             id=str(row['id']), name=str(row['name']), host=str(row['host']),
             port=int(row['port'] or 22), username=str(row['username']),
             identity_file=str(row['identity_file'] or ''), auth_method=str(row['auth_method'] or 'key'),
             remote_root=str(row['remote_root']),
             enabled=bool(row['enabled']), approval_mode=str(row['approval_mode'] or 'ask'),
-            policy=WorkspaceStore._normalize_external_target_policy(policy),
+            policy=WorkspaceStore._normalize_external_target_policy(
+                policy, approval_mode=str(row['approval_mode'] or 'ask'), managed_vm=bool(managed_vm),
+            ),
             created_at=str(row['created_at']), updated_at=str(row['updated_at']),
-            managed_vm=managed_vm if isinstance(managed_vm, dict) else {},
+            managed_vm=managed_vm,
         )
 
     def list_external_targets(self, *, enabled_only: bool = False) -> list[ExternalTarget]:
@@ -1447,7 +1444,7 @@ class WorkspaceStore:
         self, *, target_id: str | None = None, name: str, host: str, port: int = 22,
         username: str, identity_file: str = '', auth_method: str = 'key',
         password: str | None = None, remote_root: str,
-        enabled: bool = True, approval_mode: str = 'ask', policy: dict[str, Any] | None = None,
+        enabled: bool = True, approval_mode: str | None = None, policy: dict[str, Any] | None = None,
         managed_vm: dict[str, Any] | None = None,
     ) -> ExternalTarget:
         prior = self.get_external_target(target_id) if target_id else None
@@ -1461,7 +1458,16 @@ class WorkspaceStore:
         remote_root = str(remote_root or '').strip()
         identity_file = str(identity_file or '').strip()
         auth_method = str(auth_method or 'key').strip().lower()
-        approval_mode = str(approval_mode or 'ask').strip().lower()
+        approval_mode = str(
+            prior.approval_mode if approval_mode is None and prior is not None else approval_mode or 'ask'
+        ).strip().lower()
+        if approval_mode not in {'ask', 'on'}:
+            approval_mode = 'ask'
+        normalized_policy = self._normalize_external_target_policy(
+            prior.policy if policy is None and prior is not None else policy,
+            approval_mode=approval_mode, managed_vm=bool(managed_vm),
+        )
+        outside_allowed = target_action_permission(normalized_policy, 'outside_test_root') != 'off'
         if not name:
             raise ValueError('Target name cannot be empty.')
         if not host:
@@ -1478,18 +1484,20 @@ class WorkspaceStore:
             raise ValueError('Password is only used with password authentication.')
         if auth_method == 'password' and identity_file:
             raise ValueError('An identity file cannot be combined with password authentication.')
-        windows = managed_vm.get('os') == 'windows-11'
+        windows = (managed_vm.get('os') == 'windows-11'
+                   or (outside_allowed and bool(re.match(r'^[A-Za-z]:[/\\]', remote_root))))
         if windows:
             win_path = PureWindowsPath(remote_root)
             if (not win_path.is_absolute() or not re.fullmatch(r'[A-Za-z]:', win_path.drive)
-                    or len(win_path.parts) < 2 or '..' in win_path.parts
-                    or any(c in remote_root for c in ('\x00', '\n', '\r', '*', '?'))):
+                    or (not outside_allowed and len(win_path.parts) < 2) or '..' in win_path.parts
+                    or ':' in remote_root[2:]
+                    or any(ord(c) < 32 or ord(c) == 127 or c in '*?' for c in remote_root)):
                 raise ValueError('Windows test root must be an absolute drive path such as C:\\HarnessyTest.')
             remote_root = win_path.as_posix()
         if not windows and not remote_root.startswith('/'):
             raise ValueError('Remote root must be an absolute path.')
         root_path = PurePosixPath(remote_root)
-        if '..' in root_path.parts or '\x00' in remote_root or '\n' in remote_root or '\r' in remote_root:
+        if '..' in root_path.parts or any(ord(c) < 32 or ord(c) == 127 for c in remote_root):
             raise ValueError('Remote root contains an unsafe path component.')
         protected_roots = {'/', '/var', '/home', '/opt'}
         protected_prefixes = (
@@ -1497,19 +1505,16 @@ class WorkspaceStore:
             '/proc', '/sys', '/dev', '/run', '/var/lib', '/var/run',
         )
         normalized_root = root_path.as_posix().rstrip('/') or '/'
-        if not windows and (normalized_root in protected_roots or any(
+        if not windows and not outside_allowed and (normalized_root in protected_roots or any(
             normalized_root == prefix or normalized_root.startswith(prefix + '/') for prefix in protected_prefixes
         ) or (normalized_root == '/root' or (normalized_root.startswith('/root/') and username != 'root'))):
             raise ValueError('Remote root must be a dedicated writable subdirectory, not a system directory.')
-        remote_root = normalized_root
-        if approval_mode not in {'ask', 'on'}:
-            approval_mode = 'ask'
+        remote_root = remote_root if windows else normalized_root
         port = max(1, min(65535, int(port or 22)))
         target_id = str(target_id or uuid.uuid4().hex)
         if managed_vm and not re.fullmatch(r'[a-f0-9]{32}', target_id):
             raise ValueError('Invalid managed VM target identifier.')
         now = utcnow()
-        normalized_policy = self._normalize_external_target_policy(policy)
         from .target_credentials import TargetCredentialStore
         credentials = TargetCredentialStore() if auth_method == 'password' else None
         prior_password = credentials.get(self.id, target_id) if credentials and auth_method == 'password' else None
