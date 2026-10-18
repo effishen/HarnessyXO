@@ -22865,9 +22865,8 @@ def run_app() -> None:
         # including native failures; to_thread only waits for their protocol.
         with ui.column().classes('w-full items-center justify-center gap-3 p-6').style('min-height:80vh') as loading:
             ui.spinner(size='36px')
-            ui.label('Opening HarnessyXO').classes('text-xl font-semibold')
-            progress = ui.label('Checking saved workspace databases…').classes('text-sm')
-            ui.label('Workspace checks run separately so an unavailable database cannot block login.').classes('text-sm')
+            ui.label('Opening your workspaces…').classes('text-xl font-semibold')
+            progress = ui.label(f'0 of {len(registrations)} workspaces').classes('text-sm')
 
         async def initialize() -> None:
             task = asyncio.current_task()
@@ -22911,7 +22910,7 @@ def run_app() -> None:
                                   elapsed_seconds=round(time.monotonic() - started, 3))
                     completed += 1
                     if not client.is_deleted:
-                        progress.set_text(f'Checked {completed} of {len(registrations)} workspaces')
+                        progress.set_text(f'{completed} of {len(registrations)} workspaces')
 
             try:
                 await asyncio.gather(*(prepare(reg) for reg in registrations))

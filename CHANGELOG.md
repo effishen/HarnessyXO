@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.6.119
+
+- Simplify the loading screen to **Opening your workspaces…** and a workspace count. Remove the explanation about database isolation. Workspace checks and recovery controls work as before. Leave README unchanged.
+
 ## v0.6.118
 
 - Add **Extended check** and **Repair workspace** to the workspace-open error panel. Run a longer check on private preservation copies, with stage, elapsed time, copy progress, cancellation and a downloadable recovery report. Keep progress and results across browser refreshes and sign-in.
