@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.6.122
+
+- Enable or disable model access directly on each target card, beside the VM controls or SSH connection actions. A disabled target cannot be started or used by the model, including with global On or full access. The setting survives reloads and retains the target's action choices.
+- Keep model availability separate from VM power. Disabling model access does not stop a running VM; manual Start, Stop and connection controls remain available.
+- Remove the redundant **Effective model access** section and its duplicate action table. Keep the short global access status, a refresh icon and the editable Off / Ask / On controls. Leave README unchanged.
+- Verified UI persistence and disabled-target blocking on Linux. Native Mac/Windows testing was unavailable.
+
 ## v0.6.121
 
 - Replace target Model access with **Allow Full Unrestricted Access** and **Allow Only Selected Actions**. Selected actions appear in a collapsible card with an individual **Off / Ask / On** control.

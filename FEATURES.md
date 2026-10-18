@@ -1,4 +1,4 @@
-# HarnessyXO v0.6.121 Features
+# HarnessyXO v0.6.122 Features
 
 ## Workspace startup and VM resources
 
@@ -168,6 +168,7 @@ Workspace and machine databases use WAL so background reads can coexist with mes
 - Allow once applies to one request; an identical later command needs its own approval. Stale controls cannot decide or stop a newer run. Saved permission changes apply during active runs and pending approvals. Off blocks execution even after an earlier Allow; explicit Deny and Stop remain final for that request.
 - External/Test Targets is an access gate: Off blocks target calls, Ask requires approval and On permits access. Each target independently selects **Allow Full Unrestricted Access** or **Allow Only Selected Actions**. Selected actions each have Off, Ask and On controls; global On never overrides action Off or Ask. Full access enables every target action within the remote account's privileges and still obeys the global gate.
 - Set permissions for status checks, file listing, commands, copies, individual VM controls, command categories and paths. Selected command categories use best-effort text checks, not an OS sandbox. Save and restore selected choices when switching to full access. Existing targets keep their restrictions when upgraded or edited.
+- Use **Enabled for the model** on each target card to disable model access, including VM startup, without deleting the target or changing its selected actions. Availability is separate from VM power; manual controls remain available.
 - Expand **Allowed actions and command limits** beside a target’s Model access to see the approval rules, global overrides, exact SSH blocked command names and protected paths. The same breakdown is available when creating a VM. SSH command filtering remains separate from approval; managed test VMs allow privileged guest commands. Refresh the breakdown after changing global permissions.
 - Opening tabs and changing workspace or navigator preferences preserve permission changes saved from another page.
 - Export reviewed permission decisions and separate approval/tool execution timings in `PERMISSIONS.json`; show missing historical measurements as unrecorded.

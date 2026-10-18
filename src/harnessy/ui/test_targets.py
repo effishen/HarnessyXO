@@ -415,6 +415,8 @@ def render_managed_target(page, ws, target, refresh):
                 state_icon = ui.icon('schedule', size='20px').props('aria-hidden=true')
                 state_label = ui.label('Checking status…').classes('hy-target-state-text')
             ui.space()
+            model_disabled_badge = ui.badge('Disabled for model').props('outline color=warning data-hy-target-model-disabled=1')
+            model_disabled_badge.set_visibility(not target.enabled)
             ui.badge(manager.guest.label).props('outline')
         operation_progress = ui.linear_progress(value=0).classes('hy-vm-busy-progress w-full').props(
             'indeterminate rounded size=4px aria-label="Test VM operation in progress" data-hy-target-progress=1')
@@ -424,20 +426,23 @@ def render_managed_target(page, ws, target, refresh):
         c = manager.config
         radio_status = ui.label('').classes('text-xs hy-muted whitespace-pre-wrap') if manager.guest.family == 'openwrt' else None
         ui.label(f"{c['architecture']} · {c['cpu']} CPUs · {c['memory_mb']} MiB RAM · {c['disk_gb']} GiB disk · Internet enabled").classes('text-xs hy-muted')
+        enabled = ui.switch('Enabled for the model', value=target.enabled).props('dense data-hy-target-model-enabled=1')
+        availability = {'saved': bool(target.enabled)}
         with ui.expansion('Model access and test files', icon='tune').classes('w-full hy-target-details'):
             ui.label(f'Test files: {target.remote_root}').classes('text-xs hy-muted break-all')
-            enabled = ui.switch('Available to the model', value=target.enabled)
             def save_access(_=None):
                 current = ws.get_external_target(target.id)
                 if current is None:
                     return
-                ws.upsert_external_target(target_id=current.id, name=current.name, host=current.host,
+                saved = ws.upsert_external_target(target_id=current.id, name=current.name, host=current.host,
                     port=current.port, username=current.username, identity_file=current.identity_file,
-                    auth_method=current.auth_method, remote_root=current.remote_root, enabled=bool(enabled.value),
+                    auth_method=current.auth_method, remote_root=current.remote_root, enabled=current.enabled,
                     approval_mode=access.approval_mode, policy=access.policy(), managed_vm=current.managed_vm)
+                availability['saved'] = bool(saved.enabled)
+                enabled.set_value(availability['saved'])
+                model_disabled_badge.set_visibility(not availability['saved'])
             access = TargetAccessEditor(page.machine, target.policy, approval_mode=target.approval_mode,
                                         enabled=enabled, managed_vm=True, on_change=save_access, draft=False)
-            enabled.on_value_change(save_access)
         if manager.guest.family == 'openwrt':
             with ui.expansion('Emulated radios', icon='wifi').classes('w-full hy-target-details'):
                 requested = c.get('emulation') or {}
@@ -517,15 +522,36 @@ def render_managed_target(page, ws, target, refresh):
                 ui.button('Delete test VM', on_click=remove).props('unelevated no-caps color=negative')
                 ui.button('Cancel', on_click=dialog.close).props('flat no-caps')
             dialog.open()
-        with ui.row().classes('w-full gap-1'):
+        with ui.row().classes('w-full gap-1 items-center flex-wrap').props('data-hy-target-actions=1') as action_toolbar:
             start_button = ui.button('Start', icon='play_arrow', on_click=lambda: start_action('start')).classes('hy-vm-busy-action').props('flat no-caps')
             stop_button = ui.button('Stop', icon='stop', on_click=lambda: start_action('stop')).classes('hy-vm-busy-action').props('flat no-caps')
+            enabled.move(action_toolbar)
             shell_button = ui.button('Shell', icon='terminal', on_click=lambda: open_target_shell(page, manager)).props('flat no-caps')
             desktop_button = ui.button('Web UI' if manager.guest.interface == 'web' else 'Desktop', icon='language' if manager.guest.interface == 'web' else 'desktop_windows', on_click=lambda: open_target_desktop(page, manager)).props('flat no-caps')
             desktop_button.set_visibility(bool(c['desktop']))
             snapshot_button = ui.button('Snapshot', icon='save', on_click=snapshot_dialog).props('flat no-caps')
             restore_button = ui.button('Restore', icon='restore', on_click=restore_dialog).props('flat no-caps')
             delete_button = ui.button(icon='delete_outline', on_click=delete_dialog).props('flat round color=negative aria-label="Delete test VM"').tooltip('Delete test VM')
+        ui.label('Off blocks new model actions. Existing VM activity keeps running; your Start/Stop controls remain available.').classes('text-xs hy-muted')
+        availability_error = ui.label('').classes('text-negative text-sm whitespace-pre-wrap').props('role=alert data-hy-target-availability-error=1')
+
+        def save_enabled(_event=None):
+            desired = bool(enabled.value)
+            if desired == availability['saved']:
+                return
+            try:
+                saved = ws.set_external_target_enabled(target.id, desired)
+                availability['saved'] = bool(saved.enabled)
+                enabled.set_value(availability['saved'])
+                model_disabled_badge.set_visibility(not availability['saved'])
+                availability_error.set_text('')
+            except Exception as exc:
+                enabled.set_value(availability['saved'])
+                model_disabled_badge.set_visibility(not availability['saved'])
+                availability_error.set_text(str(exc) or 'Target availability could not be saved. Try again.')
+            access.refresh()
+
+        enabled.on_value_change(save_enabled)
         with ui.expansion('Activity and setup output', icon='receipt_long').classes('w-full'):
             output = ui.label('').classes('text-xs w-full font-mono').style('white-space:pre-wrap;max-height:260px;overflow:auto')
         error_label = ui.label('').classes('text-negative text-sm whitespace-pre-wrap').props('role=alert data-hy-target-error=1')

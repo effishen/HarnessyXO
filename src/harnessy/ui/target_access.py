@@ -1,7 +1,6 @@
-"""Target action editor and the effective global/target permission breakdown."""
+"""Target action editor with a separate global access status."""
 from __future__ import annotations
 
-from html import escape
 import inspect
 from typing import Any, Callable
 
@@ -9,27 +8,8 @@ from nicegui import ui
 
 from harnessy.core.target_policy import (
     TARGET_ACCESS_MODE_LABELS, TARGET_ACTION_GROUPS, TARGET_ACTION_LABELS,
-    TARGET_PERMISSION_LABELS, merge_target_permissions, normalize_target_policy,
-    target_action_permission,
+    TARGET_PERMISSION_LABELS, normalize_target_policy,
 )
-
-
-def target_action_rows(global_permission: str, target_mode: str = 'selected', *, enabled: bool = True,
-                       managed_vm: bool = False, policy: dict[str, Any] | None = None) -> list[tuple[str, str]]:
-    """Project the same independent gates enforced by target tool execution."""
-    canonical = normalize_target_policy(policy, approval_mode=target_mode, managed_vm=managed_vm)
-    if target_mode in {'full', 'selected'}:
-        canonical['access_mode'] = target_mode
-    rows = []
-    for action, label in TARGET_ACTION_LABELS.items():
-        if action.startswith('vm_') and not managed_vm:
-            continue
-        gates = [global_permission, target_action_permission(canonical, action, managed_vm=managed_vm)]
-        if action.startswith('exec_'):
-            gates.append(target_action_permission(canonical, 'allow_exec', managed_vm=managed_vm))
-        permission = merge_target_permissions(gates) if enabled else 'off'
-        rows.append((label, {'off': 'Off — blocked', 'ask': 'Ask — approval required', 'on': 'On — allowed'}[permission]))
-    return rows
 
 
 class TargetAccessEditor:
@@ -45,7 +25,9 @@ class TargetAccessEditor:
         with ui.column().classes('w-full min-w-0 gap-2').props('data-hy-target-access-editor=1'):
             self.mode = ui.select(TARGET_ACCESS_MODE_LABELS, value=canonical['access_mode'], label='Model access').classes('w-full').props('outlined dense data-hy-target-access-mode=1')
             self.description = ui.label('').classes('text-xs hy-muted').style('overflow-wrap:anywhere')
-            self.summary = ui.label('').classes('text-xs hy-muted').props('role=status data-hy-target-global-access=1').style('overflow-wrap:anywhere')
+            with ui.row().classes('w-full min-w-0 gap-1 items-start no-wrap'):
+                self.summary = ui.label('').classes('text-xs hy-muted grow min-w-0').props('role=status data-hy-target-global-access=1').style('overflow-wrap:anywhere')
+                ui.button(icon='refresh', on_click=self.refresh).props('flat dense round aria-label="Refresh global access"').tooltip('Refresh global access')
             with ui.expansion('Selected action permissions', icon='tune', value=True).classes('w-full min-w-0').props('data-hy-target-selected-actions=1') as self.selected_card:
                 with ui.column().classes('w-full min-w-0 gap-2'):
                     ui.label('Off blocks the action. Ask requests approval. On permits it, subject to global access and the target account.').classes('text-xs hy-muted')
@@ -62,18 +44,9 @@ class TargetAccessEditor:
                                 control.on_value_change(self._changed)
                     ui.label('Command categories also require Run commands. Path permissions apply in addition to the requested tool.').classes('text-xs hy-muted')
                     ui.label('Command categories use best-effort text checks. They do not isolate a shell or prevent code from using the account’s permissions.').classes('text-xs hy-muted')
-            with ui.expansion('Effective model access', icon='policy').classes('w-full min-w-0') as effective:
-                with ui.column().classes('w-full min-w-0 gap-2'):
-                    ui.label('Global access: Settings → Agent / Tools → Tool Permissions → External/Test Targets. Global Off blocks all target calls; Ask requests approval; On permits access while preserving each selected action’s Off or Ask.').classes('text-xs hy-muted')
-                    ui.label('Save this target to apply its draft.' if self.draft else 'Changes to this target are saved as you make them.').classes('text-xs hy-muted')
-                    ui.button('Refresh global access', icon='refresh', on_click=self.refresh).props('flat dense no-caps')
-                    self.table = ui.html('').classes('w-full min-w-0')
-                    ui.label('A command matching several categories needs every applicable action. Any required Off blocks it; otherwise Ask requires approval.').classes('text-xs hy-muted')
-                    if not self.managed_vm:
-                        ui.label('VM start, stop and snapshot actions apply only to managed test VMs.').classes('text-xs hy-muted')
+            ui.label('Save the target to apply changes.' if self.draft else 'Changes save automatically.').classes('text-xs hy-muted')
             self.error = ui.label('').classes('text-xs text-negative').style('white-space:pre-wrap;overflow-wrap:anywhere')
         self.mode.on_value_change(self._changed)
-        effective.on_value_change(self.refresh)
         if self.enabled is not None:
             self.enabled.on_value_change(self.refresh)
         self.refresh()
@@ -120,10 +93,3 @@ class TargetAccessEditor:
         if not available:
             text = 'This target is unavailable to the model. ' + text
         self.summary.set_text(text)
-        rows = target_action_rows(permission, str(self.mode.value), enabled=available,
-                                  managed_vm=self.managed_vm, policy=self.policy())
-        cell = 'padding:6px 4px;border-bottom:1px solid var(--hy-border);vertical-align:top;overflow-wrap:anywhere'
-        body = ''.join(f'<tr><td style="{cell}">{escape(label)}</td><td style="{cell}">{escape(access)}</td></tr>' for label, access in rows)
-        self.table.set_content('<table style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:12px">'
-                               '<thead><tr><th scope="col" style="text-align:left;width:58%">Action</th>'
-                               '<th scope="col" style="text-align:left">Effective access</th></tr></thead><tbody>' + body + '</tbody></table>')

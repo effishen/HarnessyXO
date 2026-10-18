@@ -1552,6 +1552,25 @@ class WorkspaceStore:
         assert target is not None
         return target
 
+    def set_external_target_enabled(self, target_id: str, enabled: bool) -> ExternalTarget:
+        """Change model availability without rewriting target access or credentials."""
+        if not isinstance(target_id, str) or not target_id:
+            raise ValueError('Choose an existing target id.')
+        if not isinstance(enabled, bool):
+            raise ValueError('Target availability must be true or false.')
+        with self._connect() as con:
+            updated = con.execute(
+                'UPDATE external_targets SET enabled=?,updated_at=? WHERE id=?',
+                (1 if enabled else 0, utcnow(), target_id),
+            )
+            if updated.rowcount != 1:
+                raise ValueError('The selected target no longer exists.')
+            row = con.execute('SELECT * FROM external_targets WHERE id=?', (target_id,)).fetchone()
+            assert row is not None
+            target = self._external_target_from_row(row)
+            con.commit()
+        return target
+
     def delete_external_target(self, target_id: str) -> None:
         with self._connect() as con:
             con.execute('DELETE FROM external_targets WHERE id=?', (str(target_id),))

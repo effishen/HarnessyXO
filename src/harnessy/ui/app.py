@@ -3028,7 +3028,7 @@ class HarnessyPage:
                             with ui.column().classes('gap-0 min-w-0'):
                                 with ui.row().classes('items-center gap-2'):
                                     ui.label(target.name).classes('font-semibold hy-target-name')
-                                    ui.badge('Enabled' if target.enabled else 'Disabled').props(
+                                    ui.badge('Enabled' if target.enabled else 'Disabled for model').props(
                                         'color=positive' if target.enabled else 'color=grey'
                                     )
                                 ui.label(f'{target.username}@{target.host}:{target.port}  →  {target.remote_root}').classes('text-xs hy-muted break-all')
@@ -3041,6 +3041,16 @@ class HarnessyPage:
                                     'Full unrestricted access' if target.policy.get('access_mode') == 'full' else 'Only selected actions'
                                 ).classes('text-xs hy-muted')
                             with ui.row().classes('gap-1'):
+                                availability = ui.switch('Enabled for the model', value=target.enabled).props(
+                                    'dense data-hy-target-model-enabled=1')
+                                availability.tooltip('Disable to prevent the model from using this target. Your manual controls remain available.')
+                                def save_availability(event, target_id=target.id):
+                                    try:
+                                        ws.set_external_target_enabled(target_id, bool(event.value))
+                                    except Exception as exc:
+                                        ui.notify(f'Could not change target availability: {exc}', type='negative')
+                                    render_targets()
+                                availability.on_value_change(save_availability)
                                 ui.button('Test connection', icon='cable', on_click=lambda _=None, tid=target.id: test_target(tid)).props('flat no-caps dense')
                                 ui.button('Edit', icon='edit', on_click=lambda _=None, tid=target.id: open_editor(tid)).props('flat no-caps dense')
                                 ui.button(icon='delete_outline', on_click=lambda _=None, tid=target.id: delete_target(tid)).props('flat round dense color=negative aria-label="Remove external device"').tooltip('Remove connection')
