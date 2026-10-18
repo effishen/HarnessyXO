@@ -1,7 +1,9 @@
-# HarnessyXO v0.6.123 Features
+# HarnessyXO v0.6.124 Features
 
 ## Workspace startup and VM resources
 
+- **Remove Workspace** only removes the registration and stops safely identified VMs. It leaves the workspace folder, files, chat history and VM disks on disk. The whole-folder permanent deletion option has been removed.
+- Choose a dedicated workspace subfolder. Home folders, system directories, mounted-volume roots, HarnessyXO application/settings folders and protected ancestors are rejected before workspace initialization. Existing unsafe registrations can be removed without opening or repairing their folders.
 - **Use this folder** shows an animated loading indicator, the current opening stage and elapsed time while the workspace is checked. Folder and database checks run off the interface thread. Repeated clicks are blocked until opening finishes; a failed attempt keeps the dialog open for retry.
 - Reuse an opened workspace when starting chats, processing queued work or reloading the page. Normal database writes do not repeat its full startup check. Give large databases additional bounded time for the first check; report busy databases separately from confirmed corruption.
 - Sign in before saved workspace database checks finish. Show visible loading progress while bounded isolated workers check a coherent SQLite snapshot and initialize each workspace. A corrupt, unavailable or stalled workspace gets a persistent error instead of blocking the controller.

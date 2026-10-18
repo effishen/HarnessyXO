@@ -14,6 +14,7 @@ from typing import Any
 from ..diagnostics.sqlite import connect_database
 from .sqlite_store import StoreConnection, backup_legacy_store_database, enable_store_wal
 from .paths import settings_dir
+from .workspace_roots import validate_workspace_root
 from .instructions import DEFAULT_GLOBAL_INSTRUCTIONS
 from .chat_templates import DEFAULT_CHAT_TEMPLATES, append_new_templates
 from .notifications import DEFAULT_NTFY_SETTINGS, normalize_ntfy_settings
@@ -1054,12 +1055,16 @@ class MachineStore:
         )
 
     def register_workspace(self, path: str | Path, name: str | None = None, workspace_id: str | None = None) -> WorkspaceRegistration:
-        resolved = Path(path).expanduser().resolve()
+        resolved = validate_workspace_root(path, state_root=self.root)
         if not resolved.exists() or not resolved.is_dir():
             raise ValueError(f'Workspace directory does not exist: {resolved}')
         workspace_id = workspace_id or str(uuid.uuid4())
         display_name = (name or resolved.name or str(resolved) or 'Workspace').strip()
         with self._connect() as con:
+            validate_workspace_root(
+                resolved, state_root=self.root,
+                other_workspace_roots=(row['path'] for row in con.execute('SELECT path FROM workspaces').fetchall()),
+            )
             existing = con.execute('SELECT id FROM workspaces WHERE path=?', (str(resolved),)).fetchone()
             if existing:
                 con.execute('UPDATE workspaces SET name=? WHERE id=?', (display_name, existing['id']))

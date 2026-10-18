@@ -23,6 +23,7 @@ from ..diagnostics.sqlite import connect_database
 from .sqlite_store import enable_store_wal
 from .target_policy import normalize_target_policy, target_action_permission
 from .workspace_access import WorkspaceConnection, workspace_generation, workspace_shared_access
+from .workspace_roots import validate_workspace_root
 from .workspace_health import (
     probe_workspace_database, require_workspace_database_admitted,
     remember_workspace_database_admitted, require_workspace_not_quarantined,
@@ -151,7 +152,7 @@ class WorkspaceStore:
     def __init__(
         self, root: str | Path, name: str | None = None, *, database_admission: str = 'probe',
     ) -> None:
-        self.root = Path(root).expanduser().resolve()
+        self.root = validate_workspace_root(root)
         if not self.root.exists() or not self.root.is_dir():
             raise ValueError(f'Workspace directory does not exist: {self.root}')
 

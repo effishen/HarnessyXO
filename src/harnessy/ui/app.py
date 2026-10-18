@@ -25,6 +25,7 @@ import math
 from urllib.parse import quote
 
 from harnessy.core.paths import settings_dir
+from harnessy.core.workspace_roots import validate_workspace_root, validate_workspace_delete_target
 from harnessy.core.network import preferred_lan_ipv4 as _preferred_lan_ipv4
 
 # Keep NiceGUI runtime storage with the rest of HarnessyXO's persistent settings.
@@ -247,7 +248,7 @@ def _prepare_runtime_workspace(
     a new full database copy, integrity scan or schema initialization whenever
     a chat starts or another browser page connects.
     """
-    key = str(Path(root).expanduser().resolve())
+    key = str(validate_workspace_root(root))
     options = dict(kwargs)
     if options.get('timeout') is None:
         options['timeout'] = workspace_preparation_timeout(root)
@@ -4031,7 +4032,10 @@ class HarnessyPage:
                         config = selected_config()
 
                         def prepare_folder() -> Path:
-                            target = selected_path.expanduser().resolve()
+                            target = validate_workspace_root(
+                                selected_path, state_root=self.machine.root,
+                                other_workspace_roots=(item.path for item in self.machine.list_workspaces()),
+                            )
                             if not target.is_dir():
                                 raise ValueError('Selected folder is not available')
                             manager = EnvironmentManager(target)
@@ -4170,78 +4174,52 @@ class HarnessyPage:
         dialog.open()
 
     def _remove_workspace_dialog(self, reg: WorkspaceRegistration) -> None:
-        workspace_path = reg.path.resolve()
+        # Removing a registration must never recursively delete its folder.
+        # Legacy registrations may point at a home or system directory.
+        workspace_path = reg.path.expanduser().absolute()
+        operation = {'running': False}
         with ui.dialog().props('persistent') as dialog, ui.card().classes('w-[650px] max-w-[94vw]'):
             ui.label(f'Remove {reg.name}?').classes('text-xl font-semibold')
-            ui.label('By default, this only unregisters the workspace from HarnessyXO. The workspace folder and everything inside it are left untouched.').classes('text-sm')
-            ui.label(str(workspace_path)).classes('text-xs font-mono hy-muted')
-            ui.label('Files/, .harnessy/ history/environment/SQLite instructions and memory, and .LLM/ workspace skills will remain on disk unless you explicitly choose the destructive option below.').classes('text-xs hy-muted')
-            ui.separator()
-            path_available = workspace_path.is_dir()
-            if not path_available:
-                ui.label('The registered workspace folder is not currently available. You can still remove this workspace registration from HarnessyXO.').classes('text-xs text-negative font-semibold')
-            delete_disk = ui.checkbox('Also delete this workspace folder from disk', value=False)
-            if not path_available or workspace_path == Path('/'):
-                delete_disk.disable()
-            destructive_area = ui.column().classes('w-full gap-2')
-            with destructive_area:
-                ui.label('Permanent deletion').classes('text-negative font-semibold')
-                ui.label('This deletes the workspace directory itself, including Files/, the VM disk/snapshots, .harnessy/ history/artifacts/state/SQLite instructions and memory, and .LLM/ workspace skills. HarnessyXO cannot undo this.').classes('text-xs text-negative')
-                if workspace_path == Path('/'):
-                    ui.label('Filesystem root cannot be deleted as a workspace.').classes('text-xs text-negative font-semibold')
-                confirm_text = ui.input('Type DELETE to confirm permanent deletion').classes('w-full')
-            destructive_area.set_visibility(False)
+            ui.label('Remove this workspace from HarnessyXO. Its folder, files, chat history and VM disks stay on disk.').classes('text-sm')
+            ui.label(str(workspace_path)).classes('text-xs font-mono hy-muted').style('overflow-wrap:anywhere')
+
+            def close_dialog() -> None:
+                if not operation['running']:
+                    dialog.close()
 
             with ui.row().classes('w-full justify-end'):
-                ui.button('Cancel', on_click=dialog.close).props('flat no-caps')
+                cancel_button = ui.button('Cancel', on_click=close_dialog).props('flat no-caps')
                 confirm_button = ui.button('Remove Workspace').props('unelevated no-caps')
 
-            def sync_destructive() -> None:
-                destructive = bool(delete_disk.value)
-                destructive_area.set_visibility(destructive)
-                if destructive:
-                    confirm_button.set_text('Delete Folder and Remove')
-                    confirm_button.props('color=negative')
-                    allowed = path_available and workspace_path != Path('/') and str(confirm_text.value or '') == 'DELETE'
-                    confirm_button.enable() if allowed else confirm_button.disable()
-                else:
-                    confirm_button.set_text('Remove Workspace')
-                    confirm_button.props(remove='color')
-                    confirm_button.enable()
-
             async def remove() -> None:
-                destructive = bool(delete_disk.value)
-                if destructive and (not path_available or workspace_path == Path('/') or str(confirm_text.value or '') != 'DELETE'):
+                if operation['running'] or not dialog.value:
                     return
                 if self._workspace_is_busy(reg.id):
                     ui.notify('Stop the active workspace agent job before removing this workspace.', type='warning')
                     return
+                operation['running'] = True
+                confirm_button.disable()
+                confirm_button.props('loading')
+                cancel_button.disable()
                 try:
                     self.machine.check_workspace_removal_allowed(reg.id)
-                    # Close only this workspace's tabs/PTYs before touching its
-                    # registration or directory; other workspaces stay intact.
+                    try:
+                        safe_root = validate_workspace_root(
+                            workspace_path, state_root=self.machine.root,
+                            other_workspace_roots=(item.path for item in self.machine.list_workspaces()),
+                        )
+                    except ValueError:
+                        safe_root = None
+                    # Unsafe legacy registrations can always be unregistered.
+                    # Do not initialize, repair or inspect a VM under that path.
+                    removed_ws = self.workspace_cache.get(reg.id) if safe_root is not None else None
                     removed_tabs = [tab for tab in self.open_tabs if tab.workspace_id == reg.id]
                     removed_keys = {tab.key for tab in removed_tabs}
-                    removed_ws = None
-                    if workspace_path.is_dir():
-                        try:
-                            removed_ws = self._load_workspace(reg)
-                        except Exception:
-                            removed_ws = None
                     for removed_tab in removed_tabs:
-                        if removed_tab.kind != 'chat' or not removed_tab.chat_id:
-                            continue
-                        if removed_ws is not None:
-                            self._clear_chat_composer_draft(
-                                removed_ws, removed_tab.chat_id,
-                                persist=removed_ws.get_chat(removed_tab.chat_id) is not None,
-                            )
-                        else:
+                        if removed_tab.kind == 'chat' and removed_tab.chat_id:
                             self.chat_composer_drafts.pop((reg.id, removed_tab.chat_id), None)
                     pending_terminal_starts = []
-                    for tab in list(self.open_tabs):
-                        if tab.workspace_id != reg.id:
-                            continue
+                    for tab in removed_tabs:
                         if tab.kind in {'terminal', 'target_terminal'}:
                             task = self.terminal_start_tasks.pop(tab.key, None)
                             if task is not None and not task.done():
@@ -4265,18 +4243,14 @@ class HarnessyPage:
                     if removed_ws is not None:
                         from harnessy.environment.test_targets import stop_workspace_test_targets
                         await stop_workspace_test_targets(removed_ws)
-                    if workspace_path.is_dir():
-                        manager = EnvironmentManager(workspace_path)
-                        if manager.config is not None:
-                            provider = manager.provider()
+                    if safe_root is not None and safe_root.is_dir():
+                        manager = await asyncio.to_thread(EnvironmentManager, safe_root)
+                        config = await asyncio.to_thread(lambda: manager.config)
+                        if config is not None:
+                            provider = manager.provider(config)
                             status = await provider.status()
                             if status.available:
-                                if destructive:
-                                    await provider.destroy()
-                                else:
-                                    await provider.stop()
-                    if destructive:
-                        shutil.rmtree(workspace_path)
+                                await provider.stop()
                     self.machine.unregister_workspace(reg.id)
                     _wake_run_queue()
                     _observe_run_queue_snapshot(self.machine, source='state_change')
@@ -4301,17 +4275,19 @@ class HarnessyPage:
                         self.refresh_sidebar()
                         self.refresh_tabs()
                     dialog.close()
-                    ui.notify('Workspace folder deleted' if destructive else 'Workspace removed from HarnessyXO', type='positive')
+                    ui.notify('Workspace removed from HarnessyXO. Its files remain on disk.', type='positive')
                 except Exception as exc:
                     ui.notify(f'Could not remove workspace: {exc}', type='negative', timeout=9000)
+                finally:
+                    operation['running'] = False
+                    confirm_button.props(remove='loading')
+                    confirm_button.enable()
+                    cancel_button.enable()
 
             confirm_button.on('click', remove)
-            # Enter confirms only when focus is not in an editable field; Escape
-            # always cancels. This avoids accidental destructive confirmation
-            # while the user is typing DELETE or editing another control.
             dialog.on(
                 'keydown',
-                lambda e: remove() if (e.args or {}).get('key') == 'Enter' else dialog.close(),
+                lambda e: remove() if (e.args or {}).get('key') == 'Enter' else close_dialog(),
                 js_handler="""(e) => {
                     if (e.key !== 'Enter' && e.key !== 'Escape') return;
                     const t = e.target;
@@ -4320,9 +4296,6 @@ class HarnessyPage:
                     e.preventDefault(); e.stopPropagation(); emit({key:e.key});
                 }""",
             )
-            delete_disk.on_value_change(lambda _e: sync_destructive())
-            confirm_text.on_value_change(lambda _e: sync_destructive())
-            sync_destructive()
         dialog.open()
 
     async def _provision_workspace_environment(self, ws: WorkspaceStore) -> None:
@@ -4806,6 +4779,13 @@ class HarnessyPage:
                 ui.label('Could not open workspace').classes('text-xl font-semibold')
                 ui.label(reg.name).classes('font-semibold break-words')
                 ui.label(message).classes('hy-muted break-words')
+                try:
+                    validate_workspace_root(reg.path, state_root=self.machine.root)
+                except ValueError:
+                    ui.label('This folder cannot be used as a workspace. Remove it from HarnessyXO, then choose a dedicated workspace subfolder. Its files will stay on disk.').classes('text-sm')
+                    ui.button('Remove from HarnessyXO', icon='remove_circle_outline',
+                              on_click=lambda: self._remove_workspace_dialog(reg)).props('no-caps unelevated')
+                    return
                 active = next((tab for tab in self.open_tabs if tab.key == self.active_tab_key
                                and tab.workspace_id == reg.id and tab.chat_id), None)
                 draft = self.chat_composer_drafts.get((reg.id, str(active.chat_id)), '') if active else ''
@@ -4835,6 +4815,7 @@ class HarnessyPage:
         current = self.machine.get_workspace(reg.id)
         if current is None or current.path.resolve() != reg.path.resolve():
             raise RuntimeError('The workspace registration changed. Reload this page before continuing.')
+        validate_workspace_root(current.path, state_root=self.machine.root)
         return current
 
     async def _hold_workspace_recovery(self, reg: WorkspaceRegistration) -> WorkspaceRegistration:
@@ -16024,7 +16005,7 @@ window.harnessyTerminalFocus = function(terminalId) {
         paths: list[Path] = []
         for raw in data.get('paths') or []:
             try:
-                path = Path(str(raw)).expanduser().resolve()
+                path = Path(str(raw)).expanduser().absolute()
                 if self._file_path_in_scope(ws, path):
                     paths.append(path)
             except Exception:
@@ -16034,15 +16015,15 @@ window.harnessyTerminalFocus = function(terminalId) {
     def _file_targets(self, ws: WorkspaceStore | ToolScope, fallback: Path | None = None) -> list[Path]:
         selected = [
             p for p in self.file_selections.get(ws.id, [])
-            if p.exists() and self._file_path_in_scope(ws, p)
+            if (p.exists() or p.is_symlink()) and self._file_path_in_scope(ws, p)
         ]
         if fallback is not None:
-            resolved = fallback.resolve()
-            if not self._file_path_in_scope(ws, resolved):
+            selected_path = fallback.expanduser().absolute()
+            if not self._file_path_in_scope(ws, selected_path):
                 return []
-            if resolved in selected:
+            if selected_path in selected:
                 return selected
-            return [resolved]
+            return [selected_path]
         return selected
 
     def _browser_file_action(self, e) -> None:
@@ -16058,8 +16039,8 @@ window.harnessyTerminalFocus = function(terminalId) {
         paths: list[Path] = []
         for raw in data.get('paths') or []:
             try:
-                p = Path(str(raw)).expanduser().resolve()
-                if p.exists() and self._file_path_in_scope(ws, p):
+                p = Path(str(raw)).expanduser().absolute()
+                if (p.exists() or p.is_symlink()) and self._file_path_in_scope(ws, p):
                     paths.append(p)
             except Exception:
                 continue
@@ -18680,8 +18661,18 @@ window.harnessyTerminalFocus = function(terminalId) {
 
     def _file_delete(self, ws: WorkspaceStore | ToolScope, paths: Path | list[Path]) -> None:
         items = [paths] if isinstance(paths, Path) else list(paths)
-        items = [p.resolve() for p in items if p.exists()]
+        items = [p.expanduser().absolute() for p in items if p.exists() or p.is_symlink()]
         if not items:
+            return
+        try:
+            for path in items:
+                if path.is_dir() and not path.is_symlink():
+                    validate_workspace_delete_target(
+                        path, state_root=self.machine.root,
+                        other_workspace_roots=(item.path for item in self.machine.list_workspaces()),
+                    )
+        except ValueError as exc:
+            ui.notify(f'Cannot delete this folder: {exc}', type='negative', timeout=9000)
             return
         with ui.dialog() as dialog, ui.card().classes('w-[600px] max-w-[92vw]'):
             ui.label('Delete permanently?').classes('text-lg font-semibold')
@@ -18700,9 +18691,16 @@ window.harnessyTerminalFocus = function(terminalId) {
                 def work() -> int:
                     removed = 0
                     for path in items:
-                        if not path.exists():
+                        if not path.exists() and not path.is_symlink():
                             continue
-                        shutil.rmtree(path) if path.is_dir() and not path.is_symlink() else path.unlink()
+                        if path.is_dir() and not path.is_symlink():
+                            validate_workspace_delete_target(
+                                path, state_root=self.machine.root,
+                                other_workspace_roots=(item.path for item in self.machine.list_workspaces()),
+                            )
+                            shutil.rmtree(path)
+                        else:
+                            path.unlink()
                         removed += 1
                     return removed
                 self._launch_file_operation(

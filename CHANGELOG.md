@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.6.124
+
+- Remove permanent folder deletion from **Remove Workspace**. Removing a workspace now leaves its files, chat history, VM disks and snapshots on disk. Stop safely identified VMs instead of destroying them.
+- Reject home folders, system directories, mounted-volume roots, HarnessyXO application/settings folders and protected ancestors before workspace initialization. Resolve aliases before checking. Allow dedicated workspace subfolders, and let old unsafe registrations be removed without opening, repairing or deleting their folders.
+- Protect home and other protected folders from whole-folder deletion in Home File Explorer. Deleting a selected symlink removes the link rather than following it to delete the target.
+- This update prevents the unsafe workspace-removal behavior; it cannot restore files deleted by earlier versions. Leave README unchanged. Verified with synthetic filesystem cases and browser flows on Linux; native Mac disk testing was unavailable.
+
 ## v0.6.123
 
 - Show an animated loading indicator, the current stage and elapsed time immediately after **Use this folder**. Keep progress visible at the bottom of the picker while checking the folder, opening its database and saving the selection.
