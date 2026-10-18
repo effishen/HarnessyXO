@@ -325,6 +325,17 @@ _VM_DIAGNOSTIC_ENUMS = {
         'restarting_reset_vm', 'rebuilding', 'network_stopping', 'network_applying', 'network_starting',
     }),
 }
+_WORKSPACE_DATABASE_ENUMS = {
+    'database_health_status': frozenset({'ready', 'corrupt', 'unavailable', 'timed_out', 'worker_failed'}),
+    'database_health_reason': frozenset({
+        'integrity_failed', 'sqlite_corrupt', 'sqlite_error', 'filesystem_error', 'database_changed',
+        'admission_required', 'worker_timeout', 'worker_exit', 'worker_protocol', 'invalid_file',
+        'empty_database', 'initialization_failed', 'verified', 'cancelled', 'history_busy',
+    }),
+    'database_health_phase': frozenset({'database_admission', 'workspace_initialization', 'admission', 'initialization'}),
+    'database_worker_signal': frozenset({'SIGBUS', 'SIGSEGV', 'SIGABRT', 'SIGKILL', 'SIGTERM', 'other', 'none'}),
+}
+
 _VM_COMMAND_ID_KEYS = frozenset({'command_id', 'parent_start_command_id', 'startup_attempt_id'})
 
 
@@ -335,6 +346,8 @@ def _safe_event_field(key: str, value: Any) -> Any:
     if key in {'technical_error', 'controller_evidence', 'host_resources', 'requested_vm_config', 'environment_action',
                'error_type', 'terminal_stop_reason', 'terminal_reason', 'backend_done_reason',
                'completion_state', 'last_error_code', 'source', 'state', 'component', 'missing_dependency'}:
+        return _privacy_safe_value(value, key=key)
+    if key in _WORKSPACE_DATABASE_ENUMS or key == 'database_worker_returncode':
         return _privacy_safe_value(value, key=key)
     if key in {'archive_check', 'storage_issue'}:
         return _privacy_safe_value(value, key=key)
@@ -1456,7 +1469,7 @@ def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
         from .host_state import validate_resource_snapshot
         return validate_resource_snapshot(value)
     if lowered == 'environment_action':
-        return value if isinstance(value, str) and value in {'create', 'start', 'stop', 'reset', 'rebuild', 'destroy', 'restore', 'snapshot', 'tools', 'network'} else None
+        return value if isinstance(value, str) and value in {'create', 'start', 'stop', 'reset', 'rebuild', 'destroy', 'restore', 'snapshot', 'tools', 'network', 'resources'} else None
     if lowered == 'lifecycle_action':
         return value if isinstance(value, str) and value in {'create', 'start', 'stop', 'reset', 'rebuild', 'destroy'} else None
     if lowered == 'preservation_reason':
@@ -1567,6 +1580,10 @@ def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
             action = argv[position] if len(argv) > position else None
             if isinstance(action, str) and action in _VM_DIAGNOSTIC_ENUMS['controller_action']:
                 value = {**value, 'controller_action': action}
+    if lowered == 'database_worker_returncode':
+        return value if type(value) is int and -255 <= value <= 255 else None
+    if lowered in _WORKSPACE_DATABASE_ENUMS:
+        return value if isinstance(value, str) and value in _WORKSPACE_DATABASE_ENUMS[lowered] else _privacy_marker(value, label=lowered)
     if lowered in _VM_DIAGNOSTIC_ENUMS:
         if value is None:
             return None
@@ -2296,7 +2313,7 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
             target_report, target_members = _collect_test_target_export(latest, include_content=include_content)
             try:
                 from .host_state import collect_host_diagnostics, validate_host_diagnostics
-                host_report = validate_host_diagnostics(collect_host_diagnostics())
+                host_report = validate_host_diagnostics(collect_host_diagnostics(application_root=app_root))
             except Exception as exc:
                 from .technical import technical_error_evidence
                 host_report = {'schema_version': 1, 'status': 'collector_failed',

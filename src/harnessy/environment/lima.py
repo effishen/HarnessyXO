@@ -3311,6 +3311,85 @@ exit $rc
             clear_environment_provider_cache(self.workspace_root)
             release()
 
+    async def apply_resources(self, *, cpu: int, memory_mb: int, disk_gb: int,
+                              expected: dict[str, Any] | None = None, progress=None,
+                              reservation_held: bool = False) -> EnvironmentStatus:
+        """Edit a stopped VM in place; primary-disk growth takes effect on Start.
+
+        Lima validates the edit. Read its reported configuration back before
+        committing portable settings. A failed/uncertain edit leaves the saved
+        definition unchanged and never attempts a compensating disk shrink.
+        """
+        from .resources import changed_resources, lima_resource_values, resources_match
+
+        release = (lambda: None) if reservation_held else reserve_environment_change(self.workspace_root, 'VM resources')
+        try:
+            async with self._workspace_start_lock():
+                original = load_environment_config(self.workspace_root)
+                if original is None:
+                    raise RuntimeError('The workspace environment definition is missing.')
+                if expected is not None and expected != original.to_dict():
+                    raise RuntimeError('Workspace settings changed since this editor opened. Reopen Edit VM Resources before applying.')
+                changed = changed_resources(original, cpu=cpu, memory_mb=memory_mb, disk_gb=disk_gb)
+                self.config = original
+                await self._emit_progress(progress, 'resources_checking', 'Checking stopped VM resources…',
+                                          stage_timeout_seconds=45.0)
+                status = await self.status()
+                if status.running or (status.created and status.state != 'stopped'):
+                    raise RuntimeError('Stop the workspace VM before changing CPU, RAM, or storage. No work was interrupted.')
+                if not status.created and (self.vm_root / self.INSTANCE).exists():
+                    raise RuntimeError('Cannot verify the existing VM state. Resource settings were not changed; restore host backend access and retry.')
+                if status.created:
+                    row = await self._instance_row()
+                    if not row or str(row.get('name') or row.get('Name') or '') != self.INSTANCE:
+                        raise RuntimeError('Cannot verify the workspace VM identity. Resource settings were not changed.')
+                    if str(row.get('status') or row.get('Status') or '').lower() != 'stopped':
+                        raise RuntimeError('The VM is no longer stopped. Resource settings were not changed.')
+                    current = lima_resource_values(row)
+                    if changed.disk_gb * 1024 ** 3 < current['disk']:
+                        raise ValueError('Storage cannot be smaller than the current Lima disk. Reopen the editor and choose at least its existing capacity; no disk shrink was attempted.')
+                    if not resources_match(row, changed):
+                        await self._emit_progress(progress, 'resources_applying', 'Applying stopped VM resource settings…',
+                                                  detail='The VM stays stopped. Storage can grow; the existing disk is preserved.',
+                                                  stage_timeout_seconds=self.TIMEOUT_EDIT)
+                        try:
+                            await self._run('edit', self.INSTANCE, '--cpus', str(changed.cpu),
+                                            '--memory', f'{changed.memory_mb / 1024:.10f}'.rstrip('0').rstrip('.'),
+                                            '--disk', str(changed.disk_gb), timeout=self.TIMEOUT_EDIT, check=True)
+                            verified = await self._instance_row()
+                            if (not verified or str(verified.get('name') or verified.get('Name') or '') != self.INSTANCE
+                                    or str(verified.get('status') or verified.get('Status') or '').lower() != 'stopped'
+                                    or not resources_match(verified, changed)):
+                                raise RuntimeError('Lima did not confirm all requested values on the stopped VM.')
+                        except BaseException as exc:
+                            if isinstance(exc, asyncio.CancelledError):
+                                raise
+                            raise RuntimeError(f'Resource update could not be verified: {exc}. The previous saved settings remain. '
+                                               'Lima may have accepted part of the edit; keep the VM stopped and retry the same or larger storage size. '
+                                               'No disk shrink, rebuild, or deletion was attempted.') from exc
+                await self._emit_progress(progress, 'resources_saving', 'Saving verified VM resources…', stage_timeout_seconds=20.0)
+                self.config = changed
+                try:
+                    self._write_template()
+                    self._clear_readiness('resources_changed')
+                    save_environment_config(self.workspace_root, changed)
+                except BaseException as exc:
+                    self.config = original
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
+                    raise RuntimeError(f'Could not save the new resource settings: {exc}. The portable settings remain unchanged; '
+                                       'keep the VM stopped and retry. No disk shrink or deletion was attempted.') from exc
+                log_event('runtime', 'vm_resources_applied', workspace=str(self.workspace_root), provider='lima',
+                          cpu=changed.cpu, memory_mb=changed.memory_mb, disk_gb=changed.disk_gb,
+                          vm_running=False, disk_growth_pending=changed.disk_gb > original.disk_gb)
+                await self._emit_progress(progress, 'resources_complete', 'VM resources saved. Start the VM to use them.',
+                                          detail='The VM disk and workspace files were preserved.', stage_timeout_seconds=10.0)
+                return status
+        finally:
+            from .manager import clear_environment_provider_cache
+            clear_environment_provider_cache(self.workspace_root)
+            release()
+
     @_lifecycle_diagnostics('stop')
     async def stop(self, *, force: bool = False) -> EnvironmentStatus:
         status = await self.status()

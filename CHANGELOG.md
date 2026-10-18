@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.117
+
+- Keep login responsive while saved workspaces open. Check a coherent database snapshot for corruption and initialize the workspace in bounded, isolated processes. Show a persistent error for an unhealthy workspace, preserve its saved tabs, and provide an explicit Retry. Do not automatically reset, rebuild or repair its database or journals.
+- Avoid repeating the full history catalogue copy on every workspace open. Backfill only missing checkpoint snapshots while preserving existing entries and labels.
+- Edit workspace VM CPU, RAM and storage under Workspace Environment → Details → Edit VM Resources. Require a stopped VM and idle workspace; verify Lima's applied settings before saving. Support disk expansion without rebuilding, with the larger capacity applied on the next Start. Keep resource controls and an explicit Stop VM available when the workspace database cannot open.
+- Diagnose database corruption separately from locking. Include isolated worker failure and signal evidence, distinguish the diagnostics collector from the running app, and summarize retained native crash evidence without including conversation or project content.
+- Verified real SQLite corruption, active WAL writers, isolated native faults, worker timeouts, shutdown, saved-tab recovery, resource validation and browser flows on Linux. Native Mac and live Lima resizing were not available for testing. Leave README unchanged.
+
 ## v0.6.116
 
 - Keep sign-in responsive when another operation holds a workspace history lock. Show a busy-history error so you can reopen the workspace after that operation finishes. Preserve existing files, saved tabs and lock holders; bound other history lock waits to ten seconds.

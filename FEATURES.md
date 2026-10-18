@@ -1,5 +1,14 @@
 # HarnessyXO v0.6.100 Features
 
+## Workspace startup and VM resources
+
+- Sign in before saved workspace database checks finish. Show visible loading progress while bounded isolated workers check a coherent SQLite snapshot and initialize each workspace. A corrupt, unavailable or stalled workspace gets a persistent error instead of blocking the controller.
+- Retain saved tabs for unavailable workspaces. Use **Retry workspace** after addressing the disk or restoring a known healthy database. HarnessyXO does not automatically reset, rebuild or repair damaged workspace databases or their journals.
+- Open **Workspace Environment → Details → Edit VM Resources** to change CPU, RAM and storage. Stop the VM and finish active workspace work first. CPU and RAM can increase or decrease; storage can only grow. Start the VM afterward to use the new values and expand its disk capacity. Existing files, installed tools and VM disks are retained.
+- Check the current VM identity, stopped state and settings before applying an edit, then verify the controller's reported values before saving. An uncertain edit keeps the saved definition unchanged and explains how to retry without shrinking the disk.
+- Keep VM resource settings and an explicit **Stop VM** control available on a workspace-open error, independently of the workspace database.
+- Diagnostics distinguish SQLite corruption from locks, record bounded workspace worker failures and native signals, and label collector resource/version observations separately from recorded application state.
+
 ## Model progress across backends
 
 - Keep total **Run** elapsed time visible throughout the current run, with a separate **Request** clock while waiting for or processing a model request. Keep the run clock on narrow screens and freeze it when the run finishes, stops or fails.

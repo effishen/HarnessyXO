@@ -39,7 +39,7 @@ def validate_controller_observation(event: Any, value: Any) -> dict[str, Any] | 
         if identifier:
             safe[key] = identifier
     if isinstance(value.get('environment_action'), str) and value['environment_action'] in {'create', 'start', 'stop', 'reset', 'rebuild', 'destroy',
-                                           'restore', 'snapshot', 'tools', 'network'}:
+                                           'restore', 'snapshot', 'tools', 'network', 'resources'}:
         safe['environment_action'] = value['environment_action']
     for key, choices in {'controller_state': {'running', 'exited'},
                          'completion_phase': {'running_controller', 'collecting_output'},

@@ -73,7 +73,7 @@ _ARCHES = {'x86_64': 'x86_64', 'amd64': 'x86_64', 'arm64': 'aarch64', 'aarch64':
            'i386': 'x86', 'i686': 'x86', 'armv7l': 'armv7', 'riscv64': 'riscv64',
            'ppc64le': 'ppc64le', 's390x': 's390x'}
 _DEPENDENCIES = ('nicegui', 'httpx', 'segno', 'playwright', 'fastapi', 'starlette',
-                 'uvicorn', 'anyio', 'pydantic', 'aiohttp', 'python-socketio', 'PyYAML')
+                 'uvicorn', 'uvloop', 'anyio', 'pydantic', 'aiohttp', 'python-socketio', 'PyYAML')
 _MEM_KEYS = ('MemTotal', 'MemFree', 'MemAvailable', 'Buffers', 'Cached', 'SwapTotal',
              'SwapFree', 'SwapCached', 'Shmem', 'Slab', 'SReclaimable', 'PageTables',
              'CommitLimit', 'Committed_AS', 'HugePages_Total', 'HugePages_Free', 'Hugepagesize')
@@ -313,7 +313,7 @@ def _load_average() -> dict[str, Any]:
 
 
 def _process_state(system: str) -> dict[str, Any]:
-    out: dict[str, Any] = {'status': 'ok', 'scope': 'harnessy_process_only', 'pid': os.getpid()}
+    out: dict[str, Any] = {'status': 'ok', 'scope': 'collecting_process_only', 'pid': os.getpid()}
     for name in ('getuid', 'geteuid', 'getgid', 'getegid'):
         if hasattr(os, name):
             out[name[3:]] = getattr(os, name)()
@@ -619,8 +619,73 @@ def _darwin_probe(key: str, deadline: float) -> dict[str, Any]:
     return {'status': 'unparseable'}
 
 
+def _application_root() -> Path:
+    package = Path(__file__).resolve().parents[1]
+    return package.parent.parent if package.parent.name == 'src' else package.parent
+
+
+def _dependency_versions(application_root: Path) -> dict[str, Any]:
+    """Read installation metadata, never import a dependency or amend sys.path.
+
+    Only this installation's fixed .vendor directory is considered. Metadata
+    proves an installed distribution version, not which module a live process
+    has imported. A separate offline collector may use a different interpreter.
+    """
+    vendor = application_root / '.vendor'
+    entries: dict[str, list[Path]] = {}
+    vendor_status = 'ok'
+    try:
+        _path_status(vendor, final_type='directory')
+        with os.scandir(vendor) as iterator:
+            for index, item in enumerate(iterator):
+                if index >= 2048:
+                    raise _ProbeError('truncated')
+                if item.name.endswith('.dist-info'):
+                    normalized = re.sub(r'[-_.]+', '-', item.name[:-10].split('-', 1)[0]).lower()
+                    entries.setdefault(normalized, []).append(Path(item.path) / 'METADATA')
+    except (OSError, _ProbeError) as exc:
+        vendor_status = _error(exc)['status']
+    result = {}
+    for name in _DEPENDENCIES:
+        normalized = re.sub(r'[-_.]+', '-', name).lower()
+        # Wheel distribution filenames normalize dashes to underscores.
+        matches = entries.get(normalized, [])
+        if matches:
+            row: dict[str, Any] = {'source_scope': 'application_vendor_metadata'}
+            try:
+                if len(matches) != 1:
+                    raise _ProbeError('unavailable')
+                text = _read_os_file(matches[0], 128 * 1024)
+                header = text.split('\n\n', 1)[0]
+                names = re.findall(r'^Name: ([^\r\n]{1,200})\r?$', header, re.M)
+                versions = re.findall(r'^Version: ([^\r\n]{1,200})\r?$', header, re.M)
+                if (len(names) != 1 or re.sub(r'[-_.]+', '-', names[0]).lower() != normalized
+                        or len(versions) != 1):
+                    raise _ProbeError('unparseable')
+                version = _version(versions[0])
+                row.update({'status': 'ok', 'version': version} if version else {'status': 'version_unparseable'})
+            except (OSError, _ProbeError) as exc:
+                row.update(_error(exc))
+            result[name] = row
+        elif vendor_status not in {'ok', 'missing'}:
+            # Do not claim missing after incomplete directory discovery.
+            result[name] = {'status': vendor_status, 'source_scope': 'application_vendor_metadata'}
+        else:
+            row = {'source_scope': 'collecting_python_metadata'}
+            try:
+                version = _version(importlib.metadata.version(name))
+                row.update({'status': 'ok', 'version': version} if version else {'status': 'version_unparseable'})
+            except importlib.metadata.PackageNotFoundError:
+                row['status'] = 'missing'
+            except (OSError, ValueError):
+                row['status'] = 'unavailable'
+            result[name] = row
+    return result
+
+
 def collect_host_diagnostics(workspace_roots: Sequence[Path | str] = (), *,
-                             include_tool_versions: bool = True) -> dict[str, Any]:
+                             include_tool_versions: bool = True,
+                             application_root: Path | None = None) -> dict[str, Any]:
     """Return JSON-safe technical inventory without touching workspace contents.
 
     At most eight supplied roots are stat'ed and identified only as workspace_1,
@@ -645,11 +710,13 @@ def collect_host_diagnostics(workspace_roots: Sequence[Path | str] = (), *,
                     'sqlite_version': _version(sqlite3.sqlite_version)},
         'filesystems': [_filesystem(Path('/'), 'system_root')],
         'dependencies': {},
+        'dependency_scope': 'installed_metadata_not_live_imports',
+        'runtime_scope': 'collecting_python_process',
     }
     try:
-        report['filesystems'].append(_filesystem(Path.cwd(), 'application_current_directory'))
+        report['filesystems'].append(_filesystem(Path.cwd(), 'collecting_process_current_directory'))
     except OSError as exc:
-        report['filesystems'].append({'role': 'application_current_directory', **_error(exc)})
+        report['filesystems'].append({'role': 'collecting_process_current_directory', **_error(exc)})
     if isinstance(workspace_roots, (list, tuple)):
         for index, root in enumerate(workspace_roots[:MAX_WORKSPACES], 1):
             role = 'workspace_' + str(index)
@@ -658,14 +725,7 @@ def collect_host_diagnostics(workspace_roots: Sequence[Path | str] = (), *,
             else:
                 report['filesystems'].append(_filesystem(Path(root), role))
         report['workspace_roots_omitted'] = max(0, len(workspace_roots) - MAX_WORKSPACES)
-    for name in _DEPENDENCIES:
-        try:
-            version = _version(importlib.metadata.version(name))
-            report['dependencies'][name] = {'status': 'ok', 'version': version} if version else {'status': 'version_unparseable'}
-        except importlib.metadata.PackageNotFoundError:
-            report['dependencies'][name] = {'status': 'missing'}
-        except (OSError, ValueError):
-            report['dependencies'][name] = {'status': 'unavailable'}
+    report['dependencies'] = _dependency_versions(Path(application_root) if application_root is not None else _application_root())
     if system == 'Linux':
         report.update(cpu=_linux_cpu(), memory=_linux_memory(), cgroup=_linux_cgroup(), pressure=_pressure(),
                       kvm=_file_metadata(Path('/dev/kvm'), device=True),
@@ -762,8 +822,9 @@ def _project_process(value: Any) -> dict[str, Any]:
     result = _project(value, _PROCESS_NUMBERS, booleans=('open_fd_count_capped',))
     if not isinstance(value, dict):
         return result
-    if value.get('scope') == 'harnessy_process_only':
-        result['scope'] = 'harnessy_process_only'
+    if isinstance(value.get('scope'), str) and value['scope'] in {'collecting_process_only', 'harnessy_process_only', 'legacy_collecting_process_scope_unverified'}:
+        result['scope'] = ('collecting_process_only' if value['scope'] == 'collecting_process_only'
+                           else 'legacy_collecting_process_scope_unverified')
     if isinstance(value.get('supplementary_group_ids'), list):
         result['supplementary_group_ids'] = [item for item in value['supplementary_group_ids'][:256] if type(item) is int and 0 <= item <= 2**32 - 1]
     for key in ('proc_status',):
@@ -799,7 +860,9 @@ def _project_filesystems(value: Any) -> list[dict[str, Any]]:
         if not isinstance(item, dict):
             continue
         role = item.get('role')
-        if role not in ('system_root', 'application_current_directory') and not (isinstance(role, str) and re.fullmatch(r'workspace_[1-8]', role)):
+        if role == 'application_current_directory':
+            role = 'collecting_process_current_directory'
+        if role not in ('system_root', 'collecting_process_current_directory') and not (isinstance(role, str) and re.fullmatch(r'workspace_[1-8]', role)):
             continue
         result.append({'role': role, **_project(item, _FS_NUMBERS, booleans=('read_only',))})
     return result
@@ -878,6 +941,10 @@ def validate_host_diagnostics(value: Any) -> dict[str, Any]:
         return {'schema_version': SCHEMA_VERSION, 'status': 'unavailable'}
     result = _project(value, ('captured_at_epoch', 'collection_duration_seconds', 'workspace_roots_omitted'), booleans=('command_budget_exhausted',))
     result['schema_version'] = SCHEMA_VERSION
+    for key, allowed in (('dependency_scope', 'installed_metadata_not_live_imports'),
+                         ('runtime_scope', 'collecting_python_process')):
+        if value.get(key) == allowed:
+            result[key] = allowed
     result['content_policy'] = 'technical_values_only_no_content_paths_accounts_argv_environment'
     result.update(process=_project_process(value.get('process')), memory=_project_memory(value.get('memory')),
                   cgroup=_project_cgroup(value.get('cgroup')), pressure=_project_pressure(value.get('pressure')),
@@ -954,6 +1021,8 @@ def validate_host_diagnostics(value: Any) -> dict[str, Any]:
             version = item.get('version')
             if isinstance(version, str) and re.fullmatch(r'\d{1,6}(?:\.\d{1,6}){1,4}', version):
                 out['version'] = version
+            if isinstance(item.get('source_scope'), str) and item['source_scope'] in {'application_vendor_metadata', 'collecting_python_metadata'}:
+                out['source_scope'] = item['source_scope']
             if item.get('discovery') == 'fixed_name_search':
                 out['discovery'] = 'fixed_name_search'
             if item.get('reason') == 'snapshot':

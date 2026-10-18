@@ -12,6 +12,7 @@ import json
 import math
 from pathlib import Path
 import re
+import sqlite3
 from typing import Any
 from .permissions import PERMISSION_EVENTS
 from .startup import STARTUP_EVENTS
@@ -33,6 +34,8 @@ _ACCESS_RESTORE_EVENTS = frozenset({
     'page_build_started', 'page_session_restore_started', 'page_session_restore_completed',
     'page_workspace_restore_started', 'page_built',
     'saved_tab_restore_failed', 'workspace_open_failed', 'history_lock_busy',
+    'workspace_database_health_started', 'workspace_database_health_completed',
+    'workspace_database_health_failed',
 })
 _ACCESS_RESTORE_FAILURES = {
     'account_store_check_busy': 'account_store_busy',
@@ -42,6 +45,7 @@ _ACCESS_RESTORE_FAILURES = {
     'saved_tab_restore_failed': 'saved_tab_restore_failed',
     'workspace_open_failed': 'workspace_open_failed',
     'history_lock_busy': 'history_lock_contention',
+    'workspace_database_health_failed': 'workspace_database_health_failed',
 }
 _ERROR_EVENTS = frozenset({
     'agent_run_error', 'headless_run_error', 'uncaught_exception',
@@ -506,6 +510,49 @@ def _same_scope(candidate: dict[str, Any], incident: dict[str, Any]) -> bool:
     return True
 
 
+def _workspace_database_classification(row: dict[str, Any]) -> str | None:
+    if row.get('event') not in {'workspace_database_health_failed', 'workspace_open_failed', 'saved_tab_restore_failed'}:
+        return None
+    status = row.get('database_health_status')
+    if status == 'unavailable' and row.get('database_health_reason') == 'history_busy':
+        return 'workspace_database_history_busy'
+    return {
+        'corrupt': 'workspace_database_corruption',
+        'timed_out': 'workspace_database_health_timeout',
+        'worker_failed': 'workspace_database_worker_failed',
+        'unavailable': 'workspace_database_unavailable',
+    }.get(status) if isinstance(status, str) else None
+
+
+def _database_condition(row: dict[str, Any]) -> str | None:
+    """Classify only SQLite's reviewed numeric or symbolic result identifiers."""
+    known_names = {name for name, value in vars(sqlite3).items()
+                   if name.startswith('SQLITE_') and type(value) is int}
+    pending: list[tuple[Any, int]] = [(row, 0)]
+    while pending:
+        value, depth = pending.pop()
+        if not isinstance(value, dict) or depth > 4:
+            continue
+        code, name = value.get('sqlite_errorcode'), value.get('sqlite_errorname')
+        base = (code & 255) if type(code) is int and 0 <= code <= 2**31 - 1 else None
+        if base == sqlite3.SQLITE_CORRUPT:
+            return 'sqlite_database_corruption'
+        if base == sqlite3.SQLITE_NOTADB:
+            return 'sqlite_not_a_database'
+        if base is None and isinstance(name, str) and name in known_names:
+            if name == 'SQLITE_CORRUPT' or name.startswith('SQLITE_CORRUPT_'):
+                return 'sqlite_database_corruption'
+            if name == 'SQLITE_NOTADB':
+                return 'sqlite_not_a_database'
+        for key in ('error', 'detail', 'fault', 'exception_evidence'):
+            if isinstance(value.get(key), dict):
+                pending.append((value[key], depth + 1))
+        chain = value.get('chain')
+        if isinstance(chain, list):
+            pending.extend((item, depth + 1) for item in chain[:4])
+    return None
+
+
 def _is_lock(row: dict[str, Any]) -> bool:
     if type(row.get('sqlite_errorcode')) is int and (row['sqlite_errorcode'] & 255) in {5, 6}:
         return True
@@ -571,7 +618,10 @@ def _evidence(row: dict[str, Any]) -> dict[str, Any]:
     if row.get('event') == 'host_prerequisite_setup':
         from .startup import validate_startup_event
         evidence.update(validate_startup_event('host_prerequisite_setup', row) or {})
-    if _is_lock(row):
+    condition = _database_condition(row)
+    if condition:
+        evidence['error_code'] = condition
+    elif _is_lock(row):
         evidence['error_code'] = 'sqlite_database_locked'
     return evidence
 
@@ -585,6 +635,12 @@ def _access_restore_evidence(row: dict[str, Any]) -> dict[str, Any]:
             evidence[key] = value
     if isinstance(row.get('lock_kind'), str) and row['lock_kind'] in {'thread', 'process'}:
         evidence['lock_kind'] = row['lock_kind']
+    from .logging import _WORKSPACE_DATABASE_ENUMS
+    for key, allowed in _WORKSPACE_DATABASE_ENUMS.items():
+        if isinstance(row.get(key), str) and row[key] in allowed:
+            evidence[key] = row[key]
+    if type(row.get('database_worker_returncode')) is int and -255 <= row['database_worker_returncode'] <= 255:
+        evidence['database_worker_returncode'] = row['database_worker_returncode']
     from .operational import operational_label
     error_class = operational_label(row.get('error_class'), 'exception_class')
     if error_class:
@@ -607,7 +663,9 @@ def _access_restore_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], l
                 ('login', {event for event in _ACCESS_RESTORE_EVENTS if event.startswith('login_')}),
                 ('page_restore', {event for event in _ACCESS_RESTORE_EVENTS if event.startswith('page_')}
                                  | {'saved_tab_restore_failed', 'workspace_open_failed'}),
-                ('history_lock', {'history_lock_busy'})):
+                ('history_lock', {'history_lock_busy'}),
+                ('workspace_database', {'workspace_database_health_started', 'workspace_database_health_completed',
+                                        'workspace_database_health_failed'})):
             latest = next((row for row in reversed(scoped) if row['event'] in events), None)
             if latest:
                 receipt = _access_restore_evidence(latest)
@@ -615,7 +673,15 @@ def _access_restore_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], l
                 elapsed = receipt.get('elapsed_seconds', receipt.get('waited_seconds'))
                 timing = f'; elapsed {elapsed:g}s' if elapsed is not None else ''
                 lines.append(f'  {scope} session / {stage}: latest recorded {receipt["event"]} at {receipt["timestamp"]}{timing}.')
+        accepted = [row for row in scoped if row['event'] == 'login_accepted']
+        restore = latest_by_stage.get('page_restore', {})
+        unfinished = bool(restore.get('event') in {'page_build_started', 'page_session_restore_started',
+                                                  'page_workspace_restore_started'})
+        if accepted and unfinished:
+            lines.append(f'  {scope} session contains accepted credentials and an unfinished page-restore stage. Password verification passed; no later page completion is present in this examined tail. Browser-attempt identity is not recorded.')
         sessions.append({'session_scope': scope, 'records_examined': len(scoped),
+                         'accepted_credentials_observed': bool(accepted),
+                         'latest_page_restore_unfinished': unfinished,
                          'event_counts': dict(sorted(Counter(row['event'] for row in scoped).items())),
                          'latest_by_stage': latest_by_stage})
     if not observed:
@@ -629,6 +695,94 @@ def _access_restore_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], l
             'event_counts': dict(sorted(counts.items())), 'sessions': sessions,
             'recent_events': [_access_restore_evidence(row) for row in observed[-120:]],
             'recent_event_limit': 120, 'recent_events_limited': len(observed) > 120}, lines
+
+
+def _native_fault_audit(latest: Path, previous: Path | None) -> tuple[dict[str, Any], list[str]]:
+    """Index fixed native-fault signatures from bounded existing captures only."""
+    from itertools import islice
+    from .logging import _read_snapshot_bytes
+    from .native_faults import NATIVE_FAULT_SIGNALS, project_native_faults
+    from .faults import validate_frames
+    sources = [(latest / 'console-error.log', 'current')]
+    if previous is not None:
+        sources.append((previous / 'console-error.log', 'previous'))
+    limited = False
+    try:
+        session_root = latest.parent / 'sessions'
+        if session_root.is_symlink():
+            raise OSError('unsafe diagnostic session root')
+        sessions = list(islice(session_root.iterdir(), 257))
+        limited = len(sessions) > 256
+        sessions = sorted((path for path in sessions[:256] if not path.is_symlink() and path.is_dir()),
+                          key=lambda path: path.lstat().st_mtime, reverse=True)
+        limited |= len(sessions) > 20
+        known = {path for path, _scope in sources}
+        sources.extend((path / 'console-error.log', 'retained_session') for path in sessions[:20]
+                       if path / 'console-error.log' not in known)
+    except OSError:
+        pass
+    try:
+        crash_root = latest.parent / 'crashes'
+        if crash_root.is_symlink():
+            raise OSError('unsafe diagnostic crash root')
+        candidates = list(islice(crash_root.glob('*.log'), 257))
+        limited |= len(candidates) > 256
+        candidates = sorted(candidates[:256], key=lambda path: path.lstat().st_mtime, reverse=True)
+        limited |= len(candidates) > 20
+        sources.extend((path, 'retained_crash') for path in candidates[:20])
+    except OSError:
+        pass
+    signatures: dict[str, dict[str, Any]] = {}
+    sources_read = 0
+    for path, scope in sources:
+        payload = _read_snapshot_bytes(path, tail_bytes=512 * 1024)
+        if payload is None:
+            continue
+        sources_read += 1
+        faults = project_native_faults(payload)
+        # Previously exported logs already contain the privacy-safe projection.
+        for line in payload.decode('utf-8', errors='replace').splitlines()[-8192:]:
+            try:
+                value = json.loads(line)
+            except (ValueError, RecursionError):
+                continue
+            if isinstance(value, dict) and value.get('evidence_source') == 'native_fault':
+                faults.append(value.get('native_fault'))
+        for value in faults[:16]:
+            if not isinstance(value, dict):
+                continue
+            kind = value.get('native_fault_class')
+            if not isinstance(kind, str) or kind not in NATIVE_FAULT_SIGNALS or value.get('signal') != NATIVE_FAULT_SIGNALS[kind]:
+                continue
+            safe = {'native_fault_class': kind, 'signal': NATIVE_FAULT_SIGNALS[kind],
+                    'frames': validate_frames(value.get('frames')),
+                    'timestamp_status': 'not_in_native_fault_heading'}
+            for key in ('observed_thread_count', 'observed_frame_count'):
+                if type(value.get(key)) is int and 0 <= value[key] <= 8192:
+                    safe[key] = value[key]
+            safe['truncated'] = value.get('truncated') is True
+            identity = hashlib.sha256(json.dumps(safe, sort_keys=True).encode()).hexdigest()[:24]
+            if identity not in signatures:
+                signatures[identity] = {**safe, 'signature_id': identity, 'source_scopes': [], 'source_count': 0}
+            row = signatures[identity]
+            row['source_count'] += 1
+            if scope not in row['source_scopes']:
+                row['source_scopes'].append(scope)
+    rows = list(signatures.values())[-20:]
+    lines = ['Native crash evidence: fixed CPython fatal-signal headings from current/previous and up to 20 retained session/crash tails.']
+    for row in rows:
+        lines.append(f'  Retained native signal {row["signal"]}; observed threads {row.get("observed_thread_count", "unrecorded")}; observed frames {row.get("observed_frame_count", "unrecorded")}; scopes ' + ', '.join(row['source_scopes']) + '.')
+        useful_frames = [frame for frame in row['frames'] if frame.get('module', '').startswith('harnessy.')]
+        for frame in (useful_frames or row['frames'])[:4]:
+            if frame.get('module') != 'external':
+                lines.append(f'    {frame["module"]}.{frame["function"]}:{frame["line"]}')
+    if not rows:
+        lines.append('  No fixed native fatal-signal heading was found in these bounded sources; this does not exclude a native crash.')
+    lines.extend(['  Duplicate retained signatures are grouped; counts are not a total of crashes. Native headings carry no timestamp. A signal and sampled frame do not establish why the process crashed or why a database was corrupted.', ''])
+    return {'scope': 'bounded_native_fault_captures', 'sources_attempted': len(sources),
+            'sources_read': sources_read, 'source_limit_reached': limited,
+            'unique_signatures_available': len(signatures), 'unique_signatures_retained': len(rows),
+            'signature_limit': 20, 'signatures_limited': len(signatures) > 20, 'signatures': rows}, lines
 
 
 def _controller_observation_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
@@ -1034,7 +1188,8 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         before = [row for row in rows if row['session_scope'] == failure['session_scope']
                   and 0 <= _seconds(failure['timestamp'], row['timestamp']) <= _CONTEXT_SECONDS]
         related = [row for row in before if _same_scope(row, failure)]
-        lock = _is_lock(failure)
+        database_classification = _database_condition(failure) or _workspace_database_classification(failure)
+        lock = _is_lock(failure) and database_classification is None
         vm_classification = _vm_failure_classification(failure)
         target_classification = _target_failure_classification(failure)
         permission_classification = _permission_failure_classification(failure)
@@ -1097,7 +1252,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         identity = json.dumps(_evidence(failure), sort_keys=True)
         incidents.append({
             'incident_id': hashlib.sha256(identity.encode()).hexdigest()[:24],
-            'classification': access_restore_classification or ('sqlite_lock_contention' if lock else startup_classification or permission_classification or target_classification or vm_classification or timeout_classification or 'operation_error'),
+            'classification': database_classification or access_restore_classification or ('sqlite_lock_contention' if lock else startup_classification or permission_classification or target_classification or vm_classification or timeout_classification or 'operation_error'),
             'failure': _evidence(failure),
             'nearby_database_errors': [_evidence(row) for row in database_errors[-3:]],
             'last_successful_tool': successful_tool,
@@ -1122,7 +1277,11 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         'maximum_recorded_stall_seconds': max(durations, default=0),
         'transcript_refresh_deferrals': counts['transcript_refresh_deferred'],
         'database_errors': sum(row.get('event') == 'sqlite_operation_error' or _is_lock(row) for row in rows),
-        'database_operation_errors': counts['sqlite_operation_error'], 'incidents': incidents,
+        'database_operation_errors': counts['sqlite_operation_error'],
+        'workspace_database_health_failures': counts['workspace_database_health_failed'],
+        'database_corruption_observations': sum(_database_condition(row) == 'sqlite_database_corruption' for row in rows),
+        'database_not_database_observations': sum(_database_condition(row) == 'sqlite_not_a_database' for row in rows),
+        'incidents': incidents,
     }
     permission_audit, permission_lines = _permission_audit(rows)
     index['permission_audit'] = permission_audit
@@ -1175,6 +1334,29 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
     index['queue_audit'] = queue_audit
     access_restore_audit, access_restore_lines = _access_restore_audit(rows)
     index['access_restore_audit'] = access_restore_audit
+    native_audit, native_lines = _native_fault_audit(Path(latest), previous)
+    index['native_fault_audit'] = native_audit
+    collector_pid = host_report.get('process', {}).get('pid') if isinstance(host_report, dict) else None
+    app_pid = session.get('pid') if isinstance(session, dict) else None
+    collector_pid = collector_pid if type(collector_pid) is int and 0 < collector_pid < 2**31 else None
+    app_pid = app_pid if type(app_pid) is int and 0 < app_pid < 2**31 else None
+    process_relation = ('same_process' if collector_pid == app_pid else 'different_process') if collector_pid and app_pid else 'unrecorded'
+    index['host_capture_scope'] = {'collector_pid': collector_pid, 'session_app_pid': app_pid,
+                                   'process_relationship': process_relation,
+                                   'process_metrics_scope': 'collecting_process_only'}
+    host_lines = ['Host capture: HOST_STATE.json process metrics describe the diagnostics collecting process.']
+    if process_relation == 'different_process':
+        host_lines.append(f'  Collector PID {collector_pid} differs from recorded application PID {app_pid}; collector CPU/RAM/thread metrics are not the application metrics.')
+    host_lines.extend(['  Dependency versions describe installed distribution metadata; they do not prove which dependency versions the live application has imported.', ''])
+    database_lines = []
+    if index['database_corruption_observations']:
+        database_lines = [f'Recorded database corruption: {index["database_corruption_observations"]} SQLite SQLITE_CORRUPT observations. SQLite reported database corruption, not an ordinary busy/locked database.',
+                          '  Retain the database and its journal/WAL files. These receipts do not establish what originally caused the corruption; recreating the workspace VM cannot repair the host workspace database.', '']
+    elif index['database_not_database_observations']:
+        database_lines = ['SQLite reported SQLITE_NOTADB: the opened bytes were not a valid SQLite database. This is separate from an ordinary busy/locked database.', '']
+    latest_health_failure = next((row for row in reversed(rows) if row.get('event') == 'workspace_database_health_failed'), None)
+    if latest_health_failure and _workspace_database_classification(latest_health_failure) == 'workspace_database_history_busy':
+        database_lines = ['Workspace restoration: the latest isolated initialization reported a busy history lock. This is separate from SQLite corruption and does not establish disk or database-file unavailability.', ''] + database_lines
     control_rows = [row for row in rows if row.get('level') in {'WARNING', 'ERROR', 'CRITICAL'}
                     or str(row.get('event')).startswith(('vm_', 'environment_', 'workspace_mapping_', 'test_target_'))
                     or row.get('event') in STARTUP_EVENTS
@@ -1203,7 +1385,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         'This summary examines bounded current/previous-session log tails and startup receipts from up to two recent launcher sessions. Counts are not whole-session totals.',
         'Nearby events and tracked transactions are evidence for investigation, not proven lock ownership.', '',
         *primary_setup, *primary_cause,
-        *access_restore_lines,
+        *database_lines, *access_restore_lines, *native_lines, *host_lines,
         *queue_lines,
         *model_lines,
         *permission_acknowledgement_lines,
@@ -1228,7 +1410,24 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
             if failure.get(key):
                 lines.append(f'  {key}: {failure[key]}')
         classification = incident['classification']
-        if classification == 'history_lock_contention':
+        if classification.startswith('workspace_database_'):
+            descriptions = {
+                'workspace_database_corruption': 'The isolated workspace database health check reported corruption. Existing database files are preserved; the original cause of corruption is not established.',
+                'workspace_database_health_timeout': 'The isolated database health or initialization worker reached its deadline; this does not establish that the database is corrupt.',
+                'workspace_database_worker_failed': 'The isolated database worker failed or exited. The application stayed outside that native worker; this status alone does not establish database corruption.',
+                'workspace_database_history_busy': 'The isolated workspace initialization reported a busy history lock. This is separate from SQLite corruption and does not establish that the disk or database file is unavailable.',
+                'workspace_database_unavailable': 'The workspace database could not be admitted or initialized. The fixed reason below distinguishes invalid input, access, and changed-file observations.',
+            }
+            lines.append('  ' + descriptions.get(classification, 'Workspace database health checking did not complete.'))
+            for key in ('database_health_status', 'database_health_reason', 'database_health_phase',
+                        'database_worker_returncode', 'database_worker_signal'):
+                if key in failure:
+                    lines.append(f'  {key}: {failure[key]}')
+        elif classification == 'sqlite_database_corruption':
+            lines.append('  SQLite reported SQLITE_CORRUPT (base result code 11). This is database corruption, not ordinary lock contention; its original cause is not established.')
+        elif classification == 'sqlite_not_a_database':
+            lines.append('  SQLite reported SQLITE_NOTADB (base result code 26). The opened bytes were not recognized as a valid SQLite database.')
+        elif classification == 'history_lock_contention':
             lines.append('  The history thread/process lock wait reached its configured limit; this is separate from SQLite locking and does not identify its holder.')
             for key in ('lock_kind', 'waited_seconds', 'lock_timeout_seconds'):
                 if key in failure:

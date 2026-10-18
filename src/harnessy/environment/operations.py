@@ -69,11 +69,13 @@ class EnvironmentOperationRegistry:
         'reset': 2400.0,
         'rebuild': 3000.0,
         'tools': 2400.0,
+        'resources': 240.0,
     }
 
     TERMINAL_STATUSES = {'succeeded', 'failed', 'timed_out', 'cancelled', 'interrupted'}
 
     WORKFLOW_STAGES = {
+        'resources': ('resources_checking', 'resources_applying', 'resources_saving', 'resources_complete'),
         'network': ('checking_host_dependencies', 'network_stopping', 'network_applying', 'network_starting', 'ready'),
         'start': (
             'creating_vm', 'reconciling_environment', 'starting_vm', 'waiting_for_guest',
@@ -327,6 +329,8 @@ class EnvironmentOperationRegistry:
             policy_release = reserve_policy_change(workspace_root)
         elif action == 'tools':
             policy_release = reserve_environment_change(workspace_root, 'optional tools')
+        elif action == 'resources':
+            policy_release = reserve_environment_change(workspace_root, 'VM resources')
         else:
             policy_release = None
         try:
@@ -392,6 +396,7 @@ class EnvironmentOperationRegistry:
             'reset': 'Factory resetting environment…',
             'rebuild': 'Rebuilding environment…',
             'tools': 'Applying optional tool selection…',
+            'resources': 'Applying VM resource settings…',
         }.get(action, 'Working…')
 
     @staticmethod
@@ -413,7 +418,7 @@ class EnvironmentOperationRegistry:
             if not bool(getattr(result, 'running', False)) or not bool(getattr(result, 'ready', False)):
                 detail = str(getattr(result, 'error', '') or getattr(result, 'detail', '') or getattr(result, 'state', 'not ready'))
                 raise RuntimeError(f'Environment did not become Ready: {detail}')
-        if action == 'stop' and hasattr(result, 'running') and bool(getattr(result, 'running', False)):
+        if action in {'stop', 'resources'} and hasattr(result, 'running') and bool(getattr(result, 'running', False)):
             detail = str(getattr(result, 'detail', '') or getattr(result, 'state', 'still running'))
             raise RuntimeError(f'Environment did not stop: {detail}')
 
@@ -519,6 +524,11 @@ class EnvironmentOperationRegistry:
             )
 
         async def execute(provider):
+            if action == 'resources':
+                return await provider.apply_resources(
+                    cpu=payload.get('cpu'), memory_mb=payload.get('memory_mb'), disk_gb=payload.get('disk_gb'),
+                    expected=payload.get('expected'), progress=progress, reservation_held=True,
+                )
             if action == 'start':
                 return await provider.start(progress=progress)
             if action == 'network':
@@ -598,6 +608,7 @@ class EnvironmentOperationRegistry:
                 'reset': 'Factory reset complete. Files/ and private chat worktrees were preserved.',
                 'rebuild': 'VM rebuild complete. Files/ and private chat worktrees were preserved.',
                 'tools': 'Optional tool selection applied.',
+                'resources': 'VM resources saved. Start the VM to use them.',
             }.get(action, 'Environment operation complete.')
             completed_at = time.time()
             duration_seconds = max(0.0, completed_at - initial.started_at) if initial.started_at else 0.0

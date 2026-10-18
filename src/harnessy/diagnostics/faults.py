@@ -78,6 +78,16 @@ RUN_DIAGNOSTIC_EVENTS = frozenset({
 @lru_cache(maxsize=1)
 def _source_roots() -> tuple[tuple[Path, str], ...]:
     roots: list[tuple[Path, str]] = [(_HARNESSY_ROOT, 'harnessy')]
+    # Only the installed application's fixed vendor directory is eligible;
+    # never map arbitrary workspace Python files as reviewed dependency source.
+    installation = (_HARNESSY_ROOT.parent.parent if _HARNESSY_ROOT.parent.name == 'src'
+                    else _HARNESSY_ROOT.parent)
+    vendor = installation / '.vendor'
+    try:
+        if vendor.is_dir() and not vendor.is_symlink():
+            roots.append((vendor.resolve(), ''))
+    except OSError:
+        pass
     # Package roots must precede stdlib: site-packages is commonly inside it.
     for kind in ('purelib', 'platlib', 'stdlib', 'platstdlib'):
         root = sysconfig.get_path(kind)

@@ -98,6 +98,7 @@ from harnessy.core.chat_export import CONTENT_DETAIL, EXPORT_TYPES, ExportOption
 from harnessy.agent.chat_exports import ExportJob, EXPORT_JOBS
 from harnessy.agent.timeline_replacements import TimelineReplacementJob
 from harnessy.core.workspace import FILES_PROBE_DIR_NAME, LEGACY_IMPORTS_DIR_NAME, WorkspaceStore  # noqa: E402
+from harnessy.core.workspace_health import WorkspaceDatabaseError, prepare_workspace_store  # noqa: E402
 from harnessy.core.history import BRANCHES_DIR_NAME, REWINDS_DIR_NAME, HistoryBusyError, HistoryError  # noqa: E402
 from harnessy.core.outputs import CHAT_OUTPUT_DIR_RE  # noqa: E402
 from harnessy.diagnostics import log_event, refresh_diagnostics_bundle  # noqa: E402
@@ -226,6 +227,30 @@ _RUN_QUEUE_ADMISSION_OBSERVATIONS: dict[tuple[str, str], str] = {}
 _TIMELINE_REPLACEMENTS: dict[tuple[str, str], str] = {}
 _TIMELINE_REPLACEMENT_JOBS: dict[tuple[str, str], TimelineReplacementJob] = {}
 _EVENT_LOOP_WATCHDOG_TASK: asyncio.Task[Any] | None = None
+# Shutdown reuses successfully prepared stores. It must never initialize or
+# probe every registered workspace after the worker cancellation gate closes.
+_RUNTIME_WORKSPACE_STORES: dict[str, WorkspaceStore] = {}
+_RUNTIME_WORKSPACE_STORE_LOCK = threading.RLock()
+
+
+def _prepare_runtime_workspace(root: str | Path, name: str | None = None, **kwargs: Any) -> WorkspaceStore:
+    """Prepare off-loop and retain only the latest healthy store per path."""
+    key = str(Path(root).expanduser().resolve())
+    try:
+        store = prepare_workspace_store(root, name, **kwargs)
+    except BaseException:
+        with _RUNTIME_WORKSPACE_STORE_LOCK:
+            _RUNTIME_WORKSPACE_STORES.pop(key, None)
+        raise
+    with _RUNTIME_WORKSPACE_STORE_LOCK:
+        _RUNTIME_WORKSPACE_STORES[key] = store
+    return store
+
+
+def _prepared_runtime_workspaces() -> list[WorkspaceStore]:
+    """Return prepared references without touching workspace storage."""
+    with _RUNTIME_WORKSPACE_STORE_LOCK:
+        return list(_RUNTIME_WORKSPACE_STORES.values())
 
 
 @dataclass(frozen=True, slots=True)
@@ -1302,6 +1327,7 @@ class HarnessyPage:
         self.workspace: WorkspaceStore | None = None
         self._workspace_open_error: tuple[WorkspaceRegistration, str] | None = None
         self.workspace_cache: dict[str, WorkspaceStore] = {}
+        self._workspace_load_failures: dict[str, Exception] = {}
         self.open_tabs: list[OpenTab] = []
         self._blocked_restore_tabs: dict[str, str] = {}
         self.active_tab_key: str | None = None
@@ -1485,7 +1511,7 @@ class HarnessyPage:
                     # Do not restore a tab which can no longer be safely represented by the text editor.
                     TextFileDraft.open(candidate)
                     file_path = str(candidate)
-            except HistoryBusyError as exc:
+            except (HistoryBusyError, WorkspaceDatabaseError) as exc:
                 # Keep unavailable tabs in the saved order, including inactive
                 # ones. No target/file/chat access is allowed through these
                 # placeholders; Retry reloads and runs normal validation again.
@@ -1572,9 +1598,6 @@ class HarnessyPage:
         else:
             self.dark_mode_controller.disable()
         self._install_browser_bridges()
-        # This browser-owned bridge survives authentication closing Socket.IO;
-        # a server-side navigate event cannot traverse an already revoked socket.
-        ui.add_body_html('<script>' + AUTH_RECOVERY_JS + '</script>')
         ui.on('harnessy_attachment_uploaded', self._browser_attachment_uploaded)
         ui.on('harnessy_file_uploaded', self._browser_file_uploaded)
         ui.on('harnessy_file_move', self._browser_file_move)
@@ -1612,6 +1635,9 @@ class HarnessyPage:
         self._restore_last_workspace()
         if self.active_tab_key:
             self.activate_tab(self.active_tab_key)
+        # The initial bridge may have finished its bounded mount retries while
+        # a slow workspace was still loading. Sync the newly mounted shell.
+        ui.run_javascript('setTimeout(() => { window.harnessySetMobileSidebar?.(false); window.hyMountSocketHealth?.(); }, 0)')
         log_event('harnessy', 'page_built', page_id=self._page_id,
                   elapsed_seconds=round(time.monotonic() - started, 3))
 
@@ -1926,14 +1952,17 @@ class HarnessyPage:
 
     # -------------------------------------------------------------- workspace
     def _load_workspace(self, reg: WorkspaceRegistration) -> WorkspaceStore:
+        failure = self._workspace_load_failures.get(reg.id)
+        if failure is not None:
+            raise failure
         cached = self.workspace_cache.get(reg.id)
         if cached and cached.root == reg.path.resolve():
             if cached.name != reg.name:
                 cached.set_name(reg.name)
             return cached
-        ws = WorkspaceStore(reg.path, reg.name)
-        self.workspace_cache[reg.id] = ws
-        return ws
+        # Registered workspaces are prepared by the asynchronous page loader.
+        # Never run database admission or initialization on the UI event loop.
+        raise WorkspaceDatabaseError('unavailable', reason='admission_required')
 
     def _restore_last_workspace(self) -> None:
         regs = self.machine.list_workspaces()
@@ -3861,7 +3890,7 @@ class HarnessyPage:
                     except Exception as exc:
                         ui.notify(str(exc), type='negative')
 
-                def choose() -> None:
+                async def choose() -> None:
                     try:
                         target = Path(state.get('selected') or state['path']).expanduser().resolve()
                         if not target.is_dir():
@@ -3873,7 +3902,8 @@ class HarnessyPage:
                         # its preset/resources/network settings with picker defaults.
                         if manager.config is None:
                             manager.initialize(config)
-                        ws = WorkspaceStore(target, name_input.value or None)
+                        ws = await asyncio.to_thread(_prepare_runtime_workspace, target, name_input.value or None)
+                        self.workspace_cache[ws.id] = ws
                         reg = self.machine.register_workspace(target, name_input.value or None, ws.id)
                         dialog.close()
                         self.select_workspace(reg)
@@ -4607,7 +4637,9 @@ class HarnessyPage:
                 ui.label(reg.name).classes('font-semibold break-words')
                 ui.label(message).classes('hy-muted break-words')
                 ui.label('Your saved tabs are still available. Retry to reload them, or choose another workspace from the left.').classes('hy-muted')
-                ui.button('Retry workspace', icon='refresh', on_click=lambda: ui.navigate.to('/')).props('no-caps unelevated')
+                ui.button('Retry workspace', icon='refresh', on_click=lambda: ui.navigate.to('/?retry_workspace=' + quote(reg.id, safe=''))).props('no-caps unelevated')
+                from harnessy.ui.workspace_resources import render_unavailable_workspace_vm
+                render_unavailable_workspace_vm(reg.path)
 
     def _render_welcome(self) -> None:
         if self._workspace_open_error is not None:
@@ -9395,7 +9427,11 @@ class HarnessyPage:
         reg = self.machine.get_workspace(key[0])
         notice = None
         if reg is not None and reg.path.is_dir():
-            ws = WorkspaceStore(reg.path, reg.name)
+            try:
+                ws = await asyncio.to_thread(_prepare_runtime_workspace, reg.path, reg.name)
+            except WorkspaceDatabaseError as exc:
+                ui.notify(f'Could not retry this run: {exc}', type='negative', timeout=8000)
+                return None
             reference = resolve_run_prompt_reference(self.machine, ws, key[1], source)
             if reference is not None and reference.message_id:
                 event = 'stopped' if source.get('status') == 'stopped' else 'error'
@@ -12563,6 +12599,13 @@ class HarnessyPage:
 
     # ------------------------------------------------------- browser integrations
     def _install_browser_bridges(self) -> None:
+        if getattr(self, '_browser_bridges_installed', False):
+            return
+        self._browser_bridges_installed = True
+        # Install in the initial HTML, before asynchronous workspace loading.
+        # Scripts appended by add_body_html after that response do not execute.
+        # This bridge also survives authentication closing Socket.IO.
+        ui.add_body_html('<script>' + AUTH_RECOVERY_JS + '</script>')
         ui.add_body_html(CODE_COPY_BRIDGE)
         # xterm.js is the only browser-side dependency which is not supplied by
         # NiceGUI itself. If it cannot be loaded, the terminal tab shows a clear
@@ -12606,7 +12649,6 @@ if (!window.hyMobileSidebarInstalled) {
   if (!syncSidebar()) {
     const observer = new MutationObserver(() => { if (syncSidebar()) observer.disconnect(); });
     observer.observe(document.body, {childList:true, subtree:true});
-    setTimeout(() => observer.disconnect(), 10000);
   }
 }
 window.harnessyActiveUpload = {workspace_id: null, chat_id: null, composer_id: null};
@@ -18573,9 +18615,8 @@ window.harnessyTerminalFocus = function(terminalId) {
                                     ui.label(f'{config.architecture} · CPU only · /workspace').classes('text-xs hy-muted')
                                     readiness_detail = ui.label('').classes('text-xs hy-muted').style('white-space:pre-wrap')
                                 with ui.card().classes('hy-env-card p-4 gap-1 min-w-[280px]').style('flex:1 1 280px'):
-                                    ui.label('Resources').classes('text-xs hy-muted')
-                                    ui.label(f'{config.cpu} vCPU · {config.memory_mb // 1024} GB RAM').classes('text-sm font-semibold')
-                                    ui.label(f'{config.disk_gb} GB sparse disk max').classes('text-sm')
+                                    from .workspace_resources import WorkspaceResourceEditor
+                                    resource_editor = WorkspaceResourceEditor(config, lambda **payload: queue_action('resources', **payload))
                                     disk_usage_label = ui.label('VM storage on host: checking…').classes('text-xs hy-muted')
                                     network_status_label = ui.label('Public outbound enabled' if config.network else 'Public outbound disabled').classes('text-xs hy-muted')
                                     if preset.optional_tool_ids:
@@ -18668,15 +18709,16 @@ window.harnessyTerminalFocus = function(terminalId) {
                 with environment_panels, ui.tab_panel(targets_tab).classes('p-0'):
                     self._render_test_targets(ws)
 
-                def queue_action(kind: str, **payload: Any) -> None:
+                def queue_action(kind: str, **payload: Any) -> bool:
                     try:
                         if not ENVIRONMENT_OPERATIONS.start(ws.root, kind, **payload):
-                            return
+                            return False
                     except Exception as exc:
                         ui.notify(str(exc), type='warning')
-                        return
+                        return False
                     apply_operation_state()
                     self._refresh_sidebar_busy_indicators()
+                    return True
 
                 async def manage_optional_tools_dialog() -> None:
                     if manage_tools_button is None:
@@ -18950,6 +18992,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                             'reset': 'Resetting…',
                             'rebuild': 'Rebuilding…',
                             'tools': 'Updating optional tools…',
+                            'resources': 'Applying VM resources…',
                         }.get(op.action, 'Working…'))
 
                         if op.progress_percent is None:
@@ -19001,6 +19044,8 @@ window.harnessyTerminalFocus = function(terminalId) {
                         operation_error.set_text('')
 
                     saved_config = manager.config
+                    resource_editor.sync(saved_config, {**latest_status, 'resource_operation': op.action == 'resources'},
+                                         busy=busy, active=bool(active_work(ws.root)))
                     if saved_config is not None:
                         saved_network = bool(saved_config.network)
                         if preset.optional_tool_ids:
@@ -21751,7 +21796,7 @@ async def _execute_queued_run(machine: MachineStore, job_id: str) -> None:
         reg = machine.get_workspace(key[0])
         if reg is None or not reg.path.is_dir():
             raise RuntimeError('The queued workspace is no longer available.')
-        ws = WorkspaceStore(reg.path, reg.name)
+        ws = await asyncio.to_thread(_prepare_runtime_workspace, reg.path, reg.name)
         chat = ws.get_chat(key[1])
         if chat is None:
             raise RuntimeError('The queued Project / Chat no longer exists.')
@@ -21884,7 +21929,7 @@ def _migrate_finished_completion_holds(machine: MachineStore) -> int:
         if reg is None or not reg.path.is_dir():
             continue
         try:
-            ws = WorkspaceStore(reg.path, reg.name)
+            ws = _prepare_runtime_workspace(reg.path, reg.name)
             if ws.has_recent_terminal_run_reason(hold['chat_id'], hold['run_id'], 'completion_unconfirmed'):
                 released += int(machine.release_completion_attempts({
                     'workspace_id': hold['workspace_id'], 'chat_id': hold['chat_id'], 'run_id': hold['run_id'],
@@ -21901,7 +21946,7 @@ def _migrate_finished_completion_holds(machine: MachineStore) -> int:
 async def _run_queue_supervisor(machine: MachineStore) -> None:
     machine.recover_interrupted_backend_recoveries()
     machine.recover_interrupted_completion_holds()
-    _migrate_finished_completion_holds(machine)
+    await asyncio.to_thread(_migrate_finished_completion_holds, machine)
     interrupted = machine.recover_interrupted_run_jobs()
     _observe_run_queue_snapshot(machine, source='startup', force=True)
     if interrupted:
@@ -22000,7 +22045,11 @@ async def _handle_ntfy_recovery_command(machine: MachineStore, config: dict[str,
         else:
             notice = ticket.notice
             reg = machine.get_workspace(notice.workspace_id)
-            ws = WorkspaceStore(reg.path, reg.name) if reg and reg.path.is_dir() else None
+            try:
+                ws = (await asyncio.to_thread(_prepare_runtime_workspace, reg.path, reg.name)
+                      if reg and reg.path.is_dir() else None)
+            except WorkspaceDatabaseError:
+                ws = None
             chat = ws.get_chat(notice.chat_id) if ws else None
             key = (notice.workspace_id, notice.chat_id)
             active = _AGENT_TASKS.get(key)
@@ -22132,7 +22181,7 @@ async def _handle_ntfy_incoming(machine: MachineStore, event: NtfyIncomingMessag
                 )
                 break
             try:
-                ws = WorkspaceStore(reg.path, reg.name)
+                ws = await asyncio.to_thread(_prepare_runtime_workspace, reg.path, reg.name)
                 chat = ws.get_chat(target.chat_id)
             except Exception:
                 ws = None
@@ -22370,13 +22419,13 @@ def _external_upload_target(destination_text: str, relative_path: str, *, scope_
     return target
 
 
-def _file_api_scope_root(machine: MachineStore, workspace_id: str) -> Path | None:
+async def _file_api_scope_root(machine: MachineStore, workspace_id: str) -> Path | None:
     if workspace_id == HOME_SCOPE_ID:
         return None
     reg = machine.get_workspace(workspace_id)
     if not reg:
         raise ValueError('Workspace is not registered')
-    ws = WorkspaceStore(reg.path, reg.name)
+    ws = await asyncio.to_thread(_prepare_runtime_workspace, reg.path, reg.name)
     return ws.files_root.resolve()
 
 
@@ -22438,7 +22487,7 @@ def _register_attachment_api(machine: MachineStore) -> None:
             if query_workspace and query_chat:
                 query_reg = machine.get_workspace(query_workspace)
                 if query_reg:
-                    query_ws = WorkspaceStore(query_reg.path, query_reg.name)
+                    query_ws = await asyncio.to_thread(_prepare_runtime_workspace, query_reg.path, query_reg.name)
                     query_target = query_ws.get_chat(query_chat)
                     if query_target and query_target.locked:
                         return {'ok': False, 'error': 'This Project / Chat is locked.'}
@@ -22453,7 +22502,7 @@ def _register_attachment_api(machine: MachineStore) -> None:
             reg = machine.get_workspace(workspace_id)
             if not reg:
                 return {'ok': False, 'error': 'Workspace is not registered'}
-            ws = WorkspaceStore(reg.path, reg.name)
+            ws = await asyncio.to_thread(_prepare_runtime_workspace, reg.path, reg.name)
             target_chat = ws.get_chat(chat_id)
             if not target_chat:
                 return {'ok': False, 'error': 'Project / Chat not found'}
@@ -22495,7 +22544,10 @@ def _register_attachment_api(machine: MachineStore) -> None:
         reg = machine.get_workspace(workspace_id)
         if not reg:
             return {'ok': False, 'error': 'Workspace is not registered'}
-        ws = WorkspaceStore(reg.path, reg.name)
+        try:
+            ws = await asyncio.to_thread(_prepare_runtime_workspace, reg.path, reg.name)
+        except WorkspaceDatabaseError as exc:
+            return JSONResponse({'ok': False, 'error': str(exc)}, status_code=503)
         item = next((a for a in ws.list_attachments(chat_id) if a.id == attachment_id), None)
         if not item or not item.path.exists() or not item.path.is_file():
             return {'ok': False, 'error': 'Attachment not found'}
@@ -22507,7 +22559,7 @@ def _register_attachment_api(machine: MachineStore) -> None:
         release_activity = lambda: None
         try:
             workspace_id = str(request.query_params.get('workspace_id') or '')
-            scope_root = _file_api_scope_root(machine, workspace_id)
+            scope_root = await _file_api_scope_root(machine, workspace_id)
             release_activity = TAB_ACTIVITY.acquire(HarnessyPage._tool_tab_key('files', workspace_id))
             target = _external_upload_target(
                 str(request.query_params.get('destination') or ''),
@@ -22530,7 +22582,7 @@ def _register_attachment_api(machine: MachineStore) -> None:
         try:
             form = await request.form()
             workspace_id = str(form.get('workspace_id') or '')
-            scope_root = _file_api_scope_root(machine, workspace_id)
+            scope_root = await _file_api_scope_root(machine, workspace_id)
             release_activity = TAB_ACTIVITY.acquire(HarnessyPage._tool_tab_key('files', workspace_id))
             upload = form.get('file')
             if upload is None or not hasattr(upload, 'read'):
@@ -22590,15 +22642,87 @@ def run_app() -> None:
     from harnessy.ui.target_views import register_target_view_routes
     register_target_view_routes(app, machine, user_store)
 
+    workspace_load_tasks: set[asyncio.Task[Any]] = set()
+
     @ui.page('/')
-    def index(settings: str = '') -> None:
+    def index(settings: str = '', retry_workspace: str = '') -> None:
         page = HarnessyPage(machine)
-        request = ui.context.client.request
+        client = ui.context.client
+        request = client.request
         page._accounts = request.scope.get('state', {}).get('harnessy_accounts') if request is not None else None
         page._username = str(request.scope.get('state', {}).get('harnessy_username') or '') if request is not None else ''
-        page.build()
-        if settings == 'users':
-            page.open_settings('Users / Password')
+        page._install_browser_bridges()
+        registrations = machine.list_workspaces()
+        # Send a real signed-in page before touching workspace SQLite. The
+        # separate workers contain both integrity checks and initialization,
+        # including native failures; to_thread only waits for their protocol.
+        with ui.column().classes('w-full items-center justify-center gap-3 p-6').style('min-height:80vh') as loading:
+            ui.spinner(size='36px')
+            ui.label('Opening HarnessyXO').classes('text-xl font-semibold')
+            progress = ui.label('Checking saved workspace databases…').classes('text-sm')
+            ui.label('Workspace checks run separately so an unavailable database cannot block login.').classes('text-sm')
+
+        async def initialize() -> None:
+            task = asyncio.current_task()
+            if task is not None:
+                workspace_load_tasks.add(task)
+            semaphore = asyncio.Semaphore(2)
+            completed = 0
+
+            async def prepare(reg: WorkspaceRegistration) -> None:
+                nonlocal completed
+                async with semaphore:
+                    started = time.monotonic()
+                    log_event('harnessy', 'workspace_database_health_started',
+                              database_health_phase='workspace_initialization')
+                    try:
+                        store = await asyncio.to_thread(
+                            _prepare_runtime_workspace, reg.path, reg.name,
+                            force=bool(retry_workspace and retry_workspace == reg.id),
+                        )
+                        page.workspace_cache[reg.id] = store
+                        log_event('harnessy', 'workspace_database_health_completed',
+                                  database_health_status='ready', database_health_reason='verified',
+                                  database_health_phase='workspace_initialization',
+                                  elapsed_seconds=round(time.monotonic() - started, 3))
+                    except Exception as exc:
+                        # Fixed, content-free errors only. An unexpected error
+                        # must not expose worker output or lose saved tabs.
+                        failure = exc if isinstance(exc, (WorkspaceDatabaseError, HistoryBusyError)) else WorkspaceDatabaseError('unavailable', reason='initialization_failed')
+                        page._workspace_load_failures[reg.id] = failure
+                        log_event('harnessy', 'workspace_database_health_failed',
+                                  database_health_status=getattr(failure, 'code', 'unavailable'),
+                                  database_health_reason=getattr(failure, 'reason', 'initialization_failed'),
+                                  database_health_phase=getattr(failure, 'phase', 'workspace_initialization'),
+                                  database_worker_returncode=getattr(failure, 'worker_returncode', None),
+                                  database_worker_signal=getattr(failure, 'worker_signal', 'none'),
+                                  error_class=type(exc).__name__,
+                                  elapsed_seconds=round(time.monotonic() - started, 3))
+                    completed += 1
+                    if not client.is_deleted:
+                        progress.set_text(f'Checked {completed} of {len(registrations)} workspaces')
+
+            try:
+                await asyncio.gather(*(prepare(reg) for reg in registrations))
+                if client.is_deleted:
+                    return
+                if page._accounts is not None:
+                    try:
+                        await page._accounts._require_session()
+                    except Exception:
+                        with client:
+                            ui.navigate.to('/login')
+                        return
+                with client:
+                    loading.delete()
+                    page.build()
+                    if settings == 'users':
+                        page.open_settings('Users / Password')
+            finally:
+                if task is not None:
+                    workspace_load_tasks.discard(task)
+
+        ui.timer(0, initialize, once=True)
 
     async def reconcile_environment_operations() -> None:
         roots = [reg.path for reg in machine.list_workspaces() if reg.path.is_dir()]
@@ -22633,6 +22757,13 @@ def run_app() -> None:
 
     async def close_runtime_resources() -> None:
         global _NTFY_REPLY_SUPERVISOR_TASK, _NTFY_REPLY_TARGET, _RUN_QUEUE_SUPERVISOR_TASK, _EVENT_LOOP_WATCHDOG_TASK
+        from harnessy.core.workspace_health import cancel_pending_workspace_workers
+        await asyncio.to_thread(cancel_pending_workspace_workers)
+        pending_workspace_loads = list(workspace_load_tasks)
+        for pending in pending_workspace_loads:
+            pending.cancel()
+        if pending_workspace_loads:
+            await asyncio.gather(*pending_workspace_loads, return_exceptions=True)
         watchdog = _EVENT_LOOP_WATCHDOG_TASK
         _EVENT_LOOP_WATCHDOG_TASK = None
         if watchdog is not None and not watchdog.done():
@@ -22701,12 +22832,7 @@ def run_app() -> None:
         from harnessy.ui.test_targets import close_target_tab_views
         await close_target_tab_views()
         from harnessy.environment.test_targets import close_test_targets
-        target_workspaces = []
-        for reg in machine.list_workspaces():
-            try:
-                target_workspaces.append(WorkspaceStore(reg.path))
-            except Exception:
-                pass
+        target_workspaces = _prepared_runtime_workspaces()
         await close_test_targets(target_workspaces)
         await ENVIRONMENT_STATUS.close()
         await ENVIRONMENT_OPERATIONS.cancel_all()

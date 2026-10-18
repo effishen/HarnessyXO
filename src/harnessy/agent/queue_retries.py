@@ -9,6 +9,7 @@ from harnessy.agent.prompt_references import resolve_run_prompt_reference
 from harnessy.core.history import clone_or_copy_file
 from harnessy.core.machine import MachineStore
 from harnessy.core.workspace import WorkspaceStore, utcnow
+from harnessy.core.workspace_health import prepare_workspace_store
 
 
 def queued_retry_continues(machine: MachineStore, ws: WorkspaceStore, job: dict[str, Any]) -> bool:
@@ -35,7 +36,7 @@ def retry_queued_run(machine: MachineStore, job_id: str) -> tuple[dict[str, Any]
     reg = machine.get_workspace(str(job['workspace_id']))
     if reg is None or not reg.path.is_dir():
         raise ValueError('The original workspace is unavailable.')
-    ws = WorkspaceStore(reg.path, reg.name)
+    ws = prepare_workspace_store(reg.path, reg.name)
     chat_id = str(job['chat_id'])
     chat = ws.get_chat(chat_id)
     if chat is None or chat.archived_at is not None:

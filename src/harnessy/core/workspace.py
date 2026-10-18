@@ -21,6 +21,10 @@ from typing import Any
 
 from ..diagnostics.sqlite import connect_database
 from .sqlite_store import StoreConnection, enable_store_wal
+from .workspace_health import (
+    probe_workspace_database, require_workspace_database_admitted,
+    remember_workspace_database_admitted,
+)
 from .memory_events import current_origin, memory_lock
 from .prompt_navigator import navigator_prompt_owners, prompt_indicator_index, timeline_event_navigator_entry
 from .archive import is_archive, make_zip, safe_extract_archive
@@ -142,7 +146,9 @@ class TimelineReplacement:
 
 
 class WorkspaceStore:
-    def __init__(self, root: str | Path, name: str | None = None) -> None:
+    def __init__(
+        self, root: str | Path, name: str | None = None, *, database_admission: str = 'probe',
+    ) -> None:
         self.root = Path(root).expanduser().resolve()
         if not self.root.exists() or not self.root.is_dir():
             raise ValueError(f'Workspace directory does not exist: {self.root}')
@@ -153,6 +159,15 @@ class WorkspaceStore:
         self.metadata_path = self.meta / 'workspace.json'
         self.db_path = self.meta / 'workspace.db'
         previous_schema_version = self._preflight_v06_workspace_schema()
+        # A damaged database must not enter native SQLite in the UI process.
+        # UI construction uses an async preflight and this cache-only gate;
+        # headless callers get the same bounded subprocess check by default.
+        if database_admission == 'cached':
+            admission = require_workspace_database_admitted(self.root)
+        elif database_admission == 'probe':
+            admission = probe_workspace_database(self.root)
+        else:
+            raise ValueError('Unsupported workspace database admission mode')
         self.meta.mkdir(parents=True, exist_ok=True)
         self.environment_dir = self.meta / 'environment'
         self.is_vm_workspace = (self.environment_dir / 'environment.json').is_file()
@@ -221,6 +236,48 @@ class WorkspaceStore:
         self._finalize_archived_directories()
         if self.is_vm_workspace:
             self._migrate_legacy_vm_worktrees()
+        remember_workspace_database_admitted(self.root, admission)
+
+    @classmethod
+    def _from_prepared_metadata(
+        cls, root: Path, metadata: dict[str, Any], is_vm_workspace: bool,
+    ) -> 'WorkspaceStore':
+        """Hydrate a successful isolated initialization without opening SQLite.
+
+        This private constructor is used only by workspace_health after its
+        own fixed worker protocol and database-generation checks pass.
+        """
+        store = cls.__new__(cls)
+        store.root = root
+        store.meta = root / META_DIR_NAME
+        store.metadata_path = store.meta / 'workspace.json'
+        store.db_path = store.meta / 'workspace.db'
+        store.environment_dir = store.meta / 'environment'
+        store.is_vm_workspace = is_vm_workspace
+        store.files_root = root / FILES_DIR_NAME
+        store.references_dir = store.files_root / REFERENCES_DIR_NAME
+        for attribute, suffix in (
+            ('uploads_dir', 'uploads'), ('jobs_dir', 'jobs'),
+            ('artifacts_dir', 'artifacts'), ('trash_dir', 'trash'),
+            ('history_exports_dir', 'history-exports'), ('archives_dir', 'archives'),
+            ('private_worktrees_dir', PRIVATE_WORKTREES_DIR_NAME),
+        ):
+            setattr(store, attribute, store.meta / suffix)
+        if is_vm_workspace:
+            store.worktrees_dir = store.private_worktrees_dir / 'imports'
+            store.branches_dir = store.private_worktrees_dir / 'branches'
+            store.rewinds_dir = store.private_worktrees_dir / 'rewinds'
+        else:
+            store.worktrees_dir = store.jobs_dir
+            store.branches_dir = store.meta / 'branches'
+            store.rewinds_dir = store.meta / 'rewinds'
+        store.history = ShadowHistory(
+            store.meta, store.files_root,
+            additional_working_roots=(store.private_worktrees_dir,) if is_vm_workspace else (),
+        )
+        store.llm_dir = root / LLM_DIR_NAME
+        store.metadata = metadata
+        return store
 
     @property
     def id(self) -> str:
@@ -355,6 +412,7 @@ class WorkspaceStore:
         con = connect_database(self.db_path, role='workspace', factory=StoreConnection)
         try:
             con.row_factory = sqlite3.Row
+            con.execute('PRAGMA mmap_size=0').close()
             con.execute('PRAGMA foreign_keys=ON').close()
             return con
         except BaseException:
@@ -1146,7 +1204,10 @@ class WorkspaceStore:
                           h.file_manifest_json,h.large_manifest_json,h.git_manifest_json,
                           h.restorable,h.warning_text
                      FROM history_checkpoints AS h
-                     LEFT JOIN chats AS c ON c.id=h.chat_id'''
+                     LEFT JOIN chats AS c ON c.id=h.chat_id
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM file_history_snapshots AS f WHERE f.id=h.id
+                    )'''
             )
             branch_columns = {r['name'] for r in con.execute('PRAGMA table_info(chat_branches)').fetchall()}
             if 'parent_chat_id_snapshot' not in branch_columns:
