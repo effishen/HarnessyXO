@@ -1,7 +1,8 @@
-# HarnessyXO v0.6.118 Features
+# HarnessyXO v0.6.120 Features
 
 ## Workspace startup and VM resources
 
+- Reuse an opened workspace when starting chats, processing queued work or reloading the page. Normal database writes do not repeat its full startup check. Give large databases additional bounded time for the first check; report busy databases separately from confirmed corruption.
 - Sign in before saved workspace database checks finish. Show visible loading progress while bounded isolated workers check a coherent SQLite snapshot and initialize each workspace. A corrupt, unavailable or stalled workspace gets a persistent error instead of blocking the controller.
 - Retain saved tabs for unavailable workspaces. Use **Retry workspace** after addressing the disk, **Extended check** to give a slow database more time, or **Repair workspace** to prepare a separate recovery copy. Loading an error panel does not start repair automatically.
 - Track recovery stage, elapsed time and actual copy progress; cancel private-copy checks without replacing the originals. Refresh or sign in again to return to the same operation. Download a report with operational details and record counts, without conversations or SQL.

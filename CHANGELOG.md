@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.120
+
+- Keep an opened workspace ready when starting chats, processing queued work or reloading a browser page. Normal database writes no longer trigger another full startup check and initialization for every request.
+- Share the first workspace opening across simultaneous requests. Keep replacement and interrupted-recovery checks in place; explicit Retry and Open workspace still load the current database safely.
+- Give large workspace databases more time for their first check, within a bounded limit. Keep the usual shorter limit for small databases.
+- Identify SQLite busy and locked errors as temporary failures, preserve their result codes in diagnostics, and keep them distinct from confirmed corruption. Avoid replacing a healthy admission with a transient busy error or timeout. Leave README unchanged.
+- Verified SQLite locking, normal writes, queued work, browser refreshes and corruption guards on Linux. Native Mac testing was unavailable.
+
 ## v0.6.119
 
 - Simplify the loading screen to **Opening your workspaces…** and a workspace count. Remove the explanation about database isolation. Workspace checks and recovery controls work as before. Leave README unchanged.

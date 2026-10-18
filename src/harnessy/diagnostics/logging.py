@@ -328,7 +328,7 @@ _VM_DIAGNOSTIC_ENUMS = {
 _WORKSPACE_DATABASE_ENUMS = {
     'database_health_status': frozenset({'ready', 'corrupt', 'unavailable', 'timed_out', 'worker_failed'}),
     'database_health_reason': frozenset({
-        'integrity_failed', 'sqlite_corrupt', 'sqlite_error', 'filesystem_error', 'database_changed',
+        'integrity_failed', 'sqlite_corrupt', 'sqlite_error', 'sqlite_busy', 'filesystem_error', 'database_changed',
         'admission_required', 'worker_timeout', 'worker_exit', 'worker_protocol', 'invalid_file',
         'empty_database', 'initialization_failed', 'verified', 'cancelled', 'history_busy', 'maintenance', 'recovery_pending',
     }),
@@ -458,7 +458,7 @@ def _safe_event_field(key: str, value: Any) -> Any:
                'error_type', 'terminal_stop_reason', 'terminal_reason', 'backend_done_reason',
                'completion_state', 'last_error_code', 'source', 'state', 'component', 'missing_dependency'}:
         return _privacy_safe_value(value, key=key)
-    if key in _WORKSPACE_DATABASE_ENUMS or key == 'database_worker_returncode':
+    if key in _WORKSPACE_DATABASE_ENUMS or key in {'database_worker_returncode', 'sqlite_errorcode', 'sqlite_errorname'}:
         return _privacy_safe_value(value, key=key)
     if key in {'archive_check', 'storage_issue'}:
         return _privacy_safe_value(value, key=key)
@@ -1698,6 +1698,10 @@ def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
             action = argv[position] if len(argv) > position else None
             if isinstance(action, str) and action in _VM_DIAGNOSTIC_ENUMS['controller_action']:
                 value = {**value, 'controller_action': action}
+    if lowered == 'sqlite_errorcode':
+        return value if type(value) is int and 0 <= value <= 2**31 - 1 else None
+    if lowered == 'sqlite_errorname':
+        return value if isinstance(value, str) and value in _RECOVERY_ENUMS['sqlite_errorname'] else None
     if lowered == 'database_worker_returncode':
         return value if type(value) is int and -255 <= value <= 255 else None
     if lowered in _WORKSPACE_DATABASE_ENUMS:

@@ -35,7 +35,7 @@ _ACCESS_RESTORE_EVENTS = frozenset({
     'page_workspace_restore_started', 'page_built',
     'saved_tab_restore_failed', 'workspace_open_failed', 'history_lock_busy',
     'workspace_database_health_started', 'workspace_database_health_completed',
-    'workspace_database_health_failed',
+    'workspace_database_health_failed', 'workspace_database_store_reused', 'workspace_database_preparation_started',
 })
 _ACCESS_RESTORE_FAILURES = {
     'account_store_check_busy': 'account_store_busy',
@@ -630,6 +630,8 @@ def _workspace_database_classification(row: dict[str, Any]) -> str | None:
     if row.get('event') not in {'workspace_database_health_failed', 'workspace_open_failed', 'saved_tab_restore_failed'}:
         return None
     status = row.get('database_health_status')
+    if status == 'unavailable' and (row.get('database_health_reason') == 'sqlite_busy' or _is_lock(row)):
+        return 'workspace_database_busy'
     if status == 'unavailable' and row.get('database_health_reason') == 'history_busy':
         return 'workspace_database_history_busy'
     return {
@@ -747,7 +749,7 @@ def _evidence(row: dict[str, Any]) -> dict[str, Any]:
 def _access_restore_evidence(row: dict[str, Any]) -> dict[str, Any]:
     """Fixed stages only; no account, browser, workspace or page identities."""
     evidence = {key: row[key] for key in ('timestamp', 'channel', 'session_scope', 'event') if key in row}
-    for key in ('elapsed_seconds', 'waited_seconds', 'lock_timeout_seconds'):
+    for key in ('elapsed_seconds', 'waited_seconds', 'lock_timeout_seconds', 'timeout_seconds'):
         value = row.get(key)
         if type(value) in (int, float) and 0 <= value <= 604800 and math.isfinite(value):
             evidence[key] = value
@@ -755,6 +757,12 @@ def _access_restore_evidence(row: dict[str, Any]) -> dict[str, Any]:
         evidence['lock_kind'] = row['lock_kind']
     if isinstance(row.get('db_id'), str) and re.fullmatch(r'[0-9a-f]{64}', row['db_id']):
         evidence['db_id'] = row['db_id']
+    code, name = row.get('sqlite_errorcode'), row.get('sqlite_errorname')
+    if type(code) is int and 0 <= code <= 2**31 - 1:
+        evidence['sqlite_errorcode'] = code
+    if isinstance(name, str) and name in {key for key, value in vars(sqlite3).items()
+                                         if key.startswith('SQLITE_') and type(value) is int}:
+        evidence['sqlite_errorname'] = name
     from .logging import _WORKSPACE_DATABASE_ENUMS
     for key, allowed in _WORKSPACE_DATABASE_ENUMS.items():
         if isinstance(row.get(key), str) and row[key] in allowed:
@@ -766,6 +774,68 @@ def _access_restore_evidence(row: dict[str, Any]) -> dict[str, Any]:
     if error_class:
         evidence['error_class'] = error_class
     return evidence
+
+
+def _workspace_database_access_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
+    """Report each known database's latest outcome without opening its files."""
+    events = {'workspace_database_health_started', 'workspace_database_health_completed',
+              'workspace_database_health_failed', 'workspace_database_store_reused', 'workspace_database_preparation_started'}
+    observed = [row for row in rows if row.get('event') in events]
+    identified = [row for row in observed if isinstance(row.get('db_id'), str)
+                  and re.fullmatch(r'[0-9a-f]{64}', row['db_id'])]
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in identified:
+        groups.setdefault(row['db_id'], []).append(row)
+    databases = []
+    lines = ['Latest recorded workspace database access: admission, initialization and reuse are separate from repair.']
+    explanations = {
+        'workspace_database_busy': 'SQLite reported busy/locked contention, not verified corruption. Wait for active work to finish and retry; these receipts do not identify the lock holder.',
+        'workspace_database_history_busy': 'The history lock was busy. This is separate from SQLite corruption or disk unavailability.',
+        'workspace_database_health_timeout': 'The isolated check or initialization reached its deadline. A timeout does not establish corruption.',
+        'workspace_database_worker_failed': 'The isolated worker failed or exited. A worker failure alone does not establish database corruption.',
+        'workspace_database_corruption': 'The database health worker reported corruption; the original cause is not established.',
+        'sqlite_database_corruption': 'SQLite reported SQLITE_CORRUPT. This is a corruption result, separately from ordinary contention or timeout.',
+        'sqlite_not_a_database': 'SQLite reported that the opened file was not a database; this is separate from ordinary contention.',
+    }
+    for db_id, items in sorted(groups.items(), key=lambda pair: pair[1][-1]['timestamp'])[-12:]:
+        latest = _access_restore_evidence(items[-1])
+        failure = next((_access_restore_evidence(row) for row in reversed(items)
+                        if row.get('event') == 'workspace_database_health_failed'), None)
+        success = next((_access_restore_evidence(row) for row in reversed(items)
+                        if row.get('event') in {'workspace_database_health_completed', 'workspace_database_store_reused'}), None)
+        classification = (_database_condition(latest) or _workspace_database_classification(latest))
+        record = {'db_id': db_id, 'records_examined': len(items), 'latest': latest,
+                  'latest_failure': failure, 'latest_success_or_reuse': success,
+                  'latest_outcome_classification': classification if latest.get('event') == 'workspace_database_health_failed' else None,
+                  'latest_failure_classification': (_database_condition(failure) or _workspace_database_classification(failure)) if failure else None}
+        databases.append(record)
+        lines.append(f'  Database {db_id[:12]} / {latest.get("session_scope", "unrecorded")}: {latest["event"]} at {latest["timestamp"]}.')
+        if latest['event'] == 'workspace_database_store_reused':
+            lines.append('    A previously prepared in-process store passed its reuse guard. No fresh integrity scan or migration is implied.')
+        elif latest['event'] == 'workspace_database_health_completed':
+            lines.append('    The recorded admission/initialization completed successfully; earlier failures remain historical observations.')
+        elif latest['event'] in {'workspace_database_health_started', 'workspace_database_preparation_started'}:
+            lines.append('    A check or initialization started; this tail contains no later result for this database.')
+        elif classification in explanations:
+            lines.append('    ' + explanations[classification])
+        elif latest.get('database_health_reason') == 'sqlite_error':
+            lines.append('    A SQLite operation failed during the recorded phase. This generic error does not establish renewed corruption; inspect the preserved numeric result code/name when present.')
+        elif latest.get('database_health_reason') in {'maintenance', 'recovery_pending'}:
+            lines.append('    Workspace access is guarded by maintenance or an unfinished replacement transaction; this is separate from a corruption finding.')
+        else:
+            lines.append('    Workspace access failed; the fixed reason below distinguishes file changes, access, initialization and other failures without assuming corruption.')
+        facts = {key: latest[key] for key in ('database_health_status', 'database_health_reason', 'database_health_phase',
+                 'sqlite_errorcode', 'sqlite_errorname', 'elapsed_seconds', 'timeout_seconds',
+                 'database_worker_returncode', 'database_worker_signal') if key in latest}
+        if facts:
+            lines.append('    Result facts: ' + json.dumps(facts, sort_keys=True) + '.')
+    if not databases:
+        lines.append('  No reviewed database identity was retained on these access receipts; outcomes cannot be attributed per database from their absence.')
+    lines.extend(['  These are timestamped observations. Healthy checks, normal contention and later access failures can coexist without a new corruption finding.', ''])
+    return {'schema_version': 1, 'scope': 'bounded_log_observations_by_reviewed_database_identity',
+            'records_examined': len(observed), 'records_without_database_identity': len(observed) - len(identified),
+            'databases_available': len(groups), 'databases_retained': len(databases), 'database_limit': 12,
+            'databases_limited': len(groups) > 12, 'databases': databases}, lines
 
 
 def _access_restore_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
@@ -785,7 +855,7 @@ def _access_restore_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], l
                                  | {'saved_tab_restore_failed', 'workspace_open_failed'}),
                 ('history_lock', {'history_lock_busy'}),
                 ('workspace_database', {'workspace_database_health_started', 'workspace_database_health_completed',
-                                        'workspace_database_health_failed'})):
+                                        'workspace_database_health_failed', 'workspace_database_store_reused', 'workspace_database_preparation_started'})):
             latest = next((row for row in reversed(scoped) if row['event'] in events), None)
             if latest:
                 receipt = _access_restore_evidence(latest)
@@ -809,6 +879,7 @@ def _access_restore_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], l
     lines.extend([
         f'  Recorded login acceptances: {counts["login_accepted"]}; rejections: {counts["login_rejected"]}; '
         f'login timeouts: {counts["login_timed_out"]}; page builds: {counts["page_built"]}; history lock waits reaching their limit: {counts["history_lock_busy"]}.',
+        f'  Runtime workspace-store reuse receipts: {counts["workspace_database_store_reused"]}; reuse is distinct from running another database integrity check.',
         '  A password acceptance does not establish that the page finished restoring. A history lock wait is separate from SQLite locking.',
         '  These process-session tails may contain several browser pages and sign-in attempts; their proximity does not establish a shared attempt or the cause of a hang.', ''])
     return {'scope': 'bounded_log_stage_observations', 'records_examined': len(observed),
@@ -1455,6 +1526,8 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
     index['queue_audit'] = queue_audit
     access_restore_audit, access_restore_lines = _access_restore_audit(rows)
     index['access_restore_audit'] = access_restore_audit
+    database_access_audit, database_access_lines = _workspace_database_access_audit(rows)
+    index['workspace_database_access'] = database_access_audit
     recovery_audit, recovery_lines = _workspace_recovery_audit(rows)
     index['workspace_database_recovery'] = recovery_audit
     native_audit, native_lines = _native_fault_audit(Path(latest), previous)
@@ -1508,7 +1581,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         'This summary examines bounded current/previous-session log tails and startup receipts from up to two recent launcher sessions. Counts are not whole-session totals.',
         'Nearby events and tracked transactions are evidence for investigation, not proven lock ownership.', '',
         *primary_setup, *primary_cause,
-        *recovery_lines, *database_lines, *access_restore_lines, *native_lines, *host_lines,
+        *database_access_lines, *recovery_lines, *database_lines, *access_restore_lines, *native_lines, *host_lines,
         *queue_lines,
         *model_lines,
         *permission_acknowledgement_lines,
@@ -1544,12 +1617,13 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
                 'workspace_database_corruption': 'The isolated workspace database health check reported corruption. Existing database files are preserved; the original cause of corruption is not established.',
                 'workspace_database_health_timeout': 'The isolated database health or initialization worker reached its deadline; this does not establish that the database is corrupt.',
                 'workspace_database_worker_failed': 'The isolated database worker failed or exited. The application stayed outside that native worker; this status alone does not establish database corruption.',
+                'workspace_database_busy': 'SQLite reported a busy or locked workspace database. This is contention, not verified corruption; wait for active work to finish and retry. The receipts do not identify the lock holder.',
                 'workspace_database_history_busy': 'The isolated workspace initialization reported a busy history lock. This is separate from SQLite corruption and does not establish that the disk or database file is unavailable.',
                 'workspace_database_unavailable': 'The workspace database could not be admitted or initialized. The fixed reason below distinguishes invalid input, access, and changed-file observations.',
             }
             lines.append('  ' + descriptions.get(classification, 'Workspace database health checking did not complete.'))
             for key in ('database_health_status', 'database_health_reason', 'database_health_phase',
-                        'database_worker_returncode', 'database_worker_signal'):
+                        'database_worker_returncode', 'database_worker_signal', 'sqlite_errorcode', 'sqlite_errorname'):
                 if key in failure:
                     lines.append(f'  {key}: {failure[key]}')
         elif classification == 'sqlite_database_corruption':

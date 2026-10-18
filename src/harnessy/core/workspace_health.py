@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -31,7 +32,7 @@ _ERROR_MESSAGES = {
     'worker_failed': 'The isolated workspace database check stopped unexpectedly. Its files were preserved. Retry the workspace and include diagnostics if this repeats.',
 }
 _REASONS = frozenset({
-    'integrity_failed', 'sqlite_corrupt', 'sqlite_error', 'filesystem_error',
+    'integrity_failed', 'sqlite_corrupt', 'sqlite_error', 'sqlite_busy', 'filesystem_error',
     'database_changed', 'admission_required', 'worker_timeout', 'worker_exit',
     'worker_protocol', 'invalid_file', 'empty_database', 'initialization_failed', 'cancelled',
     'history_busy', 'maintenance', 'recovery_pending',
@@ -44,6 +45,33 @@ _PREPARE_LOCKS: dict[str, threading.Lock] = {}
 _ACTIVE_WORKERS: dict[int, subprocess.Popen] = {}
 _CANCELLING = threading.Event()
 _INITIALIZING_IN_WORKER: tuple[int, str, tuple] | None = None
+_SQLITE_CONSTANTS = {name: value for name, value in vars(sqlite3).items()
+                     if name.startswith('SQLITE_') and type(value) is int}
+
+
+def _sqlite_fields(code, name) -> dict:
+    """Retain only numeric result codes and matching SQLite-owned identifiers."""
+    fields = {}
+    if type(code) is int and 0 <= code <= 2**31 - 1:
+        fields['sqlite_errorcode'] = code
+        if isinstance(name, str) and _SQLITE_CONSTANTS.get(name) == code:
+            fields['sqlite_errorname'] = name
+    return fields
+
+
+def _sqlite_failure(exc: sqlite3.Error) -> dict:
+    fields = _sqlite_fields(getattr(exc, 'sqlite_errorcode', None),
+                            getattr(exc, 'sqlite_errorname', None))
+    primary = fields.get('sqlite_errorcode', 0) & 255
+    if primary in {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB}:
+        code, reason = 'corrupt', 'sqlite_corrupt'
+    elif primary in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+        code, reason = 'unavailable', 'sqlite_busy'
+    elif primary == sqlite3.SQLITE_INTERRUPT:
+        code, reason = 'timed_out', 'worker_timeout'
+    else:
+        code, reason = 'unavailable', 'sqlite_error'
+    return {'status': 'error', 'code': code, 'reason': reason, **fields}
 
 
 class WorkspaceDatabaseError(RuntimeError):
@@ -52,17 +80,23 @@ class WorkspaceDatabaseError(RuntimeError):
     def __init__(
         self, code: str, *, reason: str = '', phase: str = 'admission',
         worker_returncode: int | None = None,
+        sqlite_errorcode: int | None = None, sqlite_errorname: str | None = None,
     ) -> None:
         self.code = code if code in _ERROR_MESSAGES else 'worker_failed'
         self.reason = reason if reason in _REASONS else 'worker_protocol'
         self.phase = phase if phase in {'admission', 'initialization'} else 'admission'
         self.worker_returncode = worker_returncode if type(worker_returncode) is int else None
+        sqlite_fields = _sqlite_fields(sqlite_errorcode, sqlite_errorname)
+        self.sqlite_errorcode = sqlite_fields.get('sqlite_errorcode')
+        self.sqlite_errorname = sqlite_fields.get('sqlite_errorname')
         signals = {getattr(signal, name, object()): name for name in (
             'SIGBUS', 'SIGSEGV', 'SIGABRT', 'SIGKILL', 'SIGTERM',
         )}
         self.worker_signal = (signals.get(-worker_returncode, 'other')
                               if type(worker_returncode) is int and worker_returncode < 0 else 'none')
-        if self.reason == 'maintenance':
+        if self.reason == 'sqlite_busy':
+            message = 'Another operation is using the workspace database. Wait for that operation to finish, then retry opening the workspace.'
+        elif self.reason == 'maintenance':
             message = 'This workspace is being checked or repaired. Wait for the operation to finish, then retry.'
         elif self.reason == 'recovery_pending':
             message = 'Workspace recovery was interrupted. Finish or roll back recovery before opening this workspace.'
@@ -112,6 +146,48 @@ def _fingerprint(db: Path) -> tuple:
 def forget_workspace_admission(root: str | Path) -> None:
     with _CACHE_LOCK:
         _CACHE.pop(str(_database_path(root)), None)
+
+
+def require_workspace_not_quarantined(root: str | Path) -> None:
+    """Reject a known failed admission without treating WAL writes as damage.
+
+    Live stores use this cache-only check while holding their shared lease.
+    A confirmed failure remains authoritative until an explicit successful
+    probe or verified recovery replaces it, even if the main inode is stable.
+    """
+    key = str(_database_path(root))
+    with _CACHE_LOCK:
+        cached = _CACHE.get(key)
+    if isinstance(cached, WorkspaceDatabaseError):
+        raise cached
+
+
+def workspace_preparation_timeout(root: str | Path, *, minimum: float = 20.0,
+                                  maximum: float = 300.0) -> float:
+    """Budget a cold check from DB/WAL sizes without opening either in SQLite.
+
+    Up to 128 MiB keeps the ordinary 20-second limit. Larger snapshots receive
+    one additional second per 16 MiB, bounded at five minutes. Explicit caller
+    timeouts remain separate from this default sizing policy.
+    """
+    from .workspace_access import workspace_shared_access
+    with workspace_shared_access(root, allow_missing=True):
+        fingerprint = _fingerprint(_database_path(root))
+    total = sum(row[2] for row in fingerprint[:2] if row is not None)
+    extra = math.ceil(max(0, total - 128 * 1024 * 1024) / (16 * 1024 * 1024))
+    return min(float(maximum), max(float(minimum), 20.0 + extra))
+
+
+def _remember_failure(key: str, error: 'WorkspaceDatabaseError') -> None:
+    # A reader/writer lock or bounded timeout says nothing about corruption.
+    # Keep any previous admission (including a quarantine) rather than making
+    # an ordinary retry fail forever after the competing operation finishes.
+    primary = (error.sqlite_errorcode or 0) & 255
+    if (error.code == 'timed_out' or error.reason == 'sqlite_busy'
+            or primary in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}):
+        return
+    with _CACHE_LOCK:
+        _CACHE[key] = error
 
 
 def workspace_database_fingerprint(root: str | Path) -> tuple:
@@ -365,14 +441,15 @@ def _probe_workspace_database(
             if after[0] is None or before[0][:2] != after[0][:2]:
                 raise WorkspaceDatabaseError('unavailable', reason='database_changed')
             if report['status'] == 'error':
-                raise WorkspaceDatabaseError(str(report.get('code')), reason=str(report.get('reason')))
+                raise WorkspaceDatabaseError(str(report.get('code')), reason=str(report.get('reason')),
+                                             sqlite_errorcode=report.get('sqlite_errorcode'),
+                                             sqlite_errorname=report.get('sqlite_errorname'))
             result = WorkspaceAdmission('healthy', after)
         with _CACHE_LOCK:
             _CACHE[key] = result
         return result
     except WorkspaceDatabaseError as exc:
-        with _CACHE_LOCK:
-            _CACHE[key] = exc
+        _remember_failure(key, exc)
         raise
     except (OSError, ValueError) as exc:
         error = WorkspaceDatabaseError('unavailable', reason='filesystem_error')
@@ -440,12 +517,7 @@ def _worker_probe_inner(db: Path, temporary: Path, timeout: float) -> dict:
     except TimeoutError:
         return {'status': 'error', 'code': 'timed_out', 'reason': 'worker_timeout'}
     except sqlite3.Error as exc:
-        code = getattr(exc, 'sqlite_errorcode', 0) & 255
-        if code == sqlite3.SQLITE_INTERRUPT:
-            return {'status': 'error', 'code': 'timed_out', 'reason': 'worker_timeout'}
-        if code in {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB}:
-            return {'status': 'error', 'code': 'corrupt', 'reason': 'sqlite_corrupt'}
-        return {'status': 'error', 'code': 'unavailable', 'reason': 'sqlite_error'}
+        return _sqlite_failure(exc)
     finally:
         if connection is not None:
             connection.close()
@@ -490,7 +562,9 @@ def _prepare_workspace_store(
         report = _run_worker(db, '--prepare', remaining, name=name)
         if report['status'] == 'error':
             raise WorkspaceDatabaseError(str(report.get('code')), reason=str(report.get('reason')),
-                                         phase='initialization')
+                                         phase='initialization',
+                                         sqlite_errorcode=report.get('sqlite_errorcode'),
+                                         sqlite_errorname=report.get('sqlite_errorname'))
         metadata = report.get('metadata')
         is_vm_workspace = report.get('is_vm_workspace')
         if (report['status'] != 'prepared' or not isinstance(metadata, dict)
@@ -510,8 +584,7 @@ def _prepare_workspace_store(
         from .workspace import WorkspaceStore
         return WorkspaceStore._from_prepared_metadata(db.parent.parent, metadata, is_vm_workspace)
     except WorkspaceDatabaseError as exc:
-        with _CACHE_LOCK:
-            _CACHE[key] = exc
+        _remember_failure(key, exc)
         raise
     except (OSError, ValueError) as exc:
         error = WorkspaceDatabaseError('unavailable', reason='filesystem_error')
@@ -540,12 +613,7 @@ def _worker_prepare(db: Path, name: str | None) -> dict:
     try:
         store = WorkspaceStore(db.parent.parent, name, database_admission='cached')
     except sqlite3.Error as exc:
-        code = getattr(exc, 'sqlite_errorcode', 0) & 255
-        return {'status': 'error', 'code': 'corrupt' if code in {
-            sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB,
-        } else 'unavailable', 'reason': 'sqlite_corrupt' if code in {
-            sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB,
-        } else 'sqlite_error'}
+        return _sqlite_failure(exc)
     except HistoryBusyError:
         return {'status': 'error', 'code': 'unavailable', 'reason': 'history_busy'}
     except (HistoryError, RuntimeError, ValueError):

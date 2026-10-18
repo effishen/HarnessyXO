@@ -98,7 +98,8 @@ from harnessy.core.chat_export import CONTENT_DETAIL, EXPORT_TYPES, ExportOption
 from harnessy.agent.chat_exports import ExportJob, EXPORT_JOBS
 from harnessy.agent.timeline_replacements import TimelineReplacementJob
 from harnessy.core.workspace import FILES_PROBE_DIR_NAME, LEGACY_IMPORTS_DIR_NAME, WorkspaceStore  # noqa: E402
-from harnessy.core.workspace_health import WorkspaceDatabaseError, prepare_workspace_store  # noqa: E402
+from harnessy.core.workspace_health import (WorkspaceDatabaseError, prepare_workspace_store,
+                                           require_workspace_not_quarantined, workspace_preparation_timeout)  # noqa: E402
 from harnessy.core.workspace_access import workspace_shared_access  # noqa: E402
 from harnessy.core.workspace_recovery import RECOVERY_OPERATIONS  # noqa: E402
 from harnessy.core.history import BRANCHES_DIR_NAME, REWINDS_DIR_NAME, HistoryBusyError, HistoryError  # noqa: E402
@@ -234,20 +235,66 @@ _EVENT_LOOP_WATCHDOG_TASK: asyncio.Task[Any] | None = None
 # probe every registered workspace after the worker cancellation gate closes.
 _RUNTIME_WORKSPACE_STORES: dict[str, WorkspaceStore] = {}
 _RUNTIME_WORKSPACE_STORE_LOCK = threading.RLock()
+_RUNTIME_WORKSPACE_PREPARE_LOCKS: dict[str, threading.Lock] = {}
 
 
-def _prepare_runtime_workspace(root: str | Path, name: str | None = None, **kwargs: Any) -> WorkspaceStore:
-    """Prepare off-loop and retain only the latest healthy store per path."""
+def _prepare_runtime_workspace(
+    root: str | Path, name: str | None = None, *, allow_replacement: bool = False, **kwargs: Any,
+) -> WorkspaceStore:
+    """Reuse an admitted live generation; initialize each cold workspace once.
+
+    Normal chat commits change WAL and modification times. They must not cause
+    a new full database copy, integrity scan or schema initialization whenever
+    a chat starts or another browser page connects.
+    """
     key = str(Path(root).expanduser().resolve())
-    try:
-        store = prepare_workspace_store(root, name, **kwargs)
-    except BaseException:
-        with _RUNTIME_WORKSPACE_STORE_LOCK:
-            _RUNTIME_WORKSPACE_STORES.pop(key, None)
-        raise
+    options = dict(kwargs)
+    if options.get('timeout') is None:
+        options['timeout'] = workspace_preparation_timeout(root)
+    budget = float(options['timeout'])
+    started = time.monotonic()
     with _RUNTIME_WORKSPACE_STORE_LOCK:
-        _RUNTIME_WORKSPACE_STORES[key] = store
-    return store
+        preparation_lock = _RUNTIME_WORKSPACE_PREPARE_LOCKS.setdefault(key, threading.Lock())
+    if not preparation_lock.acquire(timeout=max(.1, budget)):
+        raise WorkspaceDatabaseError('timed_out', reason='worker_timeout')
+    try:
+        with _RUNTIME_WORKSPACE_STORE_LOCK:
+            cached = _RUNTIME_WORKSPACE_STORES.get(key)
+        if cached is not None and not options.get('force'):
+            try:
+                with workspace_shared_access(cached.root, expected_generation=cached._workspace_generation):
+                    require_workspace_not_quarantined(cached.root)
+                    if name is not None and cached.name != name:
+                        cached.set_name(name)
+                log_event('harnessy', 'workspace_database_store_reused',
+                          db_id=_database_identity(cached.db_path))
+                return cached
+            except WorkspaceDatabaseError as exc:
+                if exc.reason in {'maintenance', 'recovery_pending'}:
+                    raise
+                if not allow_replacement:
+                    raise
+                with _RUNTIME_WORKSPACE_STORE_LOCK:
+                    if _RUNTIME_WORKSPACE_STORES.get(key) is cached:
+                        _RUNTIME_WORKSPACE_STORES.pop(key, None)
+        remaining = budget - (time.monotonic() - started)
+        if remaining <= 0:
+            raise WorkspaceDatabaseError('timed_out', reason='worker_timeout')
+        options['timeout'] = remaining
+        log_event('harnessy', 'workspace_database_preparation_started',
+                  db_id=_database_identity(Path(key) / '.harnessy' / 'workspace.db'),
+                  timeout_seconds=options['timeout'])
+        try:
+            store = prepare_workspace_store(root, name, **options)
+        except BaseException:
+            with _RUNTIME_WORKSPACE_STORE_LOCK:
+                _RUNTIME_WORKSPACE_STORES.pop(key, None)
+            raise
+        with _RUNTIME_WORKSPACE_STORE_LOCK:
+            _RUNTIME_WORKSPACE_STORES[key] = store
+        return store
+    finally:
+        preparation_lock.release()
 
 
 def _prepared_runtime_workspaces() -> list[WorkspaceStore]:
@@ -1992,6 +2039,7 @@ class HarnessyPage:
             # A page can outlive a repair performed in another browser tab.
             # Validate the generation without opening SQLite before reusing it.
             with workspace_shared_access(cached.root, expected_generation=cached._workspace_generation):
+                require_workspace_not_quarantined(cached.root)
                 if cached.name != reg.name:
                     cached.set_name(reg.name)
             return cached
@@ -4771,7 +4819,8 @@ class HarnessyPage:
             raise RuntimeError('Wait for workspace recovery to finish before resuming queued work.')
         # A visible Resume button never bypasses database admission or another
         # recovery receipt created while this request was waiting.
-        await asyncio.to_thread(_prepare_runtime_workspace, reg.path, reg.name, timeout=120.0)
+        await asyncio.to_thread(_prepare_runtime_workspace, reg.path, reg.name,
+                                timeout=120.0, allow_replacement=True)
         reg = await self._recovery_registration(reg)
         if RECOVERY_OPERATIONS.snapshot(reg.path, state_root=self.machine.root).get('busy'):
             raise RuntimeError('Another workspace recovery started. Wait for it to finish.')
@@ -4817,7 +4866,7 @@ class HarnessyPage:
                 continue
             try:
                 with workspace_shared_access(store.root, expected_generation=store._workspace_generation):
-                    pass
+                    require_workspace_not_quarantined(store.root)
             except WorkspaceDatabaseError as exc:
                 self._workspace_load_failures[workspace_id] = exc
                 for tab in self.open_tabs:
@@ -22886,7 +22935,8 @@ def run_app() -> None:
                         store = await asyncio.to_thread(
                             _prepare_runtime_workspace, reg.path, reg.name,
                             force=bool(retry_workspace and retry_workspace == reg.id),
-                            timeout=120.0 if recovery_workspace == reg.id else 20.0,
+                            timeout=120.0 if recovery_workspace == reg.id else None,
+                            allow_replacement=bool(recovery_workspace and recovery_workspace == reg.id),
                         )
                         page.workspace_cache[reg.id] = store
                         log_event('harnessy', 'workspace_database_health_completed',
@@ -22906,6 +22956,8 @@ def run_app() -> None:
                                   database_health_phase=getattr(failure, 'phase', 'workspace_initialization'),
                                   database_worker_returncode=getattr(failure, 'worker_returncode', None),
                                   database_worker_signal=getattr(failure, 'worker_signal', 'none'),
+                                  sqlite_errorcode=getattr(failure, 'sqlite_errorcode', None),
+                                  sqlite_errorname=getattr(failure, 'sqlite_errorname', None),
                                   error_class=type(exc).__name__,
                                   elapsed_seconds=round(time.monotonic() - started, 3))
                     completed += 1
@@ -22934,6 +22986,16 @@ def run_app() -> None:
                 with client:
                     loading.delete()
                     page.build()
+                    if any(reg.id in page.workspace_cache and reg.id in {retry_workspace, recovery_workspace}
+                           for reg in registrations):
+                        # Retry is a one-time request. A later browser refresh
+                        # or transport reconnect must not repeat a forced scan.
+                        ui.run_javascript('''(() => {
+                            const url = new URL(window.location.href);
+                            url.searchParams.delete('retry_workspace');
+                            url.searchParams.delete('recovery_workspace');
+                            window.history.replaceState(window.history.state, '', url.pathname + url.search + url.hash);
+                        })();''')
                     if settings == 'users':
                         page.open_settings('Users / Password')
             finally:

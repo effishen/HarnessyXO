@@ -24,7 +24,7 @@ from .sqlite_store import enable_store_wal
 from .workspace_access import WorkspaceConnection, workspace_generation, workspace_shared_access
 from .workspace_health import (
     probe_workspace_database, require_workspace_database_admitted,
-    remember_workspace_database_admitted,
+    remember_workspace_database_admitted, require_workspace_not_quarantined,
 )
 from .memory_events import current_origin, memory_lock
 from .prompt_navigator import navigator_prompt_owners, prompt_indicator_index, timeline_event_navigator_entry
@@ -424,6 +424,7 @@ class WorkspaceStore:
             self.root, expected_generation=self._workspace_generation,
             allow_missing=self._workspace_initializing and self._workspace_generation[0] is None,
         ):
+            require_workspace_not_quarantined(self.root)
             self._write_metadata_admitted(data)
 
     def _write_metadata_admitted(self, data: dict[str, Any]) -> None:
@@ -440,6 +441,7 @@ class WorkspaceStore:
             allow_missing=self._workspace_initializing and self._workspace_generation[0] is None,
         )
         try:
+            require_workspace_not_quarantined(self.root)
             database = self.db_path.resolve().as_uri() + '?mode=ro' if readonly else self.db_path
             con = connect_database(database, role='workspace', factory=WorkspaceConnection,
                                    uri=readonly, timeout=timeout)
