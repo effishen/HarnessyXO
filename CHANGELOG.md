@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.6.118
+
+- Add **Extended check** and **Repair workspace** to the workspace-open error panel. Run a longer check on private preservation copies, with stage, elapsed time, copy progress, cancellation and a downloadable recovery report. Keep progress and results across browser refreshes and sign-in.
+- Repair confirmed index damage on a separate copy. Offer **Use repaired database** only after full integrity, relationship, schema and row-by-row verification, with original database and journal files retained. Keep uncertain SQLite salvage available for review without replacing the active workspace.
+- Protect each workspace during maintenance with shared database leases and a persisted queue hold. Keep other workspaces usable, invalidate old browser-page database generations after a switch, and require explicit **Resume queued work** when queued jobs remain. Retain existing completion and backend holds.
+- Make database activation recoverable across interruption. Preserve a durable transaction record before moving originals and offer **Restore original database** if a switch was interrupted. Keep project files, VM disks, workspace identity and saved tabs.
+- Include content-free recovery stages, failure codes, worker outcomes, byte counts and record counts in diagnostics. Correlate ordinary workspace checks with the same database identity. Leave README unchanged.
+- Verified synthetic SQLite corruption, committed WAL data, cancellation, isolated worker faults, interrupted database switches, saved-chat restoration and light/dark browser flows on Linux. Native Mac testing was unavailable.
+
 ## v0.6.117
 
 - Keep login responsive while saved workspaces open. Check a coherent database snapshot for corruption and initialize the workspace in bounded, isolated processes. Show a persistent error for an unhealthy workspace, preserve its saved tabs, and provide an explicit Retry. Do not automatically reset, rebuild or repair its database or journals.

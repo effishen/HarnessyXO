@@ -371,6 +371,14 @@ class MachineStore:
                     PRIMARY KEY(workspace_id,chat_id)
                 )
             ''')
+            con.execute('''
+                CREATE TABLE IF NOT EXISTS workspace_recovery_holds (
+                    workspace_id TEXT PRIMARY KEY,
+                    receipt_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+                )
+            ''')
             retired = self._prune_settled_orphan_completion_holds(con)
             con.commit()
         self._log_retired_completion_holds(retired, cleanup_scope='startup')
@@ -514,9 +522,47 @@ class MachineStore:
 
     def run_admission_reason(self, workspace_id: str, chat_id: str, *, include_backend: bool = False) -> str:
         with self._connect() as con:
+            if con.execute('SELECT 1 FROM workspace_recovery_holds WHERE workspace_id=?',
+                           (str(workspace_id),)).fetchone():
+                return 'Workspace paused · review database recovery before continuing'
             if include_backend and con.execute('SELECT 1 FROM backend_recoveries LIMIT 1').fetchone():
                 return 'Queue paused · backend needs attention'
             return self._completion_admission_reason(con, str(workspace_id), str(chat_id))
+
+    def pause_workspace_for_recovery(self, workspace_id: str, receipt_id: str) -> dict[str, str]:
+        """Persist this workspace's admission hold without pausing other workspaces."""
+        workspace_id, receipt_id = str(workspace_id), str(receipt_id)
+        if not receipt_id or len(receipt_id) > 128:
+            raise ValueError('Invalid workspace recovery receipt.')
+        with self._connect() as con:
+            con.execute('BEGIN IMMEDIATE')
+            if con.execute('SELECT 1 FROM workspaces WHERE id=?', (workspace_id,)).fetchone() is None:
+                raise ValueError('The workspace registration no longer exists.')
+            if con.execute("SELECT 1 FROM run_queue_jobs WHERE workspace_id=? AND status='running'",
+                           (workspace_id,)).fetchone():
+                raise RuntimeError('Stop or finish running work in this workspace before checking or repairing its database.')
+            con.execute(
+                "INSERT INTO workspace_recovery_holds(workspace_id,receipt_id,updated_at) "
+                "VALUES(?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+                "ON CONFLICT(workspace_id) DO UPDATE SET receipt_id=excluded.receipt_id,updated_at=excluded.updated_at",
+                (workspace_id, receipt_id),
+            )
+            con.commit()
+        return {'workspace_id': workspace_id, 'receipt_id': receipt_id}
+
+    def workspace_recovery_hold(self, workspace_id: str) -> dict[str, str] | None:
+        with self._connect() as con:
+            row = con.execute('SELECT * FROM workspace_recovery_holds WHERE workspace_id=?',
+                              (str(workspace_id),)).fetchone()
+        return dict(row) if row is not None else None
+
+    def release_workspace_recovery_hold(self, workspace_id: str, receipt_id: str) -> bool:
+        """Release only the reviewed receipt; retain completion/backend holds."""
+        with self._connect() as con:
+            changed = con.execute('DELETE FROM workspace_recovery_holds WHERE workspace_id=? AND receipt_id=?',
+                                  (str(workspace_id), str(receipt_id))).rowcount
+            con.commit()
+        return bool(changed)
 
     def recover_interrupted_completion_holds(self) -> int:
         with self._connect() as con:
@@ -780,6 +826,9 @@ class MachineStore:
             ).fetchone()
             if row is None:
                 con.commit()
+                return None
+            if con.execute('SELECT 1 FROM workspace_recovery_holds WHERE workspace_id=?',
+                           (str(row['workspace_id']),)).fetchone():
                 return None
             if self._completion_admission_reason(con, str(row['workspace_id']), str(row['chat_id'])):
                 return None

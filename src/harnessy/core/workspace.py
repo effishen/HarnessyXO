@@ -20,7 +20,8 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from ..diagnostics.sqlite import connect_database
-from .sqlite_store import StoreConnection, enable_store_wal
+from .sqlite_store import enable_store_wal
+from .workspace_access import WorkspaceConnection, workspace_generation, workspace_shared_access
 from .workspace_health import (
     probe_workspace_database, require_workspace_database_admitted,
     remember_workspace_database_admitted,
@@ -153,6 +154,22 @@ class WorkspaceStore:
         if not self.root.exists() or not self.root.is_dir():
             raise ValueError(f'Workspace directory does not exist: {self.root}')
 
+        with workspace_shared_access(self.root, allow_missing=True) as access:
+            # An existing workspace whose database disappeared must never be
+            # silently recreated. Only a genuinely new workspace starts empty.
+            if access.generation[0] is None and (self.root / META_DIR_NAME / 'workspace.json').exists():
+                from .workspace_health import WorkspaceDatabaseError
+                raise WorkspaceDatabaseError('unavailable', reason='database_changed')
+            self._workspace_generation = access.generation
+            self._workspace_initializing = True
+            try:
+                self._initialize(name, database_admission=database_admission)
+                self._workspace_generation = workspace_generation(self.root)
+            finally:
+                self._workspace_initializing = False
+
+    def _initialize(self, name: str | None, *, database_admission: str) -> None:
+
         # HarnessyXO-private operational state. Instructions, structured memory,
         # and per-chat continuity state are authoritative in workspace.db.
         self.meta = self.root / META_DIR_NAME
@@ -277,6 +294,8 @@ class WorkspaceStore:
         )
         store.llm_dir = root / LLM_DIR_NAME
         store.metadata = metadata
+        store._workspace_generation = workspace_generation(root)
+        store._workspace_initializing = False
         return store
 
     @property
@@ -401,6 +420,13 @@ class WorkspaceStore:
         return {}
 
     def _write_metadata_atomic(self, data: dict[str, Any]) -> None:
+        with workspace_shared_access(
+            self.root, expected_generation=self._workspace_generation,
+            allow_missing=self._workspace_initializing and self._workspace_generation[0] is None,
+        ):
+            self._write_metadata_admitted(data)
+
+    def _write_metadata_admitted(self, data: dict[str, Any]) -> None:
         encoded = json.dumps(data, indent=2)
         if self.metadata_path.exists() and self.metadata_path.read_text('utf-8') == encoded:
             return
@@ -408,9 +434,21 @@ class WorkspaceStore:
         temporary.write_text(encoded, encoding='utf-8')
         os.replace(temporary, self.metadata_path)
 
-    def _connect(self) -> sqlite3.Connection:
-        con = connect_database(self.db_path, role='workspace', factory=StoreConnection)
+    def _connect(self, *, readonly: bool = False, timeout: float = 5.0) -> sqlite3.Connection:
+        access = workspace_shared_access(
+            self.root, expected_generation=self._workspace_generation,
+            allow_missing=self._workspace_initializing and self._workspace_generation[0] is None,
+        )
         try:
+            database = self.db_path.resolve().as_uri() + '?mode=ro' if readonly else self.db_path
+            con = connect_database(database, role='workspace', factory=WorkspaceConnection,
+                                   uri=readonly, timeout=timeout)
+            con.attach_workspace_lease(access)
+        except BaseException:
+            access.close()
+            raise
+        try:
+            self._workspace_generation = workspace_generation(self.root)
             con.row_factory = sqlite3.Row
             con.execute('PRAGMA mmap_size=0').close()
             con.execute('PRAGMA foreign_keys=ON').close()

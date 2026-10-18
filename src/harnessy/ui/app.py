@@ -99,9 +99,12 @@ from harnessy.agent.chat_exports import ExportJob, EXPORT_JOBS
 from harnessy.agent.timeline_replacements import TimelineReplacementJob
 from harnessy.core.workspace import FILES_PROBE_DIR_NAME, LEGACY_IMPORTS_DIR_NAME, WorkspaceStore  # noqa: E402
 from harnessy.core.workspace_health import WorkspaceDatabaseError, prepare_workspace_store  # noqa: E402
+from harnessy.core.workspace_access import workspace_shared_access  # noqa: E402
+from harnessy.core.workspace_recovery import RECOVERY_OPERATIONS  # noqa: E402
 from harnessy.core.history import BRANCHES_DIR_NAME, REWINDS_DIR_NAME, HistoryBusyError, HistoryError  # noqa: E402
 from harnessy.core.outputs import CHAT_OUTPUT_DIR_RE  # noqa: E402
 from harnessy.diagnostics import log_event, refresh_diagnostics_bundle  # noqa: E402
+from harnessy.diagnostics.sqlite import _database_identity  # noqa: E402
 from harnessy.diagnostics.faults import (  # noqa: E402
     EventLoopStallMonitor, RUN_DIAGNOSTIC_EVENTS, exception_evidence, run_stage_evidence,
 )
@@ -251,6 +254,29 @@ def _prepared_runtime_workspaces() -> list[WorkspaceStore]:
     """Return prepared references without touching workspace storage."""
     with _RUNTIME_WORKSPACE_STORE_LOCK:
         return list(_RUNTIME_WORKSPACE_STORES.values())
+
+
+async def _prepare_queued_workspace(root: str | Path, name: str) -> WorkspaceStore:
+    """Drain a cancelled admission before releasing its queue worker.
+
+    Cancelling to_thread does not stop its native-worker supervisor. Keeping
+    the owned waiter alive ensures recovery's exclusive lease is requested
+    only after this preparation has closed its shared lease.
+    """
+    waiter = asyncio.create_task(asyncio.to_thread(_prepare_runtime_workspace, root, name))
+    try:
+        return await asyncio.shield(waiter)
+    except asyncio.CancelledError:
+        while not waiter.done():
+            try:
+                await asyncio.shield(waiter)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if waiter.done() and not waiter.cancelled():
+            waiter.exception()
+        raise
 
 
 @dataclass(frozen=True, slots=True)
@@ -1775,6 +1801,12 @@ class HarnessyPage:
                 'click', js_handler='() => window.harnessySetMobileSidebar(false)'
             )
             self.tabbar_area = ui.row().classes('hy-tabbar w-full items-end no-wrap px-2 pt-1 gap-1').props('data-hy-tab-container=1')
+            with ui.row().classes('w-full items-center gap-2 flex-wrap px-4 py-2').props('data-hy-workspace-recovery-hold=1') as recovery_hold:
+                ui.icon('pause_circle_outline').classes('text-warning')
+                self._recovery_hold_label = ui.label('Queued work is paused for this workspace.').classes('text-sm').style('flex:1;min-width:150px')
+                self._recovery_resume_button = ui.button('Resume queued work', icon='play_arrow', on_click=self._resume_selected_workspace_recovery).props('outline no-caps')
+            self._recovery_hold_area = recovery_hold
+            recovery_hold.set_visibility(False)
             self.tab_content_area = ui.column().classes('hy-tab-content w-full gap-0').style('flex:1')
         self.refresh_tabs()
 
@@ -1957,8 +1989,11 @@ class HarnessyPage:
             raise failure
         cached = self.workspace_cache.get(reg.id)
         if cached and cached.root == reg.path.resolve():
-            if cached.name != reg.name:
-                cached.set_name(reg.name)
+            # A page can outlive a repair performed in another browser tab.
+            # Validate the generation without opening SQLite before reusing it.
+            with workspace_shared_access(cached.root, expected_generation=cached._workspace_generation):
+                if cached.name != reg.name:
+                    cached.set_name(reg.name)
             return cached
         # Registered workspaces are prepared by the asynchronous page loader.
         # Never run database admission or initialization on the UI event loop.
@@ -2202,6 +2237,16 @@ class HarnessyPage:
             )
 
     def _refresh_sidebar_busy_indicators(self) -> None:
+        self._refresh_workspace_recovery_banner()
+        self._refresh_workspace_generations()
+        try:
+            self._refresh_sidebar_busy_indicators_impl()
+        except WorkspaceDatabaseError:
+            # Another page may have acquired maintenance between the cheap
+            # generation check and this timer's first database call.
+            self._refresh_workspace_generations()
+
+    def _refresh_sidebar_busy_indicators_impl(self) -> None:
         self._sync_timeline_replacement_ui()
         # A headless queued run can finish while its formerly selected chat
         # is off-screen. Reconcile every cached owner, not only the mounted
@@ -4630,16 +4675,160 @@ class HarnessyPage:
                 self._render_environment_tab(tab, ws)
 
     def _render_workspace_open_error(self, reg: WorkspaceRegistration, message: str) -> None:
-        with ui.column().classes('w-full items-center justify-center gap-3 p-6').style('flex:1'):
-            with ui.column().classes('w-full gap-3').style('max-width:600px').props('role=alert data-hy-workspace-open-error=1'):
+        with ui.column().classes('w-full items-center no-wrap gap-3 p-6').style('flex:1;min-height:0;overflow-y:auto'):
+            with ui.column().classes('w-full gap-3').style('max-width:600px;flex-shrink:0').props('role=alert data-hy-workspace-open-error=1'):
                 ui.icon('error_outline', size='36px').classes('text-negative')
                 ui.label('Could not open workspace').classes('text-xl font-semibold')
                 ui.label(reg.name).classes('font-semibold break-words')
                 ui.label(message).classes('hy-muted break-words')
+                active = next((tab for tab in self.open_tabs if tab.key == self.active_tab_key
+                               and tab.workspace_id == reg.id and tab.chat_id), None)
+                draft = self.chat_composer_drafts.get((reg.id, str(active.chat_id)), '') if active else ''
+                if draft:
+                    with ui.expansion('Unsent message retained in this tab', icon='edit_note').classes('w-full'):
+                        ui.label('Copy this text before reloading or reopening the workspace. It could not be saved to the unavailable database.').classes('text-sm hy-muted')
+                        ui.textarea(value=draft).props('readonly autogrow').classes('w-full')
+                        ui.button('Copy unsent message', icon='content_copy', on_click=lambda text=draft: self._write_clipboard(text)).props('flat no-caps')
                 ui.label('Your saved tabs are still available. Retry to reload them, or choose another workspace from the left.').classes('hy-muted')
                 ui.button('Retry workspace', icon='refresh', on_click=lambda: ui.navigate.to('/?retry_workspace=' + quote(reg.id, safe=''))).props('no-caps unelevated')
+                from harnessy.ui.workspace_recovery import render_workspace_recovery
+                render_workspace_recovery(
+                    self, reg,
+                    on_start=lambda action: self._start_workspace_recovery(reg, action),
+                    on_activate=lambda snapshot: self._activate_workspace_recovery(reg, snapshot),
+                    on_open=lambda snapshot: self._open_workspace_recovery(reg, snapshot),
+                    on_resume=lambda: self._resume_workspace_recovery(reg),
+                    is_queue_paused=lambda: self.machine.workspace_recovery_hold(reg.id) is not None,
+                )
                 from harnessy.ui.workspace_resources import render_unavailable_workspace_vm
                 render_unavailable_workspace_vm(reg.path)
+
+    async def _recovery_registration(self, reg: WorkspaceRegistration) -> WorkspaceRegistration:
+        if self._accounts is None:
+            raise RuntimeError('Sign in again before changing workspace recovery.')
+        await self._accounts._require_session()
+        current = self.machine.get_workspace(reg.id)
+        if current is None or current.path.resolve() != reg.path.resolve():
+            raise RuntimeError('The workspace registration changed. Reload this page before continuing.')
+        return current
+
+    async def _hold_workspace_recovery(self, reg: WorkspaceRegistration) -> WorkspaceRegistration:
+        reg = await self._recovery_registration(reg)
+        if RECOVERY_OPERATIONS.snapshot(reg.path, state_root=self.machine.root).get('busy'):
+            raise RuntimeError('Workspace recovery is already running.')
+        if (active_work(reg.path)
+                or any(wid == reg.id and not task.done() for (wid, _), task in _AGENT_TASKS.items())
+                or any(wid == reg.id and not task.done() for (wid, _), task in _PROJECT_REVISION_TASKS.items())):
+            raise RuntimeError('Stop or finish active work in this workspace before starting recovery. Nothing was interrupted.')
+        self.machine.pause_workspace_for_recovery(reg.id, uuid.uuid4().hex)
+        # These tasks have not claimed their persisted jobs. Release any
+        # preparation/slot wait before the engine requests exclusive access.
+        waiting = []
+        for job_id, task in list(_RUN_QUEUE_JOB_TASKS.items()):
+            job = self.machine.get_run_job(job_id)
+            if (not task.done() and job and job.get('workspace_id') == reg.id
+                    and job.get('status') == 'pending'):
+                task.cancel()
+                waiting.append(task)
+        if waiting:
+            await asyncio.gather(*waiting, return_exceptions=True)
+        return await self._recovery_registration(reg)
+
+    async def _start_workspace_recovery(self, reg: WorkspaceRegistration, action: str) -> None:
+        if action not in {'check', 'repair', 'rollback'}:
+            raise ValueError('Unknown workspace recovery action.')
+        reg = await self._hold_workspace_recovery(reg)
+        from harnessy.core.paths import APP_ROOT
+        method = {'check': RECOVERY_OPERATIONS.start_check,
+                  'repair': RECOVERY_OPERATIONS.start_repair,
+                  'rollback': RECOVERY_OPERATIONS.start_rollback}[action]
+        method(reg.path, app_root=APP_ROOT, state_root=self.machine.root)
+
+    async def _activate_workspace_recovery(self, reg: WorkspaceRegistration, snapshot: dict[str, Any]) -> None:
+        reg = await self._recovery_registration(reg)
+        receipt = str(snapshot.get('candidate_receipt_id') or '')
+        current = RECOVERY_OPERATIONS.snapshot(reg.path, state_root=self.machine.root)
+        if (not receipt or current.get('candidate_receipt_id') != receipt
+                or current.get('candidate_verified') is not True or current.get('status') != 'candidate_ready'):
+            raise RuntimeError('The recovery candidate changed. Review the latest result before using it.')
+        reg = await self._hold_workspace_recovery(reg)
+        from harnessy.core.paths import APP_ROOT
+        RECOVERY_OPERATIONS.start_activation(reg.path, receipt, app_root=APP_ROOT, state_root=self.machine.root)
+
+    async def _open_workspace_recovery(self, reg: WorkspaceRegistration, snapshot: dict[str, Any]) -> None:
+        reg = await self._recovery_registration(reg)
+        current = RECOVERY_OPERATIONS.snapshot(reg.path, state_root=self.machine.root)
+        if current.get('busy') or not (current.get('healthy') is True or current.get('status') == 'activated'):
+            raise RuntimeError('Finish a successful check or repair before opening this workspace.')
+        ui.navigate.to('/?recovery_workspace=' + quote(reg.id, safe=''))
+
+    async def _resume_workspace_recovery(self, reg: WorkspaceRegistration) -> None:
+        reg = await self._recovery_registration(reg)
+        hold = self.machine.workspace_recovery_hold(reg.id)
+        if hold is None:
+            return
+        if RECOVERY_OPERATIONS.snapshot(reg.path, state_root=self.machine.root).get('busy'):
+            raise RuntimeError('Wait for workspace recovery to finish before resuming queued work.')
+        # A visible Resume button never bypasses database admission or another
+        # recovery receipt created while this request was waiting.
+        await asyncio.to_thread(_prepare_runtime_workspace, reg.path, reg.name, timeout=120.0)
+        reg = await self._recovery_registration(reg)
+        if RECOVERY_OPERATIONS.snapshot(reg.path, state_root=self.machine.root).get('busy'):
+            raise RuntimeError('Another workspace recovery started. Wait for it to finish.')
+        if not self.machine.release_workspace_recovery_hold(reg.id, hold['receipt_id']):
+            raise RuntimeError('The recovery state changed. Review the latest result before resuming queued work.')
+        _wake_run_queue()
+        ui.navigate.to('/?recovery_workspace=' + quote(reg.id, safe=''))
+
+    async def _resume_selected_workspace_recovery(self) -> None:
+        tab = next((t for t in self.open_tabs if t.key == self.active_tab_key), None)
+        reg = self._find_reg(tab.workspace_id) if tab and tab.workspace_id != HOME_SCOPE_ID else self.registration
+        if reg is None:
+            return
+        try:
+            await self._resume_workspace_recovery(reg)
+        except (WorkspaceDatabaseError, RuntimeError) as exc:
+            ui.notify(str(exc), type='warning', timeout=7000)
+
+    def _refresh_workspace_recovery_banner(self) -> None:
+        area = getattr(self, '_recovery_hold_area', None)
+        if area is None or not self._ui_elements_alive(area):
+            return
+        tab = next((t for t in self.open_tabs if t.key == self.active_tab_key), None)
+        reg = self._find_reg(tab.workspace_id) if tab and tab.workspace_id != HOME_SCOPE_ID else self.registration
+        hold = self.machine.workspace_recovery_hold(reg.id) if reg is not None else None
+        area.set_visibility(hold is not None)
+        if hold is not None and reg is not None:
+            snapshot = RECOVERY_OPERATIONS.snapshot(reg.path, state_root=self.machine.root)
+            ready = snapshot.get('healthy') is True or snapshot.get('status') == 'activated'
+            # A normal Retry may already have admitted a healthy database after
+            # an earlier cancelled/failed check. Do not leave its hold stranded
+            # behind the old operation result. Confirmed damage still needs
+            # repair; Resume independently admits the database once more.
+            ready = ready or (reg.id in self.workspace_cache and reg.id not in self._workspace_load_failures
+                              and snapshot.get('status') not in {'candidate_ready', 'needs_review', 'partial_salvage'})
+            self._recovery_hold_label.set_text(f'{reg.name}: queued work is paused for database recovery.')
+            self._recovery_resume_button.set_enabled(not snapshot.get('busy') and ready)
+
+    def _refresh_workspace_generations(self) -> None:
+        changed = False
+        for workspace_id, store in list(self.workspace_cache.items()):
+            if workspace_id in self._workspace_load_failures:
+                continue
+            try:
+                with workspace_shared_access(store.root, expected_generation=store._workspace_generation):
+                    pass
+            except WorkspaceDatabaseError as exc:
+                self._workspace_load_failures[workspace_id] = exc
+                for tab in self.open_tabs:
+                    if tab.workspace_id == workspace_id:
+                        self._blocked_restore_tabs[tab.key] = str(exc)
+                reg = self._find_reg(workspace_id)
+                if reg is not None and self.registration is not None and self.registration.id == workspace_id:
+                    self._workspace_open_error = (reg, str(exc))
+                changed = True
+        if changed:
+            self.refresh_tabs()
 
     def _render_welcome(self) -> None:
         if self._workspace_open_error is not None:
@@ -4797,6 +4986,13 @@ class HarnessyPage:
             if deletion.running or self._apply_timeline_deletion_state(owner):
                 return  # Never save an old disabled composer over the restored state.
         workspace_id, chat_id = owner
+        text = str(getattr(composer, 'value', '') or '')
+        if workspace_id in self._workspace_load_failures:
+            # A recovery on another page can invalidate this store while its
+            # composer is still mounted. Retain the draft locally without
+            # reading or writing the retired database generation.
+            self.chat_composer_drafts[owner] = text
+            return
         ws = self.workspace_cache.get(workspace_id)
         if ws is None:
             reg = self._find_reg(workspace_id)
@@ -4805,8 +5001,14 @@ class HarnessyPage:
                     ws = self._load_workspace(reg)
                 except Exception:
                     ws = None
-        if ws is not None and ws.get_chat(chat_id) is not None:
-            self._persist_chat_composer_draft(ws, chat_id, getattr(composer, 'value', ''))
+        if ws is not None:
+            try:
+                exists = ws.get_chat(chat_id) is not None
+            except WorkspaceDatabaseError:
+                self.chat_composer_drafts[owner] = text
+                return
+            if exists:
+                self._persist_chat_composer_draft(ws, chat_id, text)
 
     def _apply_timeline_deletion_state(self, key: tuple[str, str]) -> bool:
         job = _TIMELINE_REPLACEMENT_JOBS.get(key)
@@ -4979,6 +5181,8 @@ class HarnessyPage:
         self._live_sync_busy = True
         try:
             await self._sync_active_live_agent_ui_impl()
+        except WorkspaceDatabaseError:
+            self._refresh_workspace_generations()
         except RuntimeError as exc:
             if not _is_stale_ui_error(exc):
                 raise
@@ -12037,6 +12241,8 @@ class HarnessyPage:
                     element._hy_status_text = value
                     if name in {'rate', 'elapsed', 'request_elapsed', 'previous'}:
                         element.set_visibility(bool(value))
+        except WorkspaceDatabaseError:
+            self._refresh_workspace_generations()
         except RuntimeError as exc:
             if not _is_stale_ui_error(exc):
                 raise
@@ -21554,12 +21760,13 @@ def _run_queue_jobs_with_positions(machine: MachineStore) -> list[dict[str, Any]
             row['position'] = waiting
             blocker = completion_blocking_hold(holds, str(row.get('workspace_id') or ''),
                                                str(row.get('chat_id') or ''))
-            row['queue_wait_state'] = 'backend_recovery' if pause_summary else str((blocker or {}).get('state') or '')
-            row['queue_pause_summary'] = (
-                (pause_summary or (completion_wait_reason(blocker) if blocker else '')) if machine.run_admission_reason(
-                    str(row.get('workspace_id') or ''), str(row.get('chat_id') or ''), include_backend=True,
-                ) else ''
-            )
+            reason = machine.run_admission_reason(str(row.get('workspace_id') or ''),
+                                                  str(row.get('chat_id') or ''), include_backend=True)
+            recovery_hold = machine.workspace_recovery_hold(str(row.get('workspace_id') or '')) is not None
+            row['queue_wait_state'] = ('workspace_recovery' if recovery_hold else
+                                       'backend_recovery' if pause_summary else str((blocker or {}).get('state') or ''))
+            row['queue_pause_summary'] = (reason if recovery_hold else
+                (pause_summary or (completion_wait_reason(blocker) if blocker else reason))) if reason else ''
         result.append(row)
     return result
 
@@ -21796,7 +22003,7 @@ async def _execute_queued_run(machine: MachineStore, job_id: str) -> None:
         reg = machine.get_workspace(key[0])
         if reg is None or not reg.path.is_dir():
             raise RuntimeError('The queued workspace is no longer available.')
-        ws = await asyncio.to_thread(_prepare_runtime_workspace, reg.path, reg.name)
+        ws = await _prepare_queued_workspace(reg.path, reg.name)
         chat = ws.get_chat(key[1])
         if chat is None:
             raise RuntimeError('The queued Project / Chat no longer exists.')
@@ -22645,7 +22852,7 @@ def run_app() -> None:
     workspace_load_tasks: set[asyncio.Task[Any]] = set()
 
     @ui.page('/')
-    def index(settings: str = '', retry_workspace: str = '') -> None:
+    def index(settings: str = '', retry_workspace: str = '', recovery_workspace: str = '') -> None:
         page = HarnessyPage(machine)
         client = ui.context.client
         request = client.request
@@ -22673,15 +22880,18 @@ def run_app() -> None:
                 nonlocal completed
                 async with semaphore:
                     started = time.monotonic()
+                    db_id = _database_identity(reg.path / '.harnessy' / 'workspace.db')
                     log_event('harnessy', 'workspace_database_health_started',
-                              database_health_phase='workspace_initialization')
+                              database_health_phase='workspace_initialization', db_id=db_id)
                     try:
                         store = await asyncio.to_thread(
                             _prepare_runtime_workspace, reg.path, reg.name,
                             force=bool(retry_workspace and retry_workspace == reg.id),
+                            timeout=120.0 if recovery_workspace == reg.id else 20.0,
                         )
                         page.workspace_cache[reg.id] = store
                         log_event('harnessy', 'workspace_database_health_completed',
+                                  db_id=db_id,
                                   database_health_status='ready', database_health_reason='verified',
                                   database_health_phase='workspace_initialization',
                                   elapsed_seconds=round(time.monotonic() - started, 3))
@@ -22691,6 +22901,7 @@ def run_app() -> None:
                         failure = exc if isinstance(exc, (WorkspaceDatabaseError, HistoryBusyError)) else WorkspaceDatabaseError('unavailable', reason='initialization_failed')
                         page._workspace_load_failures[reg.id] = failure
                         log_event('harnessy', 'workspace_database_health_failed',
+                                  db_id=db_id,
                                   database_health_status=getattr(failure, 'code', 'unavailable'),
                                   database_health_reason=getattr(failure, 'reason', 'initialization_failed'),
                                   database_health_phase=getattr(failure, 'phase', 'workspace_initialization'),
@@ -22713,6 +22924,14 @@ def run_app() -> None:
                         with client:
                             ui.navigate.to('/login')
                         return
+                recovered_reg = next((reg for reg in registrations if reg.id == recovery_workspace
+                                      and reg.id in page.workspace_cache), None)
+                if (recovered_reg is not None
+                        and not RECOVERY_OPERATIONS.snapshot(recovered_reg.path, state_root=machine.root).get('busy')
+                        and not machine.list_run_jobs(workspace_id=recovered_reg.id)):
+                    hold = machine.workspace_recovery_hold(recovered_reg.id)
+                    if hold is not None:
+                        machine.release_workspace_recovery_hold(recovered_reg.id, hold['receipt_id'])
                 with client:
                     loading.delete()
                     page.build()
@@ -22757,6 +22976,9 @@ def run_app() -> None:
 
     async def close_runtime_resources() -> None:
         global _NTFY_REPLY_SUPERVISOR_TASK, _NTFY_REPLY_TARGET, _RUN_QUEUE_SUPERVISOR_TASK, _EVENT_LOOP_WATCHDOG_TASK
+        # Recovery workers own private copies. Let an atomic database switch
+        # finish or roll back before closing the general worker gate.
+        await RECOVERY_OPERATIONS.close()
         from harnessy.core.workspace_health import cancel_pending_workspace_workers
         await asyncio.to_thread(cancel_pending_workspace_workers)
         pending_workspace_loads = list(workspace_load_tasks)

@@ -47,6 +47,10 @@ _ACCESS_RESTORE_FAILURES = {
     'history_lock_busy': 'history_lock_contention',
     'workspace_database_health_failed': 'workspace_database_health_failed',
 }
+_WORKSPACE_RECOVERY_EVENTS = frozenset({
+    'workspace_database_recovery_started', 'workspace_database_recovery_progress',
+    'workspace_database_recovery_completed', 'workspace_database_recovery_failed',
+})
 _ERROR_EVENTS = frozenset({
     'agent_run_error', 'headless_run_error', 'uncaught_exception',
     'sqlite_operation_error', 'tool_execution_error', 'request_error',
@@ -75,10 +79,11 @@ def _bounded_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     from .queue_observations import QUEUE_EVENTS
     queues = [row for row in rows if row.get('event') in QUEUE_EVENTS][-160:]
     access_restore = [row for row in rows if row.get('event') in _ACCESS_RESTORE_EVENTS][-120:]
+    recovery = [row for row in rows if row.get('event') in _WORKSPACE_RECOVERY_EVENTS][-600:]
     recent = rows[-(_MAX_ROWS - len(targets) - len(permissions) - len(permission_acknowledgements)
-                    - len(startup) - len(models) - len(controllers) - len(queues) - len(access_restore)):]
+                    - len(startup) - len(models) - len(controllers) - len(queues) - len(access_restore) - len(recovery)):]
     retained = {id(row): row for row in targets + permissions + permission_acknowledgements
-                + startup + models + controllers + queues + access_restore + recent}
+                + startup + models + controllers + queues + access_restore + recovery + recent}
     return sorted(retained.values(), key=lambda row: row['timestamp'])
 
 
@@ -510,6 +515,117 @@ def _same_scope(candidate: dict[str, Any], incident: dict[str, Any]) -> bool:
     return True
 
 
+def _recovery_failure_classification(row: dict[str, Any]) -> str | None:
+    if row.get('event') not in {'workspace_database_recovery_completed', 'workspace_database_recovery_failed'}:
+        return None
+    status = row.get('recovery_status')
+    if not isinstance(status, str):
+        return 'workspace_recovery_failed' if row.get('event') == 'workspace_database_recovery_failed' else None
+    if status in {'activation_blocked', 'incomplete_transaction', 'rolled_back'}:
+        return 'workspace_recovery_' + status
+    if status == 'needs_review' and row.get('corruption_established') is True:
+        return 'workspace_recovery_corruption_observed'
+    if status in {'partial_salvage', 'partial_salvage_candidate_needs_review',
+                  'salvage_candidate_needs_review_completeness_unknown', 'needs_review'}:
+        return 'workspace_recovery_needs_review'
+    if status in {'timed_out', 'inspection_timed_out_originals_preserved'}:
+        return 'workspace_recovery_timeout'
+    if status == 'corrupt':
+        return 'workspace_recovery_corruption_observed'
+    if status in {'failed', 'stopped', 'preserved_recovery_unavailable',
+                  'inspection_unavailable_originals_preserved', 'preserved_needs_specialist_recovery',
+                  'source_changed_recovery_result_not_usable'} or row.get('event') == 'workspace_database_recovery_failed':
+        return 'workspace_recovery_failed'
+    return None
+
+
+def _recovery_evidence(row: dict[str, Any]) -> dict[str, Any]:
+    from .logging import validate_workspace_recovery_event
+    safe = validate_workspace_recovery_event(row.get('event'), row) or {}
+    safe.update({key: row[key] for key in ('timestamp', 'channel', 'session_scope') if key in row})
+    return safe
+
+
+def _workspace_recovery_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
+    observed = [row for row in rows if row.get('event') in _WORKSPACE_RECOVERY_EVENTS]
+    receipts = [_recovery_evidence(row) for row in observed[-600:]]
+    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for row in receipts:
+        identity_key = next((key for key in ('recovery_operation_id', 'recovery_receipt_id', 'db_id') if key in row), 'unidentified')
+        groups.setdefault((row.get('session_scope', 'unrecorded'), identity_key, row.get(identity_key, 'unidentified')), []).append(row)
+    operations = []
+    lines = ['Workspace database recovery: DATABASE_RECOVERY.json retains bounded copy/check/repair/activation receipts; database bytes and recovered SQL are excluded.']
+    descriptions = {
+        'healthy': 'The private copy passed the recorded checks; no repair or activation is implied.',
+        'healthy_preserved_copy': 'The private copy passed the recorded checks; the original database was not repaired by this observation.',
+        'healthy_structure_needs_review': 'Structure checks passed, but application-level review remains required.',
+        'corrupt': 'A private-copy check reported corruption; the original cause is not established.',
+        'index_repaired': 'An index-repair candidate was verified. Activation requires a separate activated receipt.',
+        'verified_index_repair_candidate_needs_review': 'An index-repair candidate was verified; it remains separate until activation is recorded.',
+        'candidate_ready': 'A verified candidate is available; this does not establish activation or complete recovery of all original rows.',
+        'partial_salvage': 'Salvage may omit or reject data. Review the recorded readable-source/candidate counts before activation.',
+        'partial_salvage_candidate_needs_review': 'A salvage candidate is partial; readable-source/candidate count differences require review.',
+        'salvage_candidate_needs_review_completeness_unknown': 'A salvage candidate exists, but recovery completeness is unknown.',
+        'needs_review': 'The recovery result requires review; no complete-data recovery or activation is implied.',
+        'activation_blocked': 'Activation was blocked. The fixed failure code identifies the failed precondition.',
+        'incomplete_transaction': 'Database replacement did not finish as a complete transaction; keep the workspace closed and use the recorded rollback/recovery state.',
+        'rolled_back': 'A rollback completed. This is separate from verifying or activating a repaired candidate.',
+        'activated': 'Candidate activation completed according to the receipt. Earlier corruption observations remain historical evidence.',
+        'timed_out': 'The private-copy worker reached its time limit; this result does not establish corruption.',
+        'inspection_timed_out_originals_preserved': 'The private-copy inspection reached its time limit; no corruption conclusion or repair was made.',
+        'cancelled': 'Recovery was cancelled; inspect preservation and transaction facts before retrying.',
+        'cancelled_originals_preserved': 'Recovery was cancelled with originals preserved according to its receipt.',
+        'source_changed_recovery_result_not_usable': 'The source changed; the recovery result cannot be used for activation.',
+    }
+    for (scope, identity_key, identity), items in sorted(groups.items(), key=lambda entry: entry[1][-1].get('timestamp', ''))[-12:]:
+        latest = items[-1]
+        terminal = next((row for row in reversed(items) if row.get('event') in {'workspace_database_recovery_completed', 'workspace_database_recovery_failed'}), None)
+        operation = {'session_scope': scope, 'grouping': identity_key, 'records_retained': len(items),
+                     'latest': latest, 'latest_terminal': terminal}
+        if identity_key != 'unidentified':
+            operation[identity_key] = identity
+        fact_names = ('elapsed_seconds', 'stage_elapsed_seconds', 'timeout_seconds', 'source_db_bytes',
+                      'source_wal_bytes', 'source_shm_bytes', 'source_journal_bytes', 'source_bytes',
+                      'copied_bytes', 'total_bytes', 'free_bytes', 'required_bytes', 'candidate_bytes',
+                      'recovery_failure_code', 'database_worker_returncode', 'database_worker_signal',
+                      'originals_unchanged', 'originals_preserved', 'source_unchanged', 'candidate_verified',
+                      'integrity_ok', 'standalone_database', 'completeness_known', 'activated', 'rollback_complete',
+                      'row_counts', 'source_row_counts', 'candidate_row_counts', 'recovery_method',
+                      'corruption_established', 'integrity_error_count', 'integrity_categories',
+                      'sqlite_errorcode', 'sqlite_errorname')
+        latest_facts = {}
+        for receipt in items:
+            for key in fact_names:
+                if key in receipt:
+                    latest_facts[key] = {'value': receipt[key], 'timestamp': receipt.get('timestamp'),
+                                         'recovery_stage': receipt.get('recovery_stage')}
+        operation['latest_fact_observations'] = latest_facts
+        operations.append(operation)
+        status, stage = latest.get('recovery_status', 'unrecorded'), latest.get('recovery_stage', 'unrecorded')
+        lines.append(f'  {latest.get("timestamp", "unrecorded")} [{scope}] stage {stage}; status {status}.')
+        if status == 'needs_review' and latest.get('corruption_established') is True:
+            lines.append('    The private-copy check confirmed corruption; no verified repair or activation is established by this receipt.')
+        elif status in descriptions:
+            lines.append('    ' + descriptions[status])
+        facts = {key: value['value'] for key, value in latest_facts.items()
+                 if key not in {'row_counts', 'source_row_counts', 'candidate_row_counts'}}
+        if facts:
+            lines.append('    Most recent recorded facts per field (may span stages): ' + json.dumps(facts, sort_keys=True) + '.')
+        for key, label in (('row_counts', 'Readable row counts'), ('source_row_counts', 'Readable source rows'),
+                           ('candidate_row_counts', 'Candidate rows')):
+            if key in latest_facts:
+                lines.append('    ' + label + ': ' + json.dumps(latest_facts[key]['value'], sort_keys=True) + '.')
+    if not receipts:
+        lines.append('  No database recovery operation was recorded in these examined tails.')
+    lines.extend(['  Check, repair-candidate creation, activation and rollback are distinct stages. A timed-out check is not proof of corruption. Counts cover readable rows only and cannot establish the contents of unreadable pages.',
+                  '  Receipts describe observations at their timestamps; no database was opened to construct this export.', ''])
+    return {'schema_version': 1, 'scope': 'bounded_current_previous_log_recovery_receipts',
+            'records_available': len(observed), 'records_retained': len(receipts), 'record_limit': 600,
+            'records_limited': len(observed) > 600, 'operation_groups_available': len(groups),
+            'operation_groups_retained': len(operations), 'operation_group_limit': 12,
+            'operations': operations, 'records': receipts}, lines
+
+
 def _workspace_database_classification(row: dict[str, Any]) -> str | None:
     if row.get('event') not in {'workspace_database_health_failed', 'workspace_open_failed', 'saved_tab_restore_failed'}:
         return None
@@ -575,6 +691,8 @@ def _is_lock(row: dict[str, Any]) -> bool:
 
 def _evidence(row: dict[str, Any]) -> dict[str, Any]:
     # Keep identifiers and reviewed diagnostic structures, never error bodies.
+    if row.get('event') in _WORKSPACE_RECOVERY_EVENTS:
+        return _recovery_evidence(row)
     if row.get('event') in _ACCESS_RESTORE_EVENTS:
         return _access_restore_evidence(row)
     keys = (
@@ -635,6 +753,8 @@ def _access_restore_evidence(row: dict[str, Any]) -> dict[str, Any]:
             evidence[key] = value
     if isinstance(row.get('lock_kind'), str) and row['lock_kind'] in {'thread', 'process'}:
         evidence['lock_kind'] = row['lock_kind']
+    if isinstance(row.get('db_id'), str) and re.fullmatch(r'[0-9a-f]{64}', row['db_id']):
+        evidence['db_id'] = row['db_id']
     from .logging import _WORKSPACE_DATABASE_ENUMS
     for key, allowed in _WORKSPACE_DATABASE_ENUMS.items():
         if isinstance(row.get(key), str) and row[key] in allowed:
@@ -1179,7 +1299,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
     failures = [row for row in rows if (row.get('event') in _ERROR_EVENTS or _vm_failure_classification(row)
                                        or _target_failure_classification(row) or _permission_failure_classification(row)
                                        or _startup_failure_classification(row) or _is_lock(row)
-                                       or row.get('event') in _ACCESS_RESTORE_FAILURES)
+                                       or row.get('event') in _ACCESS_RESTORE_FAILURES or _recovery_failure_classification(row))
                 and not (row.get('event') in {'environment_command_finished', 'environment_command_timeout'}
                          and isinstance(row.get('command_id'), str)
                          and (row.get('session_scope'), row.get('command_id')) in observation_keys)]
@@ -1188,7 +1308,8 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         before = [row for row in rows if row['session_scope'] == failure['session_scope']
                   and 0 <= _seconds(failure['timestamp'], row['timestamp']) <= _CONTEXT_SECONDS]
         related = [row for row in before if _same_scope(row, failure)]
-        database_classification = _database_condition(failure) or _workspace_database_classification(failure)
+        database_classification = (_database_condition(failure) or _workspace_database_classification(failure)
+                                   or _recovery_failure_classification(failure))
         lock = _is_lock(failure) and database_classification is None
         vm_classification = _vm_failure_classification(failure)
         target_classification = _target_failure_classification(failure)
@@ -1276,7 +1397,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         'event_loop_stall_samples': counts['event_loop_stall_sample'],
         'maximum_recorded_stall_seconds': max(durations, default=0),
         'transcript_refresh_deferrals': counts['transcript_refresh_deferred'],
-        'database_errors': sum(row.get('event') == 'sqlite_operation_error' or _is_lock(row) for row in rows),
+        'database_errors': sum(row.get('event') == 'sqlite_operation_error' or _is_lock(row) or bool(_database_condition(row)) for row in rows),
         'database_operation_errors': counts['sqlite_operation_error'],
         'workspace_database_health_failures': counts['workspace_database_health_failed'],
         'database_corruption_observations': sum(_database_condition(row) == 'sqlite_database_corruption' for row in rows),
@@ -1334,6 +1455,8 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
     index['queue_audit'] = queue_audit
     access_restore_audit, access_restore_lines = _access_restore_audit(rows)
     index['access_restore_audit'] = access_restore_audit
+    recovery_audit, recovery_lines = _workspace_recovery_audit(rows)
+    index['workspace_database_recovery'] = recovery_audit
     native_audit, native_lines = _native_fault_audit(Path(latest), previous)
     index['native_fault_audit'] = native_audit
     collector_pid = host_report.get('process', {}).get('pid') if isinstance(host_report, dict) else None
@@ -1361,7 +1484,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
                     or str(row.get('event')).startswith(('vm_', 'environment_', 'workspace_mapping_', 'test_target_'))
                     or row.get('event') in STARTUP_EVENTS
                     or row.get('event') in QUEUE_EVENTS
-                    or row.get('event') in _ACCESS_RESTORE_EVENTS
+                    or row.get('event') in _ACCESS_RESTORE_EVENTS or row.get('event') in _WORKSPACE_RECOVERY_EVENTS
                     or row.get('event') in {'headless_run_error', 'agent_run_error', 'run_blocked_by_infrastructure'}]
     index['control_plane_timeline'] = [(_access_restore_evidence(row) if row.get('event') in _ACCESS_RESTORE_EVENTS else row)
                                        for row in control_rows[-1200:]]
@@ -1385,7 +1508,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         'This summary examines bounded current/previous-session log tails and startup receipts from up to two recent launcher sessions. Counts are not whole-session totals.',
         'Nearby events and tracked transactions are evidence for investigation, not proven lock ownership.', '',
         *primary_setup, *primary_cause,
-        *database_lines, *access_restore_lines, *native_lines, *host_lines,
+        *recovery_lines, *database_lines, *access_restore_lines, *native_lines, *host_lines,
         *queue_lines,
         *model_lines,
         *permission_acknowledgement_lines,
@@ -1410,7 +1533,13 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
             if failure.get(key):
                 lines.append(f'  {key}: {failure[key]}')
         classification = incident['classification']
-        if classification.startswith('workspace_database_'):
+        if classification.startswith('workspace_recovery_'):
+            lines.append('  Database recovery reported this outcome; private-copy checking, candidate creation, activation and rollback are distinct stages.')
+            for key in ('recovery_stage', 'recovery_status', 'recovery_failure_code', 'elapsed_seconds',
+                        'database_worker_returncode', 'database_worker_signal'):
+                if key in failure:
+                    lines.append(f'  {key}: {failure[key]}')
+        elif classification.startswith('workspace_database_'):
             descriptions = {
                 'workspace_database_corruption': 'The isolated workspace database health check reported corruption. Existing database files are preserved; the original cause of corruption is not established.',
                 'workspace_database_health_timeout': 'The isolated database health or initialization worker reached its deadline; this does not establish that the database is corrupt.',

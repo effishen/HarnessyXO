@@ -17,6 +17,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from .host_prerequisites import discover_binary, repaired_path
@@ -121,6 +122,11 @@ _OPERATIONS: dict[str, TargetOperation] = {}
 _ACTIVE: dict[str, int] = {}
 _RADIOS: dict[str, tuple[float, dict[str, Any]]] = {}
 _VIEW_CLEANUP: list[Any] = []
+# Retain the validated controllers this process has used independently of a
+# replaceable workspace database/store. A repair can invalidate every old store
+# while its already-running test guests still need normal host shutdown.
+_MANAGERS: dict[str, 'TestTargetManager'] = {}
+_MANAGERS_LOCK = RLock()
 
 
 def register_target_view_cleanup(callback) -> None:
@@ -155,6 +161,13 @@ class TestTargetManager:
         self.backend = 'qemu' if self.guest.family == 'openwrt' else 'lima'
         from harnessy.diagnostics.test_target_logs import register_test_target_runtime
         register_test_target_runtime(Path(self.key), self.backend)
+        if type(self) is TestTargetManager:
+            self._remember_for_shutdown()
+
+    def _remember_for_shutdown(self) -> None:
+        # Subclasses call this only after their additional path validation.
+        with _MANAGERS_LOCK:
+            _MANAGERS[self.key] = self
 
     def stage(self, stage: str, *, attempt: int = 0, timeout_seconds: float = 0,
               failure_code: str = 'none', returncode: int | None = None) -> None:
@@ -722,31 +735,67 @@ async def stop_workspace_test_targets(workspace):
             )
 
 
+def _shutdown_inventory_failure(exc: BaseException, manager=None) -> None:
+    """A diagnostic write must not interrupt cleanup of the other guests."""
+    try:
+        from harnessy.diagnostics import log_event
+        from harnessy.diagnostics.test_target_logs import classify_target_failure
+        fields = dict(target_action='stop', target_stage='stopped', target_outcome='failed',
+                      target_failure_code=classify_target_failure(exc), exception_class=type(exc).__name__)
+        if manager is not None:
+            fields.update(target_id=manager.target.id, target_backend=manager.backend)
+        log_event('runtime', 'test_target_shutdown_failed' if manager is not None else
+                  'test_target_shutdown_inventory_failed', **fields)
+    except Exception:
+        pass
+
+
 async def close_test_targets(workspaces):
-    """Release controller tasks and guest RAM when the application exits."""
-    managers = []
+    """Stop known guests without initializing any workspace database.
+
+    A supplied healthy store can discover targets not used in this process.
+    Remembered validated managers remain sufficient when that enumeration is
+    unavailable or its store belongs to an older database generation.
+    """
+    with _MANAGERS_LOCK:
+        managers = dict(_MANAGERS)
     for ws in workspaces:
-        for target in ws.list_external_targets():
-            if target.managed_vm:
+        try:
+            targets = ws.list_external_targets()
+        except Exception as exc:
+            _shutdown_inventory_failure(exc)
+            continue
+        try:
+            for target in targets:
                 try:
-                    managers.append(TestTargetManager(ws, target))
-                except (ValueError, OSError):
-                    pass  # One damaged record must not prevent other guests stopping.
-    keys = {manager.key for manager in managers}
-    tasks = [op.task for key, op in _OPERATIONS.items()
+                    if target.managed_vm:
+                        manager = TestTargetManager(ws, target)
+                        managers[manager.key] = manager
+                except Exception as exc:
+                    _shutdown_inventory_failure(exc)
+        except Exception as exc:
+            # Enumeration may itself be lazy; isolate failure after any already
+            # yielded targets rather than discarding the retained controllers.
+            _shutdown_inventory_failure(exc)
+    keys = set(managers)
+    tasks = [op.task for key, op in list(_OPERATIONS.items())
              if key in keys and op.task and not op.task.done()]
     for task in tasks:
         task.cancel()
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
+
     async def stop_one(manager):
         try:
             if (await manager.status())['running']:
+                # stop/status operate on controller state. Do not use begin(),
+                # whose optional audit path writes the old workspace database.
                 await manager.stop()
         except Exception as exc:
-            from harnessy.diagnostics import log_event
-            from harnessy.diagnostics.test_target_logs import classify_target_failure
-            log_event('runtime', 'test_target_shutdown_failed', target_id=manager.target.id,
-                      target_backend=manager.backend, target_action='stop', target_stage='stopped',
-                      target_outcome='failed', target_failure_code=classify_target_failure(exc))
-    await asyncio.gather(*(stop_one(manager) for manager in managers))
+            _shutdown_inventory_failure(exc, manager)
+            return
+        with _MANAGERS_LOCK:
+            if _MANAGERS.get(manager.key) is manager:
+                _MANAGERS.pop(manager.key, None)
+
+    await asyncio.gather(*(stop_one(manager) for manager in managers.values()))

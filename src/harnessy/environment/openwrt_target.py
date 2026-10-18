@@ -90,6 +90,7 @@ class OpenWrtTargetManager(TestTargetManager):
         self.instance_dir = self.home / 'guest'
         if self.home.is_symlink() or self.instance_dir.is_symlink():
             raise ValueError('Managed VM state directories cannot be symbolic links.')
+        self._remember_for_shutdown()
 
     def _env(self):
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)

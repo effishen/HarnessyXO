@@ -213,9 +213,10 @@ class ChatSnapshot:
                 raise RuntimeError('Export cancelled while snapshotting.')
             if time.monotonic() > deadline:
                 raise TimeoutError('Chat snapshot exceeded two minutes; the running agent was not stopped.')
-        source = connect_database(workspace.db_path.resolve().as_uri() + '?mode=ro', role='workspace', uri=True, timeout=2)
-        dest = connect_database(target, role='other')
+        source = workspace._connect(readonly=True, timeout=2)
+        dest = None
         try:
+            dest = connect_database(target, role='other')
             source.backup(dest, pages=128, progress=progress, sleep=.01)
             dest.row_factory = sqlite3.Row
             chat = dest.execute('SELECT title FROM chats WHERE id=?', (chat_id,)).fetchone()
@@ -228,7 +229,11 @@ class ChatSnapshot:
             return cls(target, workspace.root, workspace.name, chat_id, str(chat['title']),
                        datetime.now(timezone.utc).isoformat(timespec='seconds'), count, active)
         finally:
-            source.close(); dest.close()
+            try:
+                source.close()
+            finally:
+                if dest is not None:
+                    dest.close()
 
     def records(self, options: ExportOptions) -> Iterator[Record]:
         options.validate()

@@ -330,11 +330,122 @@ _WORKSPACE_DATABASE_ENUMS = {
     'database_health_reason': frozenset({
         'integrity_failed', 'sqlite_corrupt', 'sqlite_error', 'filesystem_error', 'database_changed',
         'admission_required', 'worker_timeout', 'worker_exit', 'worker_protocol', 'invalid_file',
-        'empty_database', 'initialization_failed', 'verified', 'cancelled', 'history_busy',
+        'empty_database', 'initialization_failed', 'verified', 'cancelled', 'history_busy', 'maintenance', 'recovery_pending',
     }),
     'database_health_phase': frozenset({'database_admission', 'workspace_initialization', 'admission', 'initialization'}),
     'database_worker_signal': frozenset({'SIGBUS', 'SIGSEGV', 'SIGABRT', 'SIGKILL', 'SIGTERM', 'other', 'none'}),
 }
+
+WORKSPACE_RECOVERY_EVENTS = frozenset({
+    'workspace_database_recovery_started', 'workspace_database_recovery_progress',
+    'workspace_database_recovery_completed', 'workspace_database_recovery_failed',
+})
+_RECOVERY_ENUMS = {
+    'sqlite_errorname': frozenset(name for name, value in vars(sqlite3).items()
+                                  if name.startswith('SQLITE_') and type(value) is int),
+    'recovery_method': frozenset({'check_only', 'reindex', 'salvage'}),
+    'recovery_stage': frozenset({'backup', 'copy', 'hash', 'check', 'inspect', 'schema', 'reindex',
+                                 'salvage', 'recover', 'verify', 'activate', 'rollback', 'complete'}),
+    'recovery_status': frozenset({
+        'started', 'queued', 'running', 'waiting', 'cancelling', 'needs_review', 'completed', 'failed', 'cancelled', 'timed_out',
+        'healthy', 'corrupt', 'index_repaired', 'partial_salvage', 'activation_blocked',
+        'incomplete_transaction', 'rolled_back', 'activated', 'candidate_ready',
+        'healthy_preserved_copy', 'healthy_structure_needs_review',
+        'inspection_timed_out_originals_preserved', 'inspection_unavailable_originals_preserved',
+        'verified_index_repair_candidate_needs_review', 'preserved_needs_specialist_recovery',
+        'salvage_candidate_needs_review_completeness_unknown',
+        'partial_salvage_candidate_needs_review', 'preserved_recovery_unavailable',
+        'cancelled_originals_preserved', 'stopped', 'source_changed_recovery_result_not_usable',
+    }),
+    'recovery_failure_code': frozenset({
+        'candidate_stale', 'not_lossless', 'maintenance_busy', 'source_changed',
+        'transaction_incomplete', 'filesystem_error', 'validation_failed', 'cancelled',
+        'unsafe_file', 'unsafe_workspace', 'unsafe_app', 'host_unsupported', 'app_running',
+        'launch_lock_unsafe', 'open_file', 'open_file_check_failed', 'insufficient_space',
+        'missing_database', 'timed_out', 'worker_failed', 'worker_protocol', 'sqlite_error',
+        'sqlite_cli_unavailable', 'sqlite_cli_recover_unsupported', 'sqlite_cli_recover_failed',
+        'schema_unavailable', 'invalid_report', 'receipt_invalid', 'dependency_missing',
+        'copy_failed', 'worker_timeout', 'activity_busy', 'maintenance', 'recovery_pending',
+        'report_invalid', 'candidate_unavailable', 'io_error', 'none', 'unknown',
+    }),
+    'database_worker_signal': frozenset({'SIGBUS', 'SIGSEGV', 'SIGABRT', 'SIGKILL', 'SIGTERM', 'other', 'none'}),
+}
+_RECOVERY_TABLES = frozenset("""chats chat_output_owners chat_output_id_migrations messages
+message_bubble_bookmarks memory workspace_state jobs artifacts attachments
+memory_events generation_metrics subagent_metrics instruction_documents
+chat_task_state history_checkpoints file_history_snapshots chat_branches
+ timeline_rewinds rewind_undo_transactions branch_memory_scopes branch_memory
+project_memory_provenance project_dependencies project_access_grants
+project_revisions project_upstream_baselines archived_families archived_projects
+external_targets external_target_events""".split())
+_RECOVERY_INTEGERS = frozenset({
+    'source_bytes', 'source_db_bytes', 'source_wal_bytes', 'source_shm_bytes', 'source_journal_bytes',
+    'copied_bytes', 'total_bytes', 'free_bytes', 'required_bytes', 'recovered_bytes', 'candidate_bytes',
+    'source_file_count', 'copied_file_count', 'integrity_error_count', 'unknown_table_count',
+    'foreign_key_violations', 'application_invariant_failures', 'inserted_rows',
+    'duplicate_or_rejected_rows', 'failed_insert_statements', 'lost_and_found_rows',
+    'unknown_table_rows', 'incomplete_statements', 'ignored_non_insert_statements',
+})
+_RECOVERY_BOOLEANS = frozenset({
+    'source_unchanged', 'originals_unchanged', 'originals_preserved', 'integrity_ok', 'candidate_created', 'candidate_verified',
+    'standalone_database', 'completeness_known', 'activated', 'rollback_complete', 'index_only',
+    'application_invariants_ok', 'integrity_errors_truncated', 'foreign_key_errors_truncated',
+    'foreign_key_check_failed', 'corruption_established', 'cancelled',
+})
+
+
+def validate_workspace_recovery_event(event: Any, value: Any) -> dict[str, Any] | None:
+    """Recovery receipts contain operational facts only, including at log write.
+
+    Private copies, recovered SQL and arbitrary schema/row data never enter this
+    projection. Only installed canonical table names may label numeric counts.
+    """
+    if not isinstance(event, str) or event not in WORKSPACE_RECOVERY_EVENTS or not isinstance(value, dict):
+        return None
+    result: dict[str, Any] = {'event': event}
+    for key, allowed in _RECOVERY_ENUMS.items():
+        if isinstance(value.get(key), str) and value[key] in allowed:
+            result[key] = value[key]
+    for key in ('db_id', 'candidate_id', 'source_generation_id'):
+        if isinstance(value.get(key), str) and re.fullmatch(r'[0-9a-f]{64}', value[key]):
+            result[key] = value[key]
+    for key in ('recovery_operation_id',):
+        if isinstance(value.get(key), str) and re.fullmatch(r'[0-9a-f]{32}', value[key]):
+            result[key] = value[key]
+    receipt = value.get('recovery_receipt_id')
+    if isinstance(receipt, str) and re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', receipt):
+        result['recovery_receipt_id'] = receipt
+    for key in _RECOVERY_INTEGERS:
+        if type(value.get(key)) is int and 0 <= value[key] <= 2**63 - 1:
+            result[key] = value[key]
+    for key in ('elapsed_seconds', 'stage_elapsed_seconds', 'timeout_seconds'):
+        if type(value.get(key)) in (int, float) and math.isfinite(value[key]) and 0 <= value[key] <= 604800:
+            result[key] = value[key]
+    sqlite_code = value.get('sqlite_errorcode')
+    if type(sqlite_code) is int and 0 <= sqlite_code <= 2**31 - 1:
+        result['sqlite_errorcode'] = sqlite_code
+    code = value.get('database_worker_returncode')
+    if type(code) is int and -255 <= code <= 255:
+        result['database_worker_returncode'] = code
+    for key in _RECOVERY_BOOLEANS:
+        if type(value.get(key)) is bool:
+            result[key] = value[key]
+    for key in ('row_counts', 'source_row_counts', 'candidate_row_counts'):
+        rows = value.get(key)
+        if isinstance(rows, dict):
+            result[key] = {name: rows[name] for name in sorted(_RECOVERY_TABLES)
+                           if type(rows.get(name)) is int and 0 <= rows[name] <= 2**63 - 1}
+    for key in ('row_count_failures', 'unreadable_or_missing_source_tables', 'tables_with_fewer_rows'):
+        rows = value.get(key)
+        if isinstance(rows, (list, tuple)):
+            result[key] = sorted({name for name in rows[:len(_RECOVERY_TABLES)]
+                                  if isinstance(name, str) and name in _RECOVERY_TABLES})
+    categories = value.get('integrity_categories')
+    if isinstance(categories, dict):
+        result['integrity_categories'] = {key: categories[key] for key in ('index_consistency', 'other_structure_or_data')
+            if type(categories.get(key)) is int and 0 <= categories[key] <= 100}
+    return result
+
 
 _VM_COMMAND_ID_KEYS = frozenset({'command_id', 'parent_start_command_id', 'startup_attempt_id'})
 
@@ -939,6 +1050,11 @@ class DiagnosticsManager:
             # hot path. The precise operation evidence has already been stored.
             return
         logger = self.logger(channel)
+        if event in WORKSPACE_RECOVERY_EVENTS:
+            payload = validate_workspace_recovery_event(event, fields)
+            if payload is not None:
+                logger.log(level, json.dumps(payload, ensure_ascii=False, separators=(',', ':'), allow_nan=False))
+            return
         from harnessy.agent.permission_provenance import (PERMISSION_ACKNOWLEDGEMENT_EVENTS,
                                                         validate_permission_acknowledgement_event)
         if event in PERMISSION_ACKNOWLEDGEMENT_EVENTS:
@@ -1436,6 +1552,8 @@ def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
     if _is_sensitive_log_key(lowered):
         return '<redacted>'
     if not key and isinstance(value, dict):
+        if isinstance(value.get('event'), str) and value['event'] in WORKSPACE_RECOVERY_EVENTS:
+            return validate_workspace_recovery_event(value['event'], value)
         from harnessy.agent.permission_provenance import (PERMISSION_ACKNOWLEDGEMENT_EVENTS,
                                                         validate_permission_acknowledgement_event)
         if isinstance(value.get('event'), str) and value['event'] in PERMISSION_ACKNOWLEDGEMENT_EVENTS:
@@ -1627,7 +1745,7 @@ def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
     # digest or timestamp destroys the read -> edit -> human-inspection chain.
     # Validate each newly retained string, rather than allowing arbitrary text
     # merely because it was logged under a trusted-looking metadata key.
-    if lowered in {'sha256', 'path_id', 'resolved_path_id'}:
+    if lowered in {'sha256', 'path_id', 'resolved_path_id', 'db_id'}:
         text = str(value or '')
         return text.lower() if re.fullmatch(r'[0-9a-fA-F]{64}', text) else _privacy_marker(value, label=lowered)
     if lowered == 'working_root_id':
@@ -2346,6 +2464,9 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
                 'schema_version': 1, 'status': 'unavailable', 'reason': 'summary_generation_failed',
             }), ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('MODEL_REQUESTS.json', json.dumps(incidents.get('model_request_audit', {
+                'schema_version': 1, 'status': 'unavailable', 'reason': 'summary_generation_failed',
+            }), ensure_ascii=False, indent=2, allow_nan=False))
+            zf.writestr('DATABASE_RECOVERY.json', json.dumps(incidents.get('workspace_database_recovery', {
                 'schema_version': 1, 'status': 'unavailable', 'reason': 'summary_generation_failed',
             }), ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('HOST_STATE.json', json.dumps(host_report, ensure_ascii=False, indent=2, allow_nan=False))

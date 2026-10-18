@@ -34,7 +34,7 @@ _REASONS = frozenset({
     'integrity_failed', 'sqlite_corrupt', 'sqlite_error', 'filesystem_error',
     'database_changed', 'admission_required', 'worker_timeout', 'worker_exit',
     'worker_protocol', 'invalid_file', 'empty_database', 'initialization_failed', 'cancelled',
-    'history_busy',
+    'history_busy', 'maintenance', 'recovery_pending',
 })
 _SIDECARS = ('', '-wal', '-journal')
 _CACHE_LOCK = threading.RLock()
@@ -62,7 +62,13 @@ class WorkspaceDatabaseError(RuntimeError):
         )}
         self.worker_signal = (signals.get(-worker_returncode, 'other')
                               if type(worker_returncode) is int and worker_returncode < 0 else 'none')
-        if self.reason == 'history_busy':
+        if self.reason == 'maintenance':
+            message = 'This workspace is being checked or repaired. Wait for the operation to finish, then retry.'
+        elif self.reason == 'recovery_pending':
+            message = 'Workspace recovery was interrupted. Finish or roll back recovery before opening this workspace.'
+        elif self.reason == 'database_changed':
+            message = 'The workspace database changed or disappeared. Reopen the workspace to load its current database.'
+        elif self.reason == 'history_busy':
             message = (
                 'Private file history is busy in another operation. Wait for active history work to finish, '
                 'then retry opening this workspace or the history action. '
@@ -106,6 +112,31 @@ def _fingerprint(db: Path) -> tuple:
 def forget_workspace_admission(root: str | Path) -> None:
     with _CACHE_LOCK:
         _CACHE.pop(str(_database_path(root)), None)
+
+
+def workspace_database_fingerprint(root: str | Path) -> tuple:
+    """Read durable database identities while the caller owns an access lease."""
+    return _fingerprint(_database_path(root))
+
+
+def remember_verified_workspace_database(root: str | Path, expected_fingerprint: tuple) -> WorkspaceAdmission:
+    """Acknowledge the recovery engine's full check under its exclusive lease.
+
+    This performs no SQLite work. The engine must already have verified its
+    cold copy and unchanged original generation; only the exact final durable
+    fingerprint can replace a prior admission failure.
+    """
+    from .workspace_access import owns_workspace_maintenance
+    if not owns_workspace_maintenance(root):
+        raise WorkspaceDatabaseError('unavailable', reason='maintenance')
+    db = _database_path(root)
+    actual = _fingerprint(db)
+    if actual != expected_fingerprint or actual[0] is None:
+        raise WorkspaceDatabaseError('unavailable', reason='database_changed')
+    result = WorkspaceAdmission('healthy', actual)
+    with _CACHE_LOCK:
+        _CACHE[str(db)] = result
+    return result
 
 
 def require_workspace_database_admitted(root: str | Path) -> WorkspaceAdmission:
@@ -285,6 +316,14 @@ def _run_worker_inner(db: Path, mode: str, timeout: float, *, name: str | None =
 def probe_workspace_database(
     root: str | Path, *, timeout: float = 12.0, force: bool = False,
 ) -> WorkspaceAdmission:
+    from .workspace_access import workspace_shared_access
+    with workspace_shared_access(root, allow_missing=True):
+        return _probe_workspace_database(root, timeout=timeout, force=force)
+
+
+def _probe_workspace_database(
+    root: str | Path, *, timeout: float = 12.0, force: bool = False,
+) -> WorkspaceAdmission:
     """Check one stable database copy in a bounded, separately spawned process.
 
     Async UI callers should run this through ``asyncio.to_thread``. The cached
@@ -294,7 +333,7 @@ def probe_workspace_database(
     key = str(db)
     with _CACHE_LOCK:
         lock = _PROBE_LOCKS.setdefault(key, threading.Lock())
-    timeout = min(60.0, max(.1, float(timeout)))
+    timeout = min(7200.0, max(.1, float(timeout)))
     started = time.monotonic()
     if not lock.acquire(timeout=timeout):
         raise WorkspaceDatabaseError('timed_out', reason='worker_timeout')
@@ -345,6 +384,15 @@ def probe_workspace_database(
 
 
 def _worker_probe(db: Path, temporary: Path, timeout: float) -> dict:
+    # A parent dying must not release the only lease while its SQLite child
+    # remains alive. The isolated worker acquires its own descriptor.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from harnessy.core.workspace_access import workspace_shared_access
+    with workspace_shared_access(db.parent.parent):
+        return _worker_probe_inner(db, temporary, timeout)
+
+
+def _worker_probe_inner(db: Path, temporary: Path, timeout: float) -> dict:
     """Worker-only SQLite work. Never call this directly in the app process."""
     deadline = time.monotonic() + max(.05, timeout * .95)
     before = _fingerprint(db)
@@ -412,6 +460,14 @@ def _worker_probe(db: Path, temporary: Path, timeout: float) -> dict:
 def prepare_workspace_store(
     root: str | Path, name: str | None = None, *, timeout: float = 20.0, force: bool = False,
 ):
+    from .workspace_access import workspace_shared_access
+    with workspace_shared_access(root, allow_missing=True):
+        return _prepare_workspace_store(root, name, timeout=timeout, force=force)
+
+
+def _prepare_workspace_store(
+    root: str | Path, name: str | None = None, *, timeout: float = 20.0, force: bool = False,
+):
     """Admit and initialize a workspace in bounded isolated processes.
 
     This is the UI bootstrap entry point, run through ``asyncio.to_thread``.
@@ -420,7 +476,7 @@ def prepare_workspace_store(
     """
     db = _database_path(root)
     key = str(db)
-    timeout = min(60.0, max(.1, float(timeout)))
+    timeout = min(7200.0, max(.1, float(timeout)))
     started = time.monotonic()
     with _CACHE_LOCK:
         lock = _PREPARE_LOCKS.setdefault(key, threading.Lock())

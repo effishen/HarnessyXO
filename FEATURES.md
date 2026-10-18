@@ -1,9 +1,12 @@
-# HarnessyXO v0.6.100 Features
+# HarnessyXO v0.6.118 Features
 
 ## Workspace startup and VM resources
 
 - Sign in before saved workspace database checks finish. Show visible loading progress while bounded isolated workers check a coherent SQLite snapshot and initialize each workspace. A corrupt, unavailable or stalled workspace gets a persistent error instead of blocking the controller.
-- Retain saved tabs for unavailable workspaces. Use **Retry workspace** after addressing the disk or restoring a known healthy database. HarnessyXO does not automatically reset, rebuild or repair damaged workspace databases or their journals.
+- Retain saved tabs for unavailable workspaces. Use **Retry workspace** after addressing the disk, **Extended check** to give a slow database more time, or **Repair workspace** to prepare a separate recovery copy. Loading an error panel does not start repair automatically.
+- Track recovery stage, elapsed time and actual copy progress; cancel private-copy checks without replacing the originals. Refresh or sign in again to return to the same operation. Download a report with operational details and record counts, without conversations or SQL.
+- Review a verified index repair and choose **Use repaired database**, then **Open workspace** to restore saved tabs. Require full integrity, relationship, schema and row-by-row checks before offering activation. Keep uncertain salvage separate for review; preserve original database and journal files, project files, VM disks and workspace identity.
+- Pause work only in the workspace being recovered. If queued jobs remain after recovery, choose **Resume queued work** after reviewing them. Existing completion and backend holds remain in effect. If an activation was interrupted, choose **Restore original database** before checking or opening that workspace again.
 - Open **Workspace Environment → Details → Edit VM Resources** to change CPU, RAM and storage. Stop the VM and finish active workspace work first. CPU and RAM can increase or decrease; storage can only grow. Start the VM afterward to use the new values and expand its disk capacity. Existing files, installed tools and VM disks are retained.
 - Check the current VM identity, stopped state and settings before applying an edit, then verify the controller's reported values before saving. An uncertain edit keeps the saved definition unchanged and explains how to retry without shrinking the disk.
 - Keep VM resource settings and an explicit **Stop VM** control available on a workspace-open error, independently of the workspace database.
