@@ -25,6 +25,24 @@ _MAX_INCIDENTS = 20
 _CONTEXT_SECONDS = 30.0
 _TARGET_FOLLOWUP_SECONDS = 300.0
 _PERMISSION_RECEIPTS = 120
+_ACCESS_RESTORE_EVENTS = frozenset({
+    'account_store_check_started', 'account_store_check_completed', 'account_store_check_busy',
+    'account_store_check_timed_out', 'account_store_check_failed',
+    'login_verification_started', 'login_accepted', 'login_rejected', 'login_busy',
+    'login_timed_out', 'login_failed',
+    'page_build_started', 'page_session_restore_started', 'page_session_restore_completed',
+    'page_workspace_restore_started', 'page_built',
+    'saved_tab_restore_failed', 'workspace_open_failed', 'history_lock_busy',
+})
+_ACCESS_RESTORE_FAILURES = {
+    'account_store_check_busy': 'account_store_busy',
+    'account_store_check_timed_out': 'account_store_timed_out',
+    'account_store_check_failed': 'account_store_failed',
+    'login_busy': 'login_busy', 'login_timed_out': 'login_timed_out', 'login_failed': 'login_failed',
+    'saved_tab_restore_failed': 'saved_tab_restore_failed',
+    'workspace_open_failed': 'workspace_open_failed',
+    'history_lock_busy': 'history_lock_contention',
+}
 _ERROR_EVENTS = frozenset({
     'agent_run_error', 'headless_run_error', 'uncaught_exception',
     'sqlite_operation_error', 'tool_execution_error', 'request_error',
@@ -52,10 +70,11 @@ def _bounded_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     controllers = [row for row in rows if row.get('event') in CONTROLLER_OBSERVATION_EVENTS][-120:]
     from .queue_observations import QUEUE_EVENTS
     queues = [row for row in rows if row.get('event') in QUEUE_EVENTS][-160:]
+    access_restore = [row for row in rows if row.get('event') in _ACCESS_RESTORE_EVENTS][-120:]
     recent = rows[-(_MAX_ROWS - len(targets) - len(permissions) - len(permission_acknowledgements)
-                    - len(startup) - len(models) - len(controllers) - len(queues)):]
+                    - len(startup) - len(models) - len(controllers) - len(queues) - len(access_restore)):]
     retained = {id(row): row for row in targets + permissions + permission_acknowledgements
-                + startup + models + controllers + queues + recent}
+                + startup + models + controllers + queues + access_restore + recent}
     return sorted(retained.values(), key=lambda row: row['timestamp'])
 
 
@@ -509,6 +528,8 @@ def _is_lock(row: dict[str, Any]) -> bool:
 
 def _evidence(row: dict[str, Any]) -> dict[str, Any]:
     # Keep identifiers and reviewed diagnostic structures, never error bodies.
+    if row.get('event') in _ACCESS_RESTORE_EVENTS:
+        return _access_restore_evidence(row)
     keys = (
         'timestamp', 'channel', 'event', 'workspace_id', 'chat_id', 'run_id',
         'call_id', 'step', 'tool', 'returncode', 'command_ok', 'drift_seconds',
@@ -553,6 +574,61 @@ def _evidence(row: dict[str, Any]) -> dict[str, Any]:
     if _is_lock(row):
         evidence['error_code'] = 'sqlite_database_locked'
     return evidence
+
+
+def _access_restore_evidence(row: dict[str, Any]) -> dict[str, Any]:
+    """Fixed stages only; no account, browser, workspace or page identities."""
+    evidence = {key: row[key] for key in ('timestamp', 'channel', 'session_scope', 'event') if key in row}
+    for key in ('elapsed_seconds', 'waited_seconds', 'lock_timeout_seconds'):
+        value = row.get(key)
+        if type(value) in (int, float) and 0 <= value <= 604800 and math.isfinite(value):
+            evidence[key] = value
+    if isinstance(row.get('lock_kind'), str) and row['lock_kind'] in {'thread', 'process'}:
+        evidence['lock_kind'] = row['lock_kind']
+    from .operational import operational_label
+    error_class = operational_label(row.get('error_class'), 'exception_class')
+    if error_class:
+        evidence['error_class'] = error_class
+    return evidence
+
+
+def _access_restore_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
+    observed = [row for row in rows if row.get('event') in _ACCESS_RESTORE_EVENTS]
+    counts = Counter(row['event'] for row in observed)
+    sessions = []
+    lines = ['Sign-in and page restoration: account checks, password verification and page restoration are separate stages.']
+    for scope in ('current', 'previous', 'launcher'):
+        scoped = [row for row in observed if row.get('session_scope') == scope]
+        if not scoped:
+            continue
+        latest_by_stage = {}
+        for stage, events in (
+                ('account_store', {event for event in _ACCESS_RESTORE_EVENTS if event.startswith('account_store_')}),
+                ('login', {event for event in _ACCESS_RESTORE_EVENTS if event.startswith('login_')}),
+                ('page_restore', {event for event in _ACCESS_RESTORE_EVENTS if event.startswith('page_')}
+                                 | {'saved_tab_restore_failed', 'workspace_open_failed'}),
+                ('history_lock', {'history_lock_busy'})):
+            latest = next((row for row in reversed(scoped) if row['event'] in events), None)
+            if latest:
+                receipt = _access_restore_evidence(latest)
+                latest_by_stage[stage] = receipt
+                elapsed = receipt.get('elapsed_seconds', receipt.get('waited_seconds'))
+                timing = f'; elapsed {elapsed:g}s' if elapsed is not None else ''
+                lines.append(f'  {scope} session / {stage}: latest recorded {receipt["event"]} at {receipt["timestamp"]}{timing}.')
+        sessions.append({'session_scope': scope, 'records_examined': len(scoped),
+                         'event_counts': dict(sorted(Counter(row['event'] for row in scoped).items())),
+                         'latest_by_stage': latest_by_stage})
+    if not observed:
+        lines.append('  No reviewed sign-in or page-restore stage observations were found; older versions did not record every stage.')
+    lines.extend([
+        f'  Recorded login acceptances: {counts["login_accepted"]}; rejections: {counts["login_rejected"]}; '
+        f'login timeouts: {counts["login_timed_out"]}; page builds: {counts["page_built"]}; history lock waits reaching their limit: {counts["history_lock_busy"]}.',
+        '  A password acceptance does not establish that the page finished restoring. A history lock wait is separate from SQLite locking.',
+        '  These process-session tails may contain several browser pages and sign-in attempts; their proximity does not establish a shared attempt or the cause of a hang.', ''])
+    return {'scope': 'bounded_log_stage_observations', 'records_examined': len(observed),
+            'event_counts': dict(sorted(counts.items())), 'sessions': sessions,
+            'recent_events': [_access_restore_evidence(row) for row in observed[-120:]],
+            'recent_event_limit': 120, 'recent_events_limited': len(observed) > 120}, lines
 
 
 def _controller_observation_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
@@ -948,7 +1024,8 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
                         and _vm_failure_classification(row)}
     failures = [row for row in rows if (row.get('event') in _ERROR_EVENTS or _vm_failure_classification(row)
                                        or _target_failure_classification(row) or _permission_failure_classification(row)
-                                       or _startup_failure_classification(row) or _is_lock(row))
+                                       or _startup_failure_classification(row) or _is_lock(row)
+                                       or row.get('event') in _ACCESS_RESTORE_FAILURES)
                 and not (row.get('event') in {'environment_command_finished', 'environment_command_timeout'}
                          and isinstance(row.get('command_id'), str)
                          and (row.get('session_scope'), row.get('command_id')) in observation_keys)]
@@ -963,6 +1040,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         permission_classification = _permission_failure_classification(failure)
         startup_classification = _startup_failure_classification(failure)
         timeout_classification = _timeout_failure_classification(failure)
+        access_restore_classification = _ACCESS_RESTORE_FAILURES.get(failure.get('event'))
         vm_cause = _kvm_permission_cause(failure, rows, safe_vm_report, host_kvm_facts)
         if vm_cause:
             vm_classification = 'vm_host_kvm_access_denied'
@@ -998,7 +1076,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         stalls = [row for row in before if row.get('event') in {'event_loop_stall', 'event_loop_stall_sample'}]
         transcript_deferrals = [row for row in related if row.get('event') == 'transcript_refresh_deferred']
         missing: list[str] = []
-        if not vm_classification and not target_classification and not permission_classification and not startup_classification and not timeout_classification and not _has_frames(failure) and not any(_has_frames(row) for row in database_errors):
+        if not vm_classification and not target_classification and not permission_classification and not startup_classification and not timeout_classification and not access_restore_classification and not _has_frames(failure) and not any(_has_frames(row) for row in database_errors):
             missing.append('exception_traceback_unavailable')
         if vm_classification and not vm_cause and not any(
                 isinstance(row.get('controller_evidence'), dict) and any(
@@ -1019,7 +1097,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         identity = json.dumps(_evidence(failure), sort_keys=True)
         incidents.append({
             'incident_id': hashlib.sha256(identity.encode()).hexdigest()[:24],
-            'classification': 'sqlite_lock_contention' if lock else startup_classification or permission_classification or target_classification or vm_classification or timeout_classification or 'operation_error',
+            'classification': access_restore_classification or ('sqlite_lock_contention' if lock else startup_classification or permission_classification or target_classification or vm_classification or timeout_classification or 'operation_error'),
             'failure': _evidence(failure),
             'nearby_database_errors': [_evidence(row) for row in database_errors[-3:]],
             'last_successful_tool': successful_tool,
@@ -1095,12 +1173,16 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
     from .queue_observations import QUEUE_EVENTS, build_queue_audit
     queue_audit, queue_lines = build_queue_audit(rows)
     index['queue_audit'] = queue_audit
+    access_restore_audit, access_restore_lines = _access_restore_audit(rows)
+    index['access_restore_audit'] = access_restore_audit
     control_rows = [row for row in rows if row.get('level') in {'WARNING', 'ERROR', 'CRITICAL'}
                     or str(row.get('event')).startswith(('vm_', 'environment_', 'workspace_mapping_', 'test_target_'))
                     or row.get('event') in STARTUP_EVENTS
                     or row.get('event') in QUEUE_EVENTS
+                    or row.get('event') in _ACCESS_RESTORE_EVENTS
                     or row.get('event') in {'headless_run_error', 'agent_run_error', 'run_blocked_by_infrastructure'}]
-    index['control_plane_timeline'] = control_rows[-1200:]
+    index['control_plane_timeline'] = [(_access_restore_evidence(row) if row.get('event') in _ACCESS_RESTORE_EVENTS else row)
+                                       for row in control_rows[-1200:]]
     index['control_plane_coverage'] = {'rows_available': len(control_rows), 'rows_retained': min(len(control_rows), 1200),
         'row_limit': 1200, 'row_limit_reached': len(control_rows) > 1200, 'source_coverage': coverage}
     latest_vm = next((item for item in reversed(incidents) if item['classification'].startswith('vm_')), None)
@@ -1121,6 +1203,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         'This summary examines bounded current/previous-session log tails and startup receipts from up to two recent launcher sessions. Counts are not whole-session totals.',
         'Nearby events and tracked transactions are evidence for investigation, not proven lock ownership.', '',
         *primary_setup, *primary_cause,
+        *access_restore_lines,
         *queue_lines,
         *model_lines,
         *permission_acknowledgement_lines,
@@ -1145,6 +1228,19 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
             if failure.get(key):
                 lines.append(f'  {key}: {failure[key]}')
         classification = incident['classification']
+        if classification == 'history_lock_contention':
+            lines.append('  The history thread/process lock wait reached its configured limit; this is separate from SQLite locking and does not identify its holder.')
+            for key in ('lock_kind', 'waited_seconds', 'lock_timeout_seconds'):
+                if key in failure:
+                    lines.append(f'  {key}: {failure[key]}')
+        elif classification.startswith('account_store_'):
+            lines.append('  The account-file check did not complete successfully; password verification and page restoration are separate stages.')
+        elif classification in {'login_busy', 'login_timed_out', 'login_failed'}:
+            lines.append('  Password verification could not complete; this does not establish that the supplied password was rejected.')
+        elif classification in {'saved_tab_restore_failed', 'workspace_open_failed'}:
+            lines.append('  Page restoration reported this failure; it is separate from password verification.')
+            if failure.get('error_class'):
+                lines.append('  Exception class: ' + failure['error_class'] + '.')
         if classification == 'environment_provider_timeout':
             lines.append('  A provider/controller phase raised TimeoutError before the operation deadline was reached; this is not a recorded expiration of the overall operation budget.')
         elif classification == 'environment_operation_deadline':

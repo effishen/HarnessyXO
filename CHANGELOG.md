@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.6.116
+
+- Keep sign-in responsive when another operation holds a workspace history lock. Show a busy-history error so you can reopen the workspace after that operation finishes. Preserve existing files, saved tabs and lock holders; bound other history lock waits to ten seconds.
+- Distinguish password verification from workspace restoration in diagnostics. Report verification timeouts as a temporary sign-in failure instead of rejecting the password. Capture native Python crash evidence when a crash handler is not already enabled, keeping default exports content-free.
+- Accept Homebrew's download, manifest and cache messages while checking prerequisite install plans. Keep package scope, required dependency, VM-idle and post-install checks in place.
+- Verified login, restoration, held-lock recovery and shutdown on Linux, with simulated Homebrew transactions. Native Mac installation and the reported Mac bus error were not reproduced. Leave README unchanged.
+
 ## v0.6.115
 
 - Read Homebrew’s actual prerequisite install plan instead of rejecting every mention of an installed formula. A warning mentioning glib no longer blocks an otherwise additive swtpm installation.

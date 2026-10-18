@@ -297,6 +297,7 @@ _PRIVACY_SAFE_STRING_LIST_KEYS = {
 # These startup fields are evidence from reviewed controller observations,
 # never arbitrary guest output or inferred failure causes.
 _VM_DIAGNOSTIC_ENUMS = {
+    'lock_kind': frozenset({'thread', 'process'}),
     'controller_action': frozenset({'start', 'stop', 'create', 'delete', 'edit', 'clone', 'snapshot', 'list', 'shell',
                                     'factory-reset', 'restart', '--version', 'other', 'unknown'}),
     'outcome': frozenset({'controller_error', 'controller_timeout', 'cancelled', 'completed', 'failed'}),
@@ -336,6 +337,8 @@ def _safe_event_field(key: str, value: Any) -> Any:
                'completion_state', 'last_error_code', 'source', 'state', 'component', 'missing_dependency'}:
         return _privacy_safe_value(value, key=key)
     if key in {'archive_check', 'storage_issue'}:
+        return _privacy_safe_value(value, key=key)
+    if key == 'error_class':
         return _privacy_safe_value(value, key=key)
     if key in {'client_request_id', 'usage', 'timings', 'backend_timings',
                'prompt_progress', 'native_prompt_progress', 'throughput_source',
@@ -700,6 +703,7 @@ class DiagnosticsManager:
             # ``latest`` always describes this process invocation, never a mix
             # of several historical runs. Session history remains under sessions/.
             if self.latest_dir.exists():
+                self._preserve_previous_native_fault()
                 shutil.rmtree(self.latest_dir, ignore_errors=True)
             self.latest_dir.mkdir(parents=True, exist_ok=True)
 
@@ -796,6 +800,51 @@ class DiagnosticsManager:
             sys.stdout = _Tee(sys.stdout, self._stdout_file)
         if not isinstance(sys.stderr, _Tee):
             sys.stderr = _Tee(sys.stderr, self._stderr_file)
+        from .native_faults import enable_native_fault_capture
+        self._native_fault_capture_status = enable_native_fault_capture(self._stderr_file)
+        try:
+            self.event('harnessy', 'native_fault_capture_configured', status=self._native_fault_capture_status)
+        except Exception:
+            pass
+
+    def _preserve_previous_native_fault(self) -> None:
+        """Retain a bounded crash tail before clearing the previous latest run."""
+        if self.latest_dir is None or self.root is None:
+            return
+        descriptors = []
+        try:
+            from .native_faults import native_fault_signature
+            payload = _read_snapshot_bytes(self.latest_dir / 'console-error.log', tail_bytes=512 * 1024)
+            if not payload or not any(native_fault_signature(line) for line in payload.decode(
+                    'utf-8', errors='replace').splitlines()):
+                return
+            identity = _validated_session_id((_read_snapshot_bytes(
+                self.latest_dir / 'CURRENT_SESSION.txt', tail_bytes=256) or b'').decode(
+                    'utf-8', errors='replace').strip())
+            if identity is None:
+                return
+            # Traverse only existing session directories through no-follow
+            # descriptors. An injected CURRENT_SESSION or symlink can never
+            # turn this preservation write into an arbitrary path overwrite.
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            sessions_fd = os.open(self.root / 'sessions', flags)
+            descriptors.append(sessions_fd)
+            session_fd = os.open(identity, flags, dir_fd=sessions_fd)
+            descriptors.append(session_fd)
+            target_fd = os.open('console-error.log', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                0o600, dir_fd=session_fd)
+            with os.fdopen(target_fd, 'wb') as target:
+                target.write(payload)
+        except Exception:
+            # Preservation cannot block launch if this platform lacks dir_fd
+            # support or the prior diagnostic filesystem is unavailable.
+            pass
+        finally:
+            for descriptor in reversed(descriptors):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
     def _install_exception_hook(self) -> None:
         old = self._original_excepthook
@@ -1394,6 +1443,8 @@ def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
                            else _privacy_safe_value(item, key=str(name)))
                 for name, item in list(value.items())[:120]}
     from .operational import LABEL_FIELDS, operational_label
+    if lowered == 'error_class':
+        return operational_label(value, 'exception_class')
     if (lowered in LABEL_FIELDS or lowered in {'error_type', 'exception_class', 'exception_type'}) and not isinstance(value, dict):
         return operational_label(value, lowered)
     if lowered == 'technical_error':
@@ -1974,7 +2025,9 @@ def _zip_privacy_safe_log(
 def _project_freeform_technical_bytes(payload: bytes) -> bytes:
     """Free-form console/crash output is not a trusted controller channel."""
     from .technical import technical_error_evidence
-    rows = []
+    from .native_faults import project_native_faults
+    rows = [{'evidence_source': 'native_fault', 'content_omitted': True, 'native_fault': fault}
+            for fault in project_native_faults(payload)]
     for number, line in enumerate(payload.decode('utf-8', errors='replace').splitlines()[-8192:]):
         # Preserve structured app events when stdout capture duplicated them;
         # arbitrary guest/model/file lines retain only technical signatures.

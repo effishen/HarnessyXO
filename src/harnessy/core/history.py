@@ -9,8 +9,10 @@ supports them.
 from __future__ import annotations
 
 import ctypes
+import errno
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -35,6 +37,7 @@ except ImportError:  # pragma: no cover - exercised on non-POSIX ports only
 
 HISTORY_SCHEMA_VERSION = 1
 DEFAULT_LARGE_FILE_THRESHOLD = 64 * 1024 * 1024
+DEFAULT_HISTORY_LOCK_TIMEOUT_SECONDS = 10.0
 BRANCHES_DIR_NAME = '.harnessyxo-branches'
 REWINDS_DIR_NAME = '.harnessyxo-rewinds'
 FICLONE = 0x40049409
@@ -42,6 +45,10 @@ FICLONE = 0x40049409
 
 class HistoryError(RuntimeError):
     """A checkpoint could not be made or restored safely."""
+
+
+class HistoryBusyError(HistoryError):
+    """Another history operation kept its lock past this caller's deadline."""
 
 
 @dataclass(slots=True)
@@ -257,17 +264,56 @@ class ShadowHistory:
         self._lock = _lock_for(self.history_root)
 
     @contextmanager
-    def _process_lock(self):
-        """Serialize history mutations across HarnessyXO processes when possible."""
-        lock_path = self.history_root / 'history.lock'
-        with lock_path.open('a+b') as handle:
-            if fcntl is not None and hasattr(fcntl, 'flock'):
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    def _locked(self, *, lock_timeout_seconds: float = DEFAULT_HISTORY_LOCK_TIMEOUT_SECONDS):
+        """Bound thread and process lock acquisition without disturbing the holder."""
+        timeout = float(lock_timeout_seconds)
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError('History lock timeout must be a finite nonnegative number.')
+        started = time.monotonic()
+        deadline = started + timeout
+        thread_acquired = False
+        process_acquired = False
+
+        def busy(kind: str) -> None:
             try:
-                yield
-            finally:
+                log_event('history', 'history_lock_busy', lock_kind=kind,
+                          waited_seconds=round(max(0.0, time.monotonic() - started), 6),
+                          lock_timeout_seconds=timeout)
+            except Exception:
+                pass
+            raise HistoryBusyError(
+                'Private file history is busy in another operation. Wait for active history work to finish, '
+                'then retry opening this workspace or the history action. '
+                'Existing project files and lock files were preserved.'
+            )
+
+        lock_path = self.history_root / 'history.lock'
+        try:
+            thread_acquired = self._lock.acquire(timeout=max(0.0, deadline - time.monotonic()))
+            if not thread_acquired:
+                busy('thread')
+            with lock_path.open('a+b') as handle:
                 if fcntl is not None and hasattr(fcntl, 'flock'):
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    while True:
+                        try:
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            process_acquired = True
+                            break
+                        except OSError as exc:
+                            if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                                raise
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                busy('process')
+                            time.sleep(min(0.05, remaining))
+                try:
+                    yield
+                finally:
+                    if process_acquired:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            if thread_acquired:
+                self._lock.release()
 
     def _git_env(self, *, index: Path | None = None) -> dict[str, str]:
         env = dict(os.environ)
@@ -312,7 +358,10 @@ class ShadowHistory:
                             'refs/harnessy/file-history/', 'refs/harnessy/file-history-commits/'])
         return dict(line.split(' ', 1) for line in result.stdout.decode('ascii').splitlines() if ' ' in line)
 
-    def retain_file_history_commits(self, snapshots: Iterable[tuple[str, str]]) -> None:
+    def retain_file_history_commits(
+        self, snapshots: Iterable[tuple[str, str]], *,
+        lock_timeout_seconds: float = DEFAULT_HISTORY_LOCK_TIMEOUT_SECONDS,
+    ) -> None:
         """Keep catalogue commits reachable even after another chat advances HEAD."""
         candidates: list[tuple[str, str]] = []
         for snapshot_id, commit in snapshots:
@@ -323,7 +372,7 @@ class ShadowHistory:
             candidates.append((f'refs/harnessy/file-history/{token}', value.lower()))
         if not candidates:
             return
-        with self._lock, self._process_lock():
+        with self._locked(lock_timeout_seconds=lock_timeout_seconds):
             if not (self.repo / 'HEAD').is_file():
                 self._ensure_repo()
             current_refs = self._file_history_refs()
@@ -840,7 +889,7 @@ class ShadowHistory:
         previous_commit: str = '', previous_large: dict[str, Any] | None = None,
         previous_git: dict[str, Any] | None = None,
     ) -> HistorySnapshot:
-        with self._lock, self._process_lock():
+        with self._locked():
             started = time.perf_counter()
             self._ensure_repo()
             root = self._validate_root(root)
@@ -934,7 +983,7 @@ class ShadowHistory:
     ) -> dict[str, Any]:
         """Describe one path in an immutable snapshot without materializing it."""
         rel = self._validated_history_path(relative_path)
-        with self._lock, self._process_lock():
+        with self._locked():
             self._ensure_repo()
             large_entries = (large_manifest or {}).get('entries')
             large_entries = large_entries if isinstance(large_entries, dict) else {}
@@ -1002,7 +1051,7 @@ class ShadowHistory:
         size = int(descriptor.get('size') or 0)
         if max_bytes is not None and size > max(0, int(max_bytes)):
             raise HistoryError(f'Historical file is too large to preview ({size} bytes).')
-        with self._lock, self._process_lock():
+        with self._locked():
             if descriptor.get('storage') == 'large_object':
                 object_rel = str(descriptor.get('identity') or '').removeprefix('large:')
                 source = (self.history_root / object_rel).resolve()
@@ -1017,7 +1066,7 @@ class ShadowHistory:
         self, *, shadow_commit: str, file_manifest: dict[str, Any] | None = None,
         large_manifest: dict[str, Any] | None = None,
     ) -> list[str]:
-        with self._lock, self._process_lock():
+        with self._locked():
             self._ensure_repo()
             result = self._git(['ls-tree', '-r', '-z', '--name-only', str(shadow_commit)], check=False)
             values = {
@@ -1111,7 +1160,7 @@ class ShadowHistory:
         self, destination: Path, *, shadow_commit: str, file_manifest: dict[str, Any],
         large_manifest: dict[str, Any], git_manifest: dict[str, Any], cancel_event: Any | None = None,
     ) -> None:
-        with self._lock, self._process_lock():
+        with self._locked():
             _raise_if_cancelled(cancel_event)
             self._ensure_repo()
             if self._git(['cat-file', '-e', f'{shadow_commit}^{{commit}}'], check=False).returncode != 0:

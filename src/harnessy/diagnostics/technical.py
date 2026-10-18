@@ -272,6 +272,12 @@ def technical_error_evidence(value: Any, *, source: str = 'exception') -> dict[s
     # Classification is safe for arbitrary errors: only fixed enums escape.
     lower = text[:MAX_INPUT_CHARS].lower()
     result['reason_codes'] = [code for code, tokens in _FAMILIES.items() if any(token in lower for token in tokens)]
+    from .native_faults import native_fault_signature
+    native = native_fault_signature(text)
+    if native:
+        result.update(native)
+        if 'process' not in result['reason_codes']:
+            result['reason_codes'].append('process')
     if source in _TRUSTED:
         diagnostic, omitted, truncated = _sanitize(text, MAX_TECHNICAL_LINES, MAX_TECHNICAL_CHARS)
         if diagnostic:
@@ -316,6 +322,10 @@ def validate_technical_evidence(value: Any, *, trusted_source: str | None = None
     name = value.get('signal')
     if isinstance(name, str) and name.startswith('SIG') and name in signal_module.Signals.__members__:
         result['signal'] = name
+    from .native_faults import NATIVE_FAULT_SIGNALS
+    name = value.get('native_fault_class')
+    if isinstance(name, str) and name in NATIVE_FAULT_SIGNALS and result.get('signal') == NATIVE_FAULT_SIGNALS[name]:
+        result['native_fault_class'] = name
     codes = value.get('reason_codes')
     result['reason_codes'] = sorted({code for code in codes if isinstance(code, str) and code in REASON_CODES}) if isinstance(codes, list) else []
     if source in _TRUSTED and source == trusted_source and isinstance(value.get('diagnostic_text'), str):

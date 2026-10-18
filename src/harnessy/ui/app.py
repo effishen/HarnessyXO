@@ -98,7 +98,7 @@ from harnessy.core.chat_export import CONTENT_DETAIL, EXPORT_TYPES, ExportOption
 from harnessy.agent.chat_exports import ExportJob, EXPORT_JOBS
 from harnessy.agent.timeline_replacements import TimelineReplacementJob
 from harnessy.core.workspace import FILES_PROBE_DIR_NAME, LEGACY_IMPORTS_DIR_NAME, WorkspaceStore  # noqa: E402
-from harnessy.core.history import BRANCHES_DIR_NAME, REWINDS_DIR_NAME, HistoryError  # noqa: E402
+from harnessy.core.history import BRANCHES_DIR_NAME, REWINDS_DIR_NAME, HistoryBusyError, HistoryError  # noqa: E402
 from harnessy.core.outputs import CHAT_OUTPUT_DIR_RE  # noqa: E402
 from harnessy.diagnostics import log_event, refresh_diagnostics_bundle  # noqa: E402
 from harnessy.diagnostics.faults import (  # noqa: E402
@@ -1300,8 +1300,10 @@ class HarnessyPage:
         self._username = ''
         self.registration: WorkspaceRegistration | None = None
         self.workspace: WorkspaceStore | None = None
+        self._workspace_open_error: tuple[WorkspaceRegistration, str] | None = None
         self.workspace_cache: dict[str, WorkspaceStore] = {}
         self.open_tabs: list[OpenTab] = []
+        self._blocked_restore_tabs: dict[str, str] = {}
         self.active_tab_key: str | None = None
         self.sidebar_selected_chat: tuple[str, str] | None = None
         self.chat_runtime: dict[tuple[str, str], dict[str, str]] = {}
@@ -1432,6 +1434,7 @@ class HarnessyPage:
             return
         regs = {r.id: r for r in self.machine.list_workspaces()}
         restored: list[OpenTab] = []
+        self._blocked_restore_tabs.clear()
         allowed_kinds = {'chat', 'memory', 'files', 'file', 'terminal', 'artifacts', 'environment', 'target_terminal', 'target_desktop'}
         for item in raw.get('open_tabs') or []:
             if not isinstance(item, dict):
@@ -1453,24 +1456,26 @@ class HarnessyPage:
                 target_id = str(item.get('target_id') or '')
                 from harnessy.ui.test_targets import target_tab_key
                 try:
-                    target = self._load_workspace(regs[workspace_id]).get_external_target(target_id)
-                    if not target or not target.managed_vm or key != target_tab_key(workspace_id, target_id, kind):
-                        continue
-                except (ValueError, OSError, KeyError):
+                    canonical_target_key = target_tab_key(workspace_id, target_id, kind)
+                except ValueError:
+                    continue
+                if key != canonical_target_key:
                     continue
             if kind == 'chat' or (kind in {'files', 'file'} and chat_id):
                 if not chat_id or workspace_id == HOME_SCOPE_ID:
                     continue
-                try:
+            if kind == 'file' and not file_path:
+                continue
+            try:
+                if kind in {'target_terminal', 'target_desktop'}:
+                    target = self._load_workspace(regs[workspace_id]).get_external_target(target_id)
+                    if not target or not target.managed_vm:
+                        continue
+                if kind == 'chat' or (kind in {'files', 'file'} and chat_id):
                     ws = self._load_workspace(regs[workspace_id])
                     if not ws.get_chat(str(chat_id)):
                         continue
-                except Exception:
-                    continue
-            if kind == 'file':
-                if not file_path:
-                    continue
-                try:
+                if kind == 'file':
                     scope = self.home_scope if workspace_id == HOME_SCOPE_ID else self._load_workspace(regs[workspace_id])
                     if chat_id and isinstance(scope, WorkspaceStore):
                         scope = self._chat_files_scope(scope, str(chat_id))
@@ -1480,8 +1485,15 @@ class HarnessyPage:
                     # Do not restore a tab which can no longer be safely represented by the text editor.
                     TextFileDraft.open(candidate)
                     file_path = str(candidate)
-                except Exception:
-                    continue
+            except HistoryBusyError as exc:
+                # Keep unavailable tabs in the saved order, including inactive
+                # ones. No target/file/chat access is allowed through these
+                # placeholders; Retry reloads and runs normal validation again.
+                self._blocked_restore_tabs[key] = str(exc)
+                log_event('harnessy', 'saved_tab_restore_failed', kind=kind, error_class=type(exc).__name__)
+            except Exception as exc:
+                log_event('harnessy', 'saved_tab_restore_failed', kind=kind, error_class=type(exc).__name__)
+                continue
             restored.append(OpenTab(
                 key, kind, workspace_id, str(chat_id) if chat_id else None, title or kind.title(), file_path=file_path, target_id=target_id,
             ))
@@ -1543,8 +1555,12 @@ class HarnessyPage:
     # ------------------------------------------------------------------ layout
     def build(self) -> None:
         _ensure_event_loop_watchdog()
-        log_event('harnessy', 'page_built', page_id=self._page_id)
+        started = time.monotonic()
+        log_event('harnessy', 'page_build_started', page_id=self._page_id)
+        log_event('harnessy', 'page_session_restore_started', page_id=self._page_id)
         self._restore_ui_session()
+        log_event('harnessy', 'page_session_restore_completed', page_id=self._page_id,
+                  elapsed_seconds=round(time.monotonic() - started, 3))
         ui.add_css(CSS)
         ui.colors(primary=PRIMARY_COLOR)
         # Keep incidental pointer movement quiet: tooltips only appear after a
@@ -1592,9 +1608,12 @@ class HarnessyPage:
         ui.timer(0.5, self._sync_active_live_agent_ui)
         ui.timer(0.5, self._refresh_status_metrics)
         ui.timer(1.0, self._request_backend_health)
+        log_event('harnessy', 'page_workspace_restore_started', page_id=self._page_id)
         self._restore_last_workspace()
         if self.active_tab_key:
             self.activate_tab(self.active_tab_key)
+        log_event('harnessy', 'page_built', page_id=self._page_id,
+                  elapsed_seconds=round(time.monotonic() - started, 3))
 
     async def _download_diagnostics(self, *, include_content: bool = False) -> None:
         try:
@@ -1931,8 +1950,13 @@ class HarnessyPage:
         try:
             ws = self._load_workspace(reg)
         except Exception as exc:
+            log_event('harnessy', 'workspace_open_failed', error_class=type(exc).__name__)
+            self._workspace_open_error = (reg, str(exc))
             ui.notify(f'Cannot open workspace: {exc}', type='negative', timeout=7000)
+            if not self.open_tabs:
+                self.refresh_tabs()
             return
+        self._workspace_open_error = None
         self.registration = reg
         self.workspace = ws
         if previous_workspace_id != reg.id:
@@ -2160,7 +2184,8 @@ class HarnessyPage:
         # outlive or detach from the page which started it; page-local
         # busy_tabs must never leave a ghost Stop button behind.
         active_tab = next((t for t in self.open_tabs if t.key == self.active_tab_key), None)
-        if active_tab is not None and active_tab.kind == 'chat' and active_tab.chat_id and active_tab.workspace_id != HOME_SCOPE_ID:
+        if (active_tab is not None and active_tab.key not in self._blocked_restore_tabs
+                and active_tab.kind == 'chat' and active_tab.chat_id and active_tab.workspace_id != HOME_SCOPE_ID):
             task = self._reconcile_chat_agent_task(active_tab.workspace_id, active_tab.chat_id)
             self._set_generation_ui_busy(bool(task is not None and not task.done()))
 
@@ -2172,6 +2197,7 @@ class HarnessyPage:
         self._set_sidebar_run_snapshot(queue_jobs)
         self._update_sidebar_workspace_queue_badges()
         if (active_tab is not None and active_tab.kind == 'chat' and active_tab.chat_id
+                and active_tab.key not in self._blocked_restore_tabs
                 and (queue_changed or self._queued_run_starting_ids)):
             reg = self._find_reg(active_tab.workspace_id)
             if reg is not None:
@@ -4136,6 +4162,8 @@ class HarnessyPage:
         return reg.name if reg else 'Workspace'
 
     def _tab_item_label(self, tab: OpenTab) -> str:
+        if tab.key in self._blocked_restore_tabs:
+            return tab.title
         if tab.kind == 'files' and tab.chat_id:
             return tab.title
         if tab.kind == 'chat' and tab.chat_id and tab.workspace_id != HOME_SCOPE_ID:
@@ -4345,6 +4373,9 @@ class HarnessyPage:
         self.refresh_tabs()
 
     def _sync_sidebar_to_tab(self, tab: OpenTab) -> None:
+        if tab.key in self._blocked_restore_tabs:
+            self.sidebar_selected_chat = (tab.workspace_id, tab.chat_id) if tab.chat_id else None
+            return
         if tab.workspace_id != HOME_SCOPE_ID and (self.registration is None or self.registration.id != tab.workspace_id):
             reg = self._find_reg(tab.workspace_id)
             if reg is not None:
@@ -4358,7 +4389,7 @@ class HarnessyPage:
     def close_tab(self, key: str) -> None:
         tab = next((row for row in self.open_tabs if row.key == key), None)
         self._capture_mounted_composer_draft()
-        if tab and tab.kind == 'chat' and tab.chat_id:
+        if tab and tab.kind == 'chat' and tab.chat_id and key not in self._blocked_restore_tabs:
             reg = self._find_reg(tab.workspace_id)
             ws = self._load_workspace(reg) if reg is not None else None
             chat_exists = bool(ws and ws.get_chat(tab.chat_id))
@@ -4404,7 +4435,7 @@ class HarnessyPage:
         if idx is None:
             return
         tab = self.open_tabs[idx]
-        if tab.kind == 'chat' and tab.chat_id:
+        if tab.kind == 'chat' and tab.chat_id and key not in self._blocked_restore_tabs:
             reg = self._find_reg(tab.workspace_id)
             ws = self._load_workspace(reg) if reg is not None else None
             if ws is not None:
@@ -4431,6 +4462,7 @@ class HarnessyPage:
         self.file_editor_states.pop(key, None)
         self.file_history_states.pop(key, None)
         self.open_tabs.pop(idx)
+        self._blocked_restore_tabs.pop(key, None)
         if self.active_tab_key == key:
             if self.open_tabs:
                 self.active_tab_key = self.open_tabs[min(idx, len(self.open_tabs) - 1)].key
@@ -4521,10 +4553,13 @@ class HarnessyPage:
             if not reg:
                 ui.label('Workspace registration no longer exists.').classes('text-negative p-4')
                 return
+            if tab.key in self._blocked_restore_tabs:
+                self._render_workspace_open_error(reg, self._blocked_restore_tabs[tab.key])
+                return
             try:
                 ws = self._load_workspace(reg)
             except Exception as exc:
-                ui.label(f'Workspace folder is unavailable: {exc}').classes('text-negative p-4')
+                self._render_workspace_open_error(reg, str(exc))
                 return
             if tab.kind == 'chat' and tab.chat_id:
                 self._render_chat_tab(tab, ws)
@@ -4564,12 +4599,28 @@ class HarnessyPage:
             elif tab.kind == 'environment':
                 self._render_environment_tab(tab, ws)
 
+    def _render_workspace_open_error(self, reg: WorkspaceRegistration, message: str) -> None:
+        with ui.column().classes('w-full items-center justify-center gap-3 p-6').style('flex:1'):
+            with ui.column().classes('w-full gap-3').style('max-width:600px').props('role=alert data-hy-workspace-open-error=1'):
+                ui.icon('error_outline', size='36px').classes('text-negative')
+                ui.label('Could not open workspace').classes('text-xl font-semibold')
+                ui.label(reg.name).classes('font-semibold break-words')
+                ui.label(message).classes('hy-muted break-words')
+                ui.label('Your saved tabs are still available. Retry to reload them, or choose another workspace from the left.').classes('hy-muted')
+                ui.button('Retry workspace', icon='refresh', on_click=lambda: ui.navigate.to('/')).props('no-caps unelevated')
+
     def _render_welcome(self) -> None:
+        if self._workspace_open_error is not None:
+            self._render_workspace_open_error(*self._workspace_open_error)
+            return
         with ui.column().classes('w-full h-full items-center justify-center gap-2'):
             ui.icon('forum', size='48px').classes('hy-muted')
             if self.workspace:
                 ui.label(self.workspace.name).classes('text-xl font-semibold')
                 ui.label('Open a Project / Chat or choose a workspace tool from the left.').classes('hy-muted')
+            elif self.machine.list_workspaces():
+                ui.label('Choose a workspace').classes('text-xl font-semibold')
+                ui.label('Select a workspace from the left to continue.').classes('hy-muted')
             else:
                 ui.label('Add a workspace to start').classes('text-xl font-semibold')
                 ui.label('Workspaces can live anywhere on this machine.').classes('hy-muted')
@@ -4911,7 +4962,8 @@ class HarnessyPage:
         harmless redraw permanently stopped live bubbles until manual reload.
         """
         tab = next((t for t in self.open_tabs if t.key == self.active_tab_key), None)
-        if tab is None or tab.kind != 'chat' or not tab.chat_id or tab.workspace_id == HOME_SCOPE_ID:
+        if (tab is None or tab.key in self._blocked_restore_tabs
+                or tab.kind != 'chat' or not tab.chat_id or tab.workspace_id == HOME_SCOPE_ID):
             self._live_sync_key = None
             self._live_sync_view = None
             self._live_sync_tool_view = None

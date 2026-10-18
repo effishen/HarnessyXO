@@ -129,6 +129,15 @@ class AuthBusyError(Exception):
     """Bounded password worker capacity is currently exhausted."""
 
 
+def _login_event(event: str, started: float) -> None:
+    """Observe sign-in stages without recording credentials or browser identity."""
+    try:
+        from harnessy.diagnostics import log_event
+        log_event('harnessy', event, elapsed_seconds=round(max(0.0, time.monotonic() - started), 3))
+    except Exception:
+        pass
+
+
 class HarnessyLoginMiddleware:
     """Persistent accounts, process-local random sessions, same-origin actions.
 
@@ -340,6 +349,24 @@ class HarnessyLoginMiddleware:
         work.add_done_callback(completed)
         return await asyncio.wait_for(asyncio.shield(work), timeout=AUTH_TIMEOUT)
 
+    async def _check_accounts(self) -> bool:
+        """Bound the account-file read before password verification or setup."""
+        started = time.monotonic()
+        _login_event('account_store_check_started', started)
+        try:
+            result = await self._run_auth_work(self.store.has_users)
+        except AuthBusyError:
+            _login_event('account_store_check_busy', started)
+            raise
+        except asyncio.TimeoutError:
+            _login_event('account_store_check_timed_out', started)
+            raise
+        except Exception:
+            _login_event('account_store_check_failed', started)
+            raise
+        _login_event('account_store_check_completed', started)
+        return bool(result)
+
     async def _form_or_error(self, scope: dict[str, Any], receive: Any, send: Any) -> dict[str, str] | None:
         try:
             return await self._read_form(scope, receive)
@@ -365,14 +392,28 @@ class HarnessyLoginMiddleware:
         if set(form) != {'username', 'password'} or not username or not password or len(username) > 128 or len(password) > 1024:
             await self._reply(send, 400, _login_html('Invalid sign-in form.', dark=self._is_dark()), html=True)
             return
+        started = time.monotonic()
+        _login_event('login_verification_started', started)
         try:
             account = await self._run_auth_work(self.store.authenticate, username, password)
         except AuthBusyError:
+            _login_event('login_busy', started)
             await self._reply(send, 429, b'Sign-in busy. Try again shortly.', headers=[(b'retry-after', b'5')])
             return
+        except asyncio.TimeoutError:
+            _login_event('login_timed_out', started)
+            await self._reply(send, 503, _login_html(
+                'Sign-in took too long. Check the launcher and diagnostics, then try again.',
+                dark=self._is_dark()), headers=[(b'retry-after', b'5')], html=True)
+            return
         except Exception:
-            account = None
+            _login_event('login_failed', started)
+            await self._reply(send, 503, _login_html(
+                'Sign-in could not finish. Check the local settings folder and diagnostics, then try again.',
+                dark=self._is_dark()), html=True)
+            return
         if not isinstance(account, dict) or not account.get('username') or not account.get('revision'):
+            _login_event('login_rejected', started)
             await self._reply(send, 401, _login_html('Username or password not accepted.', dark=self._is_dark()), html=True)
             return
         token = secrets.token_urlsafe(32)
@@ -388,11 +429,15 @@ class HarnessyLoginMiddleware:
             self._sessions.popitem(last=False)
         expires = now + self._session_seconds if self._session_seconds else float('inf')
         self._sessions[token] = _Session(str(account['username']), str(account['revision']), expires)
+        _login_event('login_accepted', started)
         await self._reply(send, 303, headers=[(b'location', b'/'), (b'set-cookie', self._session_cookie(scope, token))])
 
     async def _setup(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         try:
-            has_users = await asyncio.to_thread(self.store.has_users)
+            has_users = await self._check_accounts()
+        except AuthBusyError:
+            await self._reply(send, 429, b'Account storage busy. Try again shortly.', headers=[(b'retry-after', b'5')])
+            return
         except Exception:
             await self._reply(send, 503, b'Account storage unavailable. Check the local settings folder.')
             return
@@ -504,9 +549,12 @@ class HarnessyLoginMiddleware:
             return
         if kind == 'http' and path == '/login':
             try:
-                has_users = await asyncio.to_thread(self.store.has_users)
+                has_users = await self._check_accounts()
+            except AuthBusyError:
+                await self._reply(send, 429, b'Account storage busy. Try again shortly.', headers=[(b'retry-after', b'5')])
+                return
             except Exception:
-                await self._reply(send, 503, b'Account storage unavailable.')
+                await self._reply(send, 503, b'Account storage is unavailable or took too long. Check the local settings folder and diagnostics, then retry.')
                 return
             if not has_users:
                 await self._reply(send, 303, headers=[(b'location', b'/setup')])
@@ -536,7 +584,7 @@ class HarnessyLoginMiddleware:
             elif method == 'GET' and (path == '/' or b'text/html' in self._headers(scope).get(b'accept', b'')):
                 location = b'/login'
                 try:
-                    if not await asyncio.to_thread(self.store.has_users):
+                    if not await self._check_accounts():
                         location = b'/setup'
                 except Exception:
                     await self._reply(send, 503, b'Account storage unavailable.')

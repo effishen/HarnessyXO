@@ -41,6 +41,23 @@ _MUTATING = re.compile(
     r'Downgrad(?:e|ing)|Remov(?:e|ing)|Reinstall(?:ing)?|Obsolet(?:e|ing)|'
     r'Uninstall(?:ing)?|Link(?:ing)?|Unlink(?:ing)?|Pour(?:ing)?)\b)', re.I
 )
+# Homebrew resolves bottle metadata while preparing a dry run. These messages
+# describe fetching/cache reads, not package changes. Keep this list anchored
+# and explicit: an unknown heading must still stop automatic installation.
+_URL = r'https?://[^\s<>]+'
+_NAME_LIST = _NAME + r'(?:(?:, |,? and )' + _NAME + r')*'
+_DOWNLOAD_HEADING = re.compile(
+    r'^==> (?:Downloading (?:from )?' + _URL
+    + r'|Downloading bottle manifests|Fetching dependency downloads'
+    + r'|Fetching downloads for: ' + _NAME_LIST + r'|Fetching ' + _NAME + r')$'
+)
+_DOWNLOAD_CACHE = re.compile(r'^Already downloaded: /.+$')
+_DOWNLOAD_STATUS = re.compile(
+    r'^[\u2713\u2714][\ufe0e\ufe0f]? '
+    r'(?:Bottle(?: Manifest)?|API Source|JSON API) ' + _NAME
+    + r'(?: \(' + _VERSION + r'\))?$'
+)
+_CURL_PROGRESS = re.compile(r'^[#= >-]+\s+(\d{1,3}(?:\.\d+)?)%$')
 _ANSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
 _NUMERIC_VERSION = re.compile(r'v?(\d+(?:[.-]\d+)*)(?:_(\d+))?\Z')
 _PROTECTED = frozenset({'lima', 'lima-additional-guestagents', 'qemu'})
@@ -67,6 +84,7 @@ def parse_brew_plan(text: str) -> tuple[BrewPlanEntry, ...]:
     warning = False
     sections = 0
     total = 0
+    downloading = False
     for raw in text.splitlines():
         line = raw.strip()
         if not line:
@@ -86,6 +104,21 @@ def parse_brew_plan(text: str) -> tuple[BrewPlanEntry, ...]:
             continue
         if _MUTATING.match(line):
             raise BrewPlanError('The Homebrew install plan contains an unsupported package action: ' + line[:160])
+        if _DOWNLOAD_HEADING.fullmatch(line):
+            downloading = True
+            warning = False
+            continue
+        if _DOWNLOAD_STATUS.fullmatch(line) or (downloading and _DOWNLOAD_CACHE.fullmatch(line)):
+            warning = False
+            continue
+        if downloading:
+            progress = _CURL_PROGRESS.fullmatch(line)
+            if progress and float(progress.group(1)) <= 100:
+                warning = False
+                continue
+            if line == 'Trying a mirror...':
+                warning = False
+                continue
         if remaining:
             versioned = _VERSION_ROW.fullmatch(line)
             if versioned:

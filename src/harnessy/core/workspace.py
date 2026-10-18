@@ -642,7 +642,8 @@ class WorkspaceStore:
                 'SELECT id,shadow_commit FROM file_history_snapshots ORDER BY rowid ASC'
             ).fetchall()
         self.history.retain_file_history_commits(
-            (str(row['id']), str(row['shadow_commit'] or '')) for row in rows
+            ((str(row['id']), str(row['shadow_commit'] or '')) for row in rows),
+            lock_timeout_seconds=0,
         )
 
     def _ensure_safe_output_directory(self, public_id: str) -> Path:

@@ -35,6 +35,7 @@
 - Verify official release checksums, stage the complete tool bundle before activating it, and reuse a verified cache offline. Restore the managed tool path inside the application process without changing shell profiles or system PATH settings.
 - Keep ordinary host package installation and privilege checks for QEMU and other required tools. Run HarnessyXO with your normal account; official Lima refuses root operation.
 - Homebrew setup checks actual install/upgrade rows and the required dependency list. Missing prerequisites can be added with VMs running; required library updates need stopped VMs. Startup shows the package/version plan and records it in diagnostics. Installed Lima/QEMU replacement, unrelated upgrades and removals remain explicit host maintenance tasks.
+- Recognize Homebrew's download, manifest and cache progress without treating it as a package change. Require a complete, verified install plan before installing prerequisites.
 - Starting `python3 run.py` can complete normal Linux KVM group setup. If needed, the host terminal asks for your sudo password to add your current account to the standard `kvm` group owning the device. The launcher then restarts with refreshed group access and verifies the device before continuing. An account already added to the group skips the administrator command.
 - Keep automatic group refresh to one attempt and run the app under your normal account. Noninteractive launches and restricted or nonstandard host devices show the remaining setup requirement. Passwords and terminal authentication output are not collected by startup diagnostics.
 - Before native Linux QEMU Create/Start, check the current process's effective access to the existing KVM device. A permission denial gives `KVM_ACCESS_DENIED` and host repair instructions instead of allowing QEMU to fail after launch. Group changes require a new shell or login before restarting HarnessyXO.
@@ -95,6 +96,7 @@ Workspace and machine databases use WAL so background reads can coexist with mes
 - Retain exception causes, module/function/line and numeric SQLite codes without source lines, locals or exception bodies.
 - Record operation origin, elapsed wait, configured busy timeout/journal mode, connection/transaction identities, transaction age and actor, and candidate competing transactions or unfinished result cursors.
 - Capture bounded code-stack samples during event-loop stalls with an independent observer.
+- Record sign-in verification and workspace-restoration stages separately. Capture native Python fault signals and reviewed code frames when no existing crash handler is enabled; default exports exclude raw paths, locals and source contents.
 - Distinguish successful tool execution from failure to save its result.
 - Keep database evidence content-free in both modes and avoid opening application databases while collecting diagnostics.
 
@@ -564,6 +566,8 @@ Workspace and machine databases use WAL so background reads can coexist with mes
 - Exact-version download, restore-as-copy, and replace-current with a safety snapshot.
 - Browse paths that are currently deleted.
 - Private history is not visible to the model or mounted into its VM.
+- A busy history lock cannot block sign-in indefinitely. Opening a workspace reports the contention immediately; other history actions bound lock acquisition to ten seconds. Retry after the active operation finishes. Existing history, files and lock holders are preserved.
+- Keep unavailable saved tabs in their original positions with a persistent error and **Retry workspace**. Retrying reloads and validates them again, including when another workspace restored successfully.
 
 ## Permanent family archive
 
@@ -628,6 +632,7 @@ Workspace and machine databases use WAL so background reads can coexist with mes
 - Add, disable, reset, delete, and change-password controls with reauthentication and last-admin protection.
 - Any non-empty password length is accepted.
 - Shared light/dark HarnessyXO theme across setup, login, and application UI.
+- A timed-out password check reports a temporary sign-in failure, with separate diagnostics for accepted and rejected credentials and subsequent workspace loading.
 - No automatic browser launch.
 
 ## Notifications
