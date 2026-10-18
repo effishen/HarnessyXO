@@ -3784,13 +3784,20 @@ class HarnessyPage:
         dialog.open()
 
     def open_workspace_picker(self) -> None:
-        state: dict[str, Any] = {'path': Path('/').resolve(), 'selected': None, 'rows': {}}
+        state: dict[str, Any] = {
+            'path': Path('/').resolve(), 'selected': None, 'rows': {},
+            'opening': False, 'started': 0.0,
+        }
         with ui.dialog() as dialog, ui.card().classes('hy-picker-card'):
+            def close_picker() -> None:
+                if not state['opening']:
+                    dialog.close()
+
             with ui.row().classes('hy-dialog-header w-full items-center no-wrap'):
                 ui.label('Create / Select Workspace').classes('text-xl font-semibold min-w-0 grow')
                 ui.space()
-                ui.button(icon='close', on_click=dialog.close).props('flat round dense aria-label="Close dialog"')
-            with ui.column().classes('hy-picker-body w-full gap-3'):
+                close_button = ui.button(icon='close', on_click=close_picker).props('flat round dense aria-label="Close dialog"')
+            with ui.column().classes('hy-picker-body w-full gap-3') as picker_body:
                 ui.label('Single-click selects a folder. Double-click opens it. Right-click a row for folder actions.').classes('text-sm hy-muted')
                 with ui.row().classes('w-full items-center no-wrap gap-1'):
                     path_input = ui.input(value=str(state['path'])).props('dense outlined').classes('flex-grow')
@@ -3835,6 +3842,8 @@ class HarnessyPage:
                     return set(selected)
 
                 def set_optional_tool(preset_id: str, tool_id: str, enabled: bool) -> None:
+                    if state['opening']:
+                        return
                     selected = set(choice_state['optional_by_preset'].get(preset_id, set()))
                     if enabled:
                         selected.add(tool_id)
@@ -3843,6 +3852,8 @@ class HarnessyPage:
                     choice_state['optional_by_preset'][preset_id] = selected
 
                 def set_all_optional(preset_id: str, values: tuple[str, ...]) -> None:
+                    if state['opening']:
+                        return
                     choice_state['optional_by_preset'][preset_id] = set(values)
                     preview()
 
@@ -3857,7 +3868,7 @@ class HarnessyPage:
                         optional_tools=optional, gpu=False).normalized()
 
                 def preview(_e=None) -> None:
-                    if choice_state['syncing']:
+                    if choice_state['syncing'] or state['opening']:
                         return
                     cfg = selected_config()
                     if choice_state['existing'] is None:
@@ -3960,6 +3971,8 @@ class HarnessyPage:
                     control.on_value_change(preview)
 
                 def go(target: Path) -> None:
+                    if state['opening']:
+                        return
                     try:
                         resolved = target.expanduser().resolve()
                         if not resolved.is_dir():
@@ -3973,6 +3986,8 @@ class HarnessyPage:
                         ui.notify(str(exc), type='negative')
 
                 def select(target: Path) -> None:
+                    if state['opening']:
+                        return
                     try:
                         resolved = target.expanduser().resolve()
                         if not resolved.is_dir():
@@ -3991,26 +4006,67 @@ class HarnessyPage:
                         ui.notify(str(exc), type='negative')
 
                 async def choose() -> None:
+                    if state['opening'] or not dialog.value:
+                        return
+                    state['opening'] = True
+                    state['started'] = time.monotonic()
+                    choose_button.disable()
+                    choose_button.props('loading')
+                    choose_button.set_text('Opening workspace…')
+                    cancel_button.disable()
+                    close_button.disable()
+                    dialog.props('persistent')
+                    picker_body.props('inert aria-busy=true')
+                    picker_body.classes(add='opacity-60')
+                    progress_spinner.set_visibility(True)
+                    progress_status.set_text('Checking folder and environment…')
+                    progress_elapsed.set_text('0:00')
+                    progress_row.set_visibility(True)
+                    progress_timer.activate()
                     try:
-                        target = Path(state.get('selected') or state['path']).expanduser().resolve()
-                        if not target.is_dir():
-                            raise ValueError('Selected folder is not available')
+                        # Snapshot UI choices before yielding. All mounted-disk
+                        # checks run in a worker so the loading state can paint.
+                        selected_path = Path(state.get('selected') or state['path'])
+                        name = name_input.value or None
                         config = selected_config()
-                        manager = EnvironmentManager(target)
-                        # Re-selecting/copying an existing VM workspace must reuse its
-                        # portable environment definition. Do not silently overwrite
-                        # its preset/resources/network settings with picker defaults.
-                        if manager.config is None:
-                            manager.initialize(config)
-                        ws = await asyncio.to_thread(_prepare_runtime_workspace, target, name_input.value or None)
+
+                        def prepare_folder() -> Path:
+                            target = selected_path.expanduser().resolve()
+                            if not target.is_dir():
+                                raise ValueError('Selected folder is not available')
+                            manager = EnvironmentManager(target)
+                            # Existing workspaces keep their saved VM settings.
+                            if manager.config is None:
+                                manager.initialize(config)
+                            return target
+
+                        target = await asyncio.to_thread(prepare_folder)
+                        progress_status.set_text('Checking workspace files and database…')
+                        ws = await asyncio.to_thread(_prepare_runtime_workspace, target, name)
+                        progress_status.set_text('Saving workspace selection…')
+                        reg = await asyncio.to_thread(self.machine.register_workspace, target, name, ws.id)
                         self.workspace_cache[ws.id] = ws
-                        reg = self.machine.register_workspace(target, name_input.value or None, ws.id)
-                        dialog.close()
+                        progress_status.set_text('Opening workspace…')
+                        await asyncio.sleep(0)
                         self.select_workspace(reg)
+                        dialog.close()
                         ui.notify(f'Workspace ready: {reg.name} · VM will provision once on first use', type='positive')
                         background_tasks.create(self._provision_workspace_environment(ws))
                     except Exception as exc:
+                        progress_status.set_text(f'Could not open workspace: {exc}')
                         ui.notify(str(exc), type='negative', timeout=7000)
+                    finally:
+                        state['opening'] = False
+                        progress_timer.deactivate()
+                        progress_spinner.set_visibility(False)
+                        choose_button.props(remove='loading')
+                        choose_button.set_text('Use this folder')
+                        choose_button.enable()
+                        cancel_button.enable()
+                        close_button.enable()
+                        dialog.props(remove='persistent')
+                        picker_body.props(remove='inert aria-busy')
+                        picker_body.classes(remove='opacity-60')
 
                 def row_for(path: Path, label: str, *, up: bool = False) -> None:
                     try:
@@ -4050,9 +4106,23 @@ class HarnessyPage:
 
                 redraw()
                 refresh_environment()
-            with ui.row().classes('hy-picker-footer w-full justify-end'):
-                ui.button('Cancel', on_click=dialog.close).props('flat no-caps')
-                ui.button('Use this folder', on_click=choose).props('unelevated no-caps')
+            with ui.column().classes('hy-picker-footer w-full gap-2'):
+                with ui.row().classes('w-full items-center no-wrap gap-2').props('role=status aria-live=polite') as progress_row:
+                    progress_spinner = ui.spinner(size='22px')
+                    progress_status = ui.label('').classes('text-sm grow min-w-0').style('overflow-wrap:anywhere')
+                    progress_elapsed = ui.label('').classes('text-xs hy-muted shrink-0').props('aria-label="Elapsed time"')
+                progress_row.set_visibility(False)
+
+                def update_progress_elapsed() -> None:
+                    seconds = max(0, int(time.monotonic() - state['started']))
+                    minutes, seconds = divmod(seconds, 60)
+                    progress_elapsed.set_text(f'{minutes}:{seconds:02d}')
+
+                progress_timer = ui.timer(1.0, update_progress_elapsed, active=False)
+                dialog.on('hide', progress_timer.cancel)
+                with ui.row().classes('w-full justify-end gap-2'):
+                    cancel_button = ui.button('Cancel', on_click=close_picker).props('flat no-caps')
+                    choose_button = ui.button('Use this folder', on_click=choose).props('unelevated no-caps')
         dialog.open()
 
     def _workspace_picker_new_folder(self, parent: Path, on_done) -> None:

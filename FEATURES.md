@@ -1,7 +1,8 @@
-# HarnessyXO v0.6.122 Features
+# HarnessyXO v0.6.123 Features
 
 ## Workspace startup and VM resources
 
+- **Use this folder** shows an animated loading indicator, the current opening stage and elapsed time while the workspace is checked. Folder and database checks run off the interface thread. Repeated clicks are blocked until opening finishes; a failed attempt keeps the dialog open for retry.
 - Reuse an opened workspace when starting chats, processing queued work or reloading the page. Normal database writes do not repeat its full startup check. Give large databases additional bounded time for the first check; report busy databases separately from confirmed corruption.
 - Sign in before saved workspace database checks finish. Show visible loading progress while bounded isolated workers check a coherent SQLite snapshot and initialize each workspace. A corrupt, unavailable or stalled workspace gets a persistent error instead of blocking the controller.
 - Retain saved tabs for unavailable workspaces. Use **Retry workspace** after addressing the disk, **Extended check** to give a slow database more time, or **Repair workspace** to prepare a separate recovery copy. Loading an error panel does not start repair automatically.

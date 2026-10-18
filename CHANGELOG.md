@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.6.123
+
+- Show an animated loading indicator, the current stage and elapsed time immediately after **Use this folder**. Keep progress visible at the bottom of the picker while checking the folder, opening its database and saving the selection.
+- Prevent duplicate submissions and changes to the selected folder while opening. Run folder, environment and registration checks off the interface thread. Keep existing VM settings; restore the picker controls after an error so you can retry.
+- Leave README unchanged. Verified workspace opening, loading feedback and retry in a Linux browser; native Mac disk testing was unavailable.
+
 ## v0.6.122
 
 - Enable or disable model access directly on each target card, beside the VM controls or SSH connection actions. A disabled target cannot be started or used by the model, including with global On or full access. The setting survives reloads and retains the target's action choices.
