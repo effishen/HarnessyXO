@@ -33,6 +33,7 @@ _TARGET_COMMON_BINARIES = ('qemu-img', 'ssh', 'ssh-keygen')
 _E2FS_BINARIES = ('debugfs', 'e2fsck', 'resize2fs')
 _INSTALL_LOCKS: dict[int, asyncio.Lock] = {}
 _TERMINAL_AUTH_ATTEMPTED = False
+_OUTPUT_TRUNCATED = '[HarnessyXO output truncated]'
 
 
 class HostPrerequisiteError(RuntimeError):
@@ -219,7 +220,8 @@ async def _progress(callback, phase: str, message: str, **meta) -> None:
 
 def _record_host_setup(scope: str, architecture: str | None, status: str, *, required=(), missing=(), broken=(),
                        error_code: str | None = None, manager: str | None = None, packages=(),
-                       returncode: int | None = None) -> None:
+                       returncode: int | None = None, planned_formulae=(),
+                       vm_infrastructure_active: bool | None = None) -> None:
     """Content-free fixed host-tool receipts survive ordinary diagnostics."""
     try:
         from ..diagnostics import log_event
@@ -239,6 +241,10 @@ def _record_host_setup(scope: str, architecture: str | None, status: str, *, req
             fields['packages'] = list(packages)
         if returncode is not None:
             fields['returncode'] = int(returncode)
+        if planned_formulae:
+            fields['planned_formulae'] = list(planned_formulae)
+        if isinstance(vm_infrastructure_active, bool):
+            fields['vm_infrastructure_active'] = vm_infrastructure_active
         log_event('runtime', 'host_prerequisite_setup', **fields)
     except Exception:
         # Optional diagnostics must never prevent or mask host setup itself.
@@ -273,7 +279,9 @@ async def _run_command(argv: list[str], *, env: dict[str, str] | None = None,
         env=env, start_new_session=(os.name == 'posix' and not retain_session), **group_options,
     )
     chunks: list[str] = []
+    truncated = False
     async def drain():
+        nonlocal truncated
         pending = ''
         if proc.stdout is None:
             return await proc.wait()
@@ -281,6 +289,7 @@ async def _run_command(argv: list[str], *, env: dict[str, str] | None = None,
             text = data.decode('utf-8', errors='replace')
             chunks.append(text)
             if sum(map(len, chunks)) > 64000:
+                truncated = True
                 chunks[:] = [''.join(chunks)[-48000:]]
             pending += text
             if progress and ('\n' in pending or len(pending) >= 500):
@@ -311,7 +320,8 @@ async def _run_command(argv: list[str], *, env: dict[str, str] | None = None,
                 if proc.returncode is None:
                     await proc.wait()
         raise
-    return int(code), ''.join(chunks)
+    output = ''.join(chunks)
+    return int(code), (_OUTPUT_TRUNCATED + '\n' + output) if truncated else output
 
 
 def _version(text: str) -> str:
@@ -448,11 +458,102 @@ async def infrastructure_active() -> bool:
     if not ps:
         raise HostPrerequisiteError('Cannot verify whether host VM infrastructure is active (ps is missing). '
                                     'Install prerequisites manually after checking active VMs.')
-    rc, text = await _run_command([ps, '-axo', 'command='])
-    if rc:
+    # Executable names keep inspection bounded even with browsers or build
+    # processes carrying very large argument strings. A live limactl process
+    # is conservatively treated as active controller infrastructure.
+    rc, text = await _run_command([ps, '-axo', 'comm='])
+    if rc or _OUTPUT_TRUNCATED in text:
         raise HostPrerequisiteError('Could not inspect active host VM infrastructure. No packages were changed.')
-    return any(re.search(r'(?:^|/|\s)(?:qemu-system-[\w-]+|limactl(?:\s+[^\n]*?)?\s+hostagent|lima-hostagent)(?:\s|$)', line)
-               for line in text.splitlines())
+    for line in text.splitlines():
+        name = line.strip()
+        # macOS ps can wrap its fallback executable name in parentheses when
+        # arguments for another account's process cannot be read.
+        if name.startswith('(') and name.endswith(')'):
+            name = name[1:-1]
+        if re.search(r'(?:^|/)(?:qemu-system-[\w-]+|limactl|lima-hostagent)$', name):
+            return True
+    return False
+
+
+async def _review_brew_plan(binary: str, packages: list[str], transaction: str, env: dict[str, str], *, progress=None):
+    """Verify the CLI plan and required dependency closure before host changes."""
+    from dataclasses import replace
+    from .brew_plan import BrewPlanError, canonical_formula_name, parse_brew_plan, validate_brew_plan
+    facts: list[dict[str, Any]] = []
+    try:
+        entries = parse_brew_plan(transaction)
+        inventory_command = [binary, 'list', '--formula', '--versions']
+        await _progress(progress, 'checking_host_dependencies', 'Reading installed Homebrew versions…',
+                        detail=' '.join(inventory_command))
+        rc, text = await _run_command(inventory_command, env=env)
+        if rc:
+            raise HostPrerequisiteError('Cannot read installed Homebrew formulae; no installation started.',
+                                        code='package_preflight_failed')
+        installed: dict[str, tuple[str, ...]] = {}
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            fields = line.split()
+            name = canonical_formula_name(fields[0])
+            if (len(fields) < 2 or name in installed
+                    or any(not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+~:=-]{0,127}', version)
+                           for version in fields[1:])):
+                raise BrewPlanError('Installed Homebrew versions could not be read unambiguously.')
+            installed[name] = tuple(fields[1:])
+        dependency_command = [binary, 'deps', '--formula', '--union', '--full-name', '--include-build', *packages]
+        await _progress(progress, 'checking_host_dependencies', 'Checking required Homebrew dependencies…',
+                        detail=' '.join(dependency_command))
+        rc, text = await _run_command(dependency_command, env=env, timeout=90)
+        if rc:
+            raise HostPrerequisiteError('Cannot verify the required Homebrew dependency list; no installation started.',
+                                        code='package_preflight_failed')
+        dependencies = {canonical_formula_name(line.strip()) for line in text.splitlines() if line.strip()}
+        unknown = [entry.name for entry in entries if entry.name in installed and not entry.new_version]
+        if unknown:
+            metadata_command = [binary, 'info', '--json=v2', '--formula', *unknown]
+            await _progress(progress, 'checking_host_dependencies', 'Reading planned dependency versions…',
+                            detail=' '.join(metadata_command))
+            rc, text = await _run_command(metadata_command, env=env, timeout=90)
+            try:
+                document = json.loads(text) if not rc else None
+                formulae = document['formulae']
+                if not isinstance(formulae, list) or len(formulae) != len(unknown):
+                    raise ValueError('Unexpected formula metadata count.')
+                versions = {}
+                for formula in formulae:
+                    name = canonical_formula_name(formula.get('full_name') or formula['name'])
+                    stable, revision = formula['versions']['stable'], formula.get('revision', 0)
+                    if (name not in unknown or name in versions or formula.get('pinned') is True
+                            or not isinstance(stable, str) or not re.fullmatch(r'v?\d+(?:[.-]\d+)*', stable)
+                            or type(revision) is not int or revision < 0):
+                        raise ValueError('Unverifiable or pinned dependency metadata.')
+                    versions[name] = stable + (f'_{revision}' if revision else '')
+                if set(versions) != set(unknown):
+                    raise ValueError('Missing dependency metadata.')
+            except (ValueError, KeyError, TypeError, AttributeError) as exc:
+                raise HostPrerequisiteError('Cannot verify the planned Homebrew dependency versions; '
+                                            'no installation started. Check brew info for ' + ', '.join(unknown) + '.',
+                                            code='package_preflight_failed') from exc
+            entries = tuple(replace(entry, new_version=versions[entry.name]) if entry.name in versions else entry
+                            for entry in entries)
+        facts = [{'name': entry.name, 'action': 'upgrade' if entry.name in installed else 'install',
+                  'installed_versions': list(installed.get(entry.name, ())), 'target_version': entry.new_version}
+                 for entry in entries]
+        upgrades = validate_brew_plan(entries, installed, packages, dependencies)
+        for fact in facts:
+            before = ', '.join(fact['installed_versions']) or 'not installed'
+            after = fact['target_version'] or 'version selected by Homebrew'
+            await _progress(progress, 'checking_host_dependencies', 'Verified Homebrew planned action',
+                            detail=f"{fact['action']} {fact['name']}: {before} -> {after}")
+        return upgrades, facts
+    except BrewPlanError as exc:
+        error = HostPrerequisiteError('Homebrew prerequisite plan could not be accepted: ' + str(exc)
+                                      + ' No packages were changed.', code='package_plan_unverified')
+        error.planned_formulae = facts
+        raise error from exc
+    except HostPrerequisiteError as exc:
+        exc.planned_formulae = facts
+        raise
 
 
 def package_selection(manager: str, missing: list[str], arch: str) -> list[str]:
@@ -523,7 +624,9 @@ async def _install(missing: list[str], architecture: str | None, lima_version: s
     env = dict(os.environ, PATH=repaired_path(), LC_ALL='C', LANG='C',
                HOMEBREW_NO_AUTO_UPDATE='1', HOMEBREW_NO_INSTALL_UPGRADE='1',
                HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK='1', HOMEBREW_NO_INSTALL_CLEANUP='1',
-               HOMEBREW_NO_ANALYTICS='1', HOMEBREW_NO_ASK='1', DEBIAN_FRONTEND='noninteractive', NEEDRESTART_MODE='l')
+               HOMEBREW_NO_ANALYTICS='1', HOMEBREW_NO_ASK='1', HOMEBREW_NO_COLOR='1',
+               HOMEBREW_NO_EMOJI='1', HOMEBREW_NO_ENV_HINTS='1',
+               DEBIAN_FRONTEND='noninteractive', NEEDRESTART_MODE='l')
     # Never let an inherited setting force an otherwise-disabled update.
     env.pop('HOMEBREW_FORCE_API_AUTO_UPDATE', None)
     prefix: list[str] = []
@@ -580,8 +683,12 @@ async def _install(missing: list[str], architecture: str | None, lima_version: s
         install = [*prefix, binary, '-y', '--no-upgrade', '--no-remove', 'install', *packages]
         dry = [*prefix, binary, '--simulate', '--no-upgrade', '--no-remove', 'install', *packages]
     await _progress(progress, 'checking_host_dependencies', 'Checking selected host package transaction…',
-                    detail=' '.join(install))
+                    detail=' '.join(dry))
     rc, transaction = await _run_command(dry, env=env, timeout=90, retain_session=retain_session)
+    if _OUTPUT_TRUNCATED in transaction:
+        raise HostPrerequisiteError('The package-manager plan exceeded the output limit and could not be verified. '
+                                    'No installation started. Inspect the package transaction in the host terminal.',
+                                    code='package_plan_unverified')
     if manager == 'apt-get' and rc and re.search(
             r'Unable to locate package|has no installation candidate|404\s+Not Found|Failed to fetch', transaction, re.IGNORECASE):
         await _progress(progress, 'checking_host_dependencies', 'Refreshing host package indexes for missing prerequisites…')
@@ -591,38 +698,65 @@ async def _install(missing: list[str], architecture: str | None, lima_version: s
             raise HostPrerequisiteError('Host package indexes could not be refreshed; no packages were installed. '
                                         + update_text.strip()[-1500:], code='package_preflight_failed')
         rc, transaction = await _run_command(dry, env=env, timeout=90, retain_session=retain_session)
+        if _OUTPUT_TRUNCATED in transaction:
+            raise HostPrerequisiteError('The refreshed package-manager plan was truncated; no installation started.',
+                                        code='package_plan_unverified')
     if rc and not (manager == 'dnf' and ('Operation aborted' in transaction or 'Transaction Summary' in transaction)):
         raise HostPrerequisiteError('Host package preflight failed; no installation started. ' + transaction.strip()[-1500:],
                                     code='package_preflight_failed')
-    if re.search(r'(?im)^\s*(?:Upgrading|Downgrading|Removing|Reinstalling|Obsoleting)\b|^Inst \S+ \[|^Remv ', transaction):
+    if manager != 'brew' and re.search(r'(?im)^\s*(?:Upgrading|Downgrading|Removing|Reinstalling|Obsoleting)\b|^Inst \S+ \[|^Remv ', transaction):
         raise HostPrerequisiteError('The package manager proposes changing installed packages, not just adding missing prerequisites. '
                                     'No automatic upgrade/removal was allowed. Resolve this in a maintenance window.\n' + transaction[-1500:],
                                     code='non_additive_transaction')
-    # Homebrew's dry-run can list already-installed dependencies as new versions
-    # without an "Upgrading" heading. Refuse every such installed intersection.
+    planned_formulae: list[dict[str, Any]] = []
+    vm_active: bool | None = None
     if manager == 'brew':
-        rc, installed = await _run_command([binary, 'list', '--formula', '--versions'], env=env)
-        if rc:
-            raise HostPrerequisiteError('Cannot verify installed Homebrew formulae before the transaction; no changes were made.')
-        for line in installed.splitlines():
-            name = line.split()[0] if line.split() else ''
-            if name and re.search(r'(?<![\w@.+/-])' + re.escape(name) + r'(?![\w@.+/-])', transaction):
-                raise HostPrerequisiteError(f'The install plan touches installed formula {name}; resolve dependencies explicitly before retrying. '
-                                            'No automatic upgrades were performed.', code='non_additive_transaction')
-    # A verified additive transaction may install a missing MIPS emulator while
-    # other guests run. The preflight guards above reject upgrades, removals,
-    # reinstalls and dependency replacement, so no active controller is touched.
-    _record_host_setup(scope, architecture, 'installing', missing=missing, manager=manager, packages=packages)
-    await _progress(progress, 'installing_host_dependencies', 'Installing selected host prerequisites…', detail=', '.join(packages))
+        try:
+            upgrades, planned_formulae = await _review_brew_plan(binary, packages, transaction, env, progress=progress)
+            if upgrades:
+                names = ', '.join(entry.name for entry in upgrades)
+                ps = discover_binary('ps')
+                await _progress(progress, 'checking_host_dependencies', 'Checking active VMs before required dependency updates…',
+                                detail=(str(ps) + ' -axo comm=') if ps else 'Host process inspection is unavailable.')
+                try:
+                    vm_active = await infrastructure_active()
+                except HostPrerequisiteError as exc:
+                    raise HostPrerequisiteError('Required Homebrew dependency updates: ' + names + '. '
+                                                'Cannot verify that host VMs are stopped; no packages were changed. '
+                                                'Check host process inspection, stop VMs, then retry python3 run.py.',
+                                                code='dependency_update_requires_idle') from exc
+                if vm_active:
+                    raise HostPrerequisiteError('Installing ' + ', '.join(packages) + ' requires updating ' + names + '. '
+                                                'Host VM processes are still running, so no packages were changed. '
+                                                'Stop workspace and test VMs in Workspace Environment, then restart python3 run.py '
+                                                'to install these required dependencies automatically. Guest reset is not needed.',
+                                                code='dependency_update_requires_idle')
+                await _progress(progress, 'installing_host_dependencies',
+                                'Host VMs are stopped. Applying only the verified prerequisite dependency updates…', detail=names)
+        except HostPrerequisiteError as exc:
+            exc.planned_formulae = planned_formulae or getattr(exc, 'planned_formulae', ())
+            exc.vm_infrastructure_active = vm_active
+            _record_host_setup(scope, architecture, 'action_required', missing=missing, manager=manager, packages=packages,
+                               error_code=exc.code, planned_formulae=exc.planned_formulae,
+                               vm_infrastructure_active=vm_active)
+            raise
+    # Additions are safe with active guests; verified Homebrew dependency updates
+    # additionally require idle VM infrastructure. Controllers are never replaced.
+    _record_host_setup(scope, architecture, 'installing', missing=missing, manager=manager, packages=packages,
+                       planned_formulae=planned_formulae, vm_infrastructure_active=vm_active)
+    await _progress(progress, 'installing_host_dependencies', 'Installing selected host prerequisites…', detail=' '.join(install))
     rc, output = await _run_command(install, env=env, timeout=900, progress=progress,
                                   retain_session=retain_session)
     if rc:
         _record_host_setup(scope, architecture, 'failed', missing=missing, manager=manager, packages=packages,
-                           returncode=rc, error_code='package_install_failed')
+                           returncode=rc, error_code='package_install_failed', planned_formulae=planned_formulae,
+                           vm_infrastructure_active=vm_active)
         error = HostPrerequisiteError(f'Host prerequisite installation failed (exit {rc}). Verify package-manager permissions, '
                                       f'network access, and package availability, then retry.\n{output.strip()[-1800:]}',
                                       code='package_install_failed')
         error.returncode = rc
+        error.planned_formulae = planned_formulae
+        error.vm_infrastructure_active = vm_active
         raise error
 
 
@@ -754,6 +888,8 @@ async def ensure_host_prerequisites(config, *, vm_type: str | None = None, progr
         _record_host_setup('workspace_backend', config.architecture, 'failed', required=required,
                            missing=getattr(exc, 'missing_binaries', ()), broken=getattr(exc, 'broken_binaries', ()),
                            returncode=getattr(exc, 'returncode', None),
+                           planned_formulae=getattr(exc, 'planned_formulae', ()),
+                           vm_infrastructure_active=getattr(exc, 'vm_infrastructure_active', None),
                            error_code=exc.code if isinstance(exc, HostPrerequisiteError) else 'setup_failed')
         raise
     _record_host_setup('workspace_backend', config.architecture, 'ready', required=required)
@@ -773,6 +909,8 @@ async def ensure_test_target_prerequisites(architecture: str | None = None, *, w
         _record_host_setup('test_targets', architecture, 'failed', required=required,
                            missing=getattr(exc, 'missing_binaries', ()), broken=getattr(exc, 'broken_binaries', ()),
                            returncode=getattr(exc, 'returncode', None),
+                           planned_formulae=getattr(exc, 'planned_formulae', ()),
+                           vm_infrastructure_active=getattr(exc, 'vm_infrastructure_active', None),
                            error_code=exc.code if isinstance(exc, HostPrerequisiteError) else 'setup_failed')
         raise
     _record_host_setup('test_targets', architecture, 'ready', required=required)

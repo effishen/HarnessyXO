@@ -270,6 +270,7 @@ def check_registered_host_prerequisites(diagnostic_event=None) -> None:
     """
     import asyncio
     import platform
+    import time
     from harnessy.core.machine import MachineStore
     from harnessy.environment.base import EnvironmentConfig, load_environment_config
     from harnessy.environment.host_prerequisites import (
@@ -278,6 +279,14 @@ def check_registered_host_prerequisites(diagnostic_event=None) -> None:
     )
     from harnessy.environment.presets import execution_mode
     restore_host_tool_path()
+
+    def output(action, message, *, error=False):
+        # Keep copied setup logs readable, including multiline package output.
+        text = str(message).replace('\r', '\n')
+        for line in text.splitlines():
+            if line.strip():
+                print(f'[{int(time.time())}] {action} {line}',
+                      file=sys.stderr if error else sys.stdout, flush=True)
 
     def receipt(status, checks_failed=0):
         if diagnostic_event:
@@ -292,21 +301,22 @@ def check_registered_host_prerequisites(diagnostic_event=None) -> None:
         receipt('checking')
 
         def progress(phase, message, **meta):
-            print(message + (' ' + str(meta['detail']) if meta.get('detail') else ''), flush=True)
+            action = ('VERIFY' if phase == 'host_dependencies_ready' else
+                      'INSTALL' if phase == 'installing_host_dependencies' else 'CHECK')
+            output(action, message + (' ' + str(meta['detail']) if meta.get('detail') else ''))
 
         # Do not limit setup to targets or workspaces that already exist.
         try:
             await ensure_test_target_prerequisites(progress=progress, interactive=True)
         except Exception as exc:
             failures += 1
-            print(f'Test-target host setup did not complete: {exc}', file=sys.stderr, flush=True)
+            output('ACTION REQUIRED', f'Test-target host setup did not complete: {exc}', error=True)
         try:
             await ensure_lima_controller(progress=progress)
         except Exception as exc:
             # The architecture checks below retry and verify the controller.
             # An initial bootstrap failure need not outlive a successful retry.
-            print(f'Initial Lima setup did not complete: {exc}. Retrying in the backend checks.',
-                  file=sys.stderr, flush=True)
+            output('CHECK', f'Initial Lima setup did not complete: {exc}. Retrying in the backend checks.', error=True)
 
         # Both supported Lima architectures need a controller/guest-agent pair,
         # including on the first launch before a workspace has been registered.
@@ -351,14 +361,14 @@ def check_registered_host_prerequisites(diagnostic_event=None) -> None:
                     )
             except Exception as exc:
                 failures += 1
-                print(f'Host prerequisite check for {label}: {exc}', file=sys.stderr, flush=True)
+                output('ACTION REQUIRED', f'Host prerequisite check for {label}: {exc}', error=True)
         receipt('failed' if failures else 'ready', failures)
         if failures:
-            print(f'Host prerequisite setup is incomplete ({failures} failed check(s)); see the setup errors above. '
-                  'The app will still open. VM Start will retry setup; if administrator access is needed, '
-                  'restart python3 run.py in the host terminal.', file=sys.stderr, flush=True)
+            output('ACTION REQUIRED', f'Host prerequisite setup is incomplete ({failures} failed check(s)); see the setup errors above. '
+                   'The app will still open. Follow the specific repair or stop/retry instruction above; '
+                   'VM Start will recheck the tools it needs.', error=True)
         else:
-            print('Host prerequisite setup: ready for workspace VMs and all supported test-target architectures.', flush=True)
+            output('VERIFY', 'Host prerequisite setup: ready for workspace VMs and all supported test-target architectures.')
     asyncio.run(check())
 
 

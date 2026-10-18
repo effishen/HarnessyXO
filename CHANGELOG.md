@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.6.115
+
+- Read Homebrew’s actual prerequisite install plan instead of rejecting every mention of an installed formula. A warning mentioning glib no longer blocks an otherwise additive swtpm installation.
+- Allow verified, required Homebrew dependency updates when host VMs are stopped. Show the planned package names and versions; if VMs are running, keep them running and explain how to stop them and retry. Keep installed Lima/QEMU replacement, unrelated changes, removals, downgrades and reinstalls blocked.
+- Add timestamped prerequisite progress and retain content-free package-plan and VM-activity facts in diagnostics. Keep the normal post-install binary checks. Package transactions were tested with simulated Homebrew responses; a native Mac Homebrew installation was not exercised. Leave README unchanged.
+
 ## v0.6.114
 
 - Show an access summary and expandable action list beside Model access for SSH devices, managed test VMs and VM creation. See which checks run directly, which actions ask, and when global On or Off overrides the target setting. Refresh the breakdown after changing global permissions.

@@ -32,6 +32,7 @@ HOST_SETUP_ERROR_CODES = frozenset({
     'non_additive_transaction', 'post_install_verification_failed',
     'package_install_failed', 'package_manager_unavailable', 'KVM_ACCESS_DENIED',
     'controller_version_unsupported',
+    'package_plan_unverified', 'dependency_update_requires_idle',
 })
 KVM_SETUP_STATUSES = frozenset({'skipped', 'ready', 'relaunch', 'action_required', 'cancelled'})
 KVM_SETUP_REASONS = frozenset({
@@ -224,6 +225,32 @@ def validate_startup_event(event: Any, value: Any) -> dict[str, Any] | None:
         controller_version = value.get('controller_version')
         if isinstance(controller_version, str) and _VERSION.fullmatch(controller_version):
             safe['controller_version'] = controller_version
+        if isinstance(value.get('vm_infrastructure_active'), bool):
+            safe['vm_infrastructure_active'] = value['vm_infrastructure_active']
+        # Package names and versions are operational facts. Never retain raw
+        # installer output, argv, paths, URLs or arbitrary metadata here.
+        planned = value.get('planned_formulae')
+        if isinstance(planned, (list, tuple)):
+            clean = []
+            for item in planned[:256]:
+                if (not isinstance(item, dict) or not isinstance(item.get('action'), str)
+                        or item['action'] not in {'install', 'upgrade'}):
+                    continue
+                name = item.get('name')
+                if (not isinstance(name, str) or len(name) > 160
+                        or not re.fullmatch(r'[a-z0-9][a-z0-9@+_.-]*(?:/[a-z0-9][a-z0-9@+_.-]*){0,2}', name)):
+                    continue
+                versions = item.get('installed_versions')
+                target = item.get('target_version', '')
+                valid_version = lambda version: isinstance(version, str) and len(version) <= 128 and bool(
+                    re.fullmatch(r'(?:v?\d|HEAD)[A-Za-z0-9._+~:=-]*', version))
+                if (not isinstance(versions, (list, tuple)) or len(versions) > 8
+                        or not all(valid_version(version) for version in versions)
+                        or not (target == '' or valid_version(target))):
+                    continue
+                clean.append({'name': name, 'action': item['action'],
+                              'installed_versions': list(versions), 'target_version': target})
+            safe['planned_formulae'] = clean
     elif event == 'launcher_kvm_setup':
         for key, allowed in (('status', KVM_SETUP_STATUSES), ('reason_code', KVM_SETUP_REASONS)):
             if isinstance(value.get(key), str) and value[key] in allowed:
