@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.7.2
+
+- Keep VM editors open when background status/configuration refreshes rebuild a VM card. Preserve pending Settings, creation, optional-tool, resource and removal inputs instead of silently dismissing their dialogs.
+- Save a pending tool-preset change against the latest VM settings while preserving newer project permissions that were not edited in the form. Keep stale-preset and active-operation guards in place.
+- Include v0.7.1's multirow VM tabs, final **+ Create VM** tab, editable tool presets and OpenWrt Bluetooth setup fixes. Leave README unchanged.
+- Verify forced configuration refreshes with open editors and the downloaded package in a Linux browser. Native Mac/Windows and Lima provisioning remain unverified; the OpenWrt radio provider is unchanged from the verified v0.7.1 build.
+
 ## v0.7.1
 
 - Give each VM its own named tab inside **VM Environments**, with **+ Create VM** always last. Remember the active VM and wrap tab names on narrow screens. Each VM has one card; **Manage** expands Details and Snapshots inside it, with one header, one main control row and one startup-progress panel. Collapse it with **Hide details**.

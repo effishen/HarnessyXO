@@ -1,4 +1,4 @@
-# HarnessyXO v0.7.1 Features
+# HarnessyXO v0.7.2 Features
 
 ## Named VM environments
 
@@ -7,6 +7,7 @@
 - Run multiple VMs at the same time. Each has its own OS disk, settings, installed packages, runtime jobs, status, snapshots and diagnostics. View combined CPU/RAM allocations and edit the stopped VM's resources independently.
 - Open each VM in its own named tab under **VM Environments**. **+ Create VM** is always the last tab. Tab names wrap on narrow screens and the active VM is remembered. Keep one card per VM: **Manage** expands Details and Snapshots inline, and **Hide details** collapses them. One progress panel shows the current operation, stage, elapsed time and available progress/ETA, with one main control row. Overview counts distinguish starting, ready, stopped and incomplete VMs. **Retry Setup** resumes setup on an already running VM without resetting its disk.
 - Change **Tool preset** later in **VM Settings**. Presets stay within the current OS. Compatible optional selections and installed tools are retained; review and install choices in **Manage Optional Tools**. New required packages are checked on the next Start. Finish active work before switching presets; VM storage, snapshots and project access are preserved.
+- Keep VM editors open while background status/configuration refreshes update the VM list. Retain pending choices and typed values; unchanged permission fields preserve the latest saved grants when you apply a preset change.
 - Choose shared project source with read/write access, read-only source, or a separate deployed copy where supported by the guest. Canonical project source, conversations and saved artifacts belong to the workspace. Dependencies, default build directories and caches belong to the VM. Shells expose `HARNESSY_BUILD_ROOT`, `HARNESSY_VENV_ROOT`, `XDG_CACHE_HOME` and `PYTHONPYCACHEPREFIX`; explicitly writing `./build` or `./.venv` in shared source still creates shared files. VM reset, rebuild and removal preserve canonical source.
 - Shared Linux guests retain the selected-project view and read-only References/ancestor grants. OpenWrt uses explicit project synchronization rather than a host mount; changed source files are checked for conflicts before merging. Independent guest copies never write back automatically; use deploy and collect tools to move project files and results deliberately.
 - The stock OpenWrt 23.05.5 Malta big-endian option uses `mips_24kc`, musl and Linux 5.15.167. Its pinned package feed supplies Python 3.11.7. MIPS uses software CPU emulation on ARM64 and x86-64 hosts; it does not reproduce a particular router's peripherals.

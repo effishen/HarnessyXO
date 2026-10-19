@@ -354,8 +354,18 @@ def render_vm_environments(workbench, tab, workspace) -> None:
             workbench.refresh_sidebar()
         workbench.refresh_tabs()
 
+    def create_vm() -> None:
+        with local_panel:
+            open_vm_creator(workbench, workspace, selected)
+
+    def vm_dialog():
+        # NiceGUI ties a dialog's lifetime to its construction context through
+        # an invisible element; moving the dialog later does not move that tie.
+        with local_panel:
+            return ui.dialog()
+
     def edit(config) -> None:
-        with ui.dialog() as editor, ui.card().classes('w-[620px] max-w-[94vw] gap-3').style('max-height:92vh;overflow-y:auto'):
+        with vm_dialog() as editor, ui.card().classes('w-[620px] max-w-[94vw] gap-3').style('max-height:92vh;overflow-y:auto'):
             ui.label('VM Settings').classes('text-lg font-semibold')
             name = ui.input('VM name', value=config.name).classes('w-full')
             purpose = ui.textarea('Purpose / model instructions', value=config.purpose).props('autogrow').classes('w-full')
@@ -418,7 +428,7 @@ def render_vm_environments(workbench, tab, workspace) -> None:
         editor.open()
 
     def remove(config) -> None:
-        with ui.dialog() as dialog, ui.card().classes('w-[560px] max-w-[94vw] gap-3'):
+        with vm_dialog() as dialog, ui.card().classes('w-[560px] max-w-[94vw] gap-3'):
             ui.label('Remove VM Environment?').classes('text-lg font-semibold text-negative')
             ui.label(f'Remove “{config.name}” and its VM disk, snapshots, installed packages and private build files?').classes('text-sm')
             ui.label('Workspace project source and conversations are preserved. Stop this VM first.').classes('text-sm')
@@ -477,7 +487,7 @@ def render_vm_environments(workbench, tab, workspace) -> None:
             if expanded and not controls.get('details_loaded'):
                 controls['details_loaded'] = True
                 with controls['details']:
-                    workbench._render_vm_environment_details(tab, workspace, environment_id, embedded=True)
+                    workbench._render_vm_environment_details(tab, workspace, environment_id, embedded=True, dialog_parent=local_panel)
 
     def render_cards() -> None:
         configs = manager.list()
@@ -492,7 +502,7 @@ def render_vm_environments(workbench, tab, workspace) -> None:
         with vm_tabs:
             for config in configs:
                 ui.tab(config.id, label=config.name).props(f'data-hy-vm-tab={config.id}')
-            ui.tab('__create_vm__', label='+ Create VM').props('data-hy-vm-create=true').on('click', lambda: open_vm_creator(workbench, workspace, selected))
+            ui.tab('__create_vm__', label='+ Create VM').props('data-hy-vm-create=true').on('click', create_vm)
         vm_tabs.set_value(active_vm)
         if active_vm:
             workbench.environment_subtabs[active_vm_key] = active_vm

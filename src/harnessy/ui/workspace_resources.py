@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 from pathlib import Path
+from contextlib import nullcontext
 
 from nicegui import ui
 
@@ -11,9 +12,10 @@ from harnessy.environment.resources import resource_values
 
 
 class WorkspaceResourceEditor:
-    def __init__(self, config: EnvironmentConfig, on_apply: Callable[..., Any]) -> None:
+    def __init__(self, config: EnvironmentConfig, on_apply: Callable[..., Any], *, dialog_parent: Any = None) -> None:
         self.config = config
         self.on_apply = on_apply
+        self.dialog_parent = dialog_parent
         self.busy = False
         self.active = False
         self.status: dict[str, Any] = {}
@@ -57,7 +59,11 @@ class WorkspaceResourceEditor:
     def open(self) -> None:
         config = self.config
         expected = config.to_dict()
-        with ui.dialog() as dialog, ui.card().classes('w-[560px] max-w-[94vw] gap-3'):
+        # NiceGUI attaches a lifetime canary to the construction slot. Creating
+        # the modal under its stable owner keeps both alive across card redraws.
+        with self.dialog_parent if self.dialog_parent is not None else nullcontext():
+            dialog = ui.dialog()
+        with dialog, ui.card().classes('w-[560px] max-w-[94vw] gap-3'):
             ui.label(f'Edit Resources · {config.name}').classes('text-lg font-semibold')
             ui.label('Apply while the VM is stopped, then Start it to use the new settings.').classes('text-sm hy-muted')
             # Text-valued numeric inputs avoid NiceGUI Number.sanitize comparing

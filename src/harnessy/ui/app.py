@@ -18846,9 +18846,17 @@ window.harnessyTerminalFocus = function(terminalId) {
         from harnessy.ui.vm_environments import render_vm_environments
         render_vm_environments(self, tab, ws)
 
-    def _render_vm_environment_details(self, tab: OpenTab, ws: WorkspaceStore, environment_id: str, *, embedded: bool = True) -> None:
+    def _render_vm_environment_details(self, tab: OpenTab, ws: WorkspaceStore, environment_id: str, *, embedded: bool = True, dialog_parent: Any = None) -> None:
         manager = EnvironmentManager(ws.root, environment_id=environment_id)
         config = manager.config
+
+        def make_details_dialog():
+            # NiceGUI also creates a lifetime canary in the construction slot.
+            # Construct under the stable owner; moving only the dialog cannot
+            # protect it when the original card and that canary are collected.
+            with dialog_parent if dialog_parent is not None else nullcontext():
+                return ui.dialog()
+
         status_label = readiness_detail = None
         operation_banner = None
         open_terminal_button = start_button = stop_button = None
@@ -18902,7 +18910,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                                         readiness_detail = ui.label('').classes('text-xs hy-muted').style('white-space:pre-wrap;overflow-wrap:anywhere')
                                 with ui.card().classes('hy-env-card p-4 gap-1 min-w-0').style('flex:1 1 280px;max-width:100%'):
                                     from .workspace_resources import WorkspaceResourceEditor
-                                    resource_editor = WorkspaceResourceEditor(config, lambda **payload: queue_action('resources', **payload))
+                                    resource_editor = WorkspaceResourceEditor(config, lambda **payload: queue_action('resources', **payload), dialog_parent=dialog_parent)
                                     disk_usage_label = ui.label('VM storage on host: checking…').classes('text-xs hy-muted')
                                     network_status_label = ui.label(f'{network_prefix} enabled' if config.network else f'{network_prefix} disabled').classes('text-xs hy-muted')
                                     if preset.optional_tool_ids:
@@ -19012,7 +19020,8 @@ window.harnessyTerminalFocus = function(terminalId) {
                     except Exception as exc:
                         ui.notify(str(exc), type='warning')
                         return False
-                    apply_operation_state()
+                    if not detail_panel.is_deleted:
+                        apply_operation_state()
                     self._refresh_sidebar_busy_indicators()
                     return True
 
@@ -19061,7 +19070,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                         if state_label is not None:
                             state_label.set_text(f'{len(chosen)}/{len(available)} selected')
 
-                    with ui.dialog() as dialog, ui.card().classes('w-[760px] max-w-[96vw] gap-3').style('max-height:88vh'):
+                    with make_details_dialog() as dialog, ui.card().classes('w-[760px] max-w-[96vw] gap-3').style('max-height:88vh'):
                         with ui.row().classes('w-full items-center gap-2'):
                             ui.icon('construction', size='22px')
                             ui.label('Manage Optional Tools').classes('text-lg font-semibold')
@@ -19135,7 +19144,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                                     )
 
                                 if remove_owned and removed_owned:
-                                    with ui.dialog() as confirm_dialog, ui.card().classes('w-[560px] max-w-[94vw] gap-3'):
+                                    with make_details_dialog() as confirm_dialog, ui.card().classes('w-[560px] max-w-[94vw] gap-3'):
                                         ui.label('Remove supplemental bundles?').classes('text-lg font-semibold text-negative')
                                         ui.label(
                                             'HarnessyXO will delete the managed installation for: ' +
@@ -19189,7 +19198,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                     if active_work(ws.root, environment_id=environment_id):
                         ui.notify('Finish or stop active agents, tools, and workspace processes before changing network policy.', type='warning')
                         return
-                    with ui.dialog() as dialog, ui.card().classes('w-[540px] max-w-[94vw] gap-3'):
+                    with make_details_dialog() as dialog, ui.card().classes('w-[540px] max-w-[94vw] gap-3'):
                         ui.label('Apply network policy?').classes('text-lg font-semibold')
                         ui.label(f'Enable {network_label.lower()}.' if target else f'Disable {network_label.lower()}.').classes('text-sm font-semibold')
                         ui.label(network_description).classes('text-sm')
@@ -19204,7 +19213,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                 network_apply.on('click', network_dialog)
 
                 def destructive_dialog(kind: str, title: str, body: str, confirm_text: str) -> None:
-                    with ui.dialog() as dialog, ui.card().classes('w-[520px] max-w-[94vw] gap-3'):
+                    with make_details_dialog() as dialog, ui.card().classes('w-[520px] max-w-[94vw] gap-3'):
                         ui.label(title).classes('text-lg font-semibold text-negative')
                         ui.label(body).classes('text-sm')
                         ui.label('Files/ and private chat worktrees will be preserved.').classes('text-xs hy-muted')
@@ -19217,7 +19226,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                     dialog.open()
 
                 def snapshot_dialog() -> None:
-                    with ui.dialog() as dialog, ui.card().classes('w-[520px] max-w-[94vw] gap-3'):
+                    with make_details_dialog() as dialog, ui.card().classes('w-[520px] max-w-[94vw] gap-3'):
                         ui.label('Take Snapshot').classes('text-lg font-semibold')
                         ui.label('Create a restorable checkpoint of the VM environment. Files/ and private chat worktrees stay live and are not included.').classes('text-sm hy-muted')
                         name_input = ui.input('Snapshot name (optional)').classes('w-full').props('autofocus')
@@ -19232,7 +19241,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                     dialog.open()
 
                 def restore_dialog(tag_name: str) -> None:
-                    with ui.dialog() as dialog, ui.card().classes('w-[520px] max-w-[94vw] gap-3'):
+                    with make_details_dialog() as dialog, ui.card().classes('w-[520px] max-w-[94vw] gap-3'):
                         ui.label('Restore Snapshot').classes('text-lg font-semibold')
                         ui.label(f'Restore VM state from “{tag_name}”?').classes('text-sm')
                         ui.label('Files/ and private chat worktrees are live and will not be rolled back.').classes('text-xs hy-muted')
