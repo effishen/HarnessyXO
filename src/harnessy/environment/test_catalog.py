@@ -34,6 +34,8 @@ GUESTS = {item.id: item for item in (
     GuestOS('kali-2026.2', 'Kali Linux 2026.2', 'Official generic cloud image; add tools with apt. Optional Xfce desktop.', min_disk=30),
     GuestOS('openwrt-23.05.2', 'OpenWrt 23.05.2', 'Router test VM with an ash shell and LuCI web interface. Internet through private NAT.',
             family='openwrt', cpu=2, memory=512, disk=2, min_memory=256, min_disk=1, shell='ash', interface='web'),
+    GuestOS('openwrt-23.05.5', 'OpenWrt 23.05.5', 'OpenWrt Malta MIPS32 big-endian, mips_24kc, musl; Linux 5.15.167.',
+            family='openwrt', cpu=1, memory=1024, disk=8, min_memory=256, min_disk=1, shell='ash', interface='web'),
     GuestOS('openwrt-25.12.5', 'OpenWrt 25.12.5', 'Router test VM with an ash shell and LuCI web interface. Internet through private NAT.',
             family='openwrt', cpu=2, memory=512, disk=2, min_memory=256, min_disk=1, shell='ash', interface='web'),
     GuestOS('windows-11', 'Windows 11', 'Install from your own English (United States) ISO. Windows support in Lima is experimental.',
@@ -65,6 +67,11 @@ OPENWRT_RELEASE_IMAGES = {
         'mips': ('malta/be', 'malta-be',
                  '94effccff827cd7ecb20dd8cd39ffecdc96903224b186d21ec7691cda63d08ca',
                  '1b5d129f97f833c4881d579f9cbac1c2037b0331b27ba09b8933cc1f7f9b3e24'),
+    },
+    'openwrt-23.05.5': {
+        'mips': ('malta/be', 'malta-be',
+                 '922c04259d0288ae7ee18508627fe798a17ef3be255cfe872d4b14f78ce6273c',
+                 '5e7856278e3b0ce4d071a68427d8472ef1ae089448b203126add9b745f75dbef'),
     },
     'openwrt-25.12.5': {
         'x86_64': ('x86/64', 'x86-64',

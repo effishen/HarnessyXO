@@ -13,6 +13,9 @@ import shlex
 import uuid
 import time
 import threading
+import stat
+from contextvars import ContextVar
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timezone
@@ -58,6 +61,13 @@ ToolStatusCallback = Callable[[str], Awaitable[None]]
 
 
 VALID_TOOL_PERMISSIONS = {'off', 'ask', 'on'}
+
+
+class VMEnvironmentAccessError(PermissionError):
+    def __init__(self, message: str, code: str = 'VM_PROJECT_ACCESS_DENIED') -> None:
+        super().__init__(message)
+        self.code = code
+        self.error_code = code
 
 
 def target_approval_scope(workspace: WorkspaceStore, target: Any) -> str:
@@ -235,8 +245,13 @@ class WorkspaceToolbox:
         self._permission_source = 'run_start'
         self.profile = dict(profile) if isinstance(profile, dict) else None
         self.root = workspace.active_root_path(chat_id).resolve()
-        self.environment = EnvironmentManager(workspace.root).provider() if workspace.is_vm_workspace else None
-        self.guest_root = workspace.guest_path(self.root, active_root=self.root)
+        # Execution selection belongs to one tool call, never to a workspace,
+        # chat, browser tab or mutable provider singleton. ContextVar also keeps
+        # parallel calls from borrowing another call's guest.
+        self._environment_context: ContextVar[Any | None] = ContextVar(
+            f'vm_tool_environment_{self.run_id}', default=None,
+        )
+        self._canonical_guest_root = workspace.guest_path(self.root, active_root=self.root)
         self._reserved_model_root_names = (
             {LEGACY_IMPORTS_DIR_NAME, BRANCHES_DIR_NAME, REWINDS_DIR_NAME}
             if workspace.is_vm_workspace and self.root == workspace.files_root.resolve()
@@ -285,8 +300,12 @@ class WorkspaceToolbox:
             'search_attachment': self.search_attachment,
             'copy_attachment_to_project': self.copy_attachment_to_project,
             'run_command': self.run_command,
+            'list_vm_environments': self.list_vm_environments,
+            'vm_environment_status': self.vm_environment_status,
+            'vm_environment_control': self.vm_environment_control,
+            'vm_deploy_project': self.vm_deploy_project,
+            'vm_collect_file': self.vm_collect_file,
             'list_external_targets': self.list_external_targets,
-            'test_vm_control': self.test_vm_control,
             'target_status': self.target_status,
             'target_list_files': self.target_list_files,
             'target_exec': self.target_exec,
@@ -348,6 +367,38 @@ class WorkspaceToolbox:
         }
         self.registry = self._build_registry()
 
+    @property
+    def environment(self):
+        return self._environment_context.get()
+
+    @property
+    def environment_id(self) -> str | None:
+        environment = self.environment
+        return str(getattr(environment.config, 'id', '') or '') if environment is not None else None
+
+    @property
+    def guest_root(self) -> str:
+        path_mapper = getattr(self.environment, 'project_guest_root', None)
+        if not callable(path_mapper):
+            return self._canonical_guest_root
+        parameters = inspect.signature(path_mapper).parameters.values()
+        accepts_policy = any(parameter.name == 'output_policy' or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                             for parameter in parameters)
+        return str(path_mapper(self.root, output_policy=self.output_policy) if accepts_policy else path_mapper(self.root))
+
+    def _resolve_vm_environment(self, environment_id: Any):
+        if not isinstance(environment_id, str) or not environment_id.strip():
+            raise ValueError('Specify environment_id from list_vm_environments. There is no implicit VM or host-shell fallback.')
+        manager = EnvironmentManager(self.workspace.root)
+        config = manager.get(environment_id.strip())
+        if config is None:
+            raise ValueError('Unknown VM environment. Use list_vm_environments and pass its id or exact name.')
+        if not config.enabled:
+            raise VMEnvironmentAccessError('This VM environment is unavailable for model use.', 'VM_ENVIRONMENT_DISABLED')
+        if not config.allows_project(self.chat_id):
+            raise VMEnvironmentAccessError('This VM environment is not available to this Project/Chat. Only the user can change its allowed projects.')
+        return manager.provider(config)
+
     def _refresh_project_namespace(self) -> None:
         self.output_folders = set(self.output_policy.get('folders') or ())
         self.writable_output_folder = str(self.output_policy.get('writable_folder') or '')
@@ -387,6 +438,7 @@ class WorkspaceToolbox:
         """Run in the selected workspace view while preserving old providers."""
         if self.environment is None:
             raise RuntimeError('Workspace environment is unavailable')
+        self._resolve_vm_environment(self.environment_id)
         kwargs: dict[str, Any] = {
             'cwd': cwd,
             'timeout': timeout,
@@ -402,8 +454,38 @@ class WorkspaceToolbox:
         except (TypeError, ValueError):
             accepts_policy = True
         if accepts_policy:
-            kwargs['output_policy'] = self.output_policy
+            kwargs['output_policy'] = self._environment_output_policy()
         return await self.environment.exec(command, **kwargs)
+
+    def _environment_output_policy(self) -> dict[str, Any]:
+        # Private synchronization provenance. A provider returning guest edits
+        # must coordinate against the same project writer as canonical tools.
+        return {**self.output_policy,
+                '_model_project_id': self.chat_id,
+                '_mutation_workspace_id': self.workspace.id,
+                '_mutation_owner_id': self._mutation_owner_id,
+                '_mutation_conflict_keys': sorted(self.workspace.project_conflict_ids(self.chat_id)),
+                '_mutation_chat_id': self.chat_id,
+                '_mutation_lease_held': self._mutation_lease_held}
+
+    def _execution_view(self) -> dict[str, Any]:
+        environment = self.environment
+        persistent_mounts = environment is not None and environment.config.provider == 'lima'
+        mode = environment.config.files_mode if environment is not None else None
+        runtime = self._runtime_identity()
+        return {
+            'working_directory_enforced': True,
+            'mount_namespace': 'project-persistent' if persistent_mounts else 'provider-specific',
+            'bridge_mode': runtime.get('bridge_mode', 'mounted-project' if persistent_mounts else 'guest-project-bridge'),
+            'project_files_mode': mode,
+            'canonical_source_shared': mode in {'live', 'readonly'},
+            'canonical_source_writable': mode == 'live',
+            'guest_access_scope': 'whole-vm-administration' if mode == 'copy' else 'authorized-project-view',
+            'guest_data_persists_between_projects': mode == 'copy',
+            'mounts_persist_across_commands': persistent_mounts,
+            'mounts_survive_vm_restart': False,
+            'runtime_mount_visibility': 'vm-shell-only-overlay' if persistent_mounts else 'guest-runtime-only',
+        }
 
     def _build_registry(self) -> dict[str, ToolDefinition]:
         read_memory_description = (
@@ -508,7 +590,28 @@ class WorkspaceToolbox:
                     },
                 }, 'required': ['attachment_id']
             }, 'filesystem', 'filesystem_write', additional_permissions=('attachments',)),
-            ToolDefinition('run_command', 'Run a shell command inside the workspace VM with the active Project directory as the enforced cwd. The project mount namespace persists across Tool calls for the lifetime of the VM, so successful mounts remain available until unmounted, invalidated by a project-root change, or the VM stops. No host-shell fallback is used.', {
+            ToolDefinition('list_vm_environments', 'List named local VM environments, their purposes, configured software, last-observed runtime identities and project-file modes. Choose explicitly using the user instructions and verified capabilities. Configured packages are not proof of installation. No VM is started by discovery.', {
+                'type': 'object', 'properties': {}
+            }, 'environments', None, read_only=True),
+            ToolDefinition('vm_environment_status', 'Inspect one named local VM environment without starting it. Returns current state and actual verified guest capabilities when available. Do not infer installed tools or hardware from the image/purpose alone.', {
+                'type': 'object', 'properties': {},
+            }, 'environments', None, read_only=True),
+            ToolDefinition('vm_environment_control', 'Start or stop an enabled local VM environment, or snapshot/restore its guest disk. Source files belong to the workspace and are not reset by VM operations. Multiple environments may run together. This tool does not create, delete, enable or change configuration of a VM.', {
+                'type': 'object', 'properties': {
+                    'action': {'type': 'string', 'enum': ['start', 'stop', 'snapshot', 'restore']},
+                    'tag': {'type': 'string', 'description': 'Required guest snapshot name for snapshot/restore.'},
+                }, 'required': ['action'],
+            }, 'environments', 'shell'),
+            ToolDefinition('vm_deploy_project', 'Explicitly replace this project\'s independent VM copy with its current canonical project source. Only supported for Separate copy environments. Previous guest-copy edits can be replaced; canonical workspace files remain unchanged. Dependencies and guest OS remain separate.', {
+                'type': 'object', 'properties': {},
+            }, 'environments', 'shell', destructive=True),
+            ToolDefinition('vm_collect_file', 'Explicitly copy one regular file from this project\'s independent VM copy into a new canonical project file. Never overwrites an existing destination. Use this to retain tested guest artifacts; file tools otherwise operate on canonical source, not the VM copy.', {
+                'type': 'object', 'properties': {
+                    'source_path': {'type': 'string', 'description': 'Relative file in the selected VM project copy.'},
+                    'destination_path': {'type': 'string', 'description': 'New project-relative destination; must not exist.'},
+                }, 'required': ['source_path', 'destination_path'],
+            }, 'environments', 'filesystem_write', additional_permissions=('shell',)),
+            ToolDefinition('run_command', 'Run a shell command inside the explicitly named VM environment with this Project directory as enforced cwd. Shared project files synchronize with canonical file tools; Separate copy files stay independent until explicit deploy/collect. Dependencies/build caches and guest system files belong to this VM. No host-shell fallback is used.', {
                 'type': 'object', 'properties': {
                     'command': {'type': 'string'},
                     'verify_paths': {'type': 'array', 'items': {'type': 'string'}, 'maxItems': 20,
@@ -516,22 +619,15 @@ class WorkspaceToolbox:
                     'timeout_seconds': {'type': 'integer', 'minimum': 1, 'maximum': 7200},
                 }, 'required': ['command']
             }, 'shell', 'shell'),
-            ToolDefinition('list_external_targets', 'List external devices and managed test VMs for this workspace. OpenWrt hardware_emulation labels requested and last-observed software radios separately; use target_status for a live check. Emulated radios have no physical RF or USB dongle/chipset behavior. Credentials stay on the host.', {
+            ToolDefinition('list_external_targets', 'List connected external machines/devices for this workspace. Locally created VMs are separate: use list_vm_environments and the VM tools. Credentials stay on the host.', {
                 'type': 'object', 'properties': {}
             }, 'external_targets', 'external_targets', read_only=True, approve_when_ask=False),
-            ToolDefinition('test_vm_control', 'Start/stop a configured test VM, or take/restore a named snapshot while stopped. Starts an asynchronous operation; poll target_status. These guests are separate from the working VM, have internet access, and allow software installation. Creation/deletion and emulation settings are in Workspace Environment → Test targets.', {
-                'type': 'object', 'properties': {
-                    'target': {'type': 'string'},
-                    'action': {'type': 'string', 'enum': ['start', 'stop', 'snapshot', 'restore']},
-                    'tag': {'type': 'string', 'description': 'Snapshot name for snapshot/restore.'},
-                }, 'required': ['target', 'action']
-            }, 'external_targets', 'external_targets'),
-            ToolDefinition('target_status', 'Check a target, identity and test-root access. For a running OpenWrt VM, also probe live virtual Wi-Fi/Bluetooth capabilities and report hardware_emulation provenance, verification and limitations. Requested setup is not proof of active hardware; emulation cannot validate physical RF, nearby devices or USB chipsets. This is a fixed diagnostic command.', {
+            ToolDefinition('target_status', 'Check the connected external target identity and configured remote-root access. This is a fixed diagnostic command; use current observations rather than assuming its OS, installed tools or hardware capabilities.', {
                 'type': 'object', 'properties': {
                     'target': {'type': 'string', 'description': 'Configured target id or exact target name.'},
                 }, 'required': ['target']
             }, 'external_targets', 'external_targets', read_only=True, approve_when_ask=False),
-            ToolDefinition('target_list_files', 'List files on a configured target. Relative paths use its test root; absolute paths or parent traversal also require the target action Use paths outside the test root. Selected Off blocks and Ask requires approval.', {
+            ToolDefinition('target_list_files', 'List files on a configured target. Relative paths use its configured remote root; absolute paths or parent traversal also require the target action Use paths outside the configured remote root. Selected Off blocks and Ask requires approval.', {
                 'type': 'object', 'properties': {
                     'target': {'type': 'string'},
                     'path': {'type': 'string', 'default': '.'},
@@ -539,23 +635,23 @@ class WorkspaceToolbox:
                     'max_entries': {'type': 'integer', 'minimum': 1, 'maximum': 2000, 'default': 300},
                 }, 'required': ['target']
             }, 'external_targets', 'external_targets', read_only=True, approve_when_ask=False),
-            ToolDefinition('target_exec', 'Run the configured target shell (ash on OpenWrt, bash on other Linux, PowerShell on Windows). Obey its effective actions: Full permits all target actions within the account privileges; Selected applies Off/Ask/On to commands, matching command categories and paths. Text categories are best effort, not OS isolation. Check target_status hardware_emulation before hardware claims: software radios do not prove real RF or USB dongle support. Credentials remain on the host.', {
+            ToolDefinition('target_exec', 'Run the configured target shell (ash on OpenWrt, bash on other Linux, PowerShell on Windows). Obey its effective actions: Full permits all target actions within the account privileges; Selected applies Off/Ask/On to commands, matching command categories and paths. Text categories are best effort, not OS isolation. Verify current target capabilities before making hardware claims. Credentials remain on the host.', {
                 'type': 'object', 'properties': {
                     'target': {'type': 'string'},
                     'command': {'type': 'string'},
-                    'working_directory': {'type': 'string', 'default': '.', 'description': 'Relative to the test root by default. Absolute paths or parent traversal also require Use paths outside the test root.'},
+                    'working_directory': {'type': 'string', 'default': '.', 'description': 'Relative to the configured remote root by default. Absolute paths or parent traversal also require Use paths outside the configured remote root.'},
                     'timeout_seconds': {'type': 'integer', 'minimum': 1, 'maximum': 7200, 'default': 180},
                 }, 'required': ['target', 'command']
             }, 'external_targets', 'external_targets'),
-            ToolDefinition('target_copy_to', 'Copy one regular file from the active workspace to the target. Relative remote paths use its test root; paths outside it also require Use paths outside the test root. Local paths stay inside the workspace. SSH credentials stay on the host.', {
+            ToolDefinition('target_copy_to', 'Copy one regular file from the active workspace to the target. Relative remote paths use its configured remote root; paths outside it also require Use paths outside the configured remote root. Local paths stay inside the workspace. SSH credentials stay on the host.', {
                 'type': 'object', 'properties': {
                     'target': {'type': 'string'},
                     'local_path': {'type': 'string', 'description': 'Relative path under the active HarnessyXO working root.'},
-                    'remote_path': {'type': 'string', 'description': 'Remote destination, relative to the test root unless outside-root access is permitted.'},
+                    'remote_path': {'type': 'string', 'description': 'Remote destination, relative to the configured remote root unless outside-root access is permitted.'},
                     'timeout_seconds': {'type': 'integer', 'minimum': 1, 'maximum': 7200, 'default': 300},
                 }, 'required': ['target', 'local_path', 'remote_path']
             }, 'external_targets', 'external_targets'),
-            ToolDefinition('target_copy_from', 'Copy one regular file from the target into the active workspace. Relative remote paths use its test root; paths outside it also require Use paths outside the test root. Local destinations stay inside the workspace.', {
+            ToolDefinition('target_copy_from', 'Copy one regular file from the target into the active workspace. Relative remote paths use its configured remote root; paths outside it also require Use paths outside the configured remote root. Local destinations stay inside the workspace.', {
                 'type': 'object', 'properties': {
                     'target': {'type': 'string'},
                     'remote_path': {'type': 'string'},
@@ -896,6 +992,25 @@ class WorkspaceToolbox:
                 'type': 'object', 'properties': {'name': {'type': 'string'}}, 'required': ['name']
             }, 'skills', None, read_only=True),
         ]
+        vm_selected = {'get_workspace_state', 'vm_environment_status', 'vm_environment_control',
+                       'vm_deploy_project', 'vm_collect_file'}
+        for definition in defs:
+            if (self._requires_workspace_vm(definition) and definition.name not in
+                    {'poll_process', 'send_process_input', 'stop_process', 'list_processes'}
+                    or definition.name in vm_selected):
+                definition.parameters.setdefault('properties', {})['environment_id'] = {
+                    'type': 'string', 'description': 'VM id or exact name from list_vm_environments. Never guessed from another tool call.',
+                }
+                if definition.name != 'get_workspace_state':
+                    definition.parameters.setdefault('required', []).append('environment_id')
+            elif definition.name in {'poll_process', 'send_process_input', 'stop_process', 'list_processes'}:
+                definition.parameters.setdefault('properties', {})['environment_id'] = {
+                    'type': 'string', 'description': 'Optional exact VM id to restrict the job lookup. Omit to use the VM permanently pinned to this job_id.',
+                }
+            elif definition.category == 'code_intelligence':
+                definition.parameters.setdefault('properties', {})['environment_id'] = {
+                    'type': 'string', 'description': 'Optional shared-source VM for guest language-server execution. Omit for bounded canonical source indexing; no host language server is launched.',
+                }
         return {d.name: d for d in defs}
 
     @staticmethod
@@ -906,12 +1021,11 @@ class WorkspaceToolbox:
         )
 
     def _definition_available(self, definition: ToolDefinition) -> bool:
-        # Workspace-scoped execution has no host fallback. Old/non-VM workspaces
-        # may still be opened for file/memory access, but execution tools stay
-        # unavailable until the workspace is recreated with an environment.
+        # The catalogue remains available before any VM is created. Execution
+        # requires an explicit enabled environment and never falls back to host.
         if definition.name == 'attach_file' and not self._latest_user_requested_attachment():
             return False
-        return not (self.environment is None and self._requires_workspace_vm(definition))
+        return True
 
     def permission_for(self, permission: str | None) -> str:
         if permission is None:
@@ -976,11 +1090,15 @@ class WorkspaceToolbox:
                 state, error = 'not_found', 'The selected external target no longer exists.'
             elif not target.enabled:
                 state, error = 'disabled', 'The selected external target is disabled.'
+            elif target.managed_vm:
+                state, error = 'local_vm', 'Locally managed VMs use list_vm_environments and the VM tools, not External Targets.'
+            elif not target.allows_project(self.chat_id):
+                state, error = 'project_denied', 'This external target is not available to this Project/Chat.'
             else:
                 return ('enabled', str(target.policy.get('access_mode', 'selected')),
                         target_tool_permissions(target, definition.name, arguments), target_approval_scope(self.workspace, target), None)
         return state, 'not_applicable', {}, '', {
-            'ok': False, 'error_code': 'TARGET_POLICY', 'target_validation': state,
+            'ok': False, 'error_code': 'TARGET_PROJECT_ACCESS_DENIED' if state == 'project_denied' else 'TARGET_POLICY', 'target_validation': state,
             'error': error, 'write_applied': False,
             'next_model_action': 'Use list_external_targets and pass an explicit enabled target. Do not infer a target.',
         }
@@ -1029,7 +1147,8 @@ class WorkspaceToolbox:
     def _requires_mutation_lease(definition: ToolDefinition) -> bool:
         if definition.read_only:
             return False
-        return definition.category in {'filesystem', 'shell', 'processes', 'git', 'memory'}
+        return (definition.category in {'filesystem', 'shell', 'processes', 'git', 'memory'}
+                or definition.name in {'vm_deploy_project', 'vm_collect_file'})
 
     async def acquire_mutation_lease(
         self, *, on_status: ToolStatusCallback | None = None, reason: str = 'prompt_checkpoint',
@@ -1171,6 +1290,70 @@ class WorkspaceToolbox:
         on_status: ToolStatusCallback | None = None,
         on_execution_start: Callable[[float], Awaitable[None]] | None = None,
     ) -> str:
+        """Pin the selected guest for the complete permission/execution boundary."""
+        definition = self.registry.get(name)
+        wants_vm = bool(definition and name not in {'poll_process', 'send_process_input', 'stop_process', 'list_processes'}
+                        and 'environment_id' in definition.parameters.get('properties', {})
+                        and ('environment_id' in definition.parameters.get('required', [])
+                             or arguments.get('environment_id')))
+        token = None
+        try:
+            if wants_vm:
+                environment = self._resolve_vm_environment(arguments.get('environment_id'))
+                if definition.category == 'code_intelligence' and environment.config.files_mode == 'copy':
+                    raise ValueError('Code intelligence addresses canonical project source. Omit environment_id for source indexing or select a shared-source VM; use shell tools to analyze independent VM-copy files.')
+                token = self._environment_context.set(environment)
+            result = await self._execute(name, arguments, approve=approve, on_status=on_status,
+                                         on_execution_start=on_execution_start)
+            if self.environment is not None:
+                current = EnvironmentManager(self.workspace.root).get(self.environment_id)
+                if current is None or not current.enabled or not current.allows_project(self.chat_id):
+                    try:
+                        prior = json.loads(result)
+                    except (TypeError, json.JSONDecodeError):
+                        prior = None
+                    if isinstance(prior, dict) and prior.get('error_code') in {'VM_PROJECT_ACCESS_DENIED', 'VM_ENVIRONMENT_DISABLED'}:
+                        return result
+                    # An accepted operation can finish while the user revokes
+                    # access. Withhold guest output without pretending its
+                    # already-started side effects were rolled back.
+                    return json.dumps({'ok': False, 'error_code': 'VM_PROJECT_ACCESS_DENIED',
+                                       'error': 'This Project/Chat no longer has access to this VM. Guest output was withheld; an already accepted operation may have completed.',
+                                       'environment_id': self.environment_id,
+                                       'output_withheld': True, 'action_may_have_completed': True})
+            try:
+                payload = json.loads(result)
+                if isinstance(payload, dict):
+                    payload.setdefault('environment_id', self.environment_id)
+                    if self.environment is not None:
+                        payload.setdefault('environment_name', self.environment.config.name)
+                        payload.setdefault('project_files_mode', self.environment.config.files_mode)
+                    if definition and definition.category == 'filesystem':
+                        payload['file_tool_scope'] = 'canonical-workspace-project'
+                    result = json.dumps(payload, ensure_ascii=False)
+            except (TypeError, json.JSONDecodeError):
+                pass
+            return result
+        except (ValueError, PermissionError, RuntimeError) as exc:
+            error_code = exc.code if isinstance(exc, VMEnvironmentAccessError) else 'VM_ENVIRONMENT_SELECTION'
+            if isinstance(exc, VMEnvironmentAccessError):
+                log_event('tools', 'vm_project_access_denied', workspace_id=self.workspace.id,
+                          chat_id=self.chat_id, environment_id=arguments.get('environment_id'),
+                          tool=name, error_code=error_code, command_started=False)
+            return json.dumps({'ok': False, 'error_code': error_code,
+                               'error': str(exc), 'command_started': False,
+                               'environment_id': arguments.get('environment_id'),
+                               'next_model_action': 'Use list_vm_environments and select an enabled VM explicitly. File tools, chat and web research remain available.'})
+        finally:
+            if token is not None:
+                self._environment_context.reset(token)
+
+    async def _execute(
+        self, name: str, arguments: dict[str, Any], *,
+        approve: ToolApprovalCallback | None = None,
+        on_status: ToolStatusCallback | None = None,
+        on_execution_start: Callable[[float], Awaitable[None]] | None = None,
+    ) -> str:
         definition = self.registry.get(name)
         handler = self.handlers.get(name)
         if not definition or not handler:
@@ -1202,6 +1385,8 @@ class WorkspaceToolbox:
         started = time.perf_counter()
         record = {
             'tool': name, 'category': definition.category, 'permission': permission_state,
+            'environment_id': self.environment_id,
+            'environment_name': getattr(getattr(self.environment, 'config', None), 'name', None),
             'arguments': arguments, 'status': 'running', 'duration_seconds': 0.0,
             'execution_duration_seconds': None, 'approval_wait_seconds': 0.0,
             'coordination_wait_seconds': 0.0, 'timing_source': 'execution_boundary',
@@ -1220,6 +1405,19 @@ class WorkspaceToolbox:
             nonlocal previous_target_permissions, previous_target_scope
             while True:
                 available = self._refresh_permission_policy()
+                if self.environment is not None:
+                    current = EnvironmentManager(self.workspace.root).get(self.environment_id)
+                    if current is None or not current.enabled:
+                        return json.dumps({'ok': False, 'error_code': 'VM_ENVIRONMENT_DISABLED',
+                                           'error': 'The selected VM environment was removed or disabled for model use.',
+                                           'environment_id': self.environment_id})
+                    if not current.allows_project(self.chat_id):
+                        log_event('tools', 'vm_project_access_denied', workspace_id=self.workspace.id,
+                                  chat_id=self.chat_id, environment_id=self.environment_id,
+                                  tool=name, phase=phase, error_code='VM_PROJECT_ACCESS_DENIED', command_started=False)
+                        return json.dumps({'ok': False, 'error_code': 'VM_PROJECT_ACCESS_DENIED',
+                                           'error': 'This Project/Chat no longer has access to the selected VM environment.',
+                                           'environment_id': self.environment_id, 'command_started': False})
                 permission_states = self.permission_states_for(definition)
                 permission_state = self.effective_permission_for(definition)
                 policy_changed = policy_changed or permission_states != previous_permission_states
@@ -1301,7 +1499,7 @@ class WorkspaceToolbox:
                         'ok': False, 'error_code': 'TARGET_ACTION_OFF', 'write_applied': False,
                         'blocked_actions': blocked_actions,
                         'error': 'This target blocks: ' + ', '.join(TARGET_ACTION_LABELS.get(key, key) for key in blocked_actions)
-                                 + '. Change its selected actions in Workspace Environment → Test targets to allow them.',
+                                 + '. Change its selected actions in Workspace Environment → External Targets to allow them.',
                     })
                 if reason != 'ask':
                     return None
@@ -1382,7 +1580,8 @@ class WorkspaceToolbox:
                 })
                 record['result'] = result
                 return result
-            if definition.category in {'filesystem', 'shell', 'processes', 'git', 'code_intelligence'}:
+            if (definition.category in {'filesystem', 'shell', 'processes', 'git', 'code_intelligence'}
+                    or name in {'vm_deploy_project', 'vm_collect_file'}):
                 try:
                     root_selection_current = self.workspace.active_root_path(self.chat_id).resolve() == self.root
                 except (OSError, ValueError):
@@ -1428,7 +1627,10 @@ class WorkspaceToolbox:
                 return blocked
             execution_started = time.perf_counter()
             try:
-                with activity(self.workspace.root, f'Tool · {name}'), memory_origin(
+                lifecycle_tool = name in {'vm_environment_control', 'vm_deploy_project'}
+                tool_activity = (nullcontext() if lifecycle_tool else activity(
+                    self.workspace.root, f'Tool · {name}', environment_id=self.environment_id or '__project_files__'))
+                with tool_activity, memory_origin(
                     self.workspace.root, chat_id=self.chat_id, run_id=self.run_id,
                     tool=name, tool_call_id=self.tool_call_id,
                 ) as memory_scope:
@@ -1453,7 +1655,9 @@ class WorkspaceToolbox:
             record.update(status='cancelled')
             raise
         except Exception as exc:
-            if isinstance(exc, WorkspaceMappingError):
+            if getattr(exc, 'error_code', '') in {'VM_PROJECT_ACCESS_DENIED', 'VM_ENVIRONMENT_DISABLED'}:
+                error_code = exc.error_code
+            elif isinstance(exc, WorkspaceMappingError):
                 error_code = str(exc.details.get('error_code') or 'WORKSPACE_MAPPING_PROBE_FAILED')
             elif isinstance(exc, FileNotFoundError):
                 error_code = 'FILE_NOT_FOUND'
@@ -1472,6 +1676,9 @@ class WorkspaceToolbox:
             payload: dict[str, Any] = {
                 'ok': False, 'error_code': error_code, 'error': f'{type(exc).__name__}: {exc}',
             }
+            if error_code in {'VM_PROJECT_ACCESS_DENIED', 'VM_ENVIRONMENT_DISABLED'}:
+                payload.update(command_started=False, policy_denied=True,
+                               environment_id=self.environment_id)
             if isinstance(exc, WorkspaceMappingError):
                 payload.update(exc.details)
                 payload['infrastructure_ok'] = False
@@ -1834,7 +2041,8 @@ class WorkspaceToolbox:
     def _runtime_identity(self) -> dict[str, Any]:
         if self.environment is None:
             return {
-                'provider': 'host', 'vm_created': False, 'vm_running': False, 'vm_ready': False,
+                'provider': 'none', 'environment_id': None, 'environment_name': None,
+                'vm_created': False, 'vm_running': False, 'vm_ready': False,
                 'vm_generation': None, 'vm_lifecycle_event': 'not_applicable',
                 'vm_lifecycle_updated_at': None, 'vm_boot_id': '', 'vm_readiness_updated_at': None,
             }
@@ -1842,7 +2050,9 @@ class WorkspaceToolbox:
             value = self.environment.runtime_identity()
         except Exception:
             value = {}
-        return dict(value or {})
+        return {**dict(value or {}), 'environment_id': self.environment_id,
+                'environment_name': self.environment.config.name,
+                'project_files_mode': self.environment.config.files_mode}
 
     def _workspace_state(self, *, view: str, mapping_verified: bool | None = None) -> dict[str, Any]:
         storage_id = self.workspace.ensure_files_identity()
@@ -1866,7 +2076,8 @@ class WorkspaceToolbox:
             'view': view,
             'observed_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
         }
-        for key in ('provider', 'vm_created', 'vm_running', 'vm_ready', 'vm_generation', 'vm_lifecycle_event',
+        for key in ('provider', 'environment_id', 'environment_name', 'project_files_mode', 'files_bridge',
+                    'vm_created', 'vm_running', 'vm_ready', 'vm_generation', 'vm_lifecycle_event',
                     'vm_lifecycle_updated_at', 'vm_boot_id', 'vm_readiness_updated_at'):
             if key in runtime:
                 state[key] = runtime.get(key)
@@ -1886,6 +2097,8 @@ class WorkspaceToolbox:
         return (
             self.workspace.ensure_files_identity(),
             self.workspace.working_relative(self.root),
+            self.environment_id,
+            getattr(getattr(self.environment, 'config', None), 'files_mode', None),
             runtime.get('vm_generation'),
             runtime.get('vm_boot_id'),
         )
@@ -1904,13 +2117,18 @@ class WorkspaceToolbox:
                 break
         identity = self.workspace.working_root_identity(root)
         return {'workspace_id': self.workspace.id, 'working_root': root,
+                'environment_id': self.environment_id,
+                'environment_name': getattr(getattr(self.environment, 'config', None), 'name', None),
                 'working_root_id': identity['working_root_id'],
                 'working_root_kind': identity['working_root_kind']}
 
     def _file_receipt(self, operation: str, path: Path, **fields: Any) -> dict[str, Any]:
-        return log_file_operation(operation, path=path, **self._file_identity_args(path),
+        receipt = log_file_operation(operation, path=path, **self._file_identity_args(path),
                                   chat_id=self.chat_id, run_id=self.run_id,
                                   call_id=self.tool_call_id or None, **fields)
+        receipt.update(environment_id=self.environment_id,
+                       file_tool_scope='canonical-workspace-project')
+        return receipt
 
     def _halt_mapping(self, payload: dict[str, Any]) -> dict[str, Any]:
         payload.update(retryable=False, stop_agent_run=True,
@@ -1977,6 +2195,12 @@ class WorkspaceToolbox:
                 'vm_file_state': None,
                 'verified_at': verified_at,
             }
+
+        if self.environment.config.files_mode == 'copy':
+            return {'ok': True, 'status': 'INDEPENDENT_VM_COPY', 'mapping_verified': False,
+                    'digest_match': None, 'host_file_state': host_file_state,
+                    'vm_file_state': None, 'verified_at': verified_at,
+                    'message': 'Canonical project and VM copy are intentionally independent. Deploy/collect explicitly; no equivalence was asserted.'}
 
         mapping = mapping_result or await self._verify_workspace_mapping(force=True)
         if not mapping.get('ok'):
@@ -2069,6 +2293,8 @@ class WorkspaceToolbox:
                     'transient_vm_reads': transient_vm_reads,
                 }
             except Exception as exc:
+                if getattr(exc, 'error_code', '') in {'VM_PROJECT_ACCESS_DENIED', 'VM_ENVIRONMENT_DISABLED'}:
+                    raise
                 return {
                     'ok': False,
                     'status': 'VERIFICATION_FAILED',
@@ -2191,6 +2417,15 @@ class WorkspaceToolbox:
                 'workspace_state': self._workspace_state(view='host-files', mapping_verified=True),
             }
 
+        if self.environment.config.files_mode == 'copy':
+            return {'ok': True, 'mapping_status': 'INDEPENDENT_VM_COPY', 'mapping_verified': False,
+                    'cached': False, 'environment_id': self.environment_id,
+                    'message': 'Commands use this VM\'s independent project copy. File tools use canonical workspace files. Deploy/collect explicitly.',
+                    'workspace_state': self._workspace_state(view='independent-vm-copy', mapping_verified=False)}
+
+        synchronized = self.environment.config.provider == 'openwrt'
+        success_status = 'VERIFIED_SYNCHRONIZED_PROJECT' if synchronized else 'VERIFIED_SAME_STORAGE'
+
         cache_key = self._mapping_cache_identity()
         if self._mapping_failure and self._mapping_failure_key == cache_key:
             return {**self._mapping_failure, 'cached_failure': True}
@@ -2202,7 +2437,9 @@ class WorkspaceToolbox:
         ):
             return {
                 'ok': True,
-                'mapping_status': 'VERIFIED_SAME_STORAGE',
+                'mapping_status': success_status,
+                'mapping_note': ('Cached proof of the synchronized project bridge; guest files synchronize at command boundaries and do not share physical storage.'
+                                 if synchronized else 'Cached proof of the shared project storage view.'),
                 'mapping_verified': True,
                 'cached': True,
                 'workspace_state': self._workspace_state(
@@ -2241,6 +2478,8 @@ class WorkspaceToolbox:
                     )
                     break
                 except Exception as exc:
+                    if getattr(exc, 'error_code', '') in {'VM_PROJECT_ACCESS_DENIED', 'VM_ENVIRONMENT_DISABLED'}:
+                        raise
                     probe_error = (
                         'WORKSPACE_MAPPING_PROBE_FAILED',
                         f'Workspace mapping verification failed: {type(exc).__name__}: {exc}',
@@ -2264,7 +2503,7 @@ class WorkspaceToolbox:
                     break
                 runtime = self._runtime_identity()
                 log_event(
-                    'tools', 'workspace_mapping_probe_retry', workspace=str(self.workspace.root),
+                    'tools', 'workspace_mapping_probe_retry', workspace=str(self.workspace.root), environment_id=self.environment_id,
                     attempt=attempt, next_attempt=attempt + 1,
                     retry_delay_seconds=WORKSPACE_MAPPING_PROBE_RETRY_DELAYS[attempt],
                     probe_returncode=returncode,
@@ -2289,7 +2528,7 @@ class WorkspaceToolbox:
             code, message = probe_error
             runtime = self._runtime_identity()
             log_event(
-                'tools', 'workspace_mapping_probe_failed', workspace=str(self.workspace.root),
+                'tools', 'workspace_mapping_probe_failed', workspace=str(self.workspace.root), environment_id=self.environment_id,
                 error_code=code, vm_generation=runtime.get('vm_generation'),
                 vm_boot_id=runtime.get('vm_boot_id'),
             )
@@ -2317,7 +2556,7 @@ class WorkspaceToolbox:
             self._mapping_cache_verified_at = time.monotonic()
             runtime = self._runtime_identity()
             log_event(
-                'tools', 'workspace_mapping_verified', workspace=str(self.workspace.root),
+                'tools', 'workspace_mapping_verified', workspace=str(self.workspace.root), environment_id=self.environment_id,
                 probe_attempts=probe_attempts,
                 transient_probe_failures=transient_probe_failures,
                 recovered_from_transient_probe=bool(transient_probe_failures),
@@ -2325,7 +2564,9 @@ class WorkspaceToolbox:
             )
             return {
                 'ok': True,
-                'mapping_status': 'VERIFIED_SAME_STORAGE',
+                'mapping_status': success_status,
+                'mapping_note': ('The synchronized OpenWrt guest project received the current canonical nonce at this command boundary; this does not assert shared physical storage.'
+                                 if synchronized else 'The isolated guest view exposes the selected shared project storage.'),
                 'mapping_verified': True,
                 'cached': False,
                 'probe_attempts': probe_attempts,
@@ -2344,7 +2585,7 @@ class WorkspaceToolbox:
         projection_probe = workspace_projection_probe_failure(str(getattr(result, 'stderr', '') or ''))
         code = ('WORKSPACE_PROJECTION_UNAVAILABLE' if projection_error else 'WORKSPACE_MAPPING_PROBE_FAILED') if returncode else 'WORKSPACE_MAPPING_MISMATCH'
         log_event(
-            'tools', 'workspace_mapping_probe_failed' if returncode else 'workspace_mapping_mismatch', workspace=str(self.workspace.root),
+            'tools', 'workspace_mapping_probe_failed' if returncode else 'workspace_mapping_mismatch', workspace=str(self.workspace.root), environment_id=self.environment_id,
             error_code=code, projection_error_code=projection_error,
             projection_probe_code=projection_probe,
             probe_returncode=getattr(result, 'returncode', None),
@@ -2407,11 +2648,13 @@ class WorkspaceToolbox:
                 'file_state': host_file_state,
                 'file_verification': file_verification,
                 'workspace_state': self._workspace_state(
-                    view='selected-root+isolated-workspace', mapping_verified=True,
+                    view='selected-root+isolated-workspace', mapping_verified=bool(result.get('mapping_verified')),
                 ),
             }
             if file_verification.get('ok'):
                 payload['message'] = (
+                    'Canonical project files and this VM copy are intentionally independent; no cross-view equivalence was checked.'
+                    if self.environment is not None and self.environment.config.files_mode == 'copy' else
                     'Project file tools and isolated VM /workspace produced identical fresh whole-file '
                     'SHA-256 and byte-count receipts for this path.'
                     if self.environment is not None else
@@ -2423,7 +2666,14 @@ class WorkspaceToolbox:
             return json.dumps(payload)
         if result.get('ok'):
             if result.get('mapping_status') == 'HOST_ONLY':
-                result['message'] = 'This host-only workspace has no VM /workspace mapping to compare.'
+                result['message'] = 'This observation covers canonical project files only. Select environment_id to compare a specific VM.'
+            elif result.get('mapping_status') == 'INDEPENDENT_VM_COPY':
+                pass
+            elif result.get('mapping_status') == 'VERIFIED_SYNCHRONIZED_PROJECT':
+                result['message'] = (
+                    'The OpenWrt project bridge delivered the canonical project nonce at the verified command boundary. '
+                    'Guest files synchronize with canonical source; they do not use the same physical storage.'
+                )
             else:
                 result['message'] = (
                     'Project file tools and isolated VM /workspace are verified against the same temporary '
@@ -3208,26 +3458,137 @@ class WorkspaceToolbox:
     def _external_target_broker(self) -> ExternalTargetBroker:
         return ExternalTargetBroker(self.workspace, chat_id=self.chat_id)
 
-    async def test_vm_control(self, a: dict[str, Any]) -> str:
-        from harnessy.environment.test_targets import TestTargetManager
-        try:
-            target = self._external_target_broker().resolve(str(a.get('target') or ''))
-            action = str(a.get('action') or '')
-            if action not in {'start', 'stop', 'snapshot', 'restore'}:
-                raise ValueError('Unsupported VM action.')
-            if 'off' in target_tool_permissions(target, 'test_vm_control', a).values():
-                raise ExternalTargetError('This VM action is Off in the target\'s selected actions.')
-            manager = TestTargetManager(self.workspace, target)
-            operation = await manager.request_stop() if action == 'stop' else manager.begin(action, tag=str(a.get('tag') or ''))
-            result = {'ok': True, 'action': operation.action, 'state': operation.state,
-                      'next': 'Poll target_status until the operation finishes.'}
-        except Exception as exc:
-            result = {'ok': False, 'error': str(exc)}
-        return json.dumps(result, ensure_ascii=False)
+    async def list_vm_environments(self, a: dict[str, Any]) -> str:
+        manager = EnvironmentManager(self.workspace.root)
+        rows = []
+        for config in manager.list():
+            if not config.enabled or not config.allows_project(self.chat_id):
+                continue
+            identity: dict[str, Any] = {}
+            try:
+                identity = dict(manager.provider(config).runtime_identity() or {})
+            except Exception as exc:
+                identity = {'observation_error': str(exc)}
+            rows.append({
+                'environment_id': config.id, 'name': config.name, 'purpose': config.purpose,
+                'enabled': config.enabled, 'preset': config.preset,
+                'architecture_configured': config.architecture,
+                'project_files_mode': config.files_mode,
+                'optional_tools_selected': list(config.optional_tools),
+                'network_enabled': config.network,
+                'resources': {'cpu': config.cpu, 'memory_mb': config.memory_mb, 'disk_gb': config.disk_gb},
+                'last_observed_runtime': identity,
+            })
+        return json.dumps({'ok': True, 'environments': rows,
+                           'selection': 'Pass an explicit environment_id for each VM operation. Follow the user\'s requested environment/workflow; purpose is guidance, not a permission grant.',
+                           'file_separation': 'Project file tools always operate on canonical workspace files. live shares writable source, readonly shares read-only source. copy is an independent guest copy with explicit deploy/collect and permits whole-VM administration; previously deployed files on that VM can remain visible across projects. It has no canonical host-source mounts or automatic writeback. OS, dependencies and caches belong to each VM.',
+                           'empty_guidance': None if rows else 'Create a VM environment in Workspace Environment. Files, chat and research work without a VM; host execution is disabled.'}, ensure_ascii=False)
+
+    async def vm_environment_status(self, a: dict[str, Any]) -> str:
+        if self.environment is None:
+            raise ValueError('Select environment_id explicitly.')
+        from harnessy.environment.operations import ENVIRONMENT_OPERATIONS
+        from harnessy.environment.status import ENVIRONMENT_STATUS
+        inspection = await ENVIRONMENT_STATUS.get(self.workspace.root, environment_id=self.environment_id) or {}
+        safe_fields = {'status', 'guest', 'capabilities', 'guest_identity', 'verified_guest', 'tool_status',
+                       'optional_tools', 'unavailable_tools', 'files_bridge',
+                       'hardware_emulation', 'bridge_mode', 'shared_files', 'readiness'}
+        return json.dumps({'ok': True,
+                           'verified_observations': {key: value for key, value in inspection.items() if key in safe_fields},
+                           'runtime_identity': self._runtime_identity(),
+                           'operation': ENVIRONMENT_OPERATIONS.state(
+                               self.workspace.root, environment_id=self.environment_id).to_dict()}, ensure_ascii=False)
+
+    async def vm_environment_control(self, a: dict[str, Any]) -> str:
+        if self.environment is None:
+            raise ValueError('Select environment_id explicitly.')
+        from harnessy.environment.operations import ENVIRONMENT_OPERATIONS
+        action = str(a.get('action') or '')
+        if action not in {'start', 'stop', 'snapshot', 'restore'}:
+            raise ValueError('Unsupported VM action.')
+        payload = {'_model_project_id': self.chat_id}
+        if action in {'snapshot', 'restore'}:
+            tag = str(a.get('tag') or '').strip()
+            if not tag:
+                raise ValueError('A snapshot tag is required.')
+            payload['name' if action == 'snapshot' else 'tag'] = tag
+        started = ENVIRONMENT_OPERATIONS.start(self.workspace.root, action,
+                                               environment_id=self.environment_id, **payload)
+        state = ENVIRONMENT_OPERATIONS.state(self.workspace.root, environment_id=self.environment_id)
+        return json.dumps({'ok': bool(started), 'operation': state.to_dict(),
+                           'next_model_action': 'Poll vm_environment_status for this environment_id until the operation completes.'})
+
+    async def vm_deploy_project(self, a: dict[str, Any]) -> str:
+        if self.environment is None or self.environment.config.files_mode != 'copy':
+            raise ValueError('Deployment is only for an explicitly selected Separate copy VM.')
+        method = getattr(self.environment, 'deploy_project', None) or getattr(self.environment, 'refresh_project_copy', None)
+        if not callable(method):
+            raise RuntimeError('This VM provider does not support explicit project deployment.')
+        result = method(self.root, output_policy=self._environment_output_policy())
+        if inspect.isawaitable(result):
+            result = await result
+        return json.dumps({'ok': True, 'deployment': result, 'canonical_files_changed': False,
+                           'environment_id': self.environment_id})
+
+    async def vm_collect_file(self, a: dict[str, Any]) -> str:
+        if self.environment is None or self.environment.config.files_mode != 'copy':
+            raise ValueError('Collection is only for an explicitly selected Separate copy VM.')
+        raw = str(a.get('source_path') or '')
+        source = Path(raw)
+        if (not raw or source.is_absolute() or '..' in source.parts or source == Path('.')
+                or '\\' in raw or ':' in raw or '\x00' in raw):
+            raise ValueError('source_path must be a file relative to this VM project copy.')
+        destination = self._resolve(str(a.get('destination_path') or ''), for_write=True)
+        if destination.exists() or destination.is_symlink():
+            raise FileExistsError('Collection never overwrites an existing project file.')
+        collect = getattr(self.environment, 'collect_file', None)
+        if callable(collect):
+            result = collect(raw, destination, active_root=self.root, output_policy=self._environment_output_policy())
+            if inspect.isawaitable(result):
+                await result
+        else:
+            copy_root = self.environment.copy_project_root(self.root).resolve()
+            # Walk using directory handles: a guest can edit its exported copy
+            # concurrently, so a resolve/check/open sequence would follow a
+            # symlink swapped in after the check and could read host-private data.
+            if not hasattr(os, 'O_NOFOLLOW') or os.open not in os.supports_dir_fd:
+                raise RuntimeError('This host cannot safely collect a VM copy file without following symlinks.')
+            directory_fd = os.open(copy_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            source_fd = None
+            destination_created = False
+            try:
+                for component in source.parts[:-1]:
+                    child_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
+                    os.close(directory_fd)
+                    directory_fd = child_fd
+                source_fd = os.open(source.parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                    dir_fd=directory_fd)
+                if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+                    raise ValueError('Only regular non-symlink files inside this VM project copy can be collected.')
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                source_handle = os.fdopen(source_fd, 'rb')
+                source_fd = None
+                with source_handle, destination.open('xb') as destination_handle:
+                    destination_created = True
+                    shutil.copyfileobj(source_handle, destination_handle)
+                    destination_handle.flush()
+                    os.fsync(destination_handle.fileno())
+            except BaseException:
+                if destination_created:
+                    destination.unlink(missing_ok=True)
+                raise
+            finally:
+                if source_fd is not None:
+                    os.close(source_fd)
+                os.close(directory_fd)
+        _, state = self._read_file_snapshot(destination)
+        return json.dumps({'ok': True, 'path': self._logical_relative(destination),
+                           'receipt': self._file_receipt('copy', destination, file_state=state),
+                           'environment_id': self.environment_id})
 
     async def list_external_targets(self, a: dict[str, Any]) -> str:
         broker = self._external_target_broker()
-        targets = broker.list_public()
+        targets = [target for target in broker.list_public() if target.get('kind') == 'external_ssh']
         global_permission = self.permission_for('external_targets')
         for target in targets:
             target['model_access'] = {
@@ -3295,12 +3656,12 @@ class WorkspaceToolbox:
     async def target_status(self, a: dict[str, Any]) -> str:
         broker = self._external_target_broker()
         try:
-            target = broker.resolve(str(a.get('target') or ''))
+            target = broker.resolve(str(a.get('target') or ''), model_permissions=True)
             result = await broker.status(target)
         except asyncio.TimeoutError:
             result = {'ok': False, 'error_code': 'TARGET_TIMEOUT', 'error': 'External target status timed out.'}
         except ExternalTargetError as exc:
-            result = {'ok': False, 'error_code': 'TARGET_POLICY', 'error': str(exc)}
+            result = {'ok': False, 'error_code': getattr(exc, 'error_code', 'TARGET_POLICY'), 'error': str(exc)}
         except Exception as exc:
             result = {'ok': False, 'error_code': 'TARGET_EXECUTION_FAILED', 'error': str(exc)}
         return self._target_operation_result(result)
@@ -3308,7 +3669,7 @@ class WorkspaceToolbox:
     async def target_list_files(self, a: dict[str, Any]) -> str:
         broker = self._external_target_broker()
         try:
-            target = broker.resolve(str(a.get('target') or ''))
+            target = broker.resolve(str(a.get('target') or ''), model_permissions=True)
             result = await broker.list_files(
                 target,
                 path=str(a.get('path') or '.'),
@@ -3318,7 +3679,7 @@ class WorkspaceToolbox:
         except asyncio.TimeoutError:
             result = {'ok': False, 'error_code': 'TARGET_TIMEOUT', 'error': 'External target listing timed out.'}
         except ExternalTargetError as exc:
-            result = {'ok': False, 'error_code': 'TARGET_POLICY', 'error': str(exc)}
+            result = {'ok': False, 'error_code': getattr(exc, 'error_code', 'TARGET_POLICY'), 'error': str(exc)}
         except Exception as exc:
             result = {'ok': False, 'error_code': 'TARGET_EXECUTION_FAILED', 'error': str(exc)}
         return self._target_operation_result(result)
@@ -3326,7 +3687,7 @@ class WorkspaceToolbox:
     async def target_exec(self, a: dict[str, Any]) -> str:
         broker = self._external_target_broker()
         try:
-            target = broker.resolve(str(a.get('target') or ''))
+            target = broker.resolve(str(a.get('target') or ''), model_permissions=True)
             result = await broker.exec(
                 target,
                 str(a.get('command') or ''),
@@ -3336,7 +3697,7 @@ class WorkspaceToolbox:
         except asyncio.TimeoutError:
             result = {'ok': False, 'error_code': 'TARGET_TIMEOUT', 'error': 'External target command timed out.'}
         except ExternalTargetError as exc:
-            result = {'ok': False, 'error_code': 'TARGET_POLICY', 'error': str(exc)}
+            result = {'ok': False, 'error_code': getattr(exc, 'error_code', 'TARGET_POLICY'), 'error': str(exc)}
         except Exception as exc:
             result = {'ok': False, 'error_code': 'TARGET_EXECUTION_FAILED', 'error': str(exc)}
         return self._target_operation_result(result)
@@ -3344,7 +3705,7 @@ class WorkspaceToolbox:
     async def target_copy_to(self, a: dict[str, Any]) -> str:
         broker = self._external_target_broker()
         try:
-            target = broker.resolve(str(a.get('target') or ''))
+            target = broker.resolve(str(a.get('target') or ''), model_permissions=True)
             local_source = self._resolve(str(a.get('local_path') or ''), must_exist=True)
             logical_source = self._logical_relative(local_source)
             broker_root = (
@@ -3362,7 +3723,7 @@ class WorkspaceToolbox:
         except asyncio.TimeoutError:
             result = {'ok': False, 'error_code': 'TARGET_TIMEOUT', 'error': 'External target copy timed out.'}
         except ExternalTargetError as exc:
-            result = {'ok': False, 'error_code': 'TARGET_POLICY', 'error': str(exc)}
+            result = {'ok': False, 'error_code': getattr(exc, 'error_code', 'TARGET_POLICY'), 'error': str(exc)}
         except Exception as exc:
             result = {'ok': False, 'error_code': 'TARGET_EXECUTION_FAILED', 'error': str(exc)}
         return self._target_operation_result(result)
@@ -3370,7 +3731,7 @@ class WorkspaceToolbox:
     async def target_copy_from(self, a: dict[str, Any]) -> str:
         broker = self._external_target_broker()
         try:
-            target = broker.resolve(str(a.get('target') or ''))
+            target = broker.resolve(str(a.get('target') or ''), model_permissions=True)
             local_destination = self._resolve(str(a.get('local_path') or ''), for_write=True)
             logical_destination = self._logical_relative(local_destination)
             broker_root = (
@@ -3388,7 +3749,7 @@ class WorkspaceToolbox:
         except asyncio.TimeoutError:
             result = {'ok': False, 'error_code': 'TARGET_TIMEOUT', 'error': 'External target copy timed out.'}
         except ExternalTargetError as exc:
-            result = {'ok': False, 'error_code': 'TARGET_POLICY', 'error': str(exc)}
+            result = {'ok': False, 'error_code': getattr(exc, 'error_code', 'TARGET_POLICY'), 'error': str(exc)}
         except Exception as exc:
             result = {'ok': False, 'error_code': 'TARGET_EXECUTION_FAILED', 'error': str(exc)}
         return self._target_operation_result(result)
@@ -3425,9 +3786,9 @@ class WorkspaceToolbox:
             before_files = {raw: await observe(path) for raw, path in tracked}
             command_shape = shell_command_diagnostics(command)
             log_event(
-                'tools', 'vm_tool_exec_start', workspace=str(self.workspace.root),
+                'tools', 'vm_tool_exec_start', workspace=str(self.workspace.root), environment_id=self.environment_id,
                 call_id=self.tool_call_id or None, command_chars=len(command), command_shape=command_shape,
-                cwd=self.guest_root, mapping_verified=True, vm_generation=runtime.get('vm_generation'),
+                cwd=self.guest_root, mapping_verified=bool(mapping.get('mapping_verified')), vm_generation=runtime.get('vm_generation'),
                 vm_boot_id=runtime.get('vm_boot_id'), vm_lifecycle_event=runtime.get('vm_lifecycle_event'),
             )
             try:
@@ -3437,7 +3798,7 @@ class WorkspaceToolbox:
             except asyncio.TimeoutError:
                 end_runtime = self._runtime_identity()
                 log_event(
-                    'tools', 'vm_tool_exec_timeout', workspace=str(self.workspace.root),
+                    'tools', 'vm_tool_exec_timeout', workspace=str(self.workspace.root), environment_id=self.environment_id,
                     call_id=self.tool_call_id or None, command_shape=command_shape, timeout_seconds=timeout,
                     vm_generation_start=runtime.get('vm_generation'), vm_generation_end=end_runtime.get('vm_generation'),
                     vm_generation_changed=runtime.get('vm_generation') != end_runtime.get('vm_generation'),
@@ -3447,21 +3808,23 @@ class WorkspaceToolbox:
                     'ok': False, 'error_code': 'VM_COMMAND_TIMEOUT', 'infrastructure_ok': True,
                     'command_started': True, 'error': f'Command timed out after {timeout}s',
                     'environment': 'workspace-vm',
-                    'workspace_state': self._workspace_state(view='guest-workspace', mapping_verified=True),
+                    'workspace_state': self._workspace_state(view='guest-workspace', mapping_verified=bool(mapping.get('mapping_verified'))),
                 })
             except asyncio.CancelledError:
                 end_runtime = self._runtime_identity()
                 log_event(
-                    'tools', 'vm_tool_exec_cancelled', workspace=str(self.workspace.root),
+                    'tools', 'vm_tool_exec_cancelled', workspace=str(self.workspace.root), environment_id=self.environment_id,
                     call_id=self.tool_call_id or None, command_shape=command_shape,
                     vm_generation_changed=runtime.get('vm_generation') != end_runtime.get('vm_generation'),
                     vm_boot_id_changed=runtime.get('vm_boot_id') != end_runtime.get('vm_boot_id'),
                 )
                 raise
             except Exception as exc:
+                if getattr(exc, 'error_code', '') in {'VM_PROJECT_ACCESS_DENIED', 'VM_ENVIRONMENT_DISABLED'}:
+                    raise
                 end_runtime = self._runtime_identity()
                 log_event(
-                    'tools', 'vm_tool_exec_error', workspace=str(self.workspace.root),
+                    'tools', 'vm_tool_exec_error', workspace=str(self.workspace.root), environment_id=self.environment_id,
                     call_id=self.tool_call_id or None, command_shape=command_shape, error=str(exc),
                     vm_generation_changed=runtime.get('vm_generation') != end_runtime.get('vm_generation'),
                     vm_boot_id_changed=runtime.get('vm_boot_id') != end_runtime.get('vm_boot_id'),
@@ -3470,7 +3833,7 @@ class WorkspaceToolbox:
                     'ok': False, 'error_code': 'VM_EXECUTION_FAILED', 'infrastructure_ok': False,
                     'command_started': False, 'error': f'Workspace VM execution failed: {exc}',
                     'environment': 'workspace-vm',
-                    'workspace_state': self._workspace_state(view='guest-workspace', mapping_verified=True),
+                    'workspace_state': self._workspace_state(view='guest-workspace', mapping_verified=bool(mapping.get('mapping_verified'))),
                 })
             finally:
                 for raw, path in tracked:
@@ -3502,10 +3865,10 @@ class WorkspaceToolbox:
             end_runtime = self._runtime_identity()
             command_evidence = shell_result_diagnostics(command, result.stdout, stderr, result.returncode)
             log_event(
-                'tools', 'vm_tool_exec_complete', workspace=str(self.workspace.root),
+                'tools', 'vm_tool_exec_complete', workspace=str(self.workspace.root), environment_id=self.environment_id,
                 call_id=self.tool_call_id or None, command_shape=command_shape, command_evidence=command_evidence,
                 returncode=result.returncode, command_ok=result.ok, duration_seconds=result.duration_seconds,
-                stdout_chars=len(result.stdout or ''), stderr_chars=len(stderr), mapping_verified=True,
+                stdout_chars=len(result.stdout or ''), stderr_chars=len(stderr), mapping_verified=bool(mapping.get('mapping_verified')),
                 vm_generation_start=runtime.get('vm_generation'), vm_generation_end=end_runtime.get('vm_generation'),
                 vm_generation_changed=runtime.get('vm_generation') != end_runtime.get('vm_generation'),
                 vm_boot_id_start=runtime.get('vm_boot_id'), vm_boot_id_end=end_runtime.get('vm_boot_id'),
@@ -3532,15 +3895,9 @@ class WorkspaceToolbox:
                 ),
                 'environment': 'workspace-vm',
                 'working_directory': self.guest_root,
-                'execution_view': {
-                    'working_directory_enforced': True,
-                    'mount_namespace': 'project-persistent',
-                    'mounts_persist_across_commands': True,
-                    'mounts_survive_vm_restart': False,
-                    'runtime_mount_visibility': 'vm-shell-only-overlay',
-                },
+                'execution_view': self._execution_view(),
                 'duration_seconds': result.duration_seconds,
-                'workspace_state': self._workspace_state(view='guest-workspace', mapping_verified=True),
+                'workspace_state': self._workspace_state(view='guest-workspace', mapping_verified=bool(mapping.get('mapping_verified'))),
             })
 
         return json.dumps({
@@ -3565,11 +3922,15 @@ class WorkspaceToolbox:
             return json.dumps({
                 **mapping, 'process_started': False, 'environment': 'workspace-vm',
             })
-        cwd = self._resolve(a.get('working_directory', '.'), must_exist=True, for_write=True)
-        if not cwd.is_dir():
+        independent_copy = self.environment.config.files_mode == 'copy'
+        cwd = self._resolve(a.get('working_directory', '.'), must_exist=not independent_copy)
+        if not independent_copy and not cwd.is_dir():
             raise ValueError('working_directory must be a directory')
         cwd_label = self._logical_relative(cwd) or '.'
-        guest_cwd = self.workspace.guest_path(cwd, active_root=self.root)
+        if cwd != self.root and self.root not in cwd.parents:
+            raise ValueError('working_directory must be inside the owned project.')
+        relative_cwd = cwd.relative_to(self.root).as_posix()
+        guest_cwd = self.guest_root if relative_cwd == '.' else self.guest_root.rstrip('/') + '/' + relative_cwd
         result = await PROCESS_JOBS.start(
             workspace_key=self._process_workspace_key(),
             command=str(a.get('command') or ''),
@@ -3577,17 +3938,11 @@ class WorkspaceToolbox:
             cwd_label=guest_cwd,
             active_root=self.root,
             environment=self.environment, origin_chat_id=self.chat_id,
-            output_policy=self.output_policy,
+            output_policy=self._environment_output_policy(),
         )
-        result['execution_view'] = {
-            'working_directory_enforced': True,
-            'mount_namespace': 'project-persistent',
-            'mounts_persist_across_commands': True,
-            'mounts_survive_vm_restart': False,
-            'runtime_mount_visibility': 'vm-shell-only-overlay',
-        }
+        result['execution_view'] = self._execution_view()
         result['workspace_state'] = self._workspace_state(
-            view='guest-workspace', mapping_verified=True,
+            view='guest-workspace', mapping_verified=bool(mapping.get('mapping_verified')),
         )
         return json.dumps(result)
 
@@ -3596,6 +3951,7 @@ class WorkspaceToolbox:
             workspace_key=self._process_workspace_key(),
             origin_chat_id=self.chat_id,
             job_id=str(a.get('job_id') or ''),
+            environment_id=str(a['environment_id']) if a.get('environment_id') else None,
             wait_seconds=float(a.get('wait_seconds') or 0.0),
         )
         return json.dumps(result)
@@ -3605,6 +3961,7 @@ class WorkspaceToolbox:
             workspace_key=self._process_workspace_key(),
             origin_chat_id=self.chat_id,
             job_id=str(a.get('job_id') or ''),
+            environment_id=str(a['environment_id']) if a.get('environment_id') else None,
             text=str(a.get('input') or ''),
             append_newline=bool(a.get('append_newline', True)),
         )
@@ -3615,6 +3972,7 @@ class WorkspaceToolbox:
             workspace_key=self._process_workspace_key(),
             origin_chat_id=self.chat_id,
             job_id=str(a.get('job_id') or ''),
+            environment_id=str(a['environment_id']) if a.get('environment_id') else None,
             grace_seconds=float(a.get('grace_seconds') or 3.0),
         )
         return json.dumps(result)
@@ -3622,6 +3980,7 @@ class WorkspaceToolbox:
     async def list_processes(self, a: dict[str, Any]) -> str:
         return json.dumps(PROCESS_JOBS.list(
             workspace_key=self._process_workspace_key(), origin_chat_id=self.chat_id,
+            environment_id=str(a['environment_id']) if a.get('environment_id') else None,
         ))
 
     def _browser_workspace_key(self) -> str:
@@ -3786,7 +4145,7 @@ class WorkspaceToolbox:
 
     def _code_intelligence(self) -> CodeIntelligenceService:
         return CodeIntelligenceService(self.root, environment=self.environment, guest_root=self.guest_root,
-                                       output_policy=self.output_policy)
+                                       output_policy=self._environment_output_policy())
 
     async def find_symbol(self, a: dict[str, Any]) -> str:
         result = await self._code_intelligence().find_symbol(
@@ -4300,8 +4659,14 @@ class WorkspaceToolbox:
             mapping = await self._verify_workspace_mapping()
             if not mapping.get('ok'):
                 raise WorkspaceMappingError(mapping)
-            quoted = ' '.join(shlex.quote(str(arg)) for arg in args)
-            command = f'GIT_TERMINAL_PROMPT=0 GIT_PAGER=cat LC_ALL=C git -c core.fsmonitor=false {quoted}'
+            windows = str(self.environment.config.preset).startswith('windows-')
+            if windows:
+                quoted = ' '.join("'" + str(arg).replace("'", "''") + "'" for arg in args)
+                command = ("$env:GIT_TERMINAL_PROMPT='0'; $env:GIT_PAGER='cat'; "
+                           f"$env:LC_ALL='C'; & git -c core.fsmonitor=false {quoted}")
+            else:
+                quoted = ' '.join(shlex.quote(str(arg)) for arg in args)
+                command = f'GIT_TERMINAL_PROMPT=0 GIT_PAGER=cat LC_ALL=C git -c core.fsmonitor=false {quoted}'
             result = await self._environment_exec(
                 command, cwd=self.guest_root, timeout=max(1.0, timeout),
             )
@@ -4332,7 +4697,11 @@ class WorkspaceToolbox:
         # Git runs inside the guest, so its absolute root is a guest path. The
         # host path is intentionally not visible to that process.
         if self.environment is not None:
-            if repo_root_text.rstrip('/') != self.guest_root.rstrip('/'):
+            observed_root = repo_root_text.replace('\\', '/').rstrip('/')
+            selected_root = self.guest_root.replace('\\', '/').rstrip('/')
+            if str(self.environment.config.preset).startswith('windows-'):
+                observed_root, selected_root = observed_root.casefold(), selected_root.casefold()
+            if observed_root != selected_root:
                 raise ValueError(
                     'Git repository root does not match the active guest working root. '
                     'HarnessyXO Git tools will not operate on a parent repository.'

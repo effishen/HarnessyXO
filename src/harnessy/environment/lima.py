@@ -25,7 +25,7 @@ from typing import Any
 from harnessy.diagnostics import log_event
 from harnessy.core.outputs import CHAT_OUTPUT_DIR_RE
 
-from .base import EnvironmentConfig, EnvironmentStatus, ExecResult, WorkspaceEnvironment
+from .base import EnvironmentConfig, EnvironmentStatus, ExecResult, WorkspaceEnvironment, _validate_registry_path
 from .presets import (
     get_preset, execution_mode,
     GHIDRA_VERSION, GHIDRA_RELEASE_TAG, GHIDRA_RELEASE_FILE,
@@ -43,6 +43,53 @@ class LimaUnavailableError(RuntimeError):
     pass
 
 
+class _LimaDesktopView:
+    """Read-only GUI adapter; lifecycle stays in the named VM registry."""
+
+    def __init__(self, provider, workspace):
+        from types import SimpleNamespace
+        self.provider = provider
+        self.workspace = workspace
+        self.environment_id = provider.config.id
+        self.target = SimpleNamespace(id=provider.config.id, name=provider.config.name)
+        self.guest = SimpleNamespace(label=get_preset(provider.config.preset).guest_os,
+                                     family='linux', shell='Bash', interface='desktop')
+        self.config = {'desktop': provider.config.desktop}
+        self.windows = False
+        self.backend = 'lima'
+        self.root = provider.vm_root
+        self.key = str(provider.environment_root)
+
+    @property
+    def busy(self):
+        from .operations import ENVIRONMENT_OPERATIONS
+        return ENVIRONMENT_OPERATIONS.state(self.provider.workspace_root, environment_id=self.environment_id).busy
+
+    async def status(self):
+        return (await self.provider.status()).to_dict()
+
+    def acquire(self):
+        return acquire_activity(self.provider.workspace_root, 'VM graphical view', environment_id=self.environment_id)
+
+    def desktop_info(self):
+        if not self.provider.config.desktop:
+            raise ValueError('This VM was created without a graphical desktop.')
+        root = self.provider.vm_root / self.provider.INSTANCE
+        display_path = root / 'vncdisplay'
+        _validate_registry_path(display_path, self.provider.workspace_root)
+        if not display_path.is_file():
+            raise RuntimeError('The graphical display is not available yet. Start the VM first.')
+        display = display_path.read_text().strip()
+        match = re.fullmatch(r'(?:127\.0\.0\.1|localhost):(\d+)', display)
+        if not match:
+            raise RuntimeError('The VM returned an unsupported graphical display address.')
+        password_path = root / 'vncpassword'
+        _validate_registry_path(password_path, self.provider.workspace_root)
+        port = 5900 + int(match.group(1))
+        return {'url': f'vnc://127.0.0.1:{port}', 'port': str(port),
+                'password': password_path.read_text().strip() if password_path.is_file() else '', 'username': 'harnessy'}
+
+
 # Process-wide controller metadata cache. `limactl --version` is invariant for
 # the lifetime of a HarnessyXO process and must never be part of the status poll
 # hot path.
@@ -50,13 +97,14 @@ _LIMA_VERSION_CACHE: dict[str, str] = {}
 _LIMA_VERSION_LOCKS: dict[str, asyncio.Lock] = {}
 _LIMA_VERSION_LOCK_LOOPS: dict[str, asyncio.AbstractEventLoop] = {}
 
-# Readiness and boot serialization are process-owned per workspace, not per
+# Readiness and boot serialization are process-owned per named VM, not per
 # transient EnvironmentManager/provider instance. Restored tabs, terminals and
 # model tools therefore converge on one boot handshake and reuse the verified
 # boot marker after it succeeds.
 _RUNTIME_READY_BOOT: dict[str, str] = {}
 _START_LOCKS: dict[str, asyncio.Lock] = {}
 _START_LOCK_LOOPS: dict[str, asyncio.AbstractEventLoop] = {}
+_COPY_LOCKS: dict[str, threading.RLock] = {}
 
 # A disconnected filesystem must not exhaust executor workers or block process
 # shutdown. At most one daemon worker performs diagnostic I/O; later requests
@@ -95,7 +143,7 @@ FILES_BACKING_GUEST_PATH = '/mnt/harnessyxo-files'
 PRIVATE_WORKTREES_GUEST_PATH = '/mnt/harnessyxo-worktrees'
 WORKSPACE_VIEW_GUEST_PATH = '/workspace'
 PERSISTENT_VIEW_STATE_GUEST_PATH = '/run/harnessy/project-views'
-WORKSPACE_VIEW_REVISION = '0.6.16-project-access-views'
+WORKSPACE_VIEW_REVISION = '0.6.125-named-vm-project-views'
 
 _WORKSPACE_VIEW_FAILURES = {
     'INVALID_BACKING_PATH', 'ACTIVE_ROOT_UNAVAILABLE', 'BACKING_MOUNTS_UNAVAILABLE',
@@ -210,6 +258,12 @@ class LimaVMEnvironment(WorkspaceEnvironment):
 
     def __init__(self, workspace_root: Path, config: EnvironmentConfig) -> None:
         super().__init__(workspace_root, config)
+        self.canonical_files_root = self.files_root
+        self.canonical_worktrees_root = self.private_worktrees_root
+        if self.config.files_mode == 'copy':
+            self.files_root = self.environment_root / 'project-copy' / 'Files'
+            self.private_worktrees_root = self.environment_root / 'project-copy' / 'worktrees'
+        _validate_registry_path(self.environment_root, self.workspace_root)
         self.vm_root = self.environment_root / 'vm' / 'lima'
         self.templates_root = self.environment_root / 'templates'
         self.state_root = self.environment_root / 'state'
@@ -219,6 +273,9 @@ class LimaVMEnvironment(WorkspaceEnvironment):
         self.runtime_binding_path = self.state_root / 'runtime-binding.json'
         self.readiness_path = self.state_root / 'readiness.json'
         self.lifecycle_path = self.state_root / 'lifecycle.json'
+        for owned_path in (self.vm_root, self.templates_root, self.state_root, self.snapshots_root,
+                           self.files_root, self.private_worktrees_root):
+            _validate_registry_path(owned_path, self.workspace_root)
         self.vm_root.mkdir(parents=True, exist_ok=True)
         self.templates_root.mkdir(parents=True, exist_ok=True)
         self.state_root.mkdir(parents=True, exist_ok=True)
@@ -233,12 +290,12 @@ class LimaVMEnvironment(WorkspaceEnvironment):
         # collector never searches unrelated home directories for Lima logs.
         try:
             from harnessy.diagnostics.vm_logs import register_workspace_runtime
-            register_workspace_runtime(self.workspace_root)
+            register_workspace_runtime(self.workspace_root, environment_id=self.config.id, runtime_root=self.environment_root)
         except Exception:
             pass
 
     def _workspace_cache_key(self) -> str:
-        return str(self.workspace_root.expanduser().resolve())
+        return str(self.environment_root.expanduser().resolve())
 
     def _workspace_start_lock(self) -> asyncio.Lock:
         key = self._workspace_cache_key()
@@ -267,30 +324,32 @@ class LimaVMEnvironment(WorkspaceEnvironment):
         return binary
 
     def _runtime_home(self) -> Path:
-        # Lima has a strict Unix-socket path length on macOS. Keep all durable VM
-        # bytes in the workspace, but access them through a short transient alias.
+        # macOS sockaddr_un is only 104 bytes. Its normal tempfile directory
+        # can itself be long, so use the OS /tmp namespace and a private
+        # account-owned directory; durable disks stay below the workspace.
+        _validate_registry_path(self.vm_root, self.workspace_root)
         actual = self.vm_root.resolve()
         digest = hashlib.sha256(str(actual).encode()).hexdigest()[:16]
-        base = Path(tempfile.gettempdir()) / 'harnessy-lima'
-        base.mkdir(parents=True, exist_ok=True)
-        try:
-            base.chmod(0o700)
-        except OSError:
-            pass
+        base = Path('/tmp') / f'hy-lima-{os.getuid()}'
+        if base.is_symlink():
+            raise RuntimeError('The VM runtime alias directory cannot be a symbolic link.')
+        base.mkdir(exist_ok=True, mode=0o700)
+        if not base.is_dir() or base.stat().st_uid != os.getuid():
+            raise RuntimeError('The VM runtime alias directory is not owned by this account.')
+        base.chmod(0o700)
         alias = base / digest
-        try:
-            if alias.is_symlink() and alias.resolve() != actual:
-                alias.unlink()
-            elif alias.exists() and not alias.is_symlink():
-                if alias.is_dir() and not any(alias.iterdir()):
-                    alias.rmdir()
-                else:
-                    return actual
-            if not alias.exists():
+        if alias.is_symlink():
+            if alias.resolve() != actual:
+                raise RuntimeError('The VM runtime alias points to a different environment. No VM command was run.')
+        elif alias.exists():
+            raise RuntimeError('The VM runtime alias is occupied by a non-link path. No VM command was run.')
+        else:
+            try:
                 alias.symlink_to(actual, target_is_directory=True)
-            return alias
-        except OSError:
-            return actual
+            except FileExistsError:
+                if not alias.is_symlink() or alias.resolve() != actual:
+                    raise RuntimeError('The VM runtime alias changed while it was being created.')
+        return alias
 
     def _host_env(self) -> dict[str, str]:
         env = os.environ.copy()
@@ -305,7 +364,9 @@ class LimaVMEnvironment(WorkspaceEnvironment):
 
     def _desired_runtime_binding(self) -> dict[str, Any]:
         return {
-            'version': 3,
+            'version': 4,
+            'environment_id': self.config.id,
+            'files_mode': self.config.files_mode,
             'files_host_path': str(self.files_root.resolve()),
             'files_backing_guest_path': FILES_BACKING_GUEST_PATH,
             'private_worktrees_host_path': str(self.private_worktrees_root.resolve()),
@@ -326,8 +387,10 @@ class LimaVMEnvironment(WorkspaceEnvironment):
         return isinstance(raw, dict) and raw == self._desired_runtime_binding()
 
     def _write_runtime_binding(self) -> None:
+        _validate_registry_path(self.runtime_binding_path, self.workspace_root)
         self.state_root.mkdir(parents=True, exist_ok=True)
         tmp = self.runtime_binding_path.with_suffix('.tmp')
+        _validate_registry_path(tmp, self.workspace_root)
         tmp.write_text(json.dumps(self._desired_runtime_binding(), indent=2, sort_keys=True) + '\n', encoding='utf-8')
         tmp.replace(self.runtime_binding_path)
 
@@ -339,12 +402,12 @@ class LimaVMEnvironment(WorkspaceEnvironment):
             {
                 'location': str(self.files_root.resolve()),
                 'mountPoint': FILES_BACKING_GUEST_PATH,
-                'writable': True,
+                'writable': self.config.files_mode != 'readonly',
             },
             {
                 'location': str(self.private_worktrees_root.resolve()),
                 'mountPoint': PRIVATE_WORKTREES_GUEST_PATH,
-                'writable': True,
+                'writable': self.config.files_mode != 'readonly',
             },
         ]
         return '.mounts=' + json.dumps(mounts, ensure_ascii=False, separators=(',', ':'))
@@ -660,10 +723,10 @@ WantedBy=multi-user.target
         preset = get_preset(self.config.preset)
         allowed = tuple(preset.optional_tool_ids)
         desired = tuple(tool for tool in allowed if tool in set(selected))
-        release = (lambda: None) if reservation_held else reserve_environment_change(self.workspace_root, 'optional tools')
+        release = (lambda: None) if reservation_held else reserve_environment_change(self.workspace_root, 'optional tools', environment_id=self.config.id)
         try:
             async with self._workspace_start_lock():
-                original = load_environment_config(self.workspace_root)
+                original = load_environment_config(self.workspace_root, self.config.id)
                 if original is None:
                     raise RuntimeError('The workspace environment definition is missing.')
                 old_selected = tuple(
@@ -787,7 +850,7 @@ WantedBy=multi-user.target
                 return await self.status()
         finally:
             from .manager import clear_environment_provider_cache
-            clear_environment_provider_cache(self.workspace_root)
+            clear_environment_provider_cache(self.workspace_root, self.config.id)
             release()
 
     def _provision_finalize_script(self) -> str:
@@ -1213,6 +1276,8 @@ printf '%s\\n' HARNESSY_PROVISION_STAGE=required_packages
         )
 
     def _vm_type(self) -> str:
+        if self.config.desktop:
+            return 'qemu'  # Lima exposes the guest graphical display through QEMU VNC.
         return execution_mode(self.config.architecture, host_arch=platform.machine(), host_os=platform.system())[0]
 
     def _mount_type(self) -> str:
@@ -1227,23 +1292,26 @@ printf '%s\\n' HARNESSY_PROVISION_STAGE=required_packages
         mount_type = self._mount_type()
         files = str(self.files_root.resolve())
         worktrees = str(self.private_worktrees_root.resolve())
+        image_spec = (f'images:\n- location: {self._q(str(self.environment_root / "images" / "kali.img"))}\n  arch: {"aarch64" if self.config.architecture == "arm64" else "x86_64"}'
+                      if preset.image_id == 'kali-2026.2' else f'base:\n- template:{preset.image.template}')
+        video_spec = ('video:\n  display: vnc\n  vnc:\n    display: "127.0.0.1:0,to=99"' if self.config.desktop else 'video:\n  display: none')
         return f'''# Generated by HarnessyXO from portable environment.json.
 minimumLimaVersion: 2.0.0
-base:
-- template:{preset.image.template}
+{image_spec}
 vmType: {vm_type}
 arch: {"aarch64" if self.config.architecture == "arm64" else "x86_64"}
 cpus: {self.config.cpu}
 memory: "{self.config.memory_mb}MiB"
 disk: "{self.config.disk_gb}GiB"
+{video_spec}
 mountType: {mount_type}
 mounts:
 - location: {self._q(files)}
   mountPoint: {self._q(FILES_BACKING_GUEST_PATH)}
-  writable: true
+  writable: {"false" if self.config.files_mode == "readonly" else "true"}
 - location: {self._q(worktrees)}
   mountPoint: {self._q(PRIVATE_WORKTREES_GUEST_PATH)}
-  writable: true
+  writable: {"false" if self.config.files_mode == "readonly" else "true"}
 mountInotify: false
 ssh:
 {"  overVsock: false" if preset.image_id.startswith("fedora") else ""}
@@ -1272,6 +1340,7 @@ message: "HarnessyXO workspace VM · {preset.name} · {self.config.architecture}
 '''
 
     def _write_template(self) -> None:
+        _validate_registry_path(self.template_path, self.workspace_root)
         self.template_path.write_text(self._template_text(), encoding='utf-8')
 
     @staticmethod
@@ -1511,9 +1580,113 @@ message: "HarnessyXO workspace VM · {preset.name} · {self.config.architecture}
             "exit $rc"
         )
 
+    def _bridge_host_path(self, path: Path) -> Path:
+        for root in (self.files_root, self.private_worktrees_root,
+                     self.canonical_files_root, self.canonical_worktrees_root):
+            _validate_registry_path(root, self.workspace_root)
+        target = Path(path).resolve()
+        if self.config.files_mode != 'copy':
+            return target
+        for canonical, deployed in ((self.canonical_files_root, self.files_root),
+                                    (self.canonical_worktrees_root, self.private_worktrees_root)):
+            canonical = canonical.resolve()
+            if target == canonical or canonical in target.parents:
+                return deployed.resolve() / target.relative_to(canonical)
+        # Internal calls may already pass an environment-owned deployed root.
+        for deployed in (self.files_root.resolve(), self.private_worktrees_root.resolve()):
+            if target == deployed or deployed in target.parents:
+                return target
+        raise ValueError('Project copy source is outside the workspace project roots.')
+
+    def copy_project_root(self, active_root: Path) -> Path:
+        if self.config.files_mode != 'copy':
+            raise ValueError('This VM uses shared project files, not a separate copy.')
+        return self._bridge_host_path(active_root)
+
+    def _prepare_project_copy(self, active_root: Path | None,
+                              output_policy: dict[str, Any] | None = None, *, refresh: bool = False) -> dict[str, Any]:
+        """Deploy authorized project roots once; never copy guest edits back.
+
+        A user-opened whole-workspace terminal may deliberately request Files/.
+        Model tools pass their selected project and its explicit access policy.
+        Copies preserve symlinks as links, so a link cannot copy host data from
+        outside the authorized roots into the guest export.
+        """
+        if self.config.files_mode != 'copy':
+            raise ValueError('Only separate-copy VMs support deploying project copies.')
+        policy = output_policy if isinstance(output_policy, dict) else {}
+        selected = Path(active_root or self.canonical_files_root)
+        _validate_registry_path(selected, self.workspace_root)
+        selected_root = selected.resolve()
+        if selected_root == self.canonical_files_root.resolve():
+            # The user terminal's workspace-wide view copies each existing
+            # directory independently, preserving any previously deployed
+            # project edits instead of replacing the whole export.
+            roots = [child for child in selected_root.iterdir() if child.is_dir() and not child.is_symlink()]
+        else:
+            roots = [selected_root]
+        references = self.canonical_files_root / 'References'
+        if references.is_dir():
+            roots.append(references)
+        for row in (*tuple(policy.get('ancestors') or ()), *tuple(policy.get('access_projects') or ())):
+            if not isinstance(row, dict):
+                raise ValueError('Invalid project-copy access policy.')
+            raw = str(row.get('host_path') or '')
+            if raw:
+                roots.append(Path(raw))
+        deployed: list[str] = []
+        # Serialized per VM so two simultaneous first-use commands cannot
+        # install partial trees over one another.
+        lock = _COPY_LOCKS.setdefault(str(self.environment_root), threading.RLock())
+        with lock:
+            for source_path in dict.fromkeys(roots):
+                _validate_registry_path(source_path, self.workspace_root)
+                source = source_path.resolve()
+                destination = self._bridge_host_path(source)
+                _validate_registry_path(destination, self.workspace_root)
+                if source.is_symlink() or not source.is_dir():
+                    raise ValueError('The selected project-copy source is unavailable.')
+                if destination.exists() and not refresh:
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                staging = destination.with_name('.' + destination.name + '.deploy-' + uuid.uuid4().hex)
+                previous = destination.with_name('.' + destination.name + '.previous-' + uuid.uuid4().hex)
+                try:
+                    shutil.copytree(source, staging, symlinks=True)
+                    if destination.exists():
+                        destination.rename(previous)
+                    staging.rename(destination)
+                except BaseException:
+                    if previous.exists() and not destination.exists():
+                        previous.rename(destination)
+                    raise
+                finally:
+                    if staging.exists():
+                        shutil.rmtree(staging)
+                if previous.exists():
+                    shutil.rmtree(previous)
+                deployed.append(source.name)
+        return {'environment_id': self.config.id, 'files_mode': 'copy',
+                'deployed_projects': deployed, 'refreshed': bool(refresh),
+                'canonical_files_changed': False}
+
+    async def deploy_project(self, active_root: Path, *, output_policy: dict[str, Any] | None = None) -> dict[str, Any]:
+        self._authorize_model_project(output_policy)
+        # Replacing an export while a process holds it would strand old inodes.
+        from .activity import active_work
+        if active_work(self.workspace_root, environment_id=self.config.id):
+            raise RuntimeError("Stop this VM's commands and terminals before refreshing its project copy.")
+        release = reserve_environment_change(self.workspace_root, 'project deployment', environment_id=self.config.id)
+        try:
+            result = await asyncio.to_thread(self._prepare_project_copy, active_root, output_policy, refresh=True)
+            self._authorize_model_project(output_policy)
+            return result
+        finally:
+            release()
+
     def _guest_source_for_active_root(self, active_root: Path | None) -> str:
         """Return a controller-only guest backing path for one host worktree."""
-        target = Path(active_root or self.files_root).resolve()
+        target = self._bridge_host_path(Path(active_root or self.files_root))
         files = self.files_root.resolve()
         private = self.private_worktrees_root.resolve()
         if target == files or files in target.parents:
@@ -1582,6 +1755,7 @@ exec /bin/bash -c "$view_command"
         project namespace; legacy/internal views still use a fresh namespace.
         Both forms detach the raw parents before dropping to the Lima user.
         """
+        command = self._guest_work_path_exports(active_root) + '\n' + str(command)
         source = self._guest_source_for_active_root(active_root)
         view_cwd = self._validated_workspace_cwd(cwd)
         user_command_trampoline = shlex.quote(self._user_command_trampoline())
@@ -1630,6 +1804,7 @@ fi
 /usr/bin/mkdir -p {WORKSPACE_VIEW_GUEST_PATH}
 /usr/bin/mount --bind "$source_path" {WORKSPACE_VIEW_GUEST_PATH}
 /usr/bin/mount --make-private {WORKSPACE_VIEW_GUEST_PATH}
+{"/usr/bin/mount -o remount,bind,ro " + WORKSPACE_VIEW_GUEST_PATH if self.config.files_mode == "readonly" else ":"}
 if [ -n "$output_names" ]; then
   old_ifs=$IFS
   IFS=','
@@ -1770,6 +1945,7 @@ fi
 /usr/bin/mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs {WORKSPACE_VIEW_GUEST_PATH}
 /usr/bin/mkdir -p {WORKSPACE_VIEW_GUEST_PATH}/Files/{own} {WORKSPACE_VIEW_GUEST_PATH}/Files/References
 /usr/bin/mount --bind "$source_path" {WORKSPACE_VIEW_GUEST_PATH}/Files/{own}
+{"/usr/bin/mount -o remount,bind,ro " + WORKSPACE_VIEW_GUEST_PATH + "/Files/" + own if self.config.files_mode == "readonly" else ":"}
 /usr/bin/mount --bind {FILES_BACKING_GUEST_PATH}/References {WORKSPACE_VIEW_GUEST_PATH}/Files/References
 /usr/bin/mount -o remount,bind,ro {WORKSPACE_VIEW_GUEST_PATH}/Files/References
 if [ -n "$ancestor_paths" ]; then
@@ -1897,12 +2073,14 @@ exit $rc
         host_identities: list[tuple[str, int, int]] = []
         for label, raw_path in identity_paths:
             try:
-                stat = Path(raw_path).stat()
+                stat = self._bridge_host_path(Path(raw_path)).stat()
                 host_identities.append((label, int(stat.st_dev), int(stat.st_ino)))
             except (OSError, ValueError):
                 host_identities.append((label, -1, -1))
         signature_payload = {
             'revision': WORKSPACE_VIEW_REVISION,
+            'environment_id': self.config.id,
+            'files_mode': self.config.files_mode,
             'source': source,
             'own': own,
             'ancestors': ancestor_paths,
@@ -1913,7 +2091,7 @@ exit $rc
             json.dumps(signature_payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
         ).hexdigest()
         key_digest = hashlib.sha256(
-            f'{self.workspace_root.resolve()}\0{own}'.encode('utf-8')
+            f'{self.environment_root.resolve()}\0{own}'.encode('utf-8')
         ).hexdigest()[:16]
         state_key = f'{own.lower()}-{key_digest}'
 
@@ -1946,6 +2124,7 @@ fi
 /usr/bin/mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs {WORKSPACE_VIEW_GUEST_PATH}
 /usr/bin/mkdir -p {WORKSPACE_VIEW_GUEST_PATH}/Files/{own} {WORKSPACE_VIEW_GUEST_PATH}/Files/References
 /usr/bin/mount --bind "$source_path" {WORKSPACE_VIEW_GUEST_PATH}/Files/{own}
+{"/usr/bin/mount -o remount,bind,ro " + WORKSPACE_VIEW_GUEST_PATH + "/Files/" + own if self.config.files_mode == "readonly" else ":"}
 /usr/bin/mount --bind {FILES_BACKING_GUEST_PATH}/References {WORKSPACE_VIEW_GUEST_PATH}/Files/References
 /usr/bin/mount -o remount,bind,ro {WORKSPACE_VIEW_GUEST_PATH}/Files/References
 if [ -n "$ancestor_paths" ]; then
@@ -2234,7 +2413,7 @@ exit $rc
     def _controller_diagnostic_fields(self) -> dict[str, Any]:
         from .manager import current_environment_operation
 
-        fields: dict[str, Any] = {**current_environment_operation(),
+        fields: dict[str, Any] = {**current_environment_operation(), 'environment_id': self.config.id,
                                   'requested_vm_config': self._requested_vm_config()}
         # UUID metadata is immutable for a provider. Read it once through the
         # collector's nonblocking, regular-file-only, no-symlink opener. A FIFO
@@ -2283,6 +2462,7 @@ exit $rc
                 host_resources = await self._collect_host_resources()
             receipt = await _bounded_diagnostic_io(
                 preserve_vm_failure, self.workspace_root, reason=reason, operation=operation,
+                environment_id=self.config.id, runtime_root=self.environment_root,
                 controller_stdout=controller_stdout, controller_stderr=controller_stderr,
                 command_id=command_id, operation_id=fields.get('operation_id', ''),
                 requested_config=fields['requested_vm_config'],
@@ -2720,8 +2900,8 @@ exit $rc
         except json.JSONDecodeError:
             return None
         if isinstance(data, list):
-            return next((row for row in data if isinstance(row, dict) and row.get('name') == name), data[0] if data else None)
-        return data if isinstance(data, dict) else None
+            return next((row for row in data if isinstance(row, dict) and row.get('name') == name), None)
+        return data if isinstance(data, dict) and data.get('name') == name else None
 
     async def _instance_row(self) -> dict[str, Any] | None:
         return await self._instance_row_named(self.INSTANCE)
@@ -2735,14 +2915,16 @@ exit $rc
 
     def _read_readiness(self) -> dict[str, Any]:
         try:
+            _validate_registry_path(self.readiness_path, self.workspace_root)
             raw = json.loads(self.readiness_path.read_text('utf-8'))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):
             return {}
         return raw if isinstance(raw, dict) else {}
 
     def _write_readiness(
         self, *, ready: bool, phase: str, error: str = '', boot_id: str = '', guard_hash: str = '',
     ) -> None:
+        _validate_registry_path(self.readiness_path, self.workspace_root)
         self.state_root.mkdir(parents=True, exist_ok=True)
         payload = {
             'ready': bool(ready),
@@ -2753,6 +2935,7 @@ exit $rc
             'updated_at': time.time(),
         }
         tmp = self.readiness_path.with_suffix('.tmp')
+        _validate_registry_path(tmp, self.workspace_root)
         tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + '\n', encoding='utf-8')
         tmp.replace(self.readiness_path)
         self._runtime_guard_verified = bool(ready)
@@ -2768,12 +2951,14 @@ exit $rc
 
     def _read_lifecycle(self) -> dict[str, Any]:
         try:
+            _validate_registry_path(self.lifecycle_path, self.workspace_root)
             raw = json.loads(self.lifecycle_path.read_text('utf-8'))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):
             return {}
         return raw if isinstance(raw, dict) else {}
 
     def _record_lifecycle(self, event: str) -> dict[str, Any]:
+        _validate_registry_path(self.lifecycle_path, self.workspace_root)
         previous = self._read_lifecycle()
         try:
             generation = max(0, int(previous.get('generation') or 0)) + 1
@@ -2787,6 +2972,7 @@ exit $rc
         }
         self.state_root.mkdir(parents=True, exist_ok=True)
         tmp = self.lifecycle_path.with_suffix('.tmp')
+        _validate_registry_path(tmp, self.workspace_root)
         tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + '\n', encoding='utf-8')
         tmp.replace(self.lifecycle_path)
         log_event(
@@ -2808,6 +2994,8 @@ exit $rc
         else:
             running = None
         return {
+            **super().runtime_identity(),
+            'verified_guest': self._read_verified_guest(),
             'provider': 'lima',
             'vm_created': created,
             'vm_running': running,
@@ -2858,7 +3046,8 @@ exit $rc
         return False
 
     async def status(self) -> EnvironmentStatus:
-        guest = {'guest_architecture': self.config.architecture, 'guest_os': get_preset(self.config.preset).guest_os}
+        guest = {'guest_architecture': self.config.architecture, 'guest_os': get_preset(self.config.preset).guest_os,
+                 'environment_id': self.config.id, 'environment_name': self.config.name}
         try:
             binary = self._binary()
         except LimaUnavailableError as exc:
@@ -2866,6 +3055,8 @@ exit $rc
         row = await self._instance_row()
         version = await self._backend_version()
         if not row:
+            if (self.vm_root / self.INSTANCE).exists():
+                raise RuntimeError('Lima did not report the selected VM although its files exist. Restore controller access before changing its data.')
             return EnvironmentStatus('not_created', 'lima', True, False, False, 'Workspace VM has not been created yet.', version, ready=False, phase='not_created', **guest)
         raw = str(row.get('status') or row.get('Status') or 'Stopped')
         running = raw.lower() == 'running'
@@ -2901,6 +3092,7 @@ exit $rc
             return current
         self._preflight_acceleration_access()
         await self._ensure_host_prerequisites(progress=progress)
+        await self._prepare_guest_image(progress=progress)
         self._write_template()
         self._write_readiness(ready=False, phase='creating')
         await self._emit_progress(
@@ -2935,6 +3127,101 @@ exit $rc
         self._record_lifecycle('created')
         log_event('harnessy', 'vm_created', workspace=str(self.workspace_root), provider='lima', preset=self.config.preset)
         return await self.status()
+
+    async def _prepare_guest_image(self, progress=None) -> None:
+        if get_preset(self.config.preset).image_id != 'kali-2026.2':
+            return
+        from .test_catalog import KALI_IMAGES
+        from .test_images import download_verified, extract_cloud_disk, finish_thread
+        architecture, digest = KALI_IMAGES[self.config.architecture]
+        images = self.environment_root / 'images'
+        images.mkdir(parents=True, exist_ok=True)
+        destination = images / 'kali.img'
+        if destination.is_file():
+            return
+        await self._emit_progress(progress, 'creating_vm', 'Downloading the verified Kali cloud image…')
+        archive = await download_verified(
+            f'https://kali.download/cloud-images/kali-2026.2/kali-linux-2026.2-cloud-genericcloud-{architecture}.tar.xz',
+            digest, images / 'kali.tar.xz', lambda _line: None)
+        await finish_thread(extract_cloud_disk, archive, destination)
+
+    async def _ensure_desktop(self, progress=None) -> None:
+        if not self.config.desktop:
+            return
+        probe = 'test -f /var/lib/harnessy-desktop-ready && command -v startxfce4 >/dev/null && systemctl is-enabled lightdm >/dev/null'
+        rc, _, _ = await self._run('shell', self.INSTANCE, '/bin/bash', '-lc', probe, timeout=15, check=False)
+        if rc == 0:
+            return
+        if not self.config.network:
+            raise RuntimeError('The selected graphical desktop is not installed and VM network access is off. Enable networking to install it first.')
+        await self._emit_progress(progress, 'provisioning_packages', 'Installing the optional graphical desktop…',
+                                  stage_timeout_seconds=self.TIMEOUT_PROVISION)
+        apt = get_preset(self.config.preset).image.package_manager == 'apt'
+        install = ("export DEBIAN_FRONTEND=noninteractive\napt-get update\n"
+                   "echo 'lightdm shared/default-x-display-manager select lightdm' | debconf-set-selections\n"
+                   "apt-get install -y --no-install-recommends xorg xfce4 xfce4-terminal lightdm dbus-x11"
+                   if apt else 'dnf install -y @xfce-desktop-environment lightdm xorg-x11-server-Xorg')
+        script = '''set -euo pipefail
+desktop_user=$1
+''' + install + '''
+mkdir -p /etc/lightdm/lightdm.conf.d /var/lib
+printf '[Seat:*]\\nautologin-user=%s\\nautologin-user-timeout=0\\nuser-session=xfce\\n' "$desktop_user" >/etc/lightdm/lightdm.conf.d/50-harnessy.conf
+systemctl set-default graphical.target
+systemctl enable lightdm
+systemctl restart lightdm
+touch /var/lib/harnessy-desktop-ready
+'''
+        command = 'desktop_user=$(id -un); exec sudo -n /bin/bash -c ' + shlex.quote(script) + ' harnessy-desktop "$desktop_user"'
+        await self._run('shell', self.INSTANCE, '/bin/bash', '-lc', command,
+                        timeout=self.TIMEOUT_PROVISION, check=True)
+
+    def _read_verified_guest(self) -> dict[str, Any]:
+        path = self.state_root / 'verified-guest.json'
+        try:
+            _validate_registry_path(path, self.workspace_root)
+            value = json.loads(path.read_text('utf-8'))
+            return value if isinstance(value, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    async def _record_verified_guest(self) -> None:
+        """Cache fixed guest facts without entering or initializing a project."""
+        script = '''import json, os, platform, shutil, sys
+facts={"os":platform.system(),"kernel":platform.release(),"architecture":platform.machine(),
+       "byte_order":sys.byteorder,"libc":list(platform.libc_ver()),"python":platform.python_version(),
+       "tools":{name:bool(shutil.which(name)) for name in ("python3","pip3","git","gcc","g++","make","cmake","ninja","gdb","strace","tcpdump","btmon","bluetoothctl","rea")}}
+try:
+ facts["os_release"]={line.split("=",1)[0]:line.split("=",1)[1].strip().strip('"') for line in open("/etc/os-release") if "=" in line}
+except OSError: pass
+print(json.dumps(facts))
+'''
+        try:
+            rc, out, _ = await self._run('shell', self.INSTANCE, 'python3', '-c', script, timeout=10, check=False)
+            if rc:
+                return
+            value = json.loads(out.strip().splitlines()[-1])
+            if not isinstance(value, dict):
+                return
+            value.update({'environment_id': self.config.id, 'boot_id': self._runtime_boot_id,
+                          'observed_at': time.time(), 'observation': 'fixed_guest_probe'})
+            path = self.state_root / 'verified-guest.json'
+            _validate_registry_path(path, self.workspace_root)
+            temporary = path.with_suffix('.tmp')
+            _validate_registry_path(temporary, self.workspace_root)
+            temporary.write_text(json.dumps(value, sort_keys=True) + '\n', encoding='utf-8')
+            temporary.replace(path)
+        except (RuntimeError, OSError, ValueError, asyncio.TimeoutError):
+            # Missing optional metadata must not turn a verified VM boot into
+            # a failed operation. No configured fact is labelled as measured.
+            return
+
+    def project_guest_root(self, active_root: Path, *, output_policy: dict[str, Any] | None = None) -> str:
+        policy = output_policy or {}
+        name = str(policy.get('writable_folder') or Path(active_root).name)
+        if CHAT_OUTPUT_DIR_RE.fullmatch(name):
+            return WORKSPACE_VIEW_GUEST_PATH + '/Files/' + name
+        self._guest_source_for_active_root(active_root)  # validate the selected backing root
+        return WORKSPACE_VIEW_GUEST_PATH
 
     async def _install_runtime_guard(self) -> None:
         # Repair older/broken guards in-place so a workspace created by a prior
@@ -3150,9 +3437,12 @@ exit $rc
             return await self._start_locked(progress=progress)
 
     def _refresh_saved_network_policy(self) -> None:
-        saved = load_environment_config(self.workspace_root)
-        if saved is not None and saved.network != self.config.network:
-            self.config.network = saved.network
+        saved = load_environment_config(self.workspace_root, self.config.id)
+        if saved is None:
+            raise RuntimeError('The selected VM environment no longer exists.')
+        self.config.network = saved.network
+        self.config.name = saved.name
+        self.config.enabled = saved.enabled
 
     async def _start_locked(self, progress=None) -> EnvironmentStatus:
         self._refresh_saved_network_policy()
@@ -3227,12 +3517,16 @@ exit $rc
         # passed provisioning + isolation. Reuse it immediately; opening another
         # Terminal must not add even a package-marker shell round-trip.
         if await self._current_boot_is_verified():
+            if not self._read_verified_guest():
+                await self._record_verified_guest()
             await self._emit_progress(progress, 'ready', 'Environment Ready', stage_progress_percent=100.0, progress_source='lima')
             return await self.status()
         # Package installation is explicit one-time disk setup, never a Lima
         # per-boot provision script. Existing older VMs are adopted in place.
         await self._ensure_preset_provisioned(progress=progress)
+        await self._ensure_desktop(progress=progress)
         await self._enforce_runtime_guard(progress=progress)
+        await self._record_verified_guest()
         await self._emit_progress(progress, 'ready', 'Environment Ready', stage_progress_percent=100.0, progress_source='lima')
         return await self.status()
 
@@ -3247,10 +3541,10 @@ exit $rc
         """
         if not isinstance(enabled, bool):
             raise ValueError('Public outbound network must be a boolean.')
-        release = (lambda: None) if reservation_held else reserve_policy_change(self.workspace_root)
+        release = (lambda: None) if reservation_held else reserve_policy_change(self.workspace_root, environment_id=self.config.id)
         try:
             async with self._workspace_start_lock():
-                original = load_environment_config(self.workspace_root)
+                original = load_environment_config(self.workspace_root, self.config.id)
                 if original is None:
                     raise RuntimeError('The workspace environment definition is missing.')
                 if expected is not None and original.network != expected:
@@ -3308,7 +3602,7 @@ exit $rc
                                        'the VM was left stopped. VM disk and Files/ were preserved.') from exc
         finally:
             from .manager import clear_environment_provider_cache
-            clear_environment_provider_cache(self.workspace_root)
+            clear_environment_provider_cache(self.workspace_root, self.config.id)
             release()
 
     async def apply_resources(self, *, cpu: int, memory_mb: int, disk_gb: int,
@@ -3322,10 +3616,10 @@ exit $rc
         """
         from .resources import changed_resources, lima_resource_values, resources_match
 
-        release = (lambda: None) if reservation_held else reserve_environment_change(self.workspace_root, 'VM resources')
+        release = (lambda: None) if reservation_held else reserve_environment_change(self.workspace_root, 'VM resources', environment_id=self.config.id)
         try:
             async with self._workspace_start_lock():
-                original = load_environment_config(self.workspace_root)
+                original = load_environment_config(self.workspace_root, self.config.id)
                 if original is None:
                     raise RuntimeError('The workspace environment definition is missing.')
                 if expected is not None and expected != original.to_dict():
@@ -3387,7 +3681,7 @@ exit $rc
                 return status
         finally:
             from .manager import clear_environment_provider_cache
-            clear_environment_provider_cache(self.workspace_root)
+            clear_environment_provider_cache(self.workspace_root, self.config.id)
             release()
 
     @_lifecycle_diagnostics('stop')
@@ -3424,11 +3718,15 @@ exit $rc
     ) -> ExecResult:
         if not str(command or '').strip():
             raise ValueError('command must not be empty')
-        view_command = self._workspace_view_command(
-            command, cwd=cwd, active_root=active_root, output_policy=output_policy,
-        )
-        with activity(self.workspace_root, 'Guest command'):
+        self._authorize_model_project(output_policy)
+        with activity(self.workspace_root, 'Guest command', environment_id=self.config.id):
+            if self.config.files_mode == 'copy':
+                await asyncio.to_thread(self._prepare_project_copy, active_root, output_policy)
+            view_command = self._workspace_view_command(
+                command, cwd=cwd, active_root=active_root, output_policy=output_policy,
+            )
             await self._ensure_running()
+            self._authorize_model_project(output_policy)
             started = time.perf_counter()
             rc, stdout, stderr = await self._run(
                 'shell', '--workdir', '/', self.INSTANCE, '/bin/bash', '-lc', self._guest_wrapper(view_command),
@@ -3454,12 +3752,16 @@ exit $rc
     ) -> asyncio.subprocess.Process:
         if not str(command or '').strip():
             raise ValueError('command must not be empty')
-        view_command = self._workspace_view_command(
-            command, cwd=cwd, active_root=active_root, output_policy=output_policy,
-        )
-        release = acquire_activity(self.workspace_root, 'Guest process')
+        self._authorize_model_project(output_policy)
+        release = acquire_activity(self.workspace_root, 'Guest process', environment_id=self.config.id)
         try:
+            if self.config.files_mode == 'copy':
+                await asyncio.to_thread(self._prepare_project_copy, active_root, output_policy)
+            view_command = self._workspace_view_command(
+                command, cwd=cwd, active_root=active_root, output_policy=output_policy,
+            )
             await self._ensure_running()
+            self._authorize_model_project(output_policy)
             binary = self._binary()
             argv = [
                 binary, '--tty=false', 'shell', '--workdir', '/', self.INSTANCE,
@@ -3784,6 +4086,7 @@ exit $rc
             await self._run('delete', '--force', self.INSTANCE, timeout=self.TIMEOUT_DELETE, check=True)
         # Do not remove Files/ or private chat worktrees. All VM-owned bytes are
         # below vm_root and are recreated from environment.json + the template.
+        await self._prepare_guest_image(progress=progress)
         self._write_template()
         await self._emit_progress(
             progress, 'creating_vm', 'Creating clean workspace VM…',
@@ -3798,6 +4101,10 @@ exit $rc
     @_lifecycle_diagnostics('destroy')
     async def destroy(self) -> None:
         status = await self.status()
+        if not status.available:
+            raise RuntimeError('Restore VM backend access before removing this environment. Existing virtual disks were preserved.')
+        for path in (self.vm_root, self.snapshots_root):
+            _validate_registry_path(path, self.workspace_root)
         if status.created:
             await self._preserve_vm_failure(reason='before_delete', operation='delete')
             await self.stop(force=True)
@@ -3812,12 +4119,17 @@ exit $rc
     def terminal_command(self, *, active_root: Path | None = None) -> tuple[list[str], dict[str, str], Path]:
         binary = self._binary()
         from harnessy.core.terminal import guest_activity_shell_command
+        if self.config.files_mode == 'copy':
+            self._prepare_project_copy(active_root)
         view_command = self._workspace_view_command(
             guest_activity_shell_command(), cwd=WORKSPACE_VIEW_GUEST_PATH,
             active_root=active_root,
         )
         argv = [binary, 'shell', '--workdir', '/', self.INSTANCE, '/bin/bash', '-lc', view_command]
         return argv, self._host_env(), self.workspace_root
+
+    def desktop_manager(self, workspace):
+        return _LimaDesktopView(self, workspace)
 
     async def inspect(self) -> dict[str, Any]:
         status = await self.status()
@@ -3841,6 +4153,10 @@ exit $rc
             except OSError:
                 pass
         return {
+            'environment_id': self.config.id,
+            'environment_name': self.config.name,
+            'runtime_identity': self.runtime_identity(),
+            'verified_guest': self._read_verified_guest(),
             'config': self.config.to_dict(),
             'status': status.to_dict(),
             'snapshots': snapshots,

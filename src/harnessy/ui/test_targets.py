@@ -157,6 +157,13 @@ class _LeasedTargetSession:
 def _record_view_result(manager, action, operation_id, started, error=None):
     from harnessy.diagnostics import log_event
     from harnessy.diagnostics.test_target_logs import classify_target_failure
+    if getattr(manager, 'environment_id', None) is not None:
+        log_event('runtime', 'environment_view_finished', environment_id=manager.environment_id,
+            workspace_id=manager.workspace.id, provider=manager.backend,
+            action=action, outcome='failed' if error is not None else 'completed',
+            error_class=type(error).__name__ if error is not None else '',
+            operation_id=operation_id, elapsed_seconds=max(0, time.monotonic() - started))
+        return
     log_event('runtime', 'test_target_operation_finished', target_id=manager.target.id,
         target_backend=manager.backend, target_action=action,
         target_stage='probe_shell' if action == 'shell' else 'connection_test',
@@ -329,7 +336,7 @@ def _render_target_desktop(page, tab, manager):
     with ui.column().classes('hy-tool-panel w-full no-wrap gap-0') as panel:
         with ui.row().classes('hy-tool-toolbar w-full items-center py-2 gap-2'):
             ui.label(manager.target.name + ' · ' + ('Web UI' if manager.guest.interface == 'web' else 'Desktop')).classes('font-semibold')
-            ui.label('Independent test VM').classes('text-xs hy-muted')
+            ui.label('VM environment' if getattr(manager, 'environment_id', None) is not None else 'Independent test VM').classes('text-xs hy-muted')
             ui.space()
             if view is not None:
                 def reconnect():
@@ -346,9 +353,12 @@ def _render_target_desktop(page, tab, manager):
                         ui.notify('Enter a non-empty password without line breaks.', type='warning')
                         return
                     try:
-                        broker = ExternalTargetBroker(manager.workspace)
-                        command = "Set-LocalUser -Name 'harnessy' -Password (ConvertTo-SecureString " + broker._ps_literal(value) + ' -AsPlainText -Force)'
-                        result = await broker.exec(manager.target, command, model_permissions=False)
+                        if getattr(manager, 'environment_id', None) is not None:
+                            result = await manager.set_windows_password(value)
+                        else:
+                            broker = ExternalTargetBroker(manager.workspace)
+                            command = "Set-LocalUser -Name 'harnessy' -Password (ConvertTo-SecureString " + broker._ps_literal(value) + ' -AsPlainText -Force)'
+                            result = await broker.exec(manager.target, command, model_permissions=False)
                         if not result['ok']:
                             raise RuntimeError(result.get('stderr') or 'Could not set the Windows password.')
                         password.value = ''
@@ -357,13 +367,13 @@ def _render_target_desktop(page, tab, manager):
                         ui.notify(str(exc), type='negative', timeout=6000)
                 ui.button('Set Windows sign-in password', on_click=set_password).props('flat no-caps')
         if view is not None:
-            ui.element('iframe').props(f'src={view.iframe_url} sandbox="{view.sandbox}" title="Test target graphical interface" referrerpolicy=no-referrer').classes('w-full grow border-0').style('min-height:0;flex:1')
+            ui.element('iframe').props(f'src={view.iframe_url} sandbox="{view.sandbox}" title="VM graphical interface" referrerpolicy=no-referrer').classes('w-full grow border-0').style('min-height:0;flex:1')
             return
         error = _TARGET_DESKTOP_ERRORS.get(identity)
         with ui.column().classes('w-full grow items-center justify-center gap-3'):
             if error:
                 ui.icon('error_outline', size='34px').classes('text-negative')
-                ui.label('Test VM interface could not open').classes('font-semibold text-negative')
+                ui.label('VM interface could not open').classes('font-semibold text-negative')
                 ui.label(error).classes('text-sm hy-muted whitespace-pre-wrap').style('max-width:760px')
                 def retry():
                     _TARGET_DESKTOP_ERRORS.pop(identity, None)
@@ -371,13 +381,13 @@ def _render_target_desktop(page, tab, manager):
                 ui.button('Reconnect', icon='refresh', on_click=retry).props('unelevated no-caps')
             else:
                 ui.spinner(size='34px')
-                ui.label('Connecting to test VM interface…').classes('font-semibold')
+                ui.label('Connecting to VM interface…').classes('font-semibold')
         if not error and identity not in _TARGET_DESKTOP_TASKS:
             async def start():
                 operation_id, started = uuid.uuid4().hex, time.monotonic()
                 try:
                     if manager.busy or not (await manager.status())['running'] or manager.busy:
-                        raise RuntimeError('Start this test VM and wait until it is ready before opening its interface.')
+                        raise RuntimeError('Start this VM and wait until it is ready before opening its interface.')
                     from harnessy.ui.target_views import create_target_view
                     _TARGET_DESKTOP_VIEWS[identity] = await create_target_view(manager, identity[0], getattr(page, '_accounts', None))
                     _record_view_result(manager, 'web', operation_id, started)

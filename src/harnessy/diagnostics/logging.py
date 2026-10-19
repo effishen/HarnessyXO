@@ -309,7 +309,7 @@ _VM_DIAGNOSTIC_ENUMS = {
                                   'not_created', 'unavailable', 'probe_failed', 'timeout'}),
     'timeout_scope': frozenset({'operation', 'provider'}),
     'failed_stage': frozenset({
-        'queued', 'starting', 'running', 'failed', 'timed_out', 'cancelled', 'unknown',
+        'queued', 'starting', 'running', 'failed', 'timed_out', 'cancelled', 'access_denied', 'unknown',
         'checking_host_dependencies', 'installing_host_dependencies', 'host_dependencies_ready',
         'creating_vm', 'reconciling_environment', 'starting_vm', 'waiting_for_guest',
         'checking_provisioning', 'adopting_provisioning', 'provisioning_packages',
@@ -323,6 +323,8 @@ _VM_DIAGNOSTIC_ENUMS = {
         'stopping_restore_vm', 'replacing_restore_vm', 'reconciling_restore_files',
         'restarting_restore_vm', 'verifying_restore_restart', 'factory_reset',
         'restarting_reset_vm', 'rebuilding', 'network_stopping', 'network_applying', 'network_starting',
+        'resources_checking', 'resources_applying', 'resources_saving', 'resources_complete',
+        'removal_checking', 'removal_destroying', 'removal_complete',
     }),
 }
 _WORKSPACE_DATABASE_ENUMS = {
@@ -454,6 +456,10 @@ def _safe_event_field(key: str, value: Any) -> Any:
     """Keep reviewed structured evidence intact, without widening raw limits."""
     if _is_sensitive_log_key(key):
         return '<redacted>'
+    if key == 'environment_id':
+        return value if isinstance(value, str) and re.fullmatch(r'[0-9a-f]{32}', value) else None
+    if key in {'project_access', 'allowed_project_ids'}:
+        return _privacy_safe_value(value, key=key)
     if key in {'technical_error', 'controller_evidence', 'host_resources', 'requested_vm_config', 'environment_action',
                'error_type', 'terminal_stop_reason', 'terminal_reason', 'backend_done_reason',
                'completion_state', 'last_error_code', 'source', 'state', 'component', 'missing_dependency'}:
@@ -1586,8 +1592,15 @@ def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
     if lowered == 'host_resources':
         from .host_state import validate_resource_snapshot
         return validate_resource_snapshot(value)
+    if lowered == 'environment_id':
+        return value if isinstance(value, str) and re.fullmatch(r'[0-9a-f]{32}', value) else None
+    if lowered == 'project_access' and isinstance(value, str):
+        return value if value in {'all', 'selected'} else _privacy_marker(value, label=lowered)
+    if lowered == 'allowed_project_ids':
+        return [item for item in value[:1000] if isinstance(item, str)
+                and re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', item)] if isinstance(value, (list, tuple)) else []
     if lowered == 'environment_action':
-        return value if isinstance(value, str) and value in {'create', 'start', 'stop', 'reset', 'rebuild', 'destroy', 'restore', 'snapshot', 'tools', 'network', 'resources'} else None
+        return value if isinstance(value, str) and value in {'create', 'start', 'stop', 'reset', 'rebuild', 'destroy', 'remove', 'restore', 'snapshot', 'tools', 'network', 'resources'} else None
     if lowered == 'lifecycle_action':
         return value if isinstance(value, str) and value in {'create', 'start', 'stop', 'reset', 'rebuild', 'destroy'} else None
     if lowered == 'preservation_reason':
@@ -2338,7 +2351,7 @@ def _collect_vm_export(latest: Path, *, include_content: bool) -> tuple[dict[str
     """Keep VM collection optional and bounded; its failure never blocks export."""
     try:
         from .vm_logs import (MAX_EXPORT_BYTES, MAX_VM_FILES, PER_FILE_TAIL_BYTES,
-                              VM_LOG_FILENAMES, collect_vm_diagnostics, validate_vm_report)
+                              NAMED_VM_LOG_FILENAMES, collect_vm_diagnostics, validate_vm_report)
         collected = collect_vm_diagnostics(latest, include_content=include_content)
         report = validate_vm_report(collected['report'])
         members = collected['members']
@@ -2354,8 +2367,8 @@ def _collect_vm_export(latest: Path, *, include_content: bool) -> tuple[dict[str
         accepted: dict[str, bytes] = {}
         total = 0
         for name, payload in members.items():
-            matched = re.fullmatch(r'vm-logs/([0-9a-f]{64})/(.+)\.(technical\.jsonl|raw\.log)', name) if isinstance(name, str) else None
-            if matched is None or matched.group(2) not in VM_LOG_FILENAMES:
+            matched = re.fullmatch(r'vm-logs/([0-9a-f]{64})/(?:([0-9a-f]{32})/)?([^/]+)\.(technical\.jsonl|raw\.log)', name) if isinstance(name, str) else None
+            if matched is None or matched.group(3) not in NAMED_VM_LOG_FILENAMES:
                 raise ValueError('Invalid VM archive member')
             if name.endswith('.raw.log') and not include_content:
                 raise ValueError('Raw VM content was not requested')

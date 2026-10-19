@@ -1,4 +1,19 @@
-# HarnessyXO v0.6.124 Features
+# HarnessyXO v0.7.0 Features
+
+## Named VM environments
+
+- Create a workspace with its name and folder first. Open **Environments → Create VM Environment** to add named VMs whenever needed. A workspace can hold files and conversations before a VM exists; model commands never fall back to the host shell.
+- Use the same VM interface for development and testing. Give each VM a name and optional purpose/model instructions. The model can discover enabled VMs and select one explicitly for each command; a running process and terminal remain attached to their original VM.
+- Run multiple VMs at the same time. Each has its own OS disk, settings, installed packages, runtime jobs, status, snapshots and diagnostics. View combined CPU/RAM allocations and edit the stopped VM's resources independently.
+- Choose shared project source with read/write access, read-only source, or a separate deployed copy where supported by the guest. Canonical project source, conversations and saved artifacts belong to the workspace. Dependencies, default build directories and caches belong to the VM. Shells expose `HARNESSY_BUILD_ROOT`, `HARNESSY_VENV_ROOT`, `XDG_CACHE_HOME` and `PYTHONPYCACHEPREFIX`; explicitly writing `./build` or `./.venv` in shared source still creates shared files. VM reset, rebuild and removal preserve canonical source.
+- Shared Linux guests retain the selected-project view and read-only References/ancestor grants. OpenWrt uses explicit project synchronization rather than a host mount; changed source files are checked for conflicts before merging. Independent guest copies never write back automatically; use deploy and collect tools to move project files and results deliberately.
+- The stock OpenWrt 23.05.5 Malta big-endian option uses `mips_24kc`, musl and Linux 5.15.167. Its pinned package feed supplies Python 3.11.7. MIPS uses software CPU emulation on ARM64 and x86-64 hosts; it does not reproduce a particular router's peripherals.
+- Expand optional tools during VM creation or manage them afterward. Show compatible package choices, required integration packages, installed/missing results and explanations for unavailable tools. A saved selection is not proof of a successful installation.
+- **Enabled for model use** controls whether the model can select or start that VM. Human consoles remain available. Ordinary Shell, Processes, Git and file permissions continue to apply; a VM name or purpose never grants permission.
+- **External Targets** connects existing SSH machines and devices. It has its own access gate and selected-action controls; locally created VMs use VM Environments instead.
+- Set **Allowed projects / chats** on each VM or external target to **All projects / chats** or **Only selected projects / chats**. Selected mode shows individual checkboxes with project names and IDs; no selection blocks every model project. Parent/child and future projects are separate unless All is selected. Saved grants survive renames and ordinary settings changes.
+- The model discovers only VMs/targets available to its own project. Recheck grants for each operation and after approval waits; guessing an ID does not bypass them. Revoking access blocks new commands and process input, while human consoles and cleanup controls remain available. Existing guest data and already running work are not erased by changing grants.
+- Open VM terminals and supported guest graphical interfaces in named main-area tabs. Saved tabs retain their VM identity. Diagnostics retain opaque VM IDs and separate controller evidence for each VM.
 
 ## Workspace startup and VM resources
 
@@ -11,7 +26,7 @@
 - Track recovery stage, elapsed time and actual copy progress; cancel private-copy checks without replacing the originals. Refresh or sign in again to return to the same operation. Download a report with operational details and record counts, without conversations or SQL.
 - Review a verified index repair and choose **Use repaired database**, then **Open workspace** to restore saved tabs. Require full integrity, relationship, schema and row-by-row checks before offering activation. Keep uncertain salvage separate for review; preserve original database and journal files, project files, VM disks and workspace identity.
 - Pause work only in the workspace being recovered. If queued jobs remain after recovery, choose **Resume queued work** after reviewing them. Existing completion and backend holds remain in effect. If an activation was interrupted, choose **Restore original database** before checking or opening that workspace again.
-- Open **Workspace Environment → Details → Edit VM Resources** to change CPU, RAM and storage. Stop the VM and finish active workspace work first. CPU and RAM can increase or decrease; storage can only grow. Start the VM afterward to use the new values and expand its disk capacity. Existing files, installed tools and VM disks are retained.
+- Open **Environments → select a VM → Details → Edit VM Resources** to change CPU, RAM and storage. Stop the VM and finish active workspace work first. CPU and RAM can increase or decrease; storage can only grow. Start the VM afterward to use the new values and expand its disk capacity. Existing files, installed tools and VM disks are retained.
 - Check the current VM identity, stopped state and settings before applying an edit, then verify the controller's reported values before saving. An uncertain edit keeps the saved definition unchanged and explains how to retry without shrinking the disk.
 - Keep VM resource settings and an explicit **Stop VM** control available on a workspace-open error, independently of the workspace database.
 - Diagnostics distinguish SQLite corruption from locks, record bounded workspace worker failures and native signals, and label collector resource/version observations separately from recorded application state.
@@ -26,9 +41,9 @@
 - Update quiet status after each health probe. Backend reachability does not prove inference progress; repeated counters and stream heartbeats do not reset the work-progress deadline. Keep cancellation and existing request deadlines.
 - Backend versions and proxies can omit progress even when requests succeed. In that case the shared display continues to show a truthful wait until output arrives.
 
-## Workspace test-target tabs
+## VM consoles and readiness
 
-- Manage external devices and test VMs in **Workspace Environment → Test targets**.
+- Manage locally created guests in **VM Environments** and connected machines/devices in **External Targets**.
 - Keep numeric CPU, memory and disk bounds valid while switching guest OS or architecture. Apply OS defaults under the new bounds and preserve in-range values for architecture-only changes.
 - Spot a ready test VM by its bold green Ready badge and check icon beside the name, green card outline and subtle tint. Other states have distinct icons and colours; the status wraps on smaller screens and stays readable in light and dark themes. A stopped, paused or unavailable current state clears an earlier Ready result.
 - Open guest Shell, LuCI Web UI and noVNC Desktop views as separate main-area tabs, preserving selected targets across browser reloads.
@@ -169,10 +184,10 @@ Workspace and machine databases use WAL so background reads can coexist with mes
 - With a permission set to Ask, queued/retried and direct runs wait for Allow once, Deny or Stop run. The card shows the original prompt, actual held slot and exact tool arguments; the sidebar also says Needs approval.
 - Reloading, switching projects, closing a tab or signing out does not silently decide the request. Reopen the chat or Run queue to act from a valid signed-in session.
 - Allow once applies to one request; an identical later command needs its own approval. Stale controls cannot decide or stop a newer run. Saved permission changes apply during active runs and pending approvals. Off blocks execution even after an earlier Allow; explicit Deny and Stop remain final for that request.
-- External/Test Targets is an access gate: Off blocks target calls, Ask requires approval and On permits access. Each target independently selects **Allow Full Unrestricted Access** or **Allow Only Selected Actions**. Selected actions each have Off, Ask and On controls; global On never overrides action Off or Ask. Full access enables every target action within the remote account's privileges and still obeys the global gate.
-- Set permissions for status checks, file listing, commands, copies, individual VM controls, command categories and paths. Selected command categories use best-effort text checks, not an OS sandbox. Save and restore selected choices when switching to full access. Existing targets keep their restrictions when upgraded or edited.
-- Use **Enabled for the model** on each target card to disable model access, including VM startup, without deleting the target or changing its selected actions. Availability is separate from VM power; manual controls remain available.
-- Expand **Allowed actions and command limits** beside a target’s Model access to see the approval rules, global overrides, exact SSH blocked command names and protected paths. The same breakdown is available when creating a VM. SSH command filtering remains separate from approval; managed test VMs allow privileged guest commands. Refresh the breakdown after changing global permissions.
+- External Targets is an access gate: Off blocks target calls, Ask requires approval and On permits access. Each target independently selects **Allow Full Unrestricted Access** or **Allow Only Selected Actions**. Selected actions each have Off, Ask and On controls; global On never overrides action Off or Ask. Full access enables every target action within the remote account's privileges and still obeys the global gate.
+- Set external-target permissions for status checks, file listing, commands, copies, command categories and paths. Selected command categories use best-effort text checks, not an OS sandbox. Save and restore selected choices when switching to full access. Existing targets keep their restrictions when upgraded or edited.
+- Use **Enabled for the model** on an external target card to disable model access without deleting its connection or changing selected actions. Use **Enabled for model use** on a VM card to prevent model selection/startup separately from its running power state.
+- Expand **Allowed actions and command limits** beside a target’s Model access to see the approval rules, global overrides, exact SSH blocked command names and protected paths. SSH command filtering remains separate from approval. Local VM command capabilities are reported by the selected VM integration. Refresh the breakdown after changing global permissions.
 - Opening tabs and changing workspace or navigator preferences preserve permission changes saved from another page.
 - Export reviewed permission decisions and separate approval/tool execution timings in `PERMISSIONS.json`; show missing historical measurements as unrecorded.
 - Waiting tools show Waiting for approval and accrue no execution time. Other queued work waits for the retained slot. A server restart interrupts the run; pending approvals are never replayed automatically.
@@ -285,9 +300,9 @@ Workspace and machine databases use WAL so background reads can coexist with mes
 ## Model defaults and test machines
 
 - Choose the default model for new projects/chats separately from the profile being edited. Set default thinking per model; new chats and model switches inherit it, while existing saved chat choices remain intact.
-- Use one **Create VM** flow under **Workspace Environment → Test targets**, with Ubuntu 24.04/26.04, Debian 13, Fedora 44, Kali 2026.2, OpenWrt 23.05.2/25.12.5 and experimental Windows 11. Each test machine is separate from the workspace VM and has outbound internet for updates and software installation.
+- Use **Environments → Create VM Environment** for named local development/test guests. Choose the OS, architecture, resources, project-file access and network setting for each VM; no primary VM is required.
 - Use brokered model commands, binary file transfer, and main-area Bash/PowerShell/ash, noVNC Desktop and LuCI Web UI tabs. Manage start/stop and full stopped-VM snapshots, including Windows firmware/TPM state.
-- Match ARM64 or x86-64 to the host for acceleration, or choose the other architecture for CPU emulation. Windows requires matching installation media, Lima 2.2+, QEMU and swtpm. OpenWrt requires QEMU and e2fsprogs; it uses private NAT, pinned official images and a dedicated guest SSH key. See [test-target instructions](README.md#externaltest-targets).
+- Match ARM64 or x86-64 to the host for acceleration, or choose the other architecture for CPU emulation. Windows requires matching installation media, Lima 2.2+, QEMU and swtpm. OpenWrt requires QEMU and e2fsprogs; it uses private NAT, pinned official images and a dedicated guest SSH key.
 
 ## Project files and chat attachments
 
@@ -715,13 +730,13 @@ Project commands use retained, isolated mount and process namespaces. The curren
 
 You can inspect a failing command in the VM terminal, check its output in the explorer, and continue the project conversation. The environment remains available for human investigation as well as model tool calls.
 
-These are CPU-based Linux work environments. Windows as the primary working environment and Raspberry Pi board emulation remain future integrations. OpenWrt is available as a separate test target.
+These are CPU-based VM environments. OpenWrt has its own guest and file integration. Windows uses experimental Lima support, your installation media and separate deployed project copies. Raspberry Pi board emulation is not implemented.
 
-### Separate machines for testing
+### Local VMs and external targets
 
-**External/Test Targets** brings existing SSH devices and managed Ubuntu, Debian, Fedora, Kali, OpenWrt or Windows test VMs into the same workflow. The model can copy a build into a test machine, install dependencies, run tests, and retrieve the results. These machines have internet access for updates and package downloads, while project files remain in their canonical workspace home.
+Create named local VMs under **Environments → Create VM Environment**, then tell the model which VM to use for building or testing, or let it choose among enabled VMs. Shared project source stays in the workspace while each VM keeps its own system and dependencies. Separate-copy guests receive explicit deployments and require deliberate artifact collection.
 
-Choose the OS in one Create VM flow under **Workspace Environment → Test targets**. Open a Bash, ash or PowerShell shell, embedded noVNC Desktop or OpenWrt LuCI Web UI in the main area. Stop a test VM and save its full state before a disruptive experiment; restore that snapshot to repeat the test. Windows guest support uses Lima's experimental Windows integration and your installation media.
+**External Targets** links existing SSH machines and devices. External access and selected-action controls apply to those connections independently of local VM use. Supported local terminals and graphical consoles open as main-area tabs. Stop a VM and take a snapshot before disruptive guest experiments; canonical workspace source is separate from VM rollback.
 
 ### Projects that can depend on other projects
 

@@ -27,7 +27,7 @@ _OPERATIONS = {
 _VERIFICATION_STATUSES = {
     'HOST_ONLY_VERIFIED', 'MAPPING_NOT_VERIFIED', 'VERIFICATION_FAILED',
     'FILE_VIEW_MISMATCH', 'VERIFIED_IDENTICAL', 'HOST_ONLY',
-    'VERIFIED_SAME_STORAGE', 'PROBE_FAILED', 'MISMATCH', 'NOT_CHECKED', 'HOST_SNAPSHOT',
+    'VERIFIED_SAME_STORAGE', 'VERIFIED_SYNCHRONIZED_PROJECT', 'PROBE_FAILED', 'MISMATCH', 'NOT_CHECKED', 'HOST_SNAPSHOT',
 }
 
 
@@ -46,9 +46,18 @@ def _machine_id(value: Any) -> str | None:
     return _digest(text)
 
 
+def _environment_identity(environment_id: str | None, environment_name: str | None) -> dict[str, Any]:
+    identity = environment_id if isinstance(environment_id, str) and re.fullmatch(r'[0-9a-f]{32}', environment_id) else None
+    # Names are display content. They are useful in model/UI receipts and local
+    # logs, but the privacy exporter retains only the opaque environment ID.
+    name = ''.join(character for character in environment_name if ord(character) >= 32)[:160].strip() if isinstance(environment_name, str) else ''
+    return {'environment_id': identity, 'environment_name': name or None}
+
+
 def file_path_identity(
     path: Path, *, workspace_id: str, working_root: Path,
     working_root_id: str = '', working_root_kind: str = '',
+    environment_id: str | None = None, environment_name: str | None = None,
 ) -> dict[str, Any]:
     """Identify logical and resolved paths without returning either plaintext.
 
@@ -70,6 +79,7 @@ def file_path_identity(
         relative = str(lexical)
     return {
         'workspace_id': _machine_id(workspace_id),
+        **_environment_identity(environment_id, environment_name),
         'working_root_id': root_id.lower(),
         'working_root_kind': working_root_kind if working_root_kind in _ROOT_KINDS else 'unknown',
         'path_id': _digest(f'harnessyxo-file-path-v1\0{workspace_id}\0{root_id}\0{relative}'),
@@ -84,6 +94,7 @@ def _stat_identity(value: os.stat_result) -> tuple[int, ...]:
 def inspect_file_fingerprint(
     path: Path, *, workspace_id: str, working_root: Path,
     working_root_id: str = '', working_root_kind: str = '',
+    environment_id: str | None = None, environment_name: str | None = None,
 ) -> dict[str, Any]:
     """Hash a regular file off-thread with bounded memory and stability checks.
 
@@ -94,6 +105,7 @@ def inspect_file_fingerprint(
     identity = file_path_identity(
         path, workspace_id=workspace_id, working_root=working_root,
         working_root_id=working_root_id, working_root_kind=working_root_kind,
+        environment_id=environment_id, environment_name=environment_name,
     )
     source = Path(path) if Path(path).is_absolute() else Path(working_root) / path
     # O_NONBLOCK prevents accidental hangs if a path has become a FIFO/device.
@@ -113,6 +125,7 @@ def inspect_file_fingerprint(
     final_identity = file_path_identity(
         path, workspace_id=workspace_id, working_root=working_root,
         working_root_id=working_root_id, working_root_kind=working_root_kind,
+        environment_id=environment_id, environment_name=environment_name,
     )
     if _stat_identity(before) != _stat_identity(after) or _stat_identity(after) != _stat_identity(current) or count != after.st_size or identity != final_identity:
         raise OSError('File changed while HarnessyXO was hashing it; refresh to obtain a stable fingerprint')
@@ -154,6 +167,7 @@ def _normalize_file_state(value: dict[str, Any] | None) -> dict[str, Any] | None
 def log_file_operation(
     operation: str, *, path: Path, workspace_id: str, working_root: Path,
     working_root_id: str = '', working_root_kind: str = '',
+    environment_id: str | None = None, environment_name: str | None = None,
     chat_id: str | None = None, run_id: str | None = None,
     call_id: str | None = None, operation_id: str | None = None,
     before: dict[str, Any] | None = None, after: dict[str, Any] | None = None,
@@ -172,6 +186,7 @@ def log_file_operation(
     identity = file_path_identity(
         path, workspace_id=workspace_id, working_root=working_root,
         working_root_id=working_root_id, working_root_kind=working_root_kind,
+        environment_id=environment_id, environment_name=environment_name,
     )
     receipt = {
         'receipt_version': 1,

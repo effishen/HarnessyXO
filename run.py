@@ -179,7 +179,7 @@ def launcher_kvm_selection() -> tuple[str, str] | None:
     if platform.system() != 'Linux':
         return None
     from harnessy.core.machine import MachineStore
-    from harnessy.environment.base import load_environment_config
+    from harnessy.environment.manager import EnvironmentManager
     from harnessy.environment.presets import canonical_arch, execution_mode
 
     host_arch = canonical_arch(platform.machine())
@@ -188,13 +188,13 @@ def launcher_kvm_selection() -> tuple[str, str] | None:
         path = Path(registration.path).expanduser()
         if not path.is_dir():
             continue
-        config = load_environment_config(path)
-        if config is None:
-            continue
-        configured = True
-        vm_type = execution_mode(config.architecture, host_arch=host_arch, host_os='Linux')[0]
-        if str(config.provider) == 'lima' and vm_type == 'qemu' and canonical_arch(config.architecture) == host_arch:
-            return config.architecture, vm_type
+        for config in EnvironmentManager(path).list():
+            configured = True
+            vm_type = execution_mode(config.architecture, host_arch=host_arch, host_os='Linux')[0]
+            if str(config.provider) in {'openwrt', 'managed'}:
+                vm_type = 'qemu'
+            if vm_type == 'qemu' and canonical_arch(config.architecture) == host_arch:
+                return config.architecture, vm_type
     return None if configured else (host_arch, 'qemu')
 
 
@@ -272,7 +272,8 @@ def check_registered_host_prerequisites(diagnostic_event=None) -> None:
     import platform
     import time
     from harnessy.core.machine import MachineStore
-    from harnessy.environment.base import EnvironmentConfig, load_environment_config
+    from harnessy.environment.base import EnvironmentConfig
+    from harnessy.environment.manager import EnvironmentManager
     from harnessy.environment.host_prerequisites import (
         ensure_host_prerequisites, ensure_lima_controller,
         ensure_test_target_prerequisites, restore_host_tool_path,
@@ -326,9 +327,11 @@ def check_registered_host_prerequisites(diagnostic_event=None) -> None:
             path = Path(registration.path).expanduser()
             if not path.is_dir():
                 continue
-            config = load_environment_config(path)
-            if config is not None:
-                selections.append((registration.name, config, None))
+            for config in EnvironmentManager(path).list():
+                # QEMU/OpenWrt requirements are covered by the complete target
+                # prerequisite check above. Lima checks apply to Lima guests.
+                if config.provider == 'lima':
+                    selections.append((f'{registration.name} / {config.name}', config, None))
         seen = set()
         for label, config, selected_type in selections:
             # Test targets use QEMU even on a Mac whose workspace uses VZ.

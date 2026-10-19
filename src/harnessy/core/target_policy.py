@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from typing import Any
+from .project_access import normalize_project_access
 
 
 TARGET_ACCESS_MODE_LABELS = {
@@ -88,6 +89,7 @@ def normalize_target_policy(
     command restrictions survive loading and unrelated target edits.
     """
     source = policy if isinstance(policy, Mapping) else {}
+    project_scope = normalize_project_access(policy)
     if 'access_mode' in source or 'actions' in source:
         mode = source.get('access_mode')
         mode = mode if isinstance(mode, str) and mode in TARGET_ACCESS_MODES else 'selected'
@@ -97,7 +99,7 @@ def normalize_target_policy(
             action: _permission(incoming.get(action))
             for action in TARGET_ACTIONS
         }
-        return {'access_mode': mode, 'actions': actions}
+        return {'access_mode': mode, 'actions': actions, **project_scope}
 
     protected = 'on' if approval_mode == 'on' else 'ask'
     actions = {action: protected for action in TARGET_ACTIONS[:9]}
@@ -108,7 +110,7 @@ def normalize_target_policy(
             actions[action] = 'off'
     actions.update({action: 'on' if managed_vm else 'off' for action in TARGET_ACTIONS[9:-1]})
     actions['outside_test_root'] = 'off'
-    return {'access_mode': 'selected', 'actions': actions}
+    return {'access_mode': 'selected', 'actions': actions, **project_scope}
 
 
 def target_access_mode(policy: Mapping[str, Any] | None) -> str:

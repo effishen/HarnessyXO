@@ -3,18 +3,37 @@ from __future__ import annotations
 import abc
 import asyncio
 import json
-from dataclasses import asdict, dataclass
+import re
+import os
+import uuid
+import hashlib
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+from harnessy.core.project_access import canonical_project_id, normalize_project_access, allows_project
 
 from .presets import canonical_arch
 
 
-ENVIRONMENT_SCHEMA_VERSION = 2
+ENVIRONMENT_SCHEMA_VERSION = 3
+ENVIRONMENT_ID_RE = re.compile(r'^[0-9a-f]{32}$')
+
+
+class EnvironmentModelAccessError(PermissionError):
+    error_code = 'VM_PROJECT_ACCESS_DENIED'
 
 
 @dataclass(slots=True)
 class EnvironmentConfig:
+    id: str = ''
+    name: str = 'VM Environment'
+    purpose: str = ''
+    enabled: bool = True
+    iso_path: str = ''
+    desktop: bool = False
+    emulation: dict[str, bool] = field(default_factory=lambda: {'wifi': False, 'bluetooth': False})
+    project_access: str = 'all'
+    allowed_project_ids: tuple[str, ...] = ()
     type: str = 'vm'
     provider: str = 'lima'
     preset: str = 'ubuntu-reverse'
@@ -56,7 +75,7 @@ class EnvironmentConfig:
 
     def normalized(self) -> 'EnvironmentConfig':
         mode = str(self.files_mode or 'live').strip().lower()
-        if mode not in {'live', 'copy'}:
+        if mode not in {'live', 'readonly', 'copy'}:
             mode = 'invalid'  # provider/manager reject rather than weakening isolation
         raw_optional = self.optional_tools
         if isinstance(raw_optional, str):
@@ -77,7 +96,19 @@ class EnvironmentConfig:
         # tool selected. An explicit empty tuple/list remains empty.
         if raw_optional is None:
             optional_clean = ['*']
+        access_policy = normalize_project_access({'project_access': self.project_access,
+                                                  'allowed_project_ids': self.allowed_project_ids})
         return EnvironmentConfig(
+            id=str(self.id or '').strip().lower(),
+            name=' '.join(str(self.name or 'VM Environment').split())[:120] or 'VM Environment',
+            purpose=str(self.purpose or '').strip()[:2000],
+            enabled=self._bool(self.enabled, True),
+            iso_path=str(self.iso_path or '').strip(),
+            desktop=self._bool(self.desktop, False),
+            emulation={key: self._bool((self.emulation if isinstance(self.emulation, dict) else {}).get(key), False)
+                       for key in ('wifi', 'bluetooth')},
+            project_access=access_policy['project_access'],
+            allowed_project_ids=tuple(access_policy['allowed_project_ids']),
             type='vm',
             provider=str(self.provider or 'lima').strip().lower(),
             preset=str(self.preset or 'ubuntu-reverse').strip().lower(),
@@ -91,6 +122,15 @@ class EnvironmentConfig:
             files_mode=mode,
             schema_version=ENVIRONMENT_SCHEMA_VERSION,
         )
+
+    @staticmethod
+    def _project_id(value: Any) -> str:
+        return canonical_project_id(value)
+
+    def allows_project(self, chat_id: str) -> bool:
+        """Exact project/chat membership; parent/child relationships confer none."""
+        return allows_project({'project_access': self.project_access,
+                               'allowed_project_ids': self.allowed_project_ids}, chat_id)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self.normalized())
@@ -123,6 +163,8 @@ class EnvironmentStatus:
     ready: bool = False
     phase: str = ''
     error: str = ''
+    environment_id: str = ''
+    environment_name: str = ''
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -147,7 +189,7 @@ class WorkspaceEnvironment(abc.ABC):
         self.files_root = self.workspace_root / 'Files'
         self.meta_root = self.workspace_root / '.harnessy'
         self.private_worktrees_root = self.meta_root / 'worktrees'
-        self.environment_root = self.meta_root / 'environment'
+        self.environment_root = environment_root(self.workspace_root, self.config.id)
 
     @abc.abstractmethod
     async def create(self, progress=None) -> EnvironmentStatus: ...
@@ -191,8 +233,10 @@ class WorkspaceEnvironment(abc.ABC):
         await process.stdin.drain()
 
     async def open_terminal(self, *, active_root: Path | None = None) -> tuple[list[str], dict[str, str], Path]:
-        await self.start()
-        return self.terminal_command(active_root=active_root)
+        from .activity import activity
+        with activity(self.workspace_root, 'Opening VM terminal', environment_id=self.config.id):
+            await self.start()
+            return await asyncio.to_thread(self.terminal_command, active_root=active_root)
 
     def runtime_identity(self) -> dict[str, Any]:
         """Return cheap, non-blocking lifecycle identity for tool provenance.
@@ -202,6 +246,10 @@ class WorkspaceEnvironment(abc.ABC):
         model tool results.
         """
         return {
+            'environment_id': self.config.id,
+            'environment_name': self.config.name,
+            'environment_enabled': self.config.enabled,
+            'files_mode': self.config.files_mode,
             'provider': self.config.provider,
             'vm_created': None,
             'vm_running': None,
@@ -220,6 +268,58 @@ class WorkspaceEnvironment(abc.ABC):
 
     def mount_files(self) -> tuple[Path, str]:
         return self.files_root.resolve(), '/workspace'
+
+    def _guest_project_key(self, active_root: Path | None) -> str:
+        root = Path(active_root or (self.workspace_root / 'Files')).resolve()
+        try:
+            relative = root.relative_to(self.workspace_root).as_posix()
+        except ValueError as exc:
+            raise ValueError('Guest work directories require a project inside this workspace.') from exc
+        return hashlib.sha256(relative.encode('utf-8')).hexdigest()[:20]
+
+    def guest_work_paths(self, active_root: Path | None = None) -> dict[str, str]:
+        """Default paths, resolved from the guest account home at execution.
+
+        Each VM owns its guest home. The project key further separates build,
+        Python-environment and cache data between projects in that VM. Programs
+        explicitly writing ./build or .venv still write into project source.
+        """
+        key = self._guest_project_key(active_root)
+        return {
+            'HARNESSY_BUILD_ROOT': f'$HOME/.local/share/harnessy/build/{key}',
+            'HARNESSY_VENV_ROOT': f'$HOME/.local/share/harnessy/venvs/{key}',
+            'XDG_CACHE_HOME': f'$HOME/.cache/harnessy/{key}',
+            'PYTHONPYCACHEPREFIX': f'$HOME/.cache/harnessy/{key}/pycache',
+        }
+
+    def _guest_work_path_exports(self, active_root: Path | None = None) -> str:
+        """POSIX/ash-compatible setup executed after dropping guest privileges."""
+        key = self._guest_project_key(active_root)
+        return f'''_harnessy_home=$(awk -F: -v uid="$(id -u)" '$3 == uid {{ print $6; exit }}' /etc/passwd)
+case "$_harnessy_home" in
+  /workspace|/workspace/*|'') printf '%s\\n' 'HarnessyXO could not locate a VM-owned guest home for build and cache directories.' >&2; exit 72 ;;
+  /*) ;;
+  *) printf '%s\\n' 'HarnessyXO rejected an invalid guest home directory.' >&2; exit 72 ;;
+esac
+export HARNESSY_BUILD_ROOT="$_harnessy_home/.local/share/harnessy/build/{key}"
+export HARNESSY_VENV_ROOT="$_harnessy_home/.local/share/harnessy/venvs/{key}"
+export XDG_CACHE_HOME="$_harnessy_home/.cache/harnessy/{key}"
+export PYTHONPYCACHEPREFIX="$XDG_CACHE_HOME/pycache"
+mkdir -p "$HARNESSY_BUILD_ROOT" "$HARNESSY_VENV_ROOT" "$XDG_CACHE_HOME" "$PYTHONPYCACHEPREFIX" || exit 72
+unset _harnessy_home
+'''
+
+    def _authorize_model_project(self, output_policy: dict[str, Any] | None) -> None:
+        """Recheck a trusted model caller after startup or project preparation.
+
+        Human terminals omit this controller-internal key. Model tool payloads
+        never choose their own project ID; the toolbox supplies its chat ID.
+        """
+        if not isinstance(output_policy, dict) or '_model_project_id' not in output_policy:
+            return
+        current = load_environment_config(self.workspace_root, self.config.id)
+        if current is None or not current.enabled or not current.allows_project(output_policy['_model_project_id']):
+            raise EnvironmentModelAccessError('This VM is no longer enabled for model use by this project/chat.')
 
     @abc.abstractmethod
     async def snapshot(self, tag: str, progress=None) -> list[str]: ...
@@ -246,25 +346,71 @@ class WorkspaceEnvironment(abc.ABC):
     async def inspect(self) -> dict[str, Any]: ...
 
 
-def config_path(workspace_root: Path) -> Path:
-    return Path(workspace_root).resolve() / '.harnessy' / 'environment' / 'environment.json'
+def environment_root(workspace_root: Path, environment_id: str = '') -> Path:
+    root = Path(workspace_root).expanduser().resolve()
+    if not environment_id:
+        return root / '.harnessy' / 'environment'  # existing singleton, never used for new VMs
+    if not ENVIRONMENT_ID_RE.fullmatch(str(environment_id)):
+        raise ValueError('VM environment ID must contain 32 lowercase hexadecimal characters.')
+    return root / '.harnessy' / 'environments' / str(environment_id)
+
+
+def _validate_registry_path(path: Path, workspace_root: Path) -> None:
+    """Never follow a redirected controller directory or metadata file."""
+    root = Path(workspace_root).expanduser().resolve()
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError as exc:
+        raise ValueError('VM environment metadata is outside its workspace.') from exc
+    current = root
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError('VM environment metadata cannot use symlink redirects.')
+
+
+def config_path(workspace_root: Path, environment_id: str | None = None) -> Path:
+    root = Path(workspace_root).expanduser().resolve()
+    if environment_id is not None:
+        return environment_root(root, environment_id) / 'environment.json'
+    registry = root / '.harnessy' / 'environments'
+    _validate_registry_path(registry, root)
+    if registry.is_dir():
+        for entry in sorted(registry.iterdir(), key=lambda item: item.name):
+            if ENVIRONMENT_ID_RE.fullmatch(entry.name) and (entry / 'environment.json').is_file():
+                return entry / 'environment.json'
+    return environment_root(root) / 'environment.json'
 
 
 def save_environment_config(workspace_root: Path, config: EnvironmentConfig) -> Path:
-    path = config_path(workspace_root)
+    cfg = config.normalized()
+    path = config_path(workspace_root, cfg.id)
+    _validate_registry_path(path, workspace_root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix('.tmp')
-    tmp.write_text(json.dumps(config.normalized().to_dict(), indent=2) + '\n', encoding='utf-8')
-    tmp.replace(path)
+    tmp = path.with_name(f'.{path.name}.{uuid.uuid4().hex}.tmp')
+    try:
+        with tmp.open('x', encoding='utf-8') as stream:
+            stream.write(json.dumps(cfg.to_dict(), indent=2) + '\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
     return path
 
 
-def load_environment_config(workspace_root: Path) -> EnvironmentConfig | None:
-    path = config_path(workspace_root)
+def load_environment_config(workspace_root: Path, environment_id: str | None = None) -> EnvironmentConfig | None:
+    path = config_path(workspace_root, environment_id)
+    _validate_registry_path(path, workspace_root)
     if not path.is_file():
         return None
     try:
         raw = json.loads(path.read_text('utf-8'))
     except (OSError, json.JSONDecodeError):
         return None
-    return EnvironmentConfig.from_dict(raw if isinstance(raw, dict) else {})
+    if not isinstance(raw, dict):
+        raise ValueError('VM environment definition must be a JSON object.')
+    cfg = EnvironmentConfig.from_dict(raw)
+    if ENVIRONMENT_ID_RE.fullmatch(path.parent.name) and cfg.id != path.parent.name:
+        raise ValueError('VM environment definition does not match its registry ID.')
+    return cfg

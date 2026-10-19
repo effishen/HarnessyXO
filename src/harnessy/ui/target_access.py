@@ -21,9 +21,10 @@ class TargetAccessEditor:
         self.on_change, self.draft = on_change, bool(draft)
         canonical = normalize_target_policy(policy, approval_mode=approval_mode, managed_vm=self.managed_vm)
         self._selected = dict(canonical['actions'])
+        self._project_scope = {key: canonical[key] for key in ('project_access', 'allowed_project_ids') if key in canonical}
         self.controls: dict[str, Any] = {}
         with ui.column().classes('w-full min-w-0 gap-2').props('data-hy-target-access-editor=1'):
-            self.mode = ui.select(TARGET_ACCESS_MODE_LABELS, value=canonical['access_mode'], label='Model access').classes('w-full').props('outlined dense data-hy-target-access-mode=1')
+            self.mode = ui.select(TARGET_ACCESS_MODE_LABELS, value=canonical['access_mode'], label='Model actions').classes('w-full').props('outlined dense data-hy-target-access-mode=1')
             self.description = ui.label('').classes('text-xs hy-muted').style('overflow-wrap:anywhere')
             with ui.row().classes('w-full min-w-0 gap-1 items-start no-wrap'):
                 self.summary = ui.label('').classes('text-xs hy-muted grow min-w-0').props('role=status data-hy-target-global-access=1').style('overflow-wrap:anywhere')
@@ -58,7 +59,7 @@ class TargetAccessEditor:
     def policy(self) -> dict[str, Any]:
         values = dict(self._selected)
         values.update({action: control.value for action, control in self.controls.items()})
-        return normalize_target_policy({'access_mode': self.mode.value, 'actions': values}, managed_vm=self.managed_vm)
+        return normalize_target_policy({**self._project_scope, 'access_mode': self.mode.value, 'actions': values}, managed_vm=self.managed_vm)
 
     async def _changed(self, _event: Any = None) -> None:
         self.error.set_text('')
@@ -75,8 +76,8 @@ class TargetAccessEditor:
         full = self.mode.value == 'full'
         self.selected_card.set_visibility(not full)
         self.description.set_text(
-            'Every target action is On. The configured SSH or guest account’s permissions still limit what succeeds. Global access still applies. Your selected action settings are retained when you switch back.'
-            if full else 'Choose Off, Ask, or On for each action below. Global access is a separate gate.'
+            'Every target action is On. Allowed projects / chats is a separate limit. The configured account and global access still apply. Selected action settings are retained when you switch back.'
+            if full else 'Choose Off, Ask, or On for each action below. Allowed projects / chats and global access are separate limits.'
         )
         try:
             permission = self.machine.load_tool_permission_settings()['agent']['tool_permissions']['external_targets']

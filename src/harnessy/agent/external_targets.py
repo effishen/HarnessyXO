@@ -27,6 +27,10 @@ class ExternalTargetError(RuntimeError):
     pass
 
 
+class ExternalTargetProjectAccessError(ExternalTargetError):
+    error_code = 'TARGET_PROJECT_ACCESS_DENIED'
+
+
 # Categories are best-effort text checks, never an OS isolation boundary. An
 # interpreter, uploaded script or SSH account may do more than text reveals.
 EXTERNAL_TARGET_COMMAND_RULES = tuple((label, pattern, names)
@@ -124,17 +128,28 @@ class ExternalTargetBroker:
         self.ssh_binary = shutil.which('ssh') or 'ssh'
         self.known_hosts = workspace.meta / 'external_targets_known_hosts'
 
-    def resolve(self, target_id_or_name: str, *, require_enabled: bool = True) -> ExternalTarget:
+    def resolve(self, target_id_or_name: str, *, require_enabled: bool = True,
+                model_permissions: bool = False) -> ExternalTarget:
         target = self.workspace.get_external_target(target_id_or_name)
         if target is None:
             raise ExternalTargetError(f'External target not found: {target_id_or_name}')
         if require_enabled and not target.enabled:
             raise ExternalTargetError(f'External target is disabled: {target.name}')
+        if model_permissions:
+            self._require_project_access(target)
         return target
+
+    def _require_project_access(self, target: ExternalTarget) -> None:
+        # Missing origin is not a workspace-wide model grant. Explicit human
+        # connection tests bypass model permissions at their call boundary.
+        if not self.chat_id or not target.allows_project(self.chat_id):
+            raise ExternalTargetProjectAccessError('This external target is not available to this Project/Chat.')
+        if target.managed_vm:
+            raise ExternalTargetError('Locally managed VMs use the VM environment tools, not External Targets.')
 
     def _require_target(self, target: ExternalTarget, tool_name: str, arguments: dict[str, Any],
                         *, unchanged: bool = False) -> ExternalTarget:
-        current = self.resolve(target.id)
+        current = self.resolve(target.id, model_permissions=True)
         if unchanged and any(getattr(current, field) != getattr(target, field) for field in
                 ('host', 'port', 'username', 'identity_file', 'auth_method', 'remote_root', 'managed_vm')):
             raise ExternalTargetError('Target connection settings changed. Resolve the target again before retrying.')
@@ -246,9 +261,13 @@ class ExternalTargetBroker:
             result['kind'] = 'external_ssh'
         return result
 
-    def list_public(self) -> list[dict[str, Any]]:
+    def list_public(self, *, model_permissions: bool = True) -> list[dict[str, Any]]:
+        if model_permissions and not self.chat_id:
+            raise ExternalTargetProjectAccessError('External target discovery requires this Project/Chat identity.')
         results = []
         for target in self.workspace.list_external_targets(enabled_only=True):
+            if model_permissions and (target.managed_vm or not target.allows_project(self.chat_id)):
+                continue
             item = self.public_target(target)
             if str(target.managed_vm.get('os')).startswith('openwrt-'):
                 from harnessy.environment.test_targets import TestTargetManager
@@ -364,6 +383,8 @@ class ExternalTargetBroker:
                 stderr=asyncio.subprocess.PIPE,
             )
             try:
+                if policy_guard is not None:
+                    self._require_target(target, *policy_guard, unchanged=True)
                 stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(input_bytes), timeout=max(1.0, float(timeout)))
             finally:
                 if proc.returncode is None:
@@ -372,6 +393,8 @@ class ExternalTargetBroker:
                 await cleanup()
         except FileNotFoundError as exc:
             raise ExternalTargetError('OpenSSH client was not found on the HarnessyXO host.') from exc
+        if policy_guard is not None:
+            self._require_target(target, *policy_guard, unchanged=True)
         duration = max(0.0, time.perf_counter() - started)
         stdout = stdout_b.decode('utf-8', errors='replace')
         stderr = stderr_b.decode('utf-8', errors='replace')

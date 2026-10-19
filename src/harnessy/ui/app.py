@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import base64
 import html
 import hashlib
@@ -497,6 +498,7 @@ body.body--dark .q-dialog__backdrop { background:rgba(0,0,0,.68) !important; }
 .hy-tab-chat { --hy-tab-rgb:16,163,127; --hy-tab-accent:#078b6c; }
 .hy-tab-target_terminal { --hy-tab-rgb:60,147,117; --hy-tab-accent:#3c9375; }
 .hy-tab-target_desktop { --hy-tab-rgb:60,147,117; --hy-tab-accent:#3c9375; }
+.hy-tab-vm_desktop { --hy-tab-rgb:60,147,117; --hy-tab-accent:#3c9375; }
 .hy-tab-environment { --hy-tab-rgb:133,92,201; --hy-tab-accent:#8052c6; }
 .hy-tab-files, .hy-tab-file { --hy-tab-rgb:42,126,211; --hy-tab-accent:#2478ce; }
 .hy-tab-terminal { --hy-tab-rgb:206,120,26; --hy-tab-accent:#bc6d13; }
@@ -839,6 +841,8 @@ html[data-hy-bookmark-action="remove"] .hy-bookmark-menu-separator { display:blo
 .hy-tool-call-card.hy-tool-failed { border-color:rgba(220,38,38,.42); background:rgba(220,38,38,.045); }
 .hy-tool-call-card.hy-tool-failed .hy-compact-summary-label { color:#dc2626; opacity:1; }
 .hy-tool-call-header { min-height:20px; padding:8px 12px 0; }
+.hy-tool-vm-label { min-width:0; max-width:240px; flex:0 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:10px; opacity:.78; }
+@media(max-width:640px) { .hy-tool-vm-label { max-width:125px; } }
 .hy-tool-call-body { width:100%; min-width:0; box-sizing:border-box; padding:0 12px 7px; }
 .hy-activity-card { width:100% !important; min-width:0; max-width:100%; align-self:stretch; box-sizing:border-box; border:1px solid var(--hy-border); border-left-width:3px; border-radius:11px; background:rgba(127,127,127,.035); overflow:hidden; }
 .hy-activity-full { width:100%; min-width:0; padding:8px 12px 9px; box-sizing:border-box; }
@@ -1315,6 +1319,7 @@ class OpenTab:
     title: str
     file_path: str | None = None
     target_id: str | None = None
+    environment_id: str | None = None
 
 
 @dataclass
@@ -1366,6 +1371,8 @@ class ToolView:
     compact_label: Any
     compact_dots: Any
     header_label: Any = None
+    environment_badges: tuple[Any, ...] = ()
+    environment_tooltips: tuple[Any, ...] = ()
 
 
 @dataclass
@@ -1426,6 +1433,7 @@ class HarnessyPage:
         self.file_clipboard: dict[str, dict[str, Any]] = {}
         self.file_selections: dict[str, list[Path]] = {}
         self.environment_subtabs: dict[str, str] = {}
+        self.vm_environment_selection: dict[str, str] = {}
         self.busy_tabs: set[str] = set()
         self._tab_busy_signature: tuple[tuple[str, bool], ...] = ()
         self._favicon_busy_state: bool | None = None
@@ -1535,7 +1543,7 @@ class HarnessyPage:
         regs = {r.id: r for r in self.machine.list_workspaces()}
         restored: list[OpenTab] = []
         self._blocked_restore_tabs.clear()
-        allowed_kinds = {'chat', 'memory', 'files', 'file', 'terminal', 'artifacts', 'environment', 'target_terminal', 'target_desktop'}
+        allowed_kinds = {'chat', 'memory', 'files', 'file', 'terminal', 'artifacts', 'environment', 'target_terminal', 'target_desktop', 'vm_desktop'}
         for item in raw.get('open_tabs') or []:
             if not isinstance(item, dict):
                 continue
@@ -1550,6 +1558,23 @@ class HarnessyPage:
                 continue
             file_path = str(item.get('file_path') or '') or None
             target_id = None
+            environment_id = str(item.get('environment_id') or '') or None
+            if kind == 'vm_desktop' and workspace_id == HOME_SCOPE_ID:
+                continue
+            if kind in {'terminal', 'vm_desktop'} and workspace_id != HOME_SCOPE_ID:
+                try:
+                    manager = EnvironmentManager(regs[workspace_id].path)
+                    if environment_id is None:
+                        configs = manager.list()
+                        environment_id = configs[0].id if len(configs) == 1 else None
+                    if environment_id is None or manager.get(environment_id) is None:
+                        continue
+                    if kind == 'vm_desktop':
+                        from harnessy.ui.vm_views import vm_view_key
+                        if key != vm_view_key(workspace_id, environment_id):
+                            continue
+                except (OSError, ValueError, RuntimeError):
+                    continue
             if kind in {'target_terminal', 'target_desktop'}:
                 if workspace_id == HOME_SCOPE_ID:
                     continue
@@ -1595,7 +1620,7 @@ class HarnessyPage:
                 log_event('harnessy', 'saved_tab_restore_failed', kind=kind, error_class=type(exc).__name__)
                 continue
             restored.append(OpenTab(
-                key, kind, workspace_id, str(chat_id) if chat_id else None, title or kind.title(), file_path=file_path, target_id=target_id,
+                key, kind, workspace_id, str(chat_id) if chat_id else None, title or kind.title(), file_path=file_path, target_id=target_id, environment_id=environment_id,
             ))
         self.open_tabs = restored
         active = str(raw.get('active_tab_key') or '')
@@ -1623,9 +1648,12 @@ class HarnessyPage:
         subtabs = raw.get('environment_subtabs')
         if isinstance(subtabs, dict):
             self.environment_subtabs = {
-                str(k): (str(v) if str(v) in {'Details', 'Snapshots', 'Test targets'} else 'Details')
+                str(k): (str(v) if str(v) in {'Details', 'Snapshots', 'VM Environments', 'External Targets'} else 'VM Environments')
                 for k, v in subtabs.items()
             }
+        selections = raw.get('vm_environment_selection')
+        if isinstance(selections, dict):
+            self.vm_environment_selection = {str(key): str(value) for key, value in selections.items() if str(key) in regs}
 
     def _save_ui_session(self) -> None:
         session = {
@@ -1638,6 +1666,7 @@ class HarnessyPage:
                     'title': tab.title,
                     'file_path': tab.file_path,
                     'target_id': tab.target_id,
+                    'environment_id': tab.environment_id,
                 }
                 for tab in self.open_tabs
             ],
@@ -1649,6 +1678,7 @@ class HarnessyPage:
             'terminal_counters': dict(self.terminal_counters),
             'file_paths': {key: str(value) for key, value in self.file_paths.items()},
             'environment_subtabs': dict(self.environment_subtabs),
+            'vm_environment_selection': dict(self.vm_environment_selection),
         }
         self.settings = self.machine.update_settings({'ui_session': session}, replace_sections=('ui_session',))
 
@@ -1909,7 +1939,7 @@ class HarnessyPage:
         )
         self._action_menu_button(menu, 'Rename Workspace', 'drive_file_rename_outline', lambda r=reg: self._rename_workspace_dialog(r))
         ui.separator().classes('hy-action-menu-separator')
-        self._action_menu_button(menu, 'External/Test Targets', 'lan', lambda r=reg: self.open_external_targets(r), disabled=not available)
+        self._action_menu_button(menu, 'External Targets', 'lan', lambda r=reg: self.open_external_targets(r), disabled=not available)
         self._action_menu_button(menu, 'Open Terminal', 'terminal', lambda r=reg: self.open_tool_tab('terminal', r), disabled=not available)
         self._action_menu_button(menu, 'Environment', 'shield', lambda r=reg: self.open_tool_tab('environment', r), disabled=not available)
         ui.separator().classes('hy-action-menu-separator')
@@ -2102,15 +2132,11 @@ class HarnessyPage:
         detail.clear()
         with detail:
             try:
-                cfg = EnvironmentManager(ws.root).config
+                configs = EnvironmentManager(ws.root).list()
+                label = f'{len(configs)} VM environment' + ('' if len(configs) == 1 else 's')
             except Exception:
-                cfg = None
-            if cfg:
-                preset = get_preset(cfg.preset)
-                badge = 'Ubuntu 24.04 RE' if preset.id == 'ubuntu-reverse' else preset.guest_os.replace(' LTS', '')
-                ui.label(f'🛡 VM · {badge} · {cfg.architecture} · CPU only').classes('text-[10px] hy-muted').style('min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap')
-            else:
-                ui.label('Legacy workspace · no VM environment').classes('text-[10px] hy-muted')
+                label = 'VM environments unavailable'
+            ui.label(label).classes('text-[10px] hy-muted')
 
     def _browser_workspace_environment(self, event) -> None:
         args = event.args if isinstance(event.args, dict) else {}
@@ -2869,23 +2895,21 @@ class HarnessyPage:
         dialog.open()
 
     def open_external_targets(self, reg: WorkspaceRegistration) -> None:
-        """Open this workspace's Environment → Test targets tab."""
-        self.environment_subtabs[reg.id] = 'Test targets'
+        """Open this workspace's linked external machines and devices."""
+        self.environment_subtabs[reg.id] = 'External Targets'
         self.open_tool_tab('environment', reg)
 
     def _render_test_targets(self, ws: WorkspaceStore) -> None:
         """Render independent targets inside Environment, never a separate window."""
-        from harnessy.ui.test_targets import open_vm_creator, render_managed_target
         from harnessy.ui.target_access import TargetAccessEditor
+        from harnessy.ui.project_access import ProjectAccessEditor
         with ui.column().classes('hy-targets-toolbar w-full gap-3'):
-            ui.label('Connect a device or create a VM for testing. Each target has its own files and system.').classes('text-sm hy-muted')
+            ui.label('Link an existing machine or device over SSH. Locally created VMs are managed in VM Environments.').classes('text-sm hy-muted')
             with ui.row().classes('w-full items-center gap-2'):
                 count_label = ui.label('Targets').classes('font-semibold grow')
                 ui.button('Connect device', icon='add_link', on_click=lambda: open_editor()).props('outline no-caps')
-                ui.button('Create VM', icon='add', on_click=lambda: open_vm_creator(ws, render_targets, machine=self.machine)).props('unelevated no-caps color=primary')
             with ui.row().classes('hy-target-filters w-full gap-2'):
                 search = ui.input('Search targets', placeholder='Name, OS or host').props('outlined dense clearable debounce=200').classes('grow min-w-0')
-                kind = ui.select({'all': 'All targets', 'vm': 'Test VMs', 'device': 'External devices'}, value='all', label='Show').props('outlined dense').classes('w-44')
         target_list = ui.column().classes('w-full gap-3 px-4 pb-4')
         disposers = []
         def stop_polling():
@@ -2896,7 +2920,7 @@ class HarnessyPage:
 
         def open_editor(target_id: str | None = None) -> None:
             target = ws.get_external_target(target_id or '') if target_id else None
-            with ui.dialog() as editor, ui.card().classes('hy-simple-dialog w-[680px] max-w-[95vw]'):
+            with ui.dialog() as editor, ui.card().classes('hy-simple-dialog w-[680px] max-w-[95vw]').style('max-height:92vh;overflow-y:auto'):
                 ui.label('Edit External Target' if target else 'Add External Target').classes('text-lg font-semibold')
                 ui.label('Choose an identity file/host SSH agent, or save an SSH password for unattended connections. Credentials stay on the HarnessyXO host.').classes('text-xs hy-muted')
                 with ui.expansion('About device access', icon='info_outline').classes('w-full'):
@@ -2937,6 +2961,7 @@ class HarnessyPage:
                     'Remote test root', value=target.remote_root if target else '/home/harnessy/hx-test'
                 ).classes('w-full')
                 enabled = ui.switch('Enable target for this workspace', value=target.enabled if target else True)
+                project_access = ProjectAccessEditor(ws, target.policy if target else None, subject='external target')
                 access = TargetAccessEditor(self.machine, target.policy if target else None,
                                             approval_mode=target.approval_mode if target else 'ask',
                                             enabled=enabled, draft=True)
@@ -2954,15 +2979,16 @@ class HarnessyPage:
                                 password=str(password.value) if authentication.value == 'password' and password.value else None,
                                 remote_root=str(remote_root.value or ''),
                                 enabled=bool(enabled.value), approval_mode=access.approval_mode,
-                                policy=access.policy(),
+                                policy={**access.policy(), 'project_access': project_access.project_access,
+                                        'allowed_project_ids': list(project_access.allowed_project_ids)},
                             )
                         except ValueError as exc:
                             ui.notify(str(exc), type='warning')
                             return
                         password.value = ''
                         editor.close()
-                        render_targets()
                         ui.notify('External target saved.', type='positive', timeout=1800)
+                        render_targets()
 
                     ui.button('Save', icon='check', on_click=save_target).props('unelevated no-caps color=primary')
             editor.open()
@@ -3007,23 +3033,18 @@ class HarnessyPage:
             from harnessy.environment.test_catalog import guest_os
             stop_polling()
             target_list.clear()
-            all_targets = ws.list_external_targets()
+            all_targets = [target for target in ws.list_external_targets() if not target.managed_vm]
             count_label.set_text(f'{len(all_targets)} target' + ('' if len(all_targets) == 1 else 's'))
             query = str(search.value or '').strip().casefold()
             targets = [target for target in all_targets
-                       if (kind.value == 'all' or bool(target.managed_vm) == (kind.value == 'vm'))
-                       and query in ' '.join((target.name, target.host,
-                           guest_os(target.managed_vm['os']).label if target.managed_vm else 'External device')).casefold()]
+                       if query in ' '.join((target.name, target.host, 'External device')).casefold()]
             with target_list:
                 if not targets:
                     with ui.column().classes('hy-empty-state w-full items-center gap-2'):
                         ui.icon('search_off' if all_targets else 'devices', size='32px').classes('hy-muted')
-                        ui.label('No matching targets' if all_targets else 'Your test targets will appear here').classes('font-semibold')
-                        ui.label('Try another name or show all target types.' if all_targets else 'Create a VM or connect an existing device using the buttons above.').classes('text-sm hy-muted text-center')
+                        ui.label('No matching targets' if all_targets else 'Your external targets will appear here').classes('font-semibold')
+                        ui.label('Try another name or host.' if all_targets else 'Connect an existing device using the button above.').classes('text-sm hy-muted text-center')
                 for target in targets:
-                    if target.managed_vm:
-                        disposers.append(render_managed_target(self, ws, target, render_targets))
-                        continue
                     with ui.card().classes('w-full hy-target-card'):
                         with ui.row().classes('w-full items-start justify-between gap-3'):
                             with ui.column().classes('gap-0 min-w-0'):
@@ -3041,6 +3062,11 @@ class HarnessyPage:
                                 ui.label(
                                     'Full unrestricted access' if target.policy.get('access_mode') == 'full' else 'Only selected actions'
                                 ).classes('text-xs hy-muted')
+                                if target.policy.get('project_access', 'all') == 'all':
+                                    ui.label('Allowed projects / chats: All, including future ones').classes('text-xs hy-muted')
+                                else:
+                                    selected_projects = len(target.policy.get('allowed_project_ids') or ())
+                                    ui.label(f'Allowed projects / chats: {selected_projects} selected' if selected_projects else 'Allowed projects / chats: None · model access is blocked').classes('text-xs hy-muted' if selected_projects else 'text-xs text-negative')
                             with ui.row().classes('gap-1'):
                                 availability = ui.switch('Enabled for the model', value=target.enabled).props(
                                     'dense data-hy-target-model-enabled=1')
@@ -3065,7 +3091,6 @@ class HarnessyPage:
                                     ).classes('text-[11px] hy-muted break-all')
 
         search.on_value_change(lambda _: render_targets())
-        kind.on_value_change(lambda _: render_targets())
         render_targets()
 
     def _rename_chat_dialog(self, ws: WorkspaceStore, chat_id: str) -> None:
@@ -3809,167 +3834,7 @@ class HarnessyPage:
                 listing = ui.column().classes('hy-workspace-picker-list w-full gap-0 overflow-y-auto').style('height:clamp(150px, 24vh, 280px);flex:0 0 auto;border:1px solid var(--hy-border);border-radius:8px')
                 listing.on('pointerdown', js_handler="(e) => { if (e.button === 0 && window.getSelection) window.getSelection().removeAllRanges(); }")
                 name_input = ui.input('Workspace name (optional)').classes('w-full')
-                with ui.column().classes('w-full gap-2'):
-                    ui.label('Environment · Sandboxed Linux VM').classes('font-semibold')
-                    with ui.row().classes('w-full gap-3'):
-                        image_select = ui.select({k:v.name for k,v in IMAGES.items()}, value='ubuntu-24.04', label='Operating system').classes('flex-grow')
-                        arch_select = ui.select({'arm64':'ARM64', 'x86_64':'x86-64'}, value='arm64', label='CPU architecture').classes('w-40')
-                        tools_select = ui.select(TOOL_BUNDLES, value='reverse', label='Tool preset').classes('flex-grow')
-                    with ui.row().classes('w-full gap-3'):
-                        cpu_input = ui.number('VM CPU', value=4, min=1, max=64, step=1).classes('w-32')
-                        memory_input = ui.number('VM memory (GB)', value=8, min=1, max=256, step=1).classes('w-40')
-                        disk_input = ui.number('Sparse disk max (GB)', value=128, min=16, max=4096, step=16).classes('w-48')
-                        network_switch = ui.switch('Public outbound network', value=True)
-                    details_area = ui.column().classes('hy-settings-section w-full gap-1')
-                controls = (image_select, arch_select, tools_select, cpu_input, memory_input, disk_input, network_switch)
-                choice_state = {
-                    'syncing': False,
-                    'existing': None,
-                    'draft': EnvironmentConfig(),
-                    'optional_by_preset': {},
-                }
-
-                def optional_selection(preset, cfg: EnvironmentConfig | None = None) -> set[str]:
-                    if cfg is not None:
-                        source = tuple(cfg.optional_tools or ())
-                        selected = set(preset.optional_tool_ids if '*' in source else source)
-                        selected.intersection_update(preset.optional_tool_ids)
-                        return selected
-                    by_preset = choice_state['optional_by_preset']
-                    if preset.id in by_preset:
-                        return set(by_preset[preset.id])
-                    selected = set(preset.optional_tool_ids)
-                    by_preset[preset.id] = set(selected)
-                    return set(selected)
-
-                def set_optional_tool(preset_id: str, tool_id: str, enabled: bool) -> None:
-                    if state['opening']:
-                        return
-                    selected = set(choice_state['optional_by_preset'].get(preset_id, set()))
-                    if enabled:
-                        selected.add(tool_id)
-                    else:
-                        selected.discard(tool_id)
-                    choice_state['optional_by_preset'][preset_id] = selected
-
-                def set_all_optional(preset_id: str, values: tuple[str, ...]) -> None:
-                    if state['opening']:
-                        return
-                    choice_state['optional_by_preset'][preset_id] = set(values)
-                    preview()
-
-                def selected_config() -> EnvironmentConfig:
-                    if choice_state['existing'] is not None:
-                        return choice_state['existing']
-                    preset = select_preset(str(image_select.value), str(tools_select.value))
-                    optional = tuple(tool for tool in preset.optional_tool_ids if tool in optional_selection(preset))
-                    return EnvironmentConfig(preset=preset.id, architecture=str(arch_select.value),
-                        cpu=int(cpu_input.value or 4), memory_mb=int(float(memory_input.value or 8)*1024),
-                        disk_gb=int(disk_input.value or 128), network=bool(network_switch.value),
-                        optional_tools=optional, gpu=False).normalized()
-
-                def preview(_e=None) -> None:
-                    if choice_state['syncing'] or state['opening']:
-                        return
-                    cfg = selected_config()
-                    if choice_state['existing'] is None:
-                        choice_state['draft'] = cfg
-                    preset = get_preset(cfg.preset)
-                    selected_optional = optional_selection(preset, cfg if choice_state['existing'] is not None else None)
-                    provider, mode = execution_mode(cfg.architecture)
-                    details_area.clear()
-                    with details_area:
-                        ui.label('Existing environment — will be reused unchanged' if choice_state['existing'] else 'Environment details — preview only').classes('font-semibold text-sm')
-                        ui.label(f'{preset.guest_os} · {cfg.architecture} · {provider.upper()} · CPU only').classes('text-sm')
-                        ui.label(mode).classes('text-sm' + (' text-warning' if mode.startswith('Emulated') else ' hy-muted'))
-                        ui.label(preset.description).classes('text-xs hy-muted')
-                        ui.label('Experimental HarnessyXO combination; guest boot/isolation must pass before tools are enabled.' if preset.image.experimental or mode.startswith('Emulated') else 'Default HarnessyXO Linux integration.').classes('text-xs hy-muted')
-                        ui.label('Terminal-only (no desktop). Each command sees one selected working root at /workspace. Controller metadata, sibling worktrees, host home and GPU are outside that view.').classes('text-xs hy-muted')
-                        if preset.optional_tool_ids:
-                            with ui.expansion(
-                                'Optional tools', icon='construction', value=not bool(choice_state['existing']),
-                            ).classes('w-full'):
-                                ui.label(
-                                    f'{len(selected_optional)}/{len(preset.optional_tool_ids)} selected initially. '
-                                    'Checkboxes below are the saved selection.'
-                                ).classes('text-xs hy-muted')
-                                if 'rea' in preset.optional_tool_ids:
-                                    ui.label('REA is an optional VM command-line tool and uses shell/process permissions.').classes('text-xs hy-muted')
-                                if cfg.network:
-                                    ui.label('Selected tools are installed best-effort during first setup. Uncheck heavy tools you do not need yet to reach Ready faster.').classes('text-xs hy-muted')
-                                else:
-                                    ui.label('Public outbound is OFF: HarnessyXO will skip all downloadable optional tools instead of retrying them. Your selections are remembered for a later outbound-enabled setup.').classes('text-xs text-warning font-semibold')
-                                if not choice_state['existing']:
-                                    with ui.row().classes('gap-2 flex-wrap'):
-                                        ui.button(
-                                            'Select all',
-                                            on_click=lambda pid=preset.id, values=preset.optional_tool_ids: set_all_optional(pid, values),
-                                        ).props('flat dense no-caps')
-                                        ui.button(
-                                            'Clear optional',
-                                            on_click=lambda pid=preset.id: set_all_optional(pid, ()),
-                                        ).props('flat dense no-caps')
-                                supplemental = set(preset.supplemental_tools)
-                                if supplemental:
-                                    ui.label('Heavy / supplemental bundles').classes('text-xs font-semibold mt-1')
-                                    for tool_id in preset.supplemental_tools:
-                                        label = {
-                                            'ghidra': 'Ghidra headless (heavy; ARM64 may build native components)',
-                                            'rea': 'REA CLI (Reverse Engineer Anything)',
-                                            'python-re': 'Python RE environments (heavy: angr, capa, FLOSS, firmware, Frida)',
-                                        }.get(tool_id, tool_id)
-                                        box = ui.checkbox(label, value=tool_id in selected_optional).classes('w-full')
-                                        if choice_state['existing']:
-                                            box.disable()
-                                        else:
-                                            box.on_value_change(
-                                                lambda e, pid=preset.id, tid=tool_id: set_optional_tool(pid, tid, bool(e.value))
-                                            )
-                                if preset.optional_packages:
-                                    ui.label('Additional optional packages').classes('text-xs font-semibold mt-1')
-                                    with ui.row().classes('w-full gap-x-4 gap-y-0 flex-wrap'):
-                                        for tool_id in preset.optional_packages:
-                                            box = ui.checkbox(tool_id, value=tool_id in selected_optional).classes('text-xs').style('width:220px')
-                                            if choice_state['existing']:
-                                                box.disable()
-                                            else:
-                                                box.on_value_change(
-                                                    lambda e, pid=preset.id, tid=tool_id: set_optional_tool(pid, tid, bool(e.value))
-                                                )
-                        with ui.expansion('Image source, tools and capabilities', icon='info').classes('w-full'):
-                            ui.label(f'Image source: Lima template:{preset.image.template} (minimum Lima 2.0; newer images may require an updated Lima).').classes('text-xs')
-                            ui.label('Image build, download size and cache hit are resolved by Lima on Create; not guessed here. Disk maximum is not download size or current usage.').classes('text-xs hy-muted')
-                            ui.label('Capabilities: ' + ' · '.join(preset.image.capabilities)).classes('text-xs')
-                            ui.label(f'Required packages ({len(preset.packages)}): ' + ', '.join(preset.packages)).classes('text-xs')
-                            if preset.optional_tool_ids:
-                                ui.label(f'Optional selected ({len(selected_optional)}/{len(preset.optional_tool_ids)}): ' + (', '.join(tool for tool in preset.optional_tool_ids if tool in selected_optional) or 'none')).classes('text-xs hy-muted')
-                            ui.label('One-time provisioning uses ' + preset.image.package_manager + '; ordinary starts do not install the tool bundle.').classes('text-xs hy-muted')
-                            ui.label('Public outbound mode blocks host, LAN, private and reserved destinations. When public outbound is disabled, repository-backed tool provisioning is skipped entirely instead of being attempted and failing.').classes('text-xs hy-muted')
-                            for description in FUTURE_IMAGES.values():
-                                ui.label(description).classes('text-xs hy-muted')
-
-                def refresh_environment() -> None:
-                    target = Path(state.get('selected') or state['path'])
-                    cfg = EnvironmentManager(target).config
-                    choice_state['existing'] = cfg
-                    shown = cfg or choice_state['draft']
-                    preset = get_preset(shown.preset)
-                    choice_state['syncing'] = True
-                    try:
-                        image_select.set_value(preset.image_id)
-                        arch_select.set_value(shown.architecture)
-                        tools_select.set_value(preset.tools_id)
-                        cpu_input.set_value(shown.cpu)
-                        memory_input.set_value(shown.memory_mb / 1024)
-                        disk_input.set_value(shown.disk_gb)
-                        network_switch.set_value(shown.network)
-                        for control in controls:
-                            control.disable() if cfg else control.enable()
-                    finally:
-                        choice_state['syncing'] = False
-                    preview()
-                for control in controls:
-                    control.on_value_change(preview)
+                ui.label('Create the workspace first. Add named VMs later in Environments.').classes('text-sm hy-muted')
 
                 def go(target: Path) -> None:
                     if state['opening']:
@@ -3982,7 +3847,6 @@ class HarnessyPage:
                         state['selected'] = None
                         path_input.value = str(resolved)
                         redraw()
-                        refresh_environment()
                     except Exception as exc:
                         ui.notify(str(exc), type='negative')
 
@@ -4002,7 +3866,6 @@ class HarnessyPage:
                             previous_row.classes(remove='hy-active-item')
                         if selected_row is not None:
                             selected_row.classes(add='hy-active-item')
-                        refresh_environment()
                     except Exception as exc:
                         ui.notify(str(exc), type='negative')
 
@@ -4020,7 +3883,7 @@ class HarnessyPage:
                     picker_body.props('inert aria-busy=true')
                     picker_body.classes(add='opacity-60')
                     progress_spinner.set_visibility(True)
-                    progress_status.set_text('Checking folder and environment…')
+                    progress_status.set_text('Checking folder…')
                     progress_elapsed.set_text('0:00')
                     progress_row.set_visibility(True)
                     progress_timer.activate()
@@ -4029,7 +3892,6 @@ class HarnessyPage:
                         # checks run in a worker so the loading state can paint.
                         selected_path = Path(state.get('selected') or state['path'])
                         name = name_input.value or None
-                        config = selected_config()
 
                         def prepare_folder() -> Path:
                             target = validate_workspace_root(
@@ -4038,10 +3900,6 @@ class HarnessyPage:
                             )
                             if not target.is_dir():
                                 raise ValueError('Selected folder is not available')
-                            manager = EnvironmentManager(target)
-                            # Existing workspaces keep their saved VM settings.
-                            if manager.config is None:
-                                manager.initialize(config)
                             return target
 
                         target = await asyncio.to_thread(prepare_folder)
@@ -4053,9 +3911,12 @@ class HarnessyPage:
                         progress_status.set_text('Opening workspace…')
                         await asyncio.sleep(0)
                         self.select_workspace(reg)
+                        # A new folder has no VM yet. Make the next step
+                        # visible without requiring a VM for files or chat.
+                        if not EnvironmentManager(target).list():
+                            self.open_tool_tab('environment', reg)
                         dialog.close()
-                        ui.notify(f'Workspace ready: {reg.name} · VM will provision once on first use', type='positive')
-                        background_tasks.create(self._provision_workspace_environment(ws))
+                        ui.notify(f'Workspace ready: {reg.name}', type='positive')
                     except Exception as exc:
                         progress_status.set_text(f'Could not open workspace: {exc}')
                         ui.notify(str(exc), type='negative', timeout=7000)
@@ -4109,7 +3970,6 @@ class HarnessyPage:
                             ui.menu_item('Rename current folder', on_click=lambda: self._workspace_picker_rename(state['path'], go))
 
                 redraw()
-                refresh_environment()
             with ui.column().classes('hy-picker-footer w-full gap-2'):
                 with ui.row().classes('w-full items-center no-wrap gap-2').props('role=status aria-live=polite') as progress_row:
                     progress_spinner = ui.spinner(size='22px')
@@ -4229,7 +4089,7 @@ class HarnessyPage:
                             session = self.terminal_sessions.pop(tab.key, None)
                             if session:
                                 session.close()
-                        elif tab.kind == 'target_desktop':
+                        elif tab.kind in {'target_desktop', 'vm_desktop'}:
                             from harnessy.ui.test_targets import close_target_desktop
                             close_target_desktop(self, tab.key)
                     if pending_terminal_starts:
@@ -4245,8 +4105,8 @@ class HarnessyPage:
                         await stop_workspace_test_targets(removed_ws)
                     if safe_root is not None and safe_root.is_dir():
                         manager = await asyncio.to_thread(EnvironmentManager, safe_root)
-                        config = await asyncio.to_thread(lambda: manager.config)
-                        if config is not None:
+                        configs = await asyncio.to_thread(manager.list)
+                        for config in configs:
                             provider = manager.provider(config)
                             status = await provider.status()
                             if status.available:
@@ -4463,21 +4323,57 @@ class HarnessyPage:
         self.refresh_sidebar()
         self.open_chat_tab(chat.id)
 
-    def open_tool_tab(self, kind: str, reg: WorkspaceRegistration | None = None) -> None:
+    def open_tool_tab(self, kind: str, reg: WorkspaceRegistration | None = None, *, environment_id: str | None = None) -> None:
         reg = reg or self.registration
         if not reg:
             ui.notify('Choose a workspace first', type='warning')
             return
         labels = {'memory': 'Workspace Memory', 'files': 'File Explorer', 'terminal': 'Terminal', 'artifacts': 'ZIP / Downloads', 'environment': 'Environment'}
         if kind == 'terminal':
+            manager = EnvironmentManager(reg.path)
+            configs = manager.list()
+            if environment_id is None and len(configs) != 1:
+                if not configs:
+                    ui.notify('Create a VM environment first.', type='info')
+                    self.open_tool_tab('environment', reg)
+                    return
+                with ui.dialog() as choose_vm, ui.card().classes('p-5 gap-3'):
+                    ui.label('Open a VM terminal').classes('text-lg font-semibold')
+                    for config in configs:
+                        def choose(selected=config.id):
+                            choose_vm.close()
+                            self.open_tool_tab('terminal', reg, environment_id=selected)
+                        ui.button(config.name, icon='terminal', on_click=choose).props('outline no-caps')
+                    ui.button('Cancel', on_click=choose_vm.close).props('flat no-caps')
+                choose_vm.open()
+                return
+            config = manager.get(environment_id) if environment_id else configs[0]
+            if config is None:
+                ui.notify('This VM environment is no longer registered.', type='warning')
+                return
             number = self.terminal_counters.get(reg.id, 0) + 1
             self.terminal_counters[reg.id] = number
-            key = f'terminal:{reg.id}:{uuid.uuid4().hex}'
-            self.open_tabs.append(OpenTab(key, kind, reg.id, None, f'Terminal {number}'))
+            key = f'terminal:{reg.id}:{config.id}:{uuid.uuid4().hex}'
+            self.open_tabs.append(OpenTab(key, kind, reg.id, None, f'{config.name} · Terminal {number}', environment_id=config.id))
         else:
             key = self._tool_tab_key(kind, reg.id)
             if not any(t.key == key for t in self.open_tabs):
                 self.open_tabs.append(OpenTab(key, kind, reg.id, None, labels[kind]))
+        self.activate_tab(key)
+
+    def open_vm_tab(self, ws: WorkspaceStore, environment_id: str, kind: str = 'desktop') -> None:
+        from harnessy.ui.vm_views import vm_view_key
+        if kind != 'desktop':
+            raise ValueError('Unsupported VM view.')
+        config = EnvironmentManager(ws.root).get(environment_id)
+        if config is None:
+            ui.notify('This VM environment no longer exists.', type='warning')
+            return
+        key = vm_view_key(ws.id, config.id)
+        label = 'Web UI' if config.provider == 'openwrt' else 'Desktop'
+        if not any(tab.key == key for tab in self.open_tabs):
+            self.open_tabs.append(OpenTab(key, 'vm_desktop', ws.id, None,
+                f'{config.name} · {label}', environment_id=config.id))
         self.activate_tab(key)
 
     def open_target_tab(self, ws: WorkspaceStore, target_id: str, kind: str) -> None:
@@ -4629,7 +4525,7 @@ class HarnessyPage:
             session = self.terminal_sessions.pop(tab.key, None)
             if session:
                 session.close()
-        if tab.kind == 'target_desktop':
+        if tab.kind in {'target_desktop', 'vm_desktop'}:
             from harnessy.ui.test_targets import close_target_desktop
             close_target_desktop(self, key)
         self.file_editor_states.pop(key, None)
@@ -4660,7 +4556,7 @@ class HarnessyPage:
             for tab in self.open_tabs:
                 active = tab.key == self.active_tab_key
                 kind_class = tab.kind if tab.kind in {
-                    'chat', 'environment', 'files', 'file', 'terminal', 'memory', 'artifacts', 'history', 'target_terminal', 'target_desktop'
+                    'chat', 'environment', 'files', 'file', 'terminal', 'memory', 'artifacts', 'history', 'target_terminal', 'target_desktop', 'vm_desktop'
                 } else 'tool'
                 cls = f'hy-tab hy-tab-{kind_class}' + (' hy-tab-active' if active else '')
                 with ui.row().classes(cls + ' items-center no-wrap gap-0 px-1').props(f'draggable=true data-hy-tab-key={tab.key}'):
@@ -4672,7 +4568,7 @@ class HarnessyPage:
                     else:
                         icon = 'chat_bubble_outline' if tab.kind == 'chat' else {
                             'memory':'memory', 'files':'folder_special', 'file':'description', 'history':'history',
-                            'terminal':'terminal', 'target_terminal':'terminal', 'target_desktop':'desktop_windows', 'artifacts':'archive', 'environment':'shield'
+                            'terminal':'terminal', 'target_terminal':'terminal', 'target_desktop':'desktop_windows', 'vm_desktop':'desktop_windows', 'artifacts':'archive', 'environment':'shield'
                         }.get(tab.kind, 'tab')
                     workspace_label = self._tab_workspace_label(tab)
                     item_label = self._tab_item_label(tab)
@@ -4767,6 +4663,9 @@ class HarnessyPage:
             elif tab.kind in {'target_terminal', 'target_desktop'}:
                 from harnessy.ui.test_targets import render_target_tab
                 render_target_tab(self, tab, ws)
+            elif tab.kind == 'vm_desktop':
+                from harnessy.ui.vm_views import render_vm_tab
+                render_vm_tab(self, tab, ws)
             elif tab.kind == 'artifacts':
                 self._render_artifacts_tab(tab, ws)
             elif tab.kind == 'environment':
@@ -7543,6 +7442,10 @@ class HarnessyPage:
                     'role=button tabindex=0 data-hy-compact-toggle=1 aria-label="Temporarily expand Tool activity"'
                 ):
                     compact_label = ui.label(compact_text).classes('hy-compact-summary-label')
+                    compact_vm = ui.label('').classes('hy-tool-vm-label')
+                    with compact_vm:
+                        compact_vm_tip = ui.tooltip('').classes('whitespace-pre-line max-w-md')
+                    compact_vm.set_visibility(False)
                     compact_saved = ui.label('State saved').classes('hy-state-saved')
                     self._message_settings_badge(settings_tip)
                     compact_dots = ui.element('span').classes('hy-running-dots')
@@ -7551,6 +7454,10 @@ class HarnessyPage:
                 with ui.row().classes('hy-tool-call-header w-full items-center no-wrap gap-2'):
                     tool_header = ui.label(f'Tool · {name or "unknown"}').classes('text-xs font-semibold')
                     tool_header.tooltip(settings_tip)
+                    header_vm = ui.label('').classes('hy-tool-vm-label')
+                    with header_vm:
+                        header_vm_tip = ui.tooltip('').classes('whitespace-pre-line max-w-md')
+                    header_vm.set_visibility(False)
                     self._message_settings_badge(settings_tip)
                     ref_label = ui.label(self._bubble_ref('T', message_id)).classes('hy-bubble-ref')
                     ref_label.set_visibility(bool(message_id))
@@ -7598,10 +7505,26 @@ class HarnessyPage:
             raw_markdown=raw_markdown, duration_label=duration_label, time_label=time_label,
             copy_state=copy_state, copy_button=copy_button, bubble_id=bubble_id, ref_label=ref_label,
             compact_label=compact_label, compact_dots=compact_dots, header_label=tool_header,
+            environment_badges=(compact_vm, header_vm),
+            environment_tooltips=(compact_vm_tip, header_vm_tip),
         )
+        self._apply_tool_environment(view, timing)
         if building is not None:
             self._refresh_building_tool(view, building, {})
         return view
+
+    @staticmethod
+    def _apply_tool_environment(view: ToolView, metadata: dict[str, Any] | None) -> None:
+        from harnessy.ui.tool_environment import tool_environment_label
+        environment_id, text, detail = tool_environment_label(metadata)
+        for badge, tooltip in zip(view.environment_badges, view.environment_tooltips):
+            badge.set_text(text)
+            badge.set_visibility(bool(environment_id))
+            if environment_id:
+                badge.props(f'data-hy-environment-id={environment_id}')
+            else:
+                badge.props(remove='data-hy-environment-id')
+            tooltip.set_text(detail)
 
     def _refresh_building_tool(self, view: ToolView, progress: dict[str, Any], state: dict[str, Any]) -> None:
         """Project incomplete arguments as activity, never as executable input."""
@@ -7680,6 +7603,7 @@ class HarnessyPage:
             'message_id': durable_id, '_ready': True,
             'duration_seconds': duration, 'timing': dict(event),
         })
+        self._apply_tool_environment(view, event)
         if view.header_label is not None:
             view.header_label.set_text(f'Tool · {name}')
         view.copy_button.set_visibility(True)
@@ -8085,6 +8009,8 @@ class HarnessyPage:
                  else 'running' if started else 'awaiting_execution')
         name = str(tool.get('name') or 'unknown')
         arguments = tool.get('arguments') if isinstance(tool.get('arguments'), dict) else {}
+        if tool.get('environment_id'):
+            self._apply_tool_environment(view, tool)
         labels = {'stopping': 'Stopping', 'awaiting_approval': 'Waiting for approval',
                   'awaiting_execution': 'Awaiting execution', 'running': 'Running'}
         if getattr(view, '_harnessy_live_stage', None) != stage:
@@ -11726,7 +11652,8 @@ class HarnessyPage:
                 call_id = str(event.get('call_id') or '')
                 tool = process_live_state.get('current_tool')
                 if isinstance(tool, dict) and tool.get('call_id') == call_id:
-                    tool = {**tool, 'started_perf': float(event.get('started_perf') or time.perf_counter())}
+                    tool = {**tool, 'started_perf': float(event.get('started_perf') or time.perf_counter()),
+                            **{key: event[key] for key in ('environment_id', 'environment_name', 'project_files_mode') if key in event}}
                     publish_live_state(current_tool=tool)
                 tool_view = tool_views.get(call_id)
                 if isinstance(tool_view, ToolView) and live_render_available(tool_view.root):
@@ -16447,8 +16374,8 @@ window.harnessyTerminalFocus = function(terminalId) {
     def _terminal_input(self, e) -> None:
         data = e.args if isinstance(e.args, dict) else {}
         terminal_id = str(data.get('terminal_id') or '')
-        if terminal_id.startswith('test-target:') and not any(
-            tab.key == terminal_id and tab.kind == 'target_terminal' and tab.workspace_id == str(data.get('workspace_id') or '')
+        if not any(
+            tab.key == terminal_id and tab.kind in {'terminal', 'target_terminal'} and tab.workspace_id == str(data.get('workspace_id') or '')
             for tab in self.open_tabs
         ):
             return
@@ -16459,8 +16386,8 @@ window.harnessyTerminalFocus = function(terminalId) {
     def _terminal_resize(self, e) -> None:
         data = e.args if isinstance(e.args, dict) else {}
         terminal_id = str(data.get('terminal_id') or '')
-        if terminal_id.startswith('test-target:') and not any(
-            tab.key == terminal_id and tab.kind == 'target_terminal' and tab.workspace_id == str(data.get('workspace_id') or '')
+        if not any(
+            tab.key == terminal_id and tab.kind in {'terminal', 'target_terminal'} and tab.workspace_id == str(data.get('workspace_id') or '')
             for tab in self.open_tabs
         ):
             return
@@ -18730,15 +18657,20 @@ window.harnessyTerminalFocus = function(terminalId) {
     # --------------------------------------------------------------- terminal
     def _render_terminal_tab(self, tab: OpenTab, ws: WorkspaceStore | ToolScope) -> None:
         session = self.terminal_sessions.get(tab.key)
-        is_workspace_vm = isinstance(ws, WorkspaceStore) and ws.is_vm_workspace
+        manager = EnvironmentManager(ws.root, environment_id=tab.environment_id) if isinstance(ws, WorkspaceStore) else None
+        config = manager.config if manager is not None and tab.environment_id else None
+        is_workspace_vm = isinstance(ws, WorkspaceStore) and config is not None
+        if isinstance(ws, WorkspaceStore) and config is None:
+            # A saved terminal never attaches to an arbitrary replacement VM.
+            session = None
 
         if session is None and is_workspace_vm:
             error = self.terminal_errors.get(tab.key)
-            environment_busy = ENVIRONMENT_OPERATIONS.is_busy(ws.root)
+            environment_busy = ENVIRONMENT_OPERATIONS.is_busy(ws.root, environment_id=config.id)
             with ui.column().classes('hy-tool-panel hy-terminal-panel w-full no-wrap gap-0'):
                 with ui.row().classes('hy-tool-toolbar w-full items-center py-2 no-wrap gap-2').style('border-bottom:1px solid var(--hy-border); min-width:0'):
                     ui.label(tab.title).classes('font-semibold')
-                    base_label = ui.label('🛡 Workspace VM · Files at /workspace').classes('text-xs hy-muted')
+                    base_label = ui.label(f'🛡 {config.name} · Files at /workspace').classes('text-xs hy-muted')
                     base_label.tooltip(
                         'This human-operated workspace terminal is scoped to the Files container. '
                         'Model commands receive only their canonical Project directory plus read-only inputs.'
@@ -18755,7 +18687,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                     else:
                         ui.spinner(size='34px')
                         if environment_busy:
-                            op = ENVIRONMENT_OPERATIONS.state(ws.root)
+                            op = ENVIRONMENT_OPERATIONS.state(ws.root, environment_id=config.id)
                             ui.label(op.message or 'Waiting for environment operation…').classes('font-semibold')
                             ui.label('The terminal will attach after the workspace environment is Ready.').classes('text-xs hy-muted')
                         else:
@@ -18768,22 +18700,42 @@ window.harnessyTerminalFocus = function(terminalId) {
                         # operation manager as the Environment page. The job keeps
                         # running across a browser reload and carries a total
                         # deadline; the terminal task merely observes its result.
-                        ENVIRONMENT_OPERATIONS.start(ws.root, 'start')
-                        operation_task = ENVIRONMENT_OPERATIONS.task(ws.root)
+                        ENVIRONMENT_OPERATIONS.start(ws.root, 'start', environment_id=config.id)
+                        operation_task = ENVIRONMENT_OPERATIONS.task(ws.root, environment_id=config.id)
                         if operation_task is not None:
                             await asyncio.shield(operation_task)
-                        operation = ENVIRONMENT_OPERATIONS.state(ws.root)
+                        operation = ENVIRONMENT_OPERATIONS.state(ws.root, environment_id=config.id)
                         if operation.status != 'succeeded':
                             raise RuntimeError(operation.error or operation.message or 'Workspace environment did not become Ready.')
-                        provider = EnvironmentManager(ws.root).provider()
+                        provider = manager.provider()
                         status = await provider.status()
                         if not status.running or not status.ready:
                             raise RuntimeError(status.error or status.detail or f'VM state is {status.state}')
-                        argv, env, cwd = provider.terminal_command(active_root=ws.files_root)
-                        created = TerminalSession(cwd, command_argv=argv, env=env, workspace_root=ws.root)
+                        terminal_options = {'active_root': ws.files_root}
+                        if 'workspace' in inspect.signature(provider.open_terminal).parameters:
+                            terminal_options['workspace'] = ws
+                        argv, env, cwd = await provider.open_terminal(**terminal_options)
+                        construction = asyncio.create_task(asyncio.to_thread(
+                            TerminalSession, cwd, command_argv=argv, env=env,
+                            workspace_root=ws.root, environment_id=config.id))
+                        try:
+                            created = await asyncio.shield(construction)
+                        except asyncio.CancelledError:
+                            orphan = await construction
+                            orphan.close()
+                            raise
+                        try:
+                            attach = getattr(provider, 'attach_terminal_session', None)
+                            if attach is not None:
+                                attached = attach(created, workspace=ws)
+                                if inspect.isawaitable(attached):
+                                    await attached
+                        except BaseException:
+                            created.close()
+                            raise
                         log_event(
                             'runtime', 'workspace_terminal_started', workspace=str(ws.root),
-                            provider=status.provider, guest_cwd='/workspace', cpu_only=True,
+                            provider=status.provider, environment_id=config.id, guest_cwd='/workspace', cpu_only=True,
                         )
                         # The PTY is backend-owned. Closing the tab cancels this
                         # task explicitly; a browser reload merely destroys the
@@ -18794,7 +18746,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                         raise
                     except Exception as exc:
                         self.terminal_errors[tab.key] = str(exc)
-                        log_event('harnessy', 'workspace_terminal_start_failed', workspace=str(ws.root), error=str(exc))
+                        log_event('harnessy', 'workspace_terminal_start_failed', workspace=str(ws.root), environment_id=config.id, error=str(exc))
                     finally:
                         self.terminal_start_tasks.pop(tab.key, None)
                 # Do not use NiceGUI's background task wrapper here: this job must
@@ -18805,7 +18757,7 @@ window.harnessyTerminalFocus = function(terminalId) {
             if not error:
                 async def watch_terminal_start() -> None:
                     if environment_busy:
-                        if ENVIRONMENT_OPERATIONS.is_busy(ws.root):
+                        if ENVIRONMENT_OPERATIONS.is_busy(ws.root, environment_id=config.id):
                             return
                     task = self.terminal_start_tasks.get(tab.key)
                     if environment_busy or self.terminal_sessions.get(tab.key) is not None or self.terminal_errors.get(tab.key) or task is None or task.done():
@@ -18832,7 +18784,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                 with ui.column().classes('w-full h-full items-center justify-center gap-3'):
                     ui.icon('shield', size='34px').classes('text-negative')
                     ui.label('This workspace has no sandboxed VM').classes('font-semibold')
-                    ui.label('HarnessyXO will not open a host shell for a workspace. Recreate this workspace using the VM-first workspace flow.').classes('text-sm hy-muted').style('max-width:760px;text-align:center')
+                    ui.label('HarnessyXO will not open a host shell for a workspace. Create a VM in Environments, then open its terminal.').classes('text-sm hy-muted').style('max-width:760px;text-align:center')
             return
 
         if session is None:
@@ -18850,7 +18802,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                 ui.label(tab.title).classes('font-semibold')
                 ui.label(f'Started in {started_label}').classes('text-xs hy-muted hy-file-name').style('max-width:680px')
                 if is_workspace_vm:
-                    ui.label(f'🛡 VM · {EnvironmentManager(ws.root).config.architecture} · CPU only').classes('text-xs hy-muted')
+                    ui.label(f'🛡 {config.name} · {config.architecture} · CPU only').classes('text-xs hy-muted')
                 ui.space()
                 with ui.row().classes('items-center no-wrap gap-1'):
                     ui.button('Ctrl+C', on_click=session.interrupt).props('flat dense no-caps')
@@ -18887,49 +18839,43 @@ window.harnessyTerminalFocus = function(terminalId) {
             ui.timer(0.08, poll)
 
     def _render_environment_tab(self, tab: OpenTab, ws: WorkspaceStore) -> None:
-        manager = EnvironmentManager(ws.root)
+        from harnessy.ui.vm_environments import render_vm_environments
+        render_vm_environments(self, tab, ws)
+
+    def _render_vm_environment_details(self, tab: OpenTab, ws: WorkspaceStore, environment_id: str) -> None:
+        manager = EnvironmentManager(ws.root, environment_id=environment_id)
         config = manager.config
-        with ui.column().classes('hy-tool-panel w-full no-wrap gap-0'):
+        with ui.column().classes('hy-tool-panel w-full no-wrap gap-0') as detail_panel:
             with ui.row().classes('w-full items-center px-4 py-2 gap-2').style('border-bottom:1px solid var(--hy-border)'):
                 ui.icon('shield', size='20px')
-                ui.label(f'{ws.name} · Environment').classes('font-semibold')
+                ui.label(config.name if config else 'VM Environment').classes('font-semibold')
             with ui.column().classes('w-full overflow-y-auto').style('flex:1'):
                 if not config:
-                    selected_subtab = self.environment_subtabs.get(ws.id, 'Details')
-                    if selected_subtab not in {'Details', 'Test targets'}:
-                        selected_subtab = 'Details'
-                    with ui.tabs(value=selected_subtab).classes('w-full px-3').props('dense no-caps align=left') as tabs:
-                        details = ui.tab('Details')
-                        targets = ui.tab('Test targets')
-                    def remember_missing_environment(e):
-                        self.environment_subtabs[ws.id] = str(e.value or 'Details')
-                        self._save_ui_session()
-                    tabs.on_value_change(remember_missing_environment)
-                    with ui.tab_panels(tabs, value=selected_subtab).classes('w-full bg-transparent'):
-                        with ui.tab_panel(details):
-                            ui.label('This workspace has no VM environment definition.').classes('text-negative font-semibold')
-                            ui.label('Create a new workspace to use the VM-first execution model.').classes('text-sm hy-muted')
-                        with ui.tab_panel(targets).classes('p-0'):
-                            self._render_test_targets(ws)
+                    ui.label('This VM environment is no longer registered.').classes('text-sm hy-muted')
                     return
 
                 preset = get_preset(config.preset)
+                from harnessy.ui.vm_environments import network_policy_text
+                network_label, network_description = network_policy_text(config.provider)
+                network_prefix = 'Public outbound' if config.provider == 'lima' else 'Outbound network'
+                guest_project_root = 'C:/harnessy/workspace' if config.provider == 'managed' else '/workspace'
                 configured_optional = tuple(config.optional_tools or ())
                 selected_optional_tools = tuple(
                     preset.optional_tool_ids if '*' in configured_optional
                     else (tool for tool in preset.optional_tool_ids if tool in configured_optional)
                 )
-                selected_subtab = getattr(self, 'environment_subtabs', {}).get(ws.id, 'Details')
+                selected_subtab = getattr(self, 'environment_subtabs', {}).get(f'{ws.id}:{environment_id}', 'Details')
+                if selected_subtab not in {'Details', 'Snapshots'}:
+                    selected_subtab = 'Details'
                 with ui.tabs(value=selected_subtab).classes('hy-env-width px-3').props('dense no-caps align=left indicator-color=primary') as env_tabs:
                     details_tab = ui.tab('Details')
                     snapshots_tab = ui.tab('Snapshots')
-                    targets_tab = ui.tab('Test targets')
                 if not hasattr(self, 'environment_subtabs'):
                     self.environment_subtabs = {}
 
                 def remember_subtab(e) -> None:
                     value = str(e.value or 'Details')
-                    self.environment_subtabs[ws.id] = value
+                    self.environment_subtabs[f'{ws.id}:{environment_id}'] = value
                     self._save_ui_session()
 
                 env_tabs.on_value_change(remember_subtab)
@@ -18938,30 +18884,38 @@ window.harnessyTerminalFocus = function(terminalId) {
                     with ui.tab_panel(details_tab).classes('p-0'):
                         with ui.column().classes('hy-env-width p-4 gap-4'):
                             with ui.row().classes('w-full gap-3 flex-wrap items-stretch'):
-                                with ui.card().classes('hy-env-card p-4 gap-1 min-w-[280px]').style('flex:1 1 280px'):
+                                with ui.card().classes('hy-env-card p-4 gap-1 min-w-0').style('flex:1 1 280px;max-width:100%'):
                                     ui.label('Environment').classes('text-xs hy-muted')
                                     status_label = ui.label('Checking…').classes('text-lg font-semibold')
                                     ui.label(preset.name).classes('text-sm')
-                                    ui.label(f'{config.architecture} · CPU only · /workspace').classes('text-xs hy-muted')
-                                    readiness_detail = ui.label('').classes('text-xs hy-muted').style('white-space:pre-wrap')
-                                with ui.card().classes('hy-env-card p-4 gap-1 min-w-[280px]').style('flex:1 1 280px'):
+                                    ui.label(f'{config.architecture} · CPU only · {guest_project_root}').classes('text-xs hy-muted')
+                                    readiness_detail = ui.label('').classes('text-xs hy-muted').style('white-space:pre-wrap;overflow-wrap:anywhere')
+                                with ui.card().classes('hy-env-card p-4 gap-1 min-w-0').style('flex:1 1 280px;max-width:100%'):
                                     from .workspace_resources import WorkspaceResourceEditor
                                     resource_editor = WorkspaceResourceEditor(config, lambda **payload: queue_action('resources', **payload))
                                     disk_usage_label = ui.label('VM storage on host: checking…').classes('text-xs hy-muted')
-                                    network_status_label = ui.label('Public outbound enabled' if config.network else 'Public outbound disabled').classes('text-xs hy-muted')
+                                    network_status_label = ui.label(f'{network_prefix} enabled' if config.network else f'{network_prefix} disabled').classes('text-xs hy-muted')
                                     if preset.optional_tool_ids:
                                         optional_tools_summary_label = ui.label(
                                             f'Optional tools selected: {len(selected_optional_tools)}/{len(preset.optional_tool_ids)}' +
-                                            ('' if config.network else ' · downloads skipped while outbound is off')
+                                            ('' if config.network or config.provider == 'openwrt' else ' · downloads skipped while outbound is off')
                                         ).classes('text-xs hy-muted')
                                     else:
                                         optional_tools_summary_label = None
-                                with ui.card().classes('hy-env-card p-4 gap-1 min-w-[340px]').style('flex:1.5 1 340px'):
-                                    ui.label('Isolated working-root view').classes('text-xs hy-muted')
-                                    ui.label('/workspace').classes('text-sm font-semibold')
-                                    ui.label(str(ws.files_root)).classes('text-xs hy-muted hy-file-name').style('max-width:680px')
-                                    ui.label('Commands and terminals see one selected root; controller metadata and sibling roots are detached.').classes('text-xs hy-muted')
-                                    ui.label('Files/ and private chat worktrees are live; Factory Reset/Rebuild preserves them.').classes('text-xs hy-muted')
+                                with ui.card().classes('hy-env-card p-4 gap-1 min-w-0').style('flex:1.5 1 340px;max-width:100%'):
+                                    ui.label('Guest filesystem access' if config.files_mode == 'copy' and config.provider in {'openwrt', 'managed'} else 'Isolated project view').classes('text-xs hy-muted')
+                                    ui.label(guest_project_root).classes('text-sm font-semibold')
+                                    ui.label('Workspace source location').classes('text-xs hy-muted')
+                                    ui.label(str(ws.files_root)).classes('text-xs hy-muted').style('max-width:100%;min-width:0;white-space:normal;overflow-wrap:anywhere')
+                                    from harnessy.ui.vm_environments import FILE_MODES
+                                    ui.label(FILE_MODES.get(config.files_mode, config.files_mode)).classes('text-sm font-semibold')
+                                    if config.files_mode == 'copy' and config.provider in {'openwrt', 'managed'}:
+                                        ui.label('Commands have access to this VM filesystem, including previously deployed copies. Canonical workspace source is not mounted.').classes('text-xs hy-muted')
+                                    else:
+                                        ui.label('Commands and terminals see one selected project root; controller metadata and sibling roots are detached.').classes('text-xs hy-muted')
+                                    ui.label('Workspace source files are preserved when this VM is reset or rebuilt.').classes('text-xs hy-muted')
+                                    if config.provider == 'openwrt':
+                                        ui.label('System administration is available in Separate project copy mode.' if config.files_mode != 'copy' else 'System administration is available inside this guest. Deploy and collect project files explicitly.').classes('text-xs hy-muted')
 
                             with ui.row().classes('hy-env-status-banner w-full items-start gap-3 p-3') as operation_banner:
                                 operation_spinner = ui.spinner(size='20px').classes('hy-vm-busy-spinner')
@@ -18975,11 +18929,11 @@ window.harnessyTerminalFocus = function(terminalId) {
 
                             with ui.card().classes('hy-env-card w-full p-4 gap-3'):
                                 ui.label('Environment Controls').classes('font-semibold')
-                                ui.label('Workspace terminals and model tools are available only when the environment is Ready.').classes('text-xs hy-muted')
+                                ui.label('Terminals and model tools are available only when the environment is Ready.').classes('text-xs hy-muted')
                                 with ui.row().classes('gap-2 flex-wrap'):
                                     open_terminal_button = ui.button(
                                         'Open Terminal', icon='terminal',
-                                        on_click=lambda: self.open_tool_tab('terminal', self._find_reg(tab.workspace_id)),
+                                        on_click=lambda: self.open_tool_tab('terminal', self._find_reg(tab.workspace_id), environment_id=environment_id),
                                     ).props('unelevated no-caps')
                                     start_button = ui.button('Start', icon='play_arrow').props('flat no-caps')
                                     stop_button = ui.button('Stop', icon='stop').props('flat no-caps')
@@ -18990,7 +18944,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                                         with ui.column().classes('gap-0').style('flex:1;min-width:240px'):
                                             ui.label('Optional tools').classes('font-semibold')
                                             optional_manage_summary = ui.label(
-                                                f'{len(selected_optional_tools)}/{len(preset.optional_tool_ids)} selected for this workspace.'
+                                                f'{len(selected_optional_tools)}/{len(preset.optional_tool_ids)} selected for this VM.'
                                             ).classes('text-xs hy-muted')
                                         manage_tools_button = ui.button(
                                             'Manage Optional Tools', icon='construction'
@@ -19000,7 +18954,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                                     ).classes('text-xs hy-muted')
                                     if 'rea' in preset.optional_tool_ids:
                                         ui.label(
-                                            'Select REA in Manage Optional Tools and apply to install or update its CLI inside this workspace VM. '
+                                            'Select REA in Manage Optional Tools and apply to install or update its CLI inside this VM. '
                                             'The model uses it through Shell commands or Long-running processes.'
                                         ).classes('text-xs hy-muted')
                             else:
@@ -19009,8 +18963,9 @@ window.harnessyTerminalFocus = function(terminalId) {
 
                             with ui.card().classes('hy-env-card w-full p-4 gap-2'):
                                 ui.label('Network policy').classes('font-semibold')
-                                network_switch = ui.switch('Public outbound network', value=bool(config.network)).props('dense')
-                                ui.label('Host/private-network restrictions remain in force. This changes policy only; VM disk, Files/, and private chat worktrees are preserved.').classes('text-xs hy-muted')
+                                network_switch = ui.switch(network_label, value=bool(config.network)).props('dense')
+                                ui.label(network_description).classes('text-xs hy-muted')
+                                ui.label('Changing this policy preserves VM storage and workspace source.').classes('text-xs hy-muted')
                                 network_apply = ui.button('Apply Network Policy', icon='settings_ethernet').props('outline no-caps')
                                 network_state = {'saved': bool(config.network), 'dirty': False, 'updating': False}
                                 def mark_network_dirty(_event) -> None:
@@ -19030,18 +18985,17 @@ window.harnessyTerminalFocus = function(terminalId) {
                             with ui.row().classes('w-full items-center gap-2'):
                                 with ui.column().classes('gap-0'):
                                     ui.label('Snapshots').classes('text-lg font-semibold')
-                                    ui.label('Snapshots checkpoint VM state only. Files/ and private chat worktrees remain live and are not rolled back.').classes('text-xs hy-muted')
+                                    ui.label('Snapshots checkpoint this VM’s storage. Workspace source files are never rolled back.').classes('text-xs hy-muted')
+                                    if config.files_mode == 'copy' and config.provider == 'lima':
+                                        ui.label('The separate project copy is stored outside the VM disk and is not rolled back by a VM snapshot.').classes('text-xs hy-muted')
                                 ui.space()
                                 take_snapshot_button = ui.button('Take Snapshot', icon='camera').props('unelevated no-caps')
                             snapshot_operation_label = ui.label('').classes('text-sm hy-muted').style('white-space:pre-wrap')
                             snapshot_list_area = ui.column().classes('w-full gap-2')
 
-                with environment_panels, ui.tab_panel(targets_tab).classes('p-0'):
-                    self._render_test_targets(ws)
-
                 def queue_action(kind: str, **payload: Any) -> bool:
                     try:
-                        if not ENVIRONMENT_OPERATIONS.start(ws.root, kind, **payload):
+                        if not ENVIRONMENT_OPERATIONS.start(ws.root, kind, environment_id=environment_id, **payload):
                             return False
                     except Exception as exc:
                         ui.notify(str(exc), type='warning')
@@ -19053,10 +19007,10 @@ window.harnessyTerminalFocus = function(terminalId) {
                 async def manage_optional_tools_dialog() -> None:
                     if manage_tools_button is None:
                         return
-                    if ENVIRONMENT_OPERATIONS.is_busy(ws.root):
+                    if ENVIRONMENT_OPERATIONS.is_busy(ws.root, environment_id=environment_id):
                         ui.notify('Wait for the current environment operation to finish.', type='warning')
                         return
-                    if active_work(ws.root):
+                    if active_work(ws.root, environment_id=environment_id):
                         ui.notify('Finish or stop active agents, terminals, and workspace processes before changing optional tools.', type='warning')
                         return
                     latest = manager.config
@@ -19106,16 +19060,20 @@ window.harnessyTerminalFocus = function(terminalId) {
                         ).classes('text-sm')
                         if 'rea' in available:
                             ui.label(
-                                'REA runs inside this workspace VM. Apply with REA selected to install or update it; '
+                                'REA runs inside this VM. Apply with REA selected to install or update it; '
                                 'Shell commands and Long-running processes permissions control model use.'
                             ).classes('text-xs hy-muted')
-                        if latest.network:
+                        if latest.provider == 'openwrt':
                             ui.label(
-                                'Public outbound is enabled. Missing selected tools can be installed immediately if the VM is running.'
+                                'Verified setup packages download through HarnessyXO, including when guest outbound network is off.'
+                            ).classes('text-xs hy-muted')
+                        elif latest.network:
+                            ui.label(
+                                'Outbound network is enabled. Missing selected tools can be installed immediately if the VM is running.'
                             ).classes('text-xs hy-muted')
                         else:
                             ui.label(
-                                'Public outbound is OFF. HarnessyXO will save your selection but will not attempt any downloads until outbound access is enabled.'
+                                'Outbound network is OFF. HarnessyXO will save your selection but will not attempt optional tool downloads until outbound access is enabled.'
                             ).classes('text-xs text-warning font-semibold')
                         with ui.row().classes('w-full items-center gap-2 flex-wrap'):
                             state_label = ui.label(f'{len(chosen)}/{len(available)} selected').classes('text-xs font-semibold')
@@ -19194,7 +19152,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                                 'installed': 'Installed', 'missing': 'Not installed',
                                 'partial': 'Partial', 'unknown': 'Unknown',
                             }.get(state, state.title())
-                            if not latest.network and state != 'installed' and tool_id in chosen:
+                            if not latest.network and latest.provider != 'openwrt' and state != 'installed' and tool_id in chosen:
                                 prefix += ' · pending network'
                             status_labels[tool_id].set_text(prefix + (f'\n{detail}' if detail else ''))
                     except Exception as exc:
@@ -19211,13 +19169,14 @@ window.harnessyTerminalFocus = function(terminalId) {
                     expected = bool(network_state['saved'])
                     if target == expected:
                         return
-                    if active_work(ws.root):
+                    if active_work(ws.root, environment_id=environment_id):
                         ui.notify('Finish or stop active agents, tools, and workspace processes before changing network policy.', type='warning')
                         return
                     with ui.dialog() as dialog, ui.card().classes('w-[540px] max-w-[94vw] gap-3'):
-                        ui.label('Apply public outbound policy?').classes('text-lg font-semibold')
-                        ui.label('Enable public outbound network.' if target else 'Disable public outbound network.').classes('text-sm font-semibold')
-                        ui.label('An idle running VM will stop, apply the policy, then restart and verify isolation. A stopped VM stays stopped. Active work will not be interrupted. VM disk, Files/, private chat worktrees, and host/private-network restrictions are preserved.').classes('text-sm')
+                        ui.label('Apply network policy?').classes('text-lg font-semibold')
+                        ui.label(f'Enable {network_label.lower()}.' if target else f'Disable {network_label.lower()}.').classes('text-sm font-semibold')
+                        ui.label(network_description).classes('text-sm')
+                        ui.label('An idle running VM may restart to apply the policy. A stopped VM stays stopped. Finish active work first. VM storage and workspace source are preserved.').classes('text-sm')
                         with ui.row().classes('w-full justify-end gap-2'):
                             ui.button('Cancel', on_click=dialog.close).props('flat no-caps')
                             def confirm() -> None:
@@ -19277,7 +19236,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                 ))
                 rebuild_button.on('click', lambda: destructive_dialog(
                     'rebuild', 'Rebuild VM',
-                    'Delete and recreate the workspace VM from its HarnessyXO environment definition?',
+                    'Delete and recreate the VM from its HarnessyXO environment definition?',
                     'Rebuild VM',
                 ))
                 take_snapshot_button.on('click', snapshot_dialog)
@@ -19300,7 +19259,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                     return f'{secs}s'
 
                 def apply_operation_state() -> None:
-                    op = ENVIRONMENT_OPERATIONS.state(ws.root)
+                    op = ENVIRONMENT_OPERATIONS.state(ws.root, environment_id=environment_id)
                     busy = bool(op.busy)
                     show_operation = busy or bool(op.error or op.success)
                     operation_banner.set_visibility(show_operation)
@@ -19375,7 +19334,7 @@ window.harnessyTerminalFocus = function(terminalId) {
 
                     saved_config = manager.config
                     resource_editor.sync(saved_config, {**latest_status, 'resource_operation': op.action == 'resources'},
-                                         busy=busy, active=bool(active_work(ws.root)))
+                                         busy=busy, active=bool(active_work(ws.root, environment_id=environment_id)))
                     if saved_config is not None:
                         saved_network = bool(saved_config.network)
                         if preset.optional_tool_ids:
@@ -19383,14 +19342,14 @@ window.harnessyTerminalFocus = function(terminalId) {
                                 preset.optional_tool_ids if '*' in tuple(saved_config.optional_tools or ())
                                 else (tool for tool in preset.optional_tool_ids if tool in set(saved_config.optional_tools or ()))
                             )
-                            suffix = '' if saved_network else ' · downloads skipped while outbound is off'
+                            suffix = '' if saved_network or saved_config.provider == 'openwrt' else ' · downloads skipped while outbound is off'
                             if optional_tools_summary_label is not None:
                                 optional_tools_summary_label.set_text(
                                     f'Optional tools selected: {len(saved_optional)}/{len(preset.optional_tool_ids)}{suffix}'
                                 )
                             if optional_manage_summary is not None:
                                 optional_manage_summary.set_text(
-                                    f'{len(saved_optional)}/{len(preset.optional_tool_ids)} selected for this workspace.'
+                                    f'{len(saved_optional)}/{len(preset.optional_tool_ids)} selected for this VM.'
                                 )
                         if saved_network != network_state['saved']:
                             network_state['saved'] = saved_network
@@ -19399,12 +19358,12 @@ window.harnessyTerminalFocus = function(terminalId) {
                                 network_switch.value = saved_network
                                 network_state['updating'] = False
                                 network_state['dirty'] = False
-                        network_status_label.set_text('Public outbound enabled' if saved_network else 'Public outbound disabled')
+                        network_status_label.set_text(f'{network_prefix} enabled' if saved_network else f'{network_prefix} disabled')
                     network_switch.disable() if busy else network_switch.enable()
                     if manage_tools_button is not None:
-                        manage_tools_button.disable() if busy or bool(active_work(ws.root)) else manage_tools_button.enable()
+                        manage_tools_button.disable() if busy or bool(active_work(ws.root, environment_id=environment_id)) else manage_tools_button.enable()
                         manage_tools_button.props(add='loading') if busy and op.action == 'tools' else manage_tools_button.props(remove='loading')
-                    can_apply_network = not busy and not active_work(ws.root) and bool(network_switch.value) != network_state['saved']
+                    can_apply_network = not busy and not active_work(ws.root, environment_id=environment_id) and bool(network_switch.value) != network_state['saved']
                     network_apply.enable() if can_apply_network else network_apply.disable()
                     network_apply.props(add='loading') if busy and op.action == 'network' else network_apply.props(remove='loading')
 
@@ -19495,15 +19454,21 @@ window.harnessyTerminalFocus = function(terminalId) {
                                 ui.label(snapshot_tag).classes('font-medium').style('flex:1;min-width:0;overflow-wrap:anywhere')
                                 restore_button = ui.button('Restore', icon='restore', on_click=lambda tag=snapshot_tag: restore_dialog(tag)).props('flat no-caps')
                                 restore_buttons.append(restore_button)
-                                if ENVIRONMENT_OPERATIONS.is_busy(ws.root):
+                                if ENVIRONMENT_OPERATIONS.is_busy(ws.root, environment_id=environment_id):
                                     restore_button.disable()
 
                 async def refresh_environment() -> None:
                     # Every page observes the same process-owned status cache. A
                     # restored tab/client therefore cannot create another Lima
                     # poller, and lifecycle operations suppress controller polls.
+                    if detail_panel.is_deleted:
+                        environment_poll.cancel()
+                        return
                     try:
-                        info = await ENVIRONMENT_STATUS.get(ws.root)
+                        info = await ENVIRONMENT_STATUS.get(ws.root, environment_id=environment_id)
+                        if detail_panel.is_deleted:
+                            environment_poll.cancel()
+                            return
                         if info is not None:
                             status = dict(info.get('status') or {})
                             latest_status.clear()
@@ -19556,7 +19521,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                             raise
 
                 apply_operation_state()
-                ui.timer(0.75, refresh_environment, immediate=True)
+                environment_poll = ui.timer(0.75, refresh_environment, immediate=True)
 
     # --------------------------------------------------------- zip/downloads
     def _render_artifacts_tab(self, tab: OpenTab, ws: WorkspaceStore) -> None:
@@ -19766,7 +19731,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                             'web': 'Web access',
                             'code_intelligence': 'Code intelligence / LSP',
                             'diagnostics': 'HarnessyXO diagnostics',
-                            'external_targets': 'External/Test Targets',
+                            'external_targets': 'External Targets',
                         }
                         current_permissions = agent.setdefault('tool_permissions', dict(DEFAULT_TOOL_PERMISSIONS))
                         permission_inputs: dict[str, Any] = {}
@@ -19862,9 +19827,10 @@ window.harnessyTerminalFocus = function(terminalId) {
                                     'Long-running processes ask when the job starts, and browser automation asks when browser_open creates a new session; '
                                     'navigation and follow-up actions inside that HarnessyXO-owned session do not repeatedly prompt. '
                                     'On allows actions without a confirmation dialog. Saved permission changes apply to active runs. '
-                                    'External/Test Targets controls access: Off blocks all target tools, Ask requires approval before using them, '
+                                    'External Targets controls connected remote machines and devices: Off blocks those tools, Ask requires approval before using them, '
                                     'and On permits access. Each target separately controls its actions with Off, Ask or On. '
                                     'Global On never overrides an action set to Off or Ask. '
+                                    'Local VM environments use their Enabled for model use switch and the ordinary command/file permissions. '
                                     'Other required tool permissions still apply.'
                                 ).classes('text-xs hy-muted mb-2')
                                 with ui.grid(columns=2).classes('w-full gap-x-3 gap-y-1'):
@@ -23197,31 +23163,41 @@ def run_app() -> None:
         _NOTIFICATION_TASKS.clear()
         from harnessy.ui.test_targets import close_target_tab_views
         await close_target_tab_views()
+        # Finish/cancel owned lifecycle jobs before asking their controllers to
+        # stop; otherwise shutdown can race a pending Start in another VM.
+        await ENVIRONMENT_OPERATIONS.cancel_all()
+        await ENVIRONMENT_STATUS.close()
         from harnessy.environment.test_targets import close_test_targets
         target_workspaces = _prepared_runtime_workspaces()
         await close_test_targets(target_workspaces)
-        await ENVIRONMENT_STATUS.close()
-        await ENVIRONMENT_OPERATIONS.cancel_all()
         await BROWSER_SESSIONS.close_all()
         # Workspace VMs are persistent computers, but they must not keep burning
         # host RAM/CPU after HarnessyXO itself exits. Their disks remain in each
         # workspace; only the running VM processes are stopped here.
+        async def stop_registered_vm(reg, config) -> None:
+            try:
+                provider = EnvironmentManager(reg.path, environment_id=config.id).provider()
+                status = await provider.status()
+                if status.available and status.running:
+                    await provider.stop()
+            except Exception as exc:
+                log_event('harnessy', 'workspace_environment_shutdown_stop_failed',
+                          workspace=str(reg.path), environment_id=config.id, error=str(exc))
+
+        shutdown_vms = []
         for reg in machine.list_workspaces():
             if not reg.path.is_dir():
                 continue
             try:
-                manager = EnvironmentManager(reg.path)
-                if manager.config is None:
-                    continue
-                provider = manager.provider()
-                status = await provider.status()
-                if status.available and status.running:
-                    await provider.stop()
+                for config in EnvironmentManager(reg.path).list():
+                    shutdown_vms.append(stop_registered_vm(reg, config))
             except Exception as exc:
                 log_event(
                     'harnessy', 'workspace_environment_shutdown_stop_failed',
                     workspace=str(reg.path), error=str(exc),
                 )
+        if shutdown_vms:
+            await asyncio.gather(*shutdown_vms, return_exceptions=True)
 
     app.on_shutdown(close_runtime_resources)
 

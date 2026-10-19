@@ -16,6 +16,7 @@ import stat
 import threading
 import time
 import uuid
+import weakref
 from collections import OrderedDict, deque
 from datetime import datetime
 from pathlib import Path
@@ -26,8 +27,10 @@ from .technical import (MAX_TECHNICAL_CHARS, MAX_TECHNICAL_LINES,
                         technical_error_evidence, validate_technical_evidence)
 
 VM_LOG_FILENAMES = ('serial.log', 'serialp.log', 'serialv.log', 'ha.stderr.log', 'ha.stdout.log')
+NAMED_VM_LOG_FILENAMES = VM_LOG_FILENAMES + ('qemu.stderr.log', 'qemu.control-plane.log')
 MAX_WORKSPACES = 8
-MAX_VM_FILES = MAX_WORKSPACES * len(VM_LOG_FILENAMES)
+MAX_ENVIRONMENTS = 32
+MAX_VM_FILES = MAX_ENVIRONMENTS * len(NAMED_VM_LOG_FILENAMES)
 PER_FILE_TAIL_BYTES = 128 * 1024
 MAX_EXPORT_BYTES = 2 * 1024 * 1024
 MAX_READ_BYTES = MAX_EXPORT_BYTES
@@ -45,9 +48,10 @@ _FAILURE_NAME = re.compile(r'^\d{8}T\d{12}Z-[0-9a-f]{32}\.json$')
 _FAILURE_REASONS = {'before_start', 'before_reset', 'before_delete', 'controller_error',
                     'controller_timeout', 'controller_cancelled', 'controller_spawn_error'}
 _FAILURE_OPERATIONS = {'start', 'create', 'stop', 'delete', 'factory-reset', 'restart', 'reset', 'rebuild'}
-_FAILURE_LOCK = threading.Lock()
+_FAILURE_LOCKS = weakref.WeakValueDictionary()
+_FAILURE_LOCKS_GUARD = threading.Lock()
 _LIMITS = {
-    'workspaces': MAX_WORKSPACES, 'files': MAX_VM_FILES,
+    'workspaces': MAX_WORKSPACES, 'environments': MAX_ENVIRONMENTS, 'files': MAX_VM_FILES,
     'tail_bytes_per_file': PER_FILE_TAIL_BYTES, 'read_bytes_total': MAX_READ_BYTES,
     'export_bytes_total': MAX_EXPORT_BYTES, 'discovery_bytes_total': MAX_DISCOVERY_BYTES,
     'signal_rows_per_file': MAX_SIGNAL_ROWS, 'parse_lines_per_file': MAX_PARSE_LINES,
@@ -60,6 +64,7 @@ _LIMITS = {
 _REGISTRY: OrderedDict[str, None] = OrderedDict()
 _REGISTRY_LOCK = threading.Lock()
 _HEX = re.compile(r'^[0-9a-f]{64}$')
+_ENVIRONMENT_ID = re.compile(r'^[0-9a-f]{32}$')
 _SESSION = re.compile(r'^\d{4}-\d{2}-\d{2}_\d{6}(?:_\d{1,6})?$')
 _ANSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
 _ISO = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$')
@@ -99,10 +104,14 @@ def _workspace_path(value: Any) -> Path | None:
     return path
 
 
-def register_workspace_runtime(workspace_root: Path | str) -> None:
+def register_workspace_runtime(workspace_root: Path | str, *, environment_id: str = '', runtime_root: Path | str | None = None) -> None:
     """Remember a known workspace in memory, without touching its files."""
     path = _workspace_path(workspace_root)
     if path is None:
+        return
+    try:
+        _runtime_root(path, environment_id, runtime_root)
+    except ValueError:
         return
     key = str(path)
     with _REGISTRY_LOCK:
@@ -110,6 +119,57 @@ def register_workspace_runtime(workspace_root: Path | str) -> None:
         _REGISTRY[key] = None
         while len(_REGISTRY) > MAX_REGISTRY_ROOTS:
             _REGISTRY.popitem(last=False)
+
+
+def _runtime_root(root: Path, environment_id: str = '', runtime_root: Path | str | None = None) -> Path:
+    if not isinstance(environment_id, str) or (environment_id and not _ENVIRONMENT_ID.fullmatch(environment_id)):
+        raise ValueError('invalid_environment_id')
+    expected = root / '.harnessy' / ('environments' if environment_id else 'environment')
+    if environment_id:
+        expected /= environment_id
+    if runtime_root is not None:
+        supplied = _workspace_path(runtime_root)
+        if supplied is None or supplied != expected:
+            raise ValueError('invalid_environment_runtime')
+    return expected
+
+
+def _runtime_environments(root: Path) -> tuple[list[tuple[str, Path]], bool]:
+    """Discover only opaque VM directory names without following redirects."""
+    registry = root / '.harnessy' / 'environments'
+    items: list[tuple[str, Path]] = []
+    limited = False
+    descriptor = None
+    try:
+        if not _allowed_path(registry) or os.open not in os.supports_dir_fd or not hasattr(os, 'O_NOFOLLOW'):
+            raise ValueError('safe_directory_operations_unavailable')
+        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0)
+        descriptor = os.open(registry.anchor, flags)
+        for component in registry.parts[1:]:
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        with os.scandir(descriptor) as entries:
+            for index, entry in enumerate(entries):
+                if index >= MAX_SESSION_ENTRIES:
+                    limited = True
+                    break
+                if _ENVIRONMENT_ID.fullmatch(entry.name) and entry.is_dir(follow_symlinks=False):
+                    items.append((entry.name, registry / entry.name))
+        items.sort(key=lambda item: item[0])
+    except (OSError, ValueError):
+        pass
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    # Legacy logs can coexist with newly created named environments.
+    legacy = _runtime_root(root)
+    try:
+        if legacy.is_dir() and not legacy.is_symlink():
+            items.append(('', legacy))
+    except OSError:
+        pass
+    return items[:MAX_ENVIRONMENTS], limited or len(items) > MAX_ENVIRONMENTS
 
 
 def _allowed_path(path: Path) -> bool:
@@ -580,7 +640,10 @@ def validate_failure_receipt(value: Any) -> dict[str, Any] | None:
             or value.get('reason') not in _FAILURE_REASONS or not isinstance(value.get('operation'), str)
             or value.get('operation') not in _FAILURE_OPERATIONS):
         return None
-    result = {'schema_version': 1, 'receipt_id': identifier, 'captured_at': timestamp,
+    environment_id = value.get('environment_id', '')
+    if not isinstance(environment_id, str) or (environment_id and not _ENVIRONMENT_ID.fullmatch(environment_id)):
+        return None
+    result = {'schema_version': 1, 'receipt_id': identifier, 'captured_at': timestamp, 'environment_id': environment_id,
               'reason': value['reason'], 'operation': value['operation'], 'sources': [],
               'guest_console_omitted': True, 'correlation_scope': 'capture_operation',
               'requested_config': _requested_config(value.get('requested_config'))}
@@ -631,10 +694,10 @@ def _check_capture_cancelled(cancel_event: threading.Event | None) -> None:
         raise _CaptureCancelled()
 
 
-def _failure_directory(root: Path, *, create: bool,
+def _failure_directory(root: Path, *, create: bool, environment_id: str = '',
                        cancel_event: threading.Event | None = None) -> tuple[Path, int]:
     """Descriptor-relative traversal refuses redirects even on the write path."""
-    path = root / '.harnessy' / 'diagnostics' / 'vm-failures'
+    path = (_runtime_root(root, environment_id) / 'state' / 'vm-failures') if environment_id else root / '.harnessy' / 'diagnostics' / 'vm-failures'
     if not _allowed_path(path):
         raise ValueError('unsafe')
     flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
@@ -674,6 +737,7 @@ def _failure_directory(root: Path, *, create: bool,
 
 
 def preserve_vm_failure(workspace_root: Path | str, *, reason: str, operation: str = 'start',
+                        environment_id: str = '', runtime_root: Path | str | None = None,
                         controller_stderr: str = '', controller_stdout: str = '', command_id: str = '',
                         operation_id: str = '', requested_config: Any = None,
                         host_resources: Any = None, command_started_at_epoch: Any = None,
@@ -690,6 +754,16 @@ def preserve_vm_failure(workspace_root: Path | str, *, reason: str, operation: s
     if (root is None or not isinstance(reason, str) or reason not in _FAILURE_REASONS
             or not isinstance(operation, str) or operation not in _FAILURE_OPERATIONS):
         return {'schema_version': 1, 'status': 'rejected'}
+    try:
+        vm_root = _runtime_root(root, environment_id, runtime_root)
+    except ValueError:
+        return {'schema_version': 1, 'status': 'rejected'}
+    with _FAILURE_LOCKS_GUARD:
+        lock_key = (str(root), environment_id)
+        failure_lock = _FAILURE_LOCKS.get(lock_key)
+        if failure_lock is None:
+            failure_lock = threading.Lock()
+            _FAILURE_LOCKS[lock_key] = failure_lock
     lock_deadline = time.monotonic() + 0.5
     while True:
         if cancel_event is not None and cancel_event.is_set():
@@ -697,7 +771,7 @@ def preserve_vm_failure(workspace_root: Path | str, *, reason: str, operation: s
         remaining = lock_deadline - time.monotonic()
         if remaining <= 0:
             return {'schema_version': 1, 'status': 'busy'}
-        if _FAILURE_LOCK.acquire(timeout=min(0.05, remaining)):
+        if failure_lock.acquire(timeout=min(0.05, remaining)):
             break
     descriptor = None
     temp_name = None
@@ -705,7 +779,7 @@ def preserve_vm_failure(workspace_root: Path | str, *, reason: str, operation: s
         _check_capture_cancelled(cancel_event)
         deadline = time.monotonic() + 2.0
         receipt: dict[str, Any] = {'schema_version': 1, 'receipt_id': uuid.uuid4().hex,
-            'captured_at': datetime.now().astimezone().isoformat(timespec='milliseconds'),
+            'captured_at': datetime.now().astimezone().isoformat(timespec='milliseconds'), 'environment_id': environment_id,
             'reason': reason, 'operation': operation, 'command_id': command_id, 'operation_id': operation_id,
             'requested_config': requested_config, 'host_resources': host_resources,
             'command_started_at_epoch': command_started_at_epoch,
@@ -720,7 +794,7 @@ def preserve_vm_failure(workspace_root: Path | str, *, reason: str, operation: s
                 'evidence': technical_error_evidence(text[-PER_FILE_TAIL_BYTES:], source=name)})
         for name in ('ha.stderr.log', 'ha.stdout.log'):
             _check_capture_cancelled(cancel_event)
-            item = _read_tail(root / '.harnessy' / 'environment' / 'vm' / 'lima' / 'harnessy' / name,
+            item = _read_tail(vm_root / 'vm' / 'lima' / 'harnessy' / name,
                               PER_FILE_TAIL_BYTES if time.monotonic() < deadline else 0)
             _check_capture_cancelled(cancel_event)
             data = item['data']
@@ -751,7 +825,7 @@ def preserve_vm_failure(workspace_root: Path | str, *, reason: str, operation: s
         if len(payload) > MAX_FAILURE_RECEIPT_BYTES:
             return {'schema_version': 1, 'status': 'limited'}
         _check_capture_cancelled(cancel_event)
-        _, descriptor = _failure_directory(root, create=True, cancel_event=cancel_event)
+        _, descriptor = _failure_directory(root, create=True, environment_id=environment_id, cancel_event=cancel_event)
         _check_capture_cancelled(cancel_event)
         stamp = datetime.now().astimezone().strftime('%Y%m%dT%H%M%S%fZ')
         name = stamp + '-' + safe['receipt_id'] + '.json'
@@ -791,7 +865,7 @@ def preserve_vm_failure(workspace_root: Path | str, *, reason: str, operation: s
             _check_capture_cancelled(cancel_event)
             os.unlink(old, dir_fd=descriptor)
         return {'schema_version': 1, 'status': 'preserved', 'receipt_id': safe['receipt_id'],
-                'captured_at': safe['captured_at'], 'reason': reason, 'operation': operation,
+                'captured_at': safe['captured_at'], 'reason': reason, 'operation': operation, 'environment_id': environment_id,
                 'sources': len(safe['sources']), 'bytes_saved': len(payload), 'guest_console_omitted': True}
     except _CaptureCancelled:
         return {'schema_version': 1, 'status': 'cancelled'}
@@ -805,16 +879,16 @@ def preserve_vm_failure(workspace_root: Path | str, *, reason: str, operation: s
                 except OSError:
                     pass
             os.close(descriptor)
-        _FAILURE_LOCK.release()
+        failure_lock.release()
 
 
-def _failure_receipts(root: Path, deadline: float, cap: int, count: int = MAX_FAILURE_RECEIPTS) -> tuple[list[dict[str, Any]], int, bool]:
+def _failure_receipts(root: Path, deadline: float, cap: int, count: int = MAX_FAILURE_RECEIPTS, *, environment_id: str = '') -> tuple[list[dict[str, Any]], int, bool]:
     receipts = []
     consumed = 0
     limited = False
     descriptor = None
     try:
-        path, descriptor = _failure_directory(root, create=False)
+        path, descriptor = _failure_directory(root, create=False, environment_id=environment_id)
         names = []
         with os.scandir(descriptor) as entries:
             for index, entry in enumerate(entries):
@@ -857,66 +931,88 @@ def collect_vm_diagnostics(latest: Path, include_content: bool = False) -> dict[
     read_total = 0
     export_total = 0
     receipt_count = 0
+    environment_count = 0
     for root, origin in roots:
         identifier = hashlib.sha256(str(root).encode('utf-8')).hexdigest()
-        workspace: dict[str, Any] = {'workspace_id': identifier, 'source': origin, 'sources': [], 'evidence_codes': [], 'failure_receipts': []}
+        workspace: dict[str, Any] = {'workspace_id': identifier, 'source': origin, 'sources': [], 'evidence_codes': [], 'failure_receipts': [], 'environment_ids': []}
         workspace_codes: set[str] = set()
-        for filename in VM_LOG_FILENAMES:
-            kind = 'hostagent' if filename.startswith('ha.') else 'serial'
-            source: dict[str, Any] = {'filename': filename, 'kind': kind, 'bytes_read': 0, 'bytes_exported': 0,
-                                      'line_count': 0, 'signals_count': 0, 'signals_exported': 0,
-                                      'signals_limited': False, 'evidence_codes': []}
-            remaining = min(MAX_READ_BYTES - read_total, MAX_EXPORT_BYTES - export_total)
-            if time.monotonic() >= deadline or remaining <= 0:
-                result = {'status': 'limited', 'data': b'', 'bytes_available': 0, 'truncated': True}
+        environments, environment_limited = _runtime_environments(root)
+        workspace['environments_limited'] = environment_limited or environment_count + len(environments) > MAX_ENVIRONMENTS
+        for environment_id, runtime_root in environments[:max(0, MAX_ENVIRONMENTS - environment_count)]:
+            environment_count += 1
+            workspace['environment_ids'].append(environment_id)
+            member_prefix = f'vm-logs/{identifier}' + (f'/{environment_id}' if environment_id else '')
+            definition = _read_tail(runtime_root / 'environment.json', 16 * 1024)
+            try:
+                config = json.loads(definition['data']) if definition['status'] == 'included' and not definition['truncated'] else {}
+            except (ValueError, RecursionError):
+                config = {}
+            backend = 'qemu' if isinstance(config, dict) and config.get('provider') == 'openwrt' else 'lima'
+            if backend == 'qemu':
+                from .test_target_logs import _runtime, _qemu_technical_tail, _qemu_control_plane_tail
+                log_root = _runtime(runtime_root, 'qemu')
+                filenames = ('qemu.stderr.log', 'qemu.control-plane.log', 'serial.log')
             else:
-                result = _read_tail(root / '.harnessy' / 'environment' / 'vm' / 'lima' / 'harnessy' / filename,
-                                    min(PER_FILE_TAIL_BYTES, remaining))
-            data = result.pop('data')
-            source.update(result)
-            source['bytes_read'] = len(data)
-            read_total += len(data)
-            if source['status'] == 'included':
-                source['tail_sha256'] = hashlib.sha256(data).hexdigest()
-                technical, measurements = _technical_tail(data, kind, source['truncated'], deadline)
-                source.update(measurements)
-                output = technical
-                # Projection can grow terse source lines. Preserve complete JSONL
-                # rows while enforcing the same aggregate export byte budget.
-                cap = MAX_EXPORT_BYTES - export_total
-                if len(output) > cap:
-                    start = len(output) - cap
-                    tail = output[start:] if cap else b''
-                    output = tail if start and output[start - 1:start] == b'\n' else tail.partition(b'\n')[2]
-                    source['signals_limited'] = True
-                    source['truncated'] = True
-                member = f'vm-logs/{identifier}/{filename}.technical.jsonl'
-                members[member] = output
-                source['archive_member'] = member
-                source['bytes_exported'] = len(output)
-                source['technical_bytes_exported'] = len(output)
-                export_total += len(output)
-                if include_content:
+                log_root = runtime_root / 'vm' / 'lima' / 'harnessy'
+                filenames = VM_LOG_FILENAMES
+            for filename in filenames:
+                kind = 'qemu' if filename.startswith('qemu.') else 'hostagent' if filename.startswith('ha.') else 'serial'
+                source: dict[str, Any] = {'filename': filename, 'environment_id': environment_id, 'kind': kind, 'bytes_read': 0, 'bytes_exported': 0,
+                                          'line_count': 0, 'signals_count': 0, 'signals_exported': 0,
+                                          'signals_limited': False, 'evidence_codes': []}
+                remaining = min(MAX_READ_BYTES - read_total, MAX_EXPORT_BYTES - export_total)
+                if time.monotonic() >= deadline or remaining <= 0:
+                    result = {'status': 'limited', 'data': b'', 'bytes_available': 0, 'truncated': True}
+                else:
+                    result = _read_tail(log_root / filename,
+                                        min(PER_FILE_TAIL_BYTES, remaining))
+                data = result.pop('data')
+                source.update(result)
+                source['bytes_read'] = len(data)
+                read_total += len(data)
+                if source['status'] == 'included':
+                    source['tail_sha256'] = hashlib.sha256(data).hexdigest()
+                    technical, measurements = (_qemu_technical_tail(data, source['truncated'], deadline) if filename == 'qemu.stderr.log' else
+                                               _qemu_control_plane_tail(data, source['truncated'], deadline) if kind == 'qemu' else
+                                               _technical_tail(data, kind, source['truncated'], deadline))
+                    source.update(measurements)
+                    output = technical
+                    # Projection can grow terse source lines. Preserve complete JSONL
+                    # rows while enforcing the same aggregate export byte budget.
                     cap = MAX_EXPORT_BYTES - export_total
-                    raw = data[-cap:] if cap else b''
-                    if len(raw) < len(data):
+                    if len(output) > cap:
+                        start = len(output) - cap
+                        tail = output[start:] if cap else b''
+                        output = tail if start and output[start - 1:start] == b'\n' else tail.partition(b'\n')[2]
+                        source['signals_limited'] = True
                         source['truncated'] = True
-                    raw_member = f'vm-logs/{identifier}/{filename}.raw.log'
-                    members[raw_member] = raw
-                    source['raw_archive_member'] = raw_member
-                    source['raw_bytes_exported'] = len(raw)
-                    source['bytes_exported'] += len(raw)
-                    export_total += len(raw)
-                workspace_codes.update(source['evidence_codes'])
-            workspace['sources'].append(source)
+                    member = f'{member_prefix}/{filename}.technical.jsonl'
+                    members[member] = output
+                    source['archive_member'] = member
+                    source['bytes_exported'] = len(output)
+                    source['technical_bytes_exported'] = len(output)
+                    export_total += len(output)
+                    if include_content:
+                        cap = MAX_EXPORT_BYTES - export_total
+                        raw = data[-cap:] if cap else b''
+                        if len(raw) < len(data):
+                            source['truncated'] = True
+                        raw_member = f'{member_prefix}/{filename}.raw.log'
+                        members[raw_member] = raw
+                        source['raw_archive_member'] = raw_member
+                        source['raw_bytes_exported'] = len(raw)
+                        source['bytes_exported'] += len(raw)
+                        export_total += len(raw)
+                    workspace_codes.update(source['evidence_codes'])
+                workspace['sources'].append(source)
+            receipts, receipt_bytes, receipt_limited = _failure_receipts(root, deadline, MAX_READ_BYTES - read_total,
+                                                                      MAX_FAILURE_RECEIPTS - receipt_count, environment_id=environment_id)
+            workspace['failure_receipts'].extend(receipts)
+            workspace['failure_receipts_limited'] = workspace.get('failure_receipts_limited', False) or receipt_limited
+            workspace['failure_receipts_bytes_read'] = workspace.get('failure_receipts_bytes_read', 0) + receipt_bytes
+            read_total += receipt_bytes
+            receipt_count += len(receipts)
         workspace['evidence_codes'] = sorted(workspace_codes)
-        receipts, receipt_bytes, receipt_limited = _failure_receipts(root, deadline, MAX_READ_BYTES - read_total,
-                                                                  MAX_FAILURE_RECEIPTS - receipt_count)
-        workspace['failure_receipts'] = receipts
-        workspace['failure_receipts_limited'] = receipt_limited
-        workspace['failure_receipts_bytes_read'] = receipt_bytes
-        read_total += receipt_bytes
-        receipt_count += len(receipts)
         report['workspaces'].append(workspace)
     report = validate_vm_report(report)
     return {'report': report, 'members': members}
@@ -966,7 +1062,11 @@ def validate_vm_report(report: Any) -> dict[str, Any]:
         origin = _enum(origin, {'app_logs', 'registered', 'previous_session_logs'}, 'registered')
         retained = {'workspace_id': identifier, 'source': origin, 'sources': [], 'evidence_codes': [], 'failure_receipts': [],
                     'failure_receipts_limited': workspace.get('failure_receipts_limited') is True,
-                    'failure_receipts_bytes_read': _integer(workspace.get('failure_receipts_bytes_read'), MAX_READ_BYTES)}
+                    'failure_receipts_bytes_read': _integer(workspace.get('failure_receipts_bytes_read'), MAX_READ_BYTES),
+                    'environment_ids': [], 'environments_limited': workspace.get('environments_limited') is True}
+        for environment_id in workspace.get('environment_ids', [])[:MAX_ENVIRONMENTS] if isinstance(workspace.get('environment_ids'), list) else []:
+            if isinstance(environment_id, str) and (not environment_id or _ENVIRONMENT_ID.fullmatch(environment_id)) and environment_id not in retained['environment_ids']:
+                retained['environment_ids'].append(environment_id)
         for value in workspace.get('failure_receipts', [])[:MAX_FAILURE_RECEIPTS - receipt_count] if isinstance(workspace.get('failure_receipts'), list) else []:
             receipt = validate_failure_receipt(value)
             if receipt is not None:
@@ -974,16 +1074,20 @@ def validate_vm_report(report: Any) -> dict[str, Any]:
                 receipt_count += 1
         sources = workspace.get('sources') if isinstance(workspace.get('sources'), list) else []
         seen_files = set()
-        for source in sources[:len(VM_LOG_FILENAMES)]:
-            if not isinstance(source, dict) or source.get('filename') not in VM_LOG_FILENAMES:
+        for source in sources[:MAX_VM_FILES]:
+            if not isinstance(source, dict) or source.get('filename') not in NAMED_VM_LOG_FILENAMES:
                 continue
             filename = source['filename']
-            if filename in seen_files:
+            environment_id = source.get('environment_id', '')
+            if not isinstance(environment_id, str) or (environment_id and not _ENVIRONMENT_ID.fullmatch(environment_id)):
                 continue
-            seen_files.add(filename)
+            source_key = (environment_id, filename)
+            if source_key in seen_files:
+                continue
+            seen_files.add(source_key)
             source_status = source.get('status')
             source_status = _enum(source_status, {'included', 'missing', 'unsafe', 'unreadable', 'limited'}, 'unreadable')
-            item = {'filename': filename, 'kind': 'hostagent' if filename.startswith('ha.') else 'serial', 'status': source_status}
+            item = {'filename': filename, 'environment_id': environment_id, 'kind': 'qemu' if filename.startswith('qemu.') else 'hostagent' if filename.startswith('ha.') else 'serial', 'status': source_status}
             for key, cap in {'bytes_available': 2**63 - 1, 'bytes_read': PER_FILE_TAIL_BYTES,
                              'bytes_exported': MAX_EXPORT_BYTES, 'line_count': PER_FILE_TAIL_BYTES,
                              'technical_bytes_exported': MAX_EXPORT_BYTES, 'raw_bytes_exported': PER_FILE_TAIL_BYTES,
@@ -1000,17 +1104,19 @@ def validate_vm_report(report: Any) -> dict[str, Any]:
             tail_hash = source.get('tail_sha256')
             if isinstance(tail_hash, str) and _HEX.fullmatch(tail_hash):
                 item['tail_sha256'] = tail_hash
-            expected = f'vm-logs/{identifier}/{filename}.technical.jsonl'
+            prefix = f'vm-logs/{identifier}' + (f'/{environment_id}' if environment_id else '')
+            expected = f'{prefix}/{filename}.technical.jsonl'
             if source.get('archive_member') == expected and source_status == 'included':
                 item['archive_member'] = expected
-            raw_expected = f'vm-logs/{identifier}/{filename}.raw.log'
+            raw_expected = f'{prefix}/{filename}.raw.log'
             if mode == 'raw_bounded_tails' and source.get('raw_archive_member') == raw_expected and source_status == 'included':
                 item['raw_archive_member'] = raw_expected
             retained['sources'].append(item)
         retained['evidence_codes'] = sorted({code for source in retained['sources'] for code in source['evidence_codes']})
         safe['workspaces'].append(retained)
     all_sources = [source for workspace in safe['workspaces'] for source in workspace['sources']]
-    safe['summary'] = {'workspaces': len(safe['workspaces']), 'sources': len(all_sources),
+    safe['summary'] = {'workspaces': len(safe['workspaces']),
+                       'environments': sum(len(workspace['environment_ids']) for workspace in safe['workspaces']), 'sources': len(all_sources),
                        'bytes_read': sum(source['bytes_read'] for source in all_sources) + sum(workspace['failure_receipts_bytes_read'] for workspace in safe['workspaces']),
                        'bytes_exported': sum(source['bytes_exported'] for source in all_sources),
                        'recognized_signals': sum(source['signals_count'] for source in all_sources)}

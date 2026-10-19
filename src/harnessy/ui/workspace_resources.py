@@ -1,4 +1,4 @@
-"""Workspace VM resource summary and stopped-VM editor."""
+"""Per-VM resource summary and stopped-VM editor."""
 from __future__ import annotations
 
 from typing import Any, Callable
@@ -47,27 +47,29 @@ class WorkspaceResourceEditor:
         if self.active:
             return 'Finish or stop active agents, terminals, and workspace processes before applying resources.'
         if not self.status.get('known'):
-            return 'Waiting for the workspace VM status. Close this editor and try again after the check finishes.'
+            return 'Waiting for this VM’s status. Close this editor and try again after the check finishes.'
         if self.status.get('running'):
-            return 'Stop the workspace VM using Environment Controls before applying resources.'
+            return 'Stop this VM before applying resources.'
         if self.status.get('created') and self.status.get('state') != 'stopped':
-            return 'The workspace VM must be fully stopped before applying resources.'
+            return 'This VM must be fully stopped before applying resources.'
         return ''
 
     def open(self) -> None:
         config = self.config
         expected = config.to_dict()
         with ui.dialog() as dialog, ui.card().classes('w-[560px] max-w-[94vw] gap-3'):
-            ui.label('Edit Workspace VM Resources').classes('text-lg font-semibold')
+            ui.label(f'Edit Resources · {config.name}').classes('text-lg font-semibold')
             ui.label('Apply while the VM is stopped, then Start it to use the new settings.').classes('text-sm hy-muted')
             # Text-valued numeric inputs avoid NiceGUI Number.sanitize comparing
             # a browser-supplied string against a numeric bound on blur.
+            openwrt = config.provider == 'openwrt'
+            mips = openwrt and config.architecture.startswith('mips')
             with ui.row().classes('w-full gap-3 flex-wrap'):
-                cpu = ui.input('vCPU count', value=str(config.cpu)).props('type=number min=1 max=64 step=1').style('flex:1 1 130px;min-width:120px')
-                ram = ui.input('RAM (GiB)', value=self._memory_gib(config)).props('type=number min=1 max=256 step=0.5').style('flex:1 1 130px;min-width:120px')
-                disk = ui.input('Storage (GiB)', value=str(config.disk_gb)).props(f'type=number min={config.disk_gb} max=4096 step=1').style('flex:1 1 130px;min-width:120px')
+                cpu = ui.input('vCPU count', value=str(config.cpu)).props(f'type=number min=1 max={1 if mips else 64} step=1').style('flex:1 1 130px;min-width:120px')
+                ram = ui.input('RAM (GiB)', value=self._memory_gib(config)).props(f'type=number min=1 max={2 if mips else 128 if openwrt else 256} step=0.5').style('flex:1 1 130px;min-width:120px')
+                disk = ui.input('Storage (GiB)', value=str(config.disk_gb)).props(f'type=number min={config.disk_gb} max={64 if openwrt else 4096} step=1').style('flex:1 1 130px;min-width:120px')
             ui.label('Storage is sparse: this sets its maximum capacity, not an immediate host-space allocation. Existing storage can only grow. Files, installed tools, and the VM disk are retained.').classes('text-xs hy-muted')
-            ui.label('CPU: 1–64 · RAM: 1–256 GiB · Storage: 16–4,096 GiB. Leave enough host resources for your model and other apps.').classes('text-xs hy-muted')
+            ui.label('OpenWrt Malta: 1 vCPU · RAM: 1–2 GiB · Storage: 16–64 GiB.' if mips else 'OpenWrt: RAM up to 128 GiB · Storage: 16–64 GiB.' if openwrt else 'CPU: 1–64 · RAM: 1–256 GiB · Storage: 16–4,096 GiB. Leave enough host resources for your model and other apps.').classes('text-xs hy-muted')
             error = ui.label('').classes('text-sm text-negative').style('white-space:pre-wrap;overflow-wrap:anywhere')
             reason = self._block_reason()
             if reason:
@@ -84,6 +86,8 @@ class WorkspaceResourceEditor:
                         return
                     try:
                         values = resource_values(cpu.value, ram.value, disk.value)
+                        if openwrt and (values['disk_gb'] > 64 or values['memory_mb'] > (2048 if mips else 131072) or (mips and values['cpu'] != 1)):
+                            raise ValueError('OpenWrt MIPS supports 1 vCPU and up to 2 GiB RAM; other OpenWrt guests support up to 128 GiB RAM. Disk maximum is 64 GiB.')
                         if values['disk_gb'] < config.disk_gb:
                             raise ValueError('Storage can only grow. Choose at least the existing capacity.')
                         if self.on_apply(**values, expected=expected) is not False:
@@ -103,17 +107,24 @@ def render_unavailable_workspace_vm(workspace_root: str | Path) -> None:
     from harnessy.environment.activity import active_work
 
     root = Path(workspace_root)
-    manager = EnvironmentManager(root)
     try:
-        config = manager.config
+        configs = EnvironmentManager(root).list()
     except (OSError, ValueError):
         return
-    if config is None:
-        return
+    for config in configs:
+        _render_unavailable_vm(root, config)
+
+
+def _render_unavailable_vm(root: Path, config: EnvironmentConfig) -> None:
+    from harnessy.environment import EnvironmentManager, ENVIRONMENT_OPERATIONS, ENVIRONMENT_STATUS
+    from harnessy.environment.activity import active_work
+
+    environment_id = config.id
+    manager = EnvironmentManager(root, environment_id=environment_id)
     current: dict[str, Any] = {'known': False}
-    with ui.card().classes('w-full gap-2 p-4'):
-        ui.label('Workspace VM').classes('font-semibold')
-        ui.label('VM resource settings remain available while this workspace cannot open.').classes('text-xs hy-muted')
+    with ui.card().classes('w-full gap-2 p-4') as panel:
+        ui.label(config.name).classes('font-semibold')
+        ui.label('VM controls').classes('text-xs hy-muted')
         editor = WorkspaceResourceEditor(config, lambda **values: queue('resources', **values))
         status_label = ui.label('Checking VM state…').classes('text-sm hy-muted')
         with ui.row().classes('w-full items-center gap-2'):
@@ -122,12 +133,13 @@ def render_unavailable_workspace_vm(workspace_root: str | Path) -> None:
         detail = ui.label('').classes('text-xs hy-muted').style('white-space:pre-wrap;overflow-wrap:anywhere')
 
     def sync() -> None:
-        operation = ENVIRONMENT_OPERATIONS.state(root)
-        busy, active = bool(operation.busy), bool(active_work(root))
+        operation = ENVIRONMENT_OPERATIONS.state(root, environment_id=environment_id)
+        busy = bool(operation.busy)
+        active = bool(active_work(root, environment_id=environment_id))
         editor.sync(manager.config, {**current, 'resource_operation': operation.action == 'resources'}, busy=busy, active=active)
         spinner.set_visibility(busy or not current.get('known'))
         if busy:
-            status_label.set_text(operation.message or 'Updating workspace VM…')
+            status_label.set_text(operation.message or 'Updating VM…')
         elif current.get('known'):
             status_label.set_text('VM running' if current.get('running') else 'VM stopped' if current.get('created') else 'VM not created')
         stop.enable() if current.get('known') and current.get('running') and not busy and not active else stop.disable()
@@ -135,13 +147,13 @@ def render_unavailable_workspace_vm(workspace_root: str | Path) -> None:
         detail.set_text(operation.error or (operation.message if busy else operation.success) or '')
 
     def queue(action: str, **payload: Any) -> bool:
-        if active_work(root):
-            detail.set_text('Finish or stop active agents, terminals, and workspace processes before changing the VM.')
+        if active_work(root, environment_id=environment_id):
+            detail.set_text('Finish or stop active agents, terminals, and processes using this VM before changing it.')
             return False
         try:
-            queued = ENVIRONMENT_OPERATIONS.start(root, action, **payload)
+            queued = ENVIRONMENT_OPERATIONS.start(root, action, environment_id=environment_id, **payload)
             if not queued:
-                detail.set_text('Wait for the current environment operation to finish.')
+                detail.set_text('Wait for this VM’s current operation to finish.')
                 return False
             sync()
             return True
@@ -150,8 +162,14 @@ def render_unavailable_workspace_vm(workspace_root: str | Path) -> None:
             return False
 
     async def refresh() -> None:
+        if panel.is_deleted:
+            timer.cancel()
+            return
         try:
-            info = await ENVIRONMENT_STATUS.get(root)
+            info = await ENVIRONMENT_STATUS.get(root, environment_id=environment_id)
+            if panel.is_deleted:
+                timer.cancel()
+                return
             poll_error = ''
             if info is not None:
                 current.clear()
@@ -165,11 +183,13 @@ def render_unavailable_workspace_vm(workspace_root: str | Path) -> None:
                 detail.set_text(poll_error)
         except (RuntimeError, ValueError, OSError) as exc:
             current['known'] = False
-            editor.sync(editor.config, current, busy=ENVIRONMENT_OPERATIONS.is_busy(root), active=bool(active_work(root)))
+            editor.sync(editor.config, current,
+                        busy=ENVIRONMENT_OPERATIONS.is_busy(root, environment_id=environment_id),
+                        active=bool(active_work(root, environment_id=environment_id)))
             spinner.set_visibility(False)
             status_label.set_text('VM status unavailable')
             detail.set_text(str(exc))
             stop.disable()
 
     sync()
-    ui.timer(0.75, refresh, immediate=True)
+    timer = ui.timer(0.75, refresh, immediate=True)

@@ -28,6 +28,7 @@ PERMISSION_ENUMS = {
         'blocked_off', 'policy_unavailable', 'target_invalid', 'ask', 'global_on',
         'target_on', 'read_only', 'owned_session', 'approved_once', 'target_unavailable',
         'blocked_target_action', 'selected_on',
+        'vm_project_not_allowed', 'target_project_not_allowed',
     }),
     'permission_target_mode': frozenset({'full', 'selected', 'ask', 'on', 'not_applicable'}),
     'permission_target_state': frozenset({
@@ -66,6 +67,8 @@ _TOOLS = frozenset({
     'target_list_files', 'target_status', 'test_vm_control', 'update_checkpoint',
     'update_task_state', 'web_download', 'web_find', 'web_open', 'web_search',
     'workspace_symbols', 'write_file',
+    'list_vm_environments', 'vm_environment_status', 'vm_environment_control',
+    'vm_deploy_project', 'vm_collect_file',
 })
 _CATEGORIES = frozenset({
     'filesystem', 'attachments', 'memory', 'shell', 'processes', 'git', 'browser',

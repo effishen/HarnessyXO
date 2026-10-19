@@ -108,10 +108,16 @@ class TargetViewHandle:
             reg = _MACHINE.get_workspace(self.manager.workspace.id) if _MACHINE is not None else None
             if reg is None or Path(reg.path).resolve() != self.manager.workspace.root.resolve():
                 raise ValueError('Workspace unavailable')
-            target = await asyncio.to_thread(self.manager.workspace.get_external_target, self.manager.target.id)
-            # enabled controls model access, not the human's own VM console.
-            if not target or target.managed_vm != self.manager.target.managed_vm:
-                raise ValueError('Target unavailable')
+            if getattr(self.manager, 'environment_id', None) is not None:
+                # Named local VMs are registry-owned. They must never be
+                # admitted by inventing an external-target database record.
+                if not await asyncio.to_thread(self.manager.registry_valid):
+                    raise ValueError('VM environment unavailable')
+            else:
+                target = await asyncio.to_thread(self.manager.workspace.get_external_target, self.manager.target.id)
+                # enabled controls model access, not the human's own VM console.
+                if not target or target.managed_vm != self.manager.target.managed_vm:
+                    raise ValueError('Target unavailable')
             # Native VM checks are shared across parallel assets/display frames.
             # A dead guest or changed forwarded port must never silently turn
             # this lease into a proxy to a later, unrelated loopback service.
@@ -157,10 +163,10 @@ class TargetViewHandle:
 async def create_target_view(manager: Any, username: str, accounts: Any) -> TargetViewHandle:
     """Open one fixed managed display; callers cannot supply a host or port."""
     if accounts is None or not username or str(getattr(accounts, 'username', '')) != username:
-        raise RuntimeError('Sign in again before opening this test target.')
+        raise RuntimeError('Sign in again before opening this VM interface.')
     await accounts._require_session()
     if manager.busy or not (await manager.status()).get('running'):
-        raise RuntimeError('Start this test target and wait until it is ready.')
+        raise RuntimeError('Start this VM and wait until it is ready.')
     info = await asyncio.to_thread(manager.desktop_info)
     kind = 'web' if info.get('kind') == 'web' else 'vnc'
     try:
@@ -171,7 +177,7 @@ async def create_target_view(manager: Any, username: str, accounts: Any) -> Targ
         if address.username or address.password or address.scheme != ('http' if kind == 'web' else 'vnc'):
             raise ValueError()
     except (KeyError, TypeError, ValueError):
-        raise RuntimeError('The test target did not provide a valid local display address.') from None
+        raise RuntimeError('The VM did not provide a valid local display address.') from None
     # Bound abandoned browser leases, including ones whose pages vanished before
     # a close callback. Existing handles keep their original authenticated owner.
     for item in tuple(_LEASES.values()):
@@ -232,6 +238,13 @@ def close_manager_views(manager_key: str) -> None:
 def _view_failure(handle: TargetViewHandle, code: str) -> None:
     # Fixed fields only: no display capability, URL, guest body or credentials.
     family = str(getattr(getattr(handle.manager, 'guest', None), 'family', ''))
+    if getattr(handle.manager, 'environment_id', None) is not None:
+        log_event('harnessy', 'environment_view_failed', environment_id=handle.manager.environment_id,
+                  workspace_id=str(handle.manager.workspace.id),
+                  provider='qemu' if family == 'openwrt' or handle.kind == 'web' else 'lima',
+                  action='desktop', stage=handle.kind + '_transport', outcome='failed',
+                  failure_code=code)
+        return
     log_event('harnessy', 'test_target_view_failed', target_id=str(handle.manager.target.id),
               workspace_id=str(handle.manager.workspace.id),
               target_backend='qemu' if family == 'openwrt' or handle.kind == 'web' else 'lima',

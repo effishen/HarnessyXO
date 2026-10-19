@@ -41,6 +41,9 @@ class ProcessJob:
     stop_requested: bool = False
     output_truncated: bool = False
     origin_chat_id: str = ''
+    environment_id: str = ''
+    environment_name: str = ''
+    runtime_identity_start: dict[str, Any] = field(default_factory=dict)
 
     @property
     def status(self) -> str:
@@ -68,12 +71,29 @@ class ProcessJobManager:
     def __init__(self) -> None:
         self._jobs: dict[str, ProcessJob] = {}
 
-    def _job_for(self, workspace_key: str, job_id: str, origin_chat_id: str | None = None) -> ProcessJob:
+    def _job_for(self, workspace_key: str, job_id: str, origin_chat_id: str | None = None,
+                 environment_id: str | None = None) -> ProcessJob:
         job = self._jobs.get(job_id)
         if (not job or job.workspace_key != workspace_key
-                or (origin_chat_id is not None and job.origin_chat_id != origin_chat_id)):
+                or (origin_chat_id is not None and job.origin_chat_id != origin_chat_id)
+                or (environment_id is not None and job.environment_id != environment_id)):
             raise KeyError(f'Unknown process job: {job_id}')
         return job
+
+    @staticmethod
+    def _model_access_current(job: ProcessJob) -> bool:
+        from harnessy.environment import EnvironmentManager
+        try:
+            current = EnvironmentManager(job.environment.workspace_root).get(job.environment_id)
+            return bool(current and current.enabled and current.allows_project(job.origin_chat_id))
+        except Exception:
+            return False
+
+    def _withheld_poll(self, job: ProcessJob) -> dict[str, Any]:
+        self._drain(job)
+        return {**self._summary(job), 'ok': False, 'error_code': 'VM_PROJECT_ACCESS_DENIED',
+                'error': 'This Project/Chat no longer has model access to this VM. Process output was withheld; stopping the owned job is still allowed.',
+                'stdout': '', 'stderr': '', 'output_withheld': True}
 
     @staticmethod
     def _append_pending(job: ProcessJob, attr: str, chunk: bytes) -> None:
@@ -126,7 +146,15 @@ class ProcessJobManager:
             raise ValueError('command must not be empty')
         if environment is None:
             raise RuntimeError('Workspace process jobs require a sandboxed environment; host execution is disabled.')
-        release_activity = acquire_activity(environment.workspace_root, 'Process · ' + command[:80])
+        environment_id = str(getattr(environment.config, 'id', '') or '')
+        environment_name = str(getattr(environment.config, 'name', '') or '')
+        from harnessy.environment import EnvironmentManager
+        from harnessy.environment.base import EnvironmentModelAccessError
+        current = EnvironmentManager(environment.workspace_root).get(environment_id)
+        if current is None or not current.enabled or not current.allows_project(origin_chat_id):
+            raise EnvironmentModelAccessError('This Project/Chat does not have model access to this VM environment.')
+        release_activity = acquire_activity(environment.workspace_root, 'Process · ' + command[:80],
+                                            environment_id=environment_id)
         try:
             spawn_kwargs: dict[str, Any] = {
                 'cwd': cwd_label,
@@ -147,6 +175,10 @@ class ProcessJobManager:
         except BaseException:
             release_activity()
             raise
+        try:
+            runtime_identity = dict(environment.runtime_identity() or {})
+        except Exception:
+            runtime_identity = {}
         job = ProcessJob(
             id=f'job_{uuid.uuid4().hex[:12]}',
             workspace_key=workspace_key,
@@ -159,6 +191,10 @@ class ProcessJobManager:
             started_perf=time.perf_counter(),
             activity_release=release_activity,
             origin_chat_id=origin_chat_id,
+            environment_id=environment_id, environment_name=environment_name,
+            runtime_identity_start={key: value for key, value in runtime_identity.items()
+                                    if key in {'environment_id', 'vm_generation', 'vm_boot_id',
+                                               'vm_lifecycle_event', 'vm_lifecycle_updated_at'}},
         )
         self._jobs[job.id] = job
         job.stdout_task = asyncio.create_task(self._read_stream(job, process.stdout, 'stdout_pending'))
@@ -180,6 +216,10 @@ class ProcessJobManager:
             'ended_at': job.ended_at,
             'duration_seconds': job.duration_seconds,
             'environment': 'workspace-vm',
+            'environment_id': job.environment_id,
+            'environment_name': job.environment_name,
+            'project_files_mode': job.environment.config.files_mode,
+            'runtime_identity_start': job.runtime_identity_start,
         }
 
     @staticmethod
@@ -193,8 +233,10 @@ class ProcessJobManager:
         return stdout, stderr, truncated
 
     async def poll(self, *, workspace_key: str, job_id: str, wait_seconds: float = 0.0,
-                   origin_chat_id: str | None = None) -> dict[str, Any]:
-        job = self._job_for(workspace_key, job_id, origin_chat_id)
+                   origin_chat_id: str | None = None, environment_id: str | None = None) -> dict[str, Any]:
+        job = self._job_for(workspace_key, job_id, origin_chat_id, environment_id)
+        if not self._model_access_current(job):
+            return self._withheld_poll(job)
         wait_seconds = max(0.0, min(float(wait_seconds or 0.0), 30.0))
         if wait_seconds and not job.stdout_pending and not job.stderr_pending and job.process.returncode is None:
             job.activity.clear()
@@ -206,6 +248,8 @@ class ProcessJobManager:
         # Give stream-reader tasks one loop turn to drain final bytes after exit.
         if job.process.returncode is not None:
             await asyncio.sleep(0)
+        if not self._model_access_current(job):
+            return self._withheld_poll(job)
         stdout, stderr, truncated = self._drain(job)
         return {
             **self._summary(job),
@@ -222,8 +266,16 @@ class ProcessJobManager:
         text: str,
         append_newline: bool = True,
         origin_chat_id: str | None = None,
+        environment_id: str | None = None,
     ) -> dict[str, Any]:
-        job = self._job_for(workspace_key, job_id, origin_chat_id)
+        job = self._job_for(workspace_key, job_id, origin_chat_id, environment_id)
+        # A job retains its original provider. Revoking model access must also
+        # stop later stdin from turning an already-started shell into a bypass.
+        from harnessy.environment import EnvironmentManager
+        current = EnvironmentManager(job.environment.workspace_root).get(job.environment_id)
+        if current is None or not current.enabled or not current.allows_project(job.origin_chat_id):
+            return {**self._summary(job), 'ok': False, 'error_code': 'VM_PROJECT_ACCESS_DENIED',
+                    'error': 'This Project/Chat no longer has model access to this job\'s VM. Input was not sent.'}
         if job.process.returncode is not None:
             return {**self._summary(job), 'ok': False, 'error': 'Process is no longer running.'}
         if job.process.stdin is None:
@@ -243,8 +295,9 @@ class ProcessJobManager:
         job_id: str,
         grace_seconds: float = 3.0,
         origin_chat_id: str | None = None,
+        environment_id: str | None = None,
     ) -> dict[str, Any]:
-        job = self._job_for(workspace_key, job_id, origin_chat_id)
+        job = self._job_for(workspace_key, job_id, origin_chat_id, environment_id)
         if job.process.returncode is not None:
             return self._summary(job)
         job.stop_requested = True
@@ -257,14 +310,18 @@ class ProcessJobManager:
                 pass
         return self._summary(job)
 
-    def has_running(self, *, workspace_key: str, chat_id: str | None = None) -> bool:
+    def has_running(self, *, workspace_key: str, chat_id: str | None = None,
+                    environment_id: str | None = None) -> bool:
         return any(job.workspace_key == workspace_key and job.process.returncode is None
                    and (chat_id is None or job.origin_chat_id == chat_id)
+                   and (environment_id is None or job.environment_id == environment_id)
                    for job in self._jobs.values())
 
-    def list(self, *, workspace_key: str, origin_chat_id: str | None = None) -> dict[str, Any]:
+    def list(self, *, workspace_key: str, origin_chat_id: str | None = None,
+             environment_id: str | None = None) -> dict[str, Any]:
         jobs = [job for job in self._jobs.values() if job.workspace_key == workspace_key
-                and (origin_chat_id is None or job.origin_chat_id == origin_chat_id)]
+                and (origin_chat_id is None or job.origin_chat_id == origin_chat_id)
+                and (environment_id is None or job.environment_id == environment_id)]
         jobs.sort(key=lambda job: job.started_perf, reverse=True)
         return {'ok': True, 'jobs': [self._summary(job) for job in jobs]}
 

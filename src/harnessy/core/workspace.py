@@ -22,6 +22,7 @@ from typing import Any
 from ..diagnostics.sqlite import connect_database
 from .sqlite_store import enable_store_wal
 from .target_policy import normalize_target_policy, target_action_permission
+from .project_access import normalize_project_access, allows_project
 from .workspace_access import WorkspaceConnection, workspace_generation, workspace_shared_access
 from .workspace_roots import validate_workspace_root
 from .workspace_health import (
@@ -128,6 +129,17 @@ class ExternalTarget:
     updated_at: str
     managed_vm: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def project_access(self) -> str:
+        return normalize_project_access(self.policy)['project_access']
+
+    @property
+    def allowed_project_ids(self) -> tuple[str, ...]:
+        return tuple(normalize_project_access(self.policy)['allowed_project_ids'])
+
+    def allows_project(self, chat_id: str) -> bool:
+        return allows_project(self.policy, chat_id)
+
 
 @dataclass(slots=True)
 class HistoricalBranch:
@@ -188,8 +200,17 @@ class WorkspaceStore:
         else:
             raise ValueError('Unsupported workspace database admission mode')
         self.meta.mkdir(parents=True, exist_ok=True)
-        self.environment_dir = self.meta / 'environment'
-        self.is_vm_workspace = (self.environment_dir / 'environment.json').is_file()
+        self.environment_dir = self.meta / 'environments'
+        # Execution layout belongs to the workspace, not to the presence of a
+        # VM. A new workspace keeps its private project roots even when no VM
+        # has been created, or after its last VM has been removed.
+        saved_metadata = self._read_metadata()
+        self.is_vm_workspace = (
+            not self.metadata_path.exists()
+            or saved_metadata.get('execution_model') == 'multi_vm'
+            or self.environment_dir.is_dir()
+            or (self.meta / 'environment' / 'environment.json').is_file()
+        )
         # v0.6 has one physical layout on every host: private HarnessyXO state
         # stays beside Files/, while every human-visible project byte lives
         # below Files/.  Host workspaces no longer overload the workspace root
@@ -271,7 +292,7 @@ class WorkspaceStore:
         store.meta = root / META_DIR_NAME
         store.metadata_path = store.meta / 'workspace.json'
         store.db_path = store.meta / 'workspace.db'
-        store.environment_dir = store.meta / 'environment'
+        store.environment_dir = store.meta / 'environments'
         store.is_vm_workspace = is_vm_workspace
         store.files_root = root / FILES_DIR_NAME
         store.references_dir = store.files_root / REFERENCES_DIR_NAME
@@ -406,6 +427,8 @@ class WorkspaceStore:
         data.setdefault('files_storage_id', uuid.uuid4().hex)
         data['name'] = (name or data.get('name') or self.root.name or 'Workspace').strip()
         data['schema_version'] = SCHEMA_VERSION
+        if self.is_vm_workspace:
+            data['execution_model'] = 'multi_vm'
         if not defer_write:
             self._write_metadata_atomic(data)
         return data
@@ -1402,7 +1425,9 @@ class WorkspaceStore:
         try:
             policy = json.loads(str(row['policy_json'] or '{}'))
         except json.JSONDecodeError:
-            policy = {}
+            policy = {'project_access': 'selected', 'allowed_project_ids': []}
+        if not isinstance(policy, dict):
+            policy = {'project_access': 'selected', 'allowed_project_ids': []}
         managed_vm = json.loads(row['managed_vm_json'] or '{}') if 'managed_vm_json' in row.keys() else {}
         managed_vm = managed_vm if isinstance(managed_vm, dict) else {}
         return ExternalTarget(
@@ -1447,6 +1472,7 @@ class WorkspaceStore:
         password: str | None = None, remote_root: str,
         enabled: bool = True, approval_mode: str | None = None, policy: dict[str, Any] | None = None,
         managed_vm: dict[str, Any] | None = None,
+        project_access: str | None = None, allowed_project_ids: list[str] | tuple[str, ...] | None = None,
     ) -> ExternalTarget:
         prior = self.get_external_target(target_id) if target_id else None
         managed_vm = dict(managed_vm if managed_vm is not None else (prior.managed_vm if prior else {}))
@@ -1464,8 +1490,19 @@ class WorkspaceStore:
         ).strip().lower()
         if approval_mode not in {'ask', 'on'}:
             approval_mode = 'ask'
+        policy_source = prior.policy if policy is None and prior is not None else policy
+        if prior is not None and isinstance(policy_source, dict) and not any(
+                key in policy_source for key in ('project_access', 'allowed_project_ids')):
+            # Action-only editor changes and ordinary target edits preserve an
+            # existing membership restriction instead of resetting it to All.
+            policy_source = {**normalize_project_access(prior.policy), **policy_source}
+        if project_access is not None or allowed_project_ids is not None:
+            policy_source = {**(policy_source if isinstance(policy_source, dict) else {}),
+                             'project_access': project_access if project_access is not None else
+                                 'selected',
+                             'allowed_project_ids': allowed_project_ids if allowed_project_ids is not None else []}
         normalized_policy = self._normalize_external_target_policy(
-            prior.policy if policy is None and prior is not None else policy,
+            policy_source,
             approval_mode=approval_mode, managed_vm=bool(managed_vm),
         )
         outside_allowed = target_action_permission(normalized_policy, 'outside_test_root') != 'off'

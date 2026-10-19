@@ -715,6 +715,8 @@ class ProjectMutationCoordinator:
         self._condition = asyncio.Condition()
         self._owners: dict[str, dict[str, ProjectMutationLease]] = {}
         self._queues: dict[str, list[tuple[str, str, frozenset[str]]]] = {}
+        self._borrowed: dict[str, ProjectMutationLease] = {}
+        self._released_owners: set[int] = set()
 
     def owner(self, workspace_id: str) -> ProjectMutationLease | None:
         return next(iter(self._owners.get(str(workspace_id), {}).values()), None)
@@ -739,7 +741,7 @@ class ProjectMutationCoordinator:
                 wait_payload = None
                 async with self._condition:
                     owners = self._owners.setdefault(workspace_id, {})
-                    if owner_id in owners:
+                    if owner_id in owners and id(owners[owner_id]) not in self._released_owners:
                         return owners[owner_id]
                     queue = self._queues.setdefault(workspace_id, [])
                     if not queued:
@@ -804,12 +806,62 @@ class ProjectMutationCoordinator:
             self._condition.notify_all()
             return True
 
+    @asynccontextmanager
+    async def borrow(
+        self, *, workspace_id: str, owner_id: str = '', label: str = 'Guest project synchronization',
+        conflict_keys: Any = (), project_chat_id: str = '',
+    ):
+        """Keep an existing writer alive through a bounded background sync.
+
+        The borrower has its own opaque token. Releasing the original writer
+        cannot admit conflicting work until the last borrower finishes, and a
+        stale borrower cannot release a later lease reusing the same owner ID.
+        If the original writer has already ended, acquire a new independent
+        writer rather than recreating its owner identity.
+        """
+        workspace_id, owner_id = str(workspace_id), str(owner_id)
+        token = uuid.uuid4().hex
+        independent = ''
+        async with self._condition:
+            lease = self._owners.get(workspace_id, {}).get(owner_id)
+            if lease is not None and id(lease) not in self._released_owners:
+                self._borrowed[token] = lease
+            else:
+                lease = None
+        if lease is None:
+            independent = 'project-sync-' + token
+            lease = await self.acquire(workspace_id=workspace_id, owner_id=independent, label=label,
+                conflict_keys=conflict_keys, project_chat_id=project_chat_id)
+            # Register without yielding after acquire: cancellation cannot leave
+            # an acquired writer between acquisition and the cleanup region.
+            self._borrowed[token] = lease
+        try:
+            yield lease
+        finally:
+            async with self._condition:
+                borrowed = self._borrowed.pop(token, None)
+                if borrowed is not None:
+                    if independent:
+                        self._released_owners.add(id(borrowed))
+                    self._drop_released_owner(borrowed)
+                self._condition.notify_all()
+
+    def _drop_released_owner(self, lease: ProjectMutationLease) -> None:
+        if id(lease) not in self._released_owners or any(value is lease for value in self._borrowed.values()):
+            return
+        owners = self._owners.get(lease.workspace_id, {})
+        if owners.get(lease.owner_id) is lease:
+            owners.pop(lease.owner_id, None)
+        if not owners:
+            self._owners.pop(lease.workspace_id, None)
+        self._released_owners.discard(id(lease))
+
     async def release(self, *, workspace_id: str, owner_id: str) -> None:
         async with self._condition:
-            owners = self._owners.get(str(workspace_id), {})
-            owners.pop(str(owner_id), None)
-            if not owners:
-                self._owners.pop(str(workspace_id), None)
+            lease = self._owners.get(str(workspace_id), {}).get(str(owner_id))
+            if lease is not None:
+                self._released_owners.add(id(lease))
+                self._drop_released_owner(lease)
             self._condition.notify_all()
 
 

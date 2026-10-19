@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.7.0
+
+- Create the workspace first, then add named VMs under **Environments → Create VM Environment**. Development and testing share one interface; give each VM a name and optional purpose instead of choosing a fixed Dev/Test role.
+- Run multiple VMs together. Each keeps independent disks, resources, packages, snapshots, lifecycle jobs and diagnostics. The model discovers enabled VMs and selects an explicit VM for commands; terminals, background processes and tool cards retain that VM's identity.
+- Keep canonical project source and conversations in the workspace. Choose shared read/write source, read-only source or separate deployed copies where supported. VM reset, rebuild and removal preserve canonical workspace files and other VMs. Keep the protected-folder and non-destructive workspace-removal safeguards.
+- Add **OpenWrt 23.05.5 Malta MIPS big-endian** with `mips_24kc`, musl, Linux 5.15.167 and Python 3.11.7 packages. Offer compatible optional tools individually and show unsupported choices with explanations. MIPS uses software CPU emulation.
+- OpenWrt shared-source modes use a conflict-checked SSH projection, with read-only ancestor/reference enforcement and source-preserving recovery from transfer failures. Separate-copy mode supports guest administration and explicit deploy/collect operations; it has access to the guest filesystem, including earlier deployed copies, and never mounts or automatically writes back canonical host source.
+- Keep existing Linux/OpenWrt choices and experimental Windows support in the unified catalogue. Open supported terminals, LuCI and graphical desktops as named main-area tabs. Windows uses your installer ISO and separate project copies.
+- Keep **External Targets** separate for existing SSH machines/devices. Local VMs use normal Shell/Processes/Git permissions plus each VM's model-enabled, file and network settings. Disabling model use prevents model selection/startup without stopping human consoles.
+- Choose **All projects / chats** or **Only selected projects / chats** independently for every VM and external target. Select exact projects with checkboxes; selecting none blocks all model projects. Parent/child and future projects do not inherit selected grants. Preserve grants across renames and unrelated edits, hide unavailable resources from model discovery and recheck access after approval waits and before execution. Human controls remain available; changing grants does not erase existing guest data or stop work already running.
+- Supply VM-local per-project build, virtual-environment and cache directories through shell environment variables. Guide the model to use those paths explicitly; files created inside shared source remain shared.
+- Show clear VM startup progress, current readiness and combined resource allocations. Retain per-VM controller logs, failure evidence and execution identifiers in diagnostics. Leave README unchanged.
+- Networking follows the selected provider: Lima retains its public-outbound guard; OpenWrt uses QEMU NAT and Windows uses its guest firewall. This release does not add a universal internet-action policy. Verified Linux browser flows and real OpenWrt QEMU boot, concurrent VMs, protected source synchronization, terminal output, snapshots and a native MIPS GCC build. The restricted test host required a test-only TCP QMP connection; production keeps private UNIX sockets. Native macOS, Kali and Windows guest boot validation was unavailable.
+
 ## v0.6.124
 
 - Remove permanent folder deletion from **Remove Workspace**. Removing a workspace now leaves its files, chat history, VM disks and snapshots on disk. Stop safely identified VMs instead of destroying them.

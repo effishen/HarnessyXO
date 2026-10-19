@@ -73,8 +73,10 @@ class TerminalSession:
         self, cwd: Path, *, cols: int = 120, rows: int = 34,
         command_argv: list[str] | None = None, env: dict[str, str] | None = None,
         workspace_root: Path | None = None,
+        environment_id: str = '',
     ) -> None:
         self.workspace_root = workspace_root
+        self.environment_id = environment_id
         self._activity_release = None
         self.cwd = cwd.resolve()
         self.command_argv = list(command_argv) if command_argv else None
@@ -104,7 +106,8 @@ class TerminalSession:
             return
         self._release_activity()
         root = getattr(self, 'workspace_root', None)
-        release = acquire_activity(root, 'Workspace terminal (close it before changing network policy)') if root else None
+        release = acquire_activity(root, 'VM terminal (close it before changing this VM)',
+                                   environment_id=self.environment_id) if root else None
         self._activity_release = release
         try:
             self._start_child()
