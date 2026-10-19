@@ -21,10 +21,11 @@ from typing import Any
 
 from . import vm_logs
 from .technical import technical_error_evidence, validate_technical_evidence
+from .radio_setup import RADIO_SETUP_FILENAME, MAX_RADIO_RECEIPTS, radio_setup_tail
 
 MAX_TARGETS = 16
 MAX_REGISTRY_TARGETS = 64
-QEMU_LOG_FILENAMES = ('qemu.stderr.log', 'qemu.control-plane.log', 'serial.log')
+QEMU_LOG_FILENAMES = ('qemu.stderr.log', 'qemu.control-plane.log', 'serial.log', RADIO_SETUP_FILENAME)
 MAX_QEMU_RECEIPTS = 8
 MAX_TARGET_FILES = MAX_TARGETS * max(len(QEMU_LOG_FILENAMES), len(vm_logs.VM_LOG_FILENAMES))
 MAX_DISCOVERY_BYTES = 1024 * 1024
@@ -58,6 +59,7 @@ _ID = re.compile(r'^[0-9a-f]{32}$')
 _HEX = re.compile(r'^[0-9a-f]{64}$')
 _LIMITS = {'targets': MAX_TARGETS, 'files': MAX_TARGET_FILES,
            'qemu_handoff_receipts': MAX_QEMU_RECEIPTS,
+           'radio_setup_receipts': MAX_RADIO_RECEIPTS,
            'tail_bytes_per_file': vm_logs.PER_FILE_TAIL_BYTES,
            'read_bytes_total': MAX_EXPORT_BYTES, 'export_bytes_total': MAX_EXPORT_BYTES,
            'discovery_bytes_total': MAX_DISCOVERY_BYTES, 'collection_seconds': COLLECTION_SECONDS}
@@ -391,8 +393,9 @@ def collect_test_target_diagnostics(latest: Path, include_content: bool = False)
             source = {'filename': filename, **result, 'bytes_read': len(data), 'bytes_exported': 0,
                       'signals_count': 0, 'signals_exported': 0, 'signals_limited': False, 'evidence_codes': []}
             if result['status'] == 'included':
-                kind = 'qemu' if filename.startswith('qemu.') else 'hostagent' if filename.startswith('ha.') else 'serial'
-                projected, measurements = (_qemu_technical_tail(data, result['truncated'], deadline) if filename == 'qemu.stderr.log' else
+                kind = 'radio_setup' if filename == RADIO_SETUP_FILENAME else 'qemu' if filename.startswith('qemu.') else 'hostagent' if filename.startswith('ha.') else 'serial'
+                projected, measurements = (radio_setup_tail(data, result['truncated'], deadline) if filename == RADIO_SETUP_FILENAME else
+                                           _qemu_technical_tail(data, result['truncated'], deadline) if filename == 'qemu.stderr.log' else
                                            _qemu_control_plane_tail(data, result['truncated'], deadline) if kind == 'qemu' else
                                            vm_logs._technical_tail(data, kind, result['truncated'], deadline))
                 source.update(measurements)
@@ -450,9 +453,9 @@ def validate_test_target_report(report: Any) -> dict[str, Any]:
                 continue
             filename = source['filename']; used.add(filename)
             state = _safe_enum(source.get('status'), {'included', 'missing', 'unsafe', 'unreadable', 'limited'}, 'unreadable')
-            kind = 'qemu' if filename.startswith('qemu.') else 'hostagent' if filename.startswith('ha.') else 'serial'
+            kind = 'radio_setup' if filename == RADIO_SETUP_FILENAME else 'qemu' if filename.startswith('qemu.') else 'hostagent' if filename.startswith('ha.') else 'serial'
             item = {'filename': filename, 'status': state, 'kind': kind,
-                    'projection': 'fixed_boot_signals' if kind == 'serial' else 'sanitized_control_plane'}
+                    'projection': 'fixed_guest_radio_setup' if kind == 'radio_setup' else 'fixed_boot_signals' if kind == 'serial' else 'sanitized_control_plane'}
             for key, cap in {'bytes_available': 2**63 - 1, 'bytes_read': vm_logs.PER_FILE_TAIL_BYTES,
                              'bytes_exported': MAX_EXPORT_BYTES, 'raw_bytes_exported': vm_logs.PER_FILE_TAIL_BYTES,
                              'line_count': vm_logs.PER_FILE_TAIL_BYTES, 'signals_count': vm_logs.MAX_PARSE_LINES * len(vm_logs.EVIDENCE_CODES),
@@ -487,6 +490,7 @@ def validate_test_target_report(report: Any) -> dict[str, Any]:
                         'guest_serial_policy': 'fixed_signals_only',
                         'controller_output_policy': 'sanitized_technical_evidence',
                         'qemu_control_plane_scope': 'current_controller_output_and_bounded_handoff_history',
+                        'radio_setup_scope': 'fixed_script_results_and_typed_transport_errors',
                         'absence_of_evidence_proves_no_failure': False}
     safe['summary'] = {'targets': len(safe['targets']), 'sources': len(sources),
                        'technical_records_exported': sum(source['technical_records_exported'] for source in sources),

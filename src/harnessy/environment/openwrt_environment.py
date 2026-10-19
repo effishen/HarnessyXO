@@ -109,7 +109,79 @@ class _Controller(OpenWrtTargetManager):
         return argv, env
 
     async def _radio_command(self, script, *, timeout=20):
-        return (await self.owner._checked(script, timeout=timeout)).decode(errors='replace')
+        # The bundled Bluetooth ELF makes this script larger than Linux's
+        # per-argument limit. Keep SSH's command fixed and stream the script on
+        # stdin, as the legacy target transport already does.
+        from harnessy.diagnostics.radio_setup import record_radio_setup_evidence
+        from .test_bluetooth import (
+            BLUETOOTH_PACKAGES_SCRIPT, BLUETOOTH_H4_SETUP_SCRIPT,
+            BLUETOOTH_RADIO_PACKAGES,
+        )
+        from .test_radios import WIFI_SETUP_SCRIPT
+        message = (
+            'Installing matching Bluetooth packages; first setup may take several minutes…'
+            if script == BLUETOOTH_PACKAGES_SCRIPT else
+            'Installing the verified software Bluetooth controller helper…'
+            if script.startswith('# HarnessyXO verified Bluetooth helper installation v1\n') else
+            'Attaching and verifying the software Bluetooth controllers…'
+            if script == BLUETOOTH_H4_SETUP_SCRIPT else
+            'Setting up and verifying the software Wi-Fi radios…'
+            if script == WIFI_SETUP_SCRIPT else None
+        )
+        if message:
+            await self.owner._emit('provisioning_optional_packages', message)
+        out, err, returncode, failure = b'', b'', None, None
+        partial_output = {}
+        evidence_phase = 'guest_script'
+        command_timeout = timeout
+        try:
+            packages, radio = (), None
+            if script == BLUETOOTH_PACKAGES_SCRIPT:
+                packages, radio = BLUETOOTH_RADIO_PACKAGES, 'bluetooth'
+            elif script == WIFI_SETUP_SCRIPT:
+                packages, radio = ('kmod-mac80211-hwsim', 'iw'), 'wifi'
+            if packages and not self.owner._basic_copy:
+                # Use the same pinned-release, SHA-verified host downloader as
+                # the VM tool installer. Guest WAN can remain disabled. The
+                # unchanged fixed guest scripts then verify modules/utilities
+                # and skip their feed fetch when everything is already present.
+                try:
+                    evidence_phase = 'host_package_setup'
+                    started = time.monotonic()
+                    await asyncio.wait_for(self.owner._install_packages(packages), timeout=timeout)
+                    command_timeout = max(0.001, timeout - (time.monotonic() - started))
+                except (OSError, RuntimeError, TimeoutError) as error:
+                    failure = error
+                    detail = 'operation_timeout' if isinstance(error, TimeoutError) else 'unknown'
+                    out = (f'HX_RADIO_SETUP {radio}=package_install_failed\n'
+                           f'HX_RADIO_DETAIL {radio}={detail}\n').encode('ascii')
+                    err = str(error).encode('utf-8', errors='replace')[-16384:]
+                    return out.decode('ascii')
+                evidence_phase = 'guest_script'
+            returncode, out, err = await self.owner._raw(
+                '/bin/ash -s', data=script.encode('utf-8'), timeout=command_timeout,
+                output_limit=256 * 1024, failure_capture=partial_output,
+            )
+            if returncode:
+                raise RuntimeError('The optional guest radio command failed.')
+            return out.decode(errors='replace')
+        except (OSError, RuntimeError, TimeoutError, asyncio.CancelledError) as error:
+            failure = error
+            raise
+        finally:
+            try:
+                record_radio_setup_evidence(
+                    self.runtime_dir(), script,
+                    stdout=out or partial_output.get('stdout', b''),
+                    stderr=err or partial_output.get('stderr', b''),
+                    returncode=returncode, error=failure, timeout_seconds=timeout,
+                    phase=evidence_phase,
+                )
+            except (OSError, RuntimeError, ValueError):
+                pass  # Evidence capture cannot change the actual guest result.
+
+    def radio_repair_hint(self):
+        return 'Use Retry Setup on this running VM to finish radio setup without rebuilding it.'
 
     async def _copy_tree(self, source, destination):
         def copy_file(old, new):
@@ -190,14 +262,19 @@ class OpenWrtEnvironment(WorkspaceEnvironment):
             if hasattr(result, '__await__'):
                 await result
 
-    async def _raw(self, command: str, *, data: bytes | None = None, timeout: float = 120, output_limit: int = 16 * 1024 * 1024) -> tuple[int, bytes, bytes]:
+    async def _raw(self, command: str, *, data: bytes | None = None, timeout: float = 120, output_limit: int = 16 * 1024 * 1024,
+                   failure_capture: dict[str, bytes] | None = None) -> tuple[int, bytes, bytes]:
         argv, env = self.controller.command(command)
         process = await asyncio.create_subprocess_exec(*argv, env=env, cwd=self.environment_root,
             stdin=asyncio.subprocess.PIPE if data is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        async def read(stream, limit):
+        async def read(stream, limit, name):
             chunks, count = [], 0
             while chunk := await stream.read(65536):
+                if failure_capture is not None:
+                    # Preserve a bounded tail even when wait_for cancels the
+                    # transfer. Only fixed radio setup callers export it.
+                    failure_capture[name] = (failure_capture.get(name, b'') + chunk)[-16384:]
                 count += len(chunk)
                 if count > limit:
                     raise RuntimeError('OpenWrt command output exceeded its bounded transfer limit; guest data was retained.')
@@ -214,8 +291,8 @@ class OpenWrtEnvironment(WorkspaceEnvironment):
                 await process.stdin.wait_closed()
             except (BrokenPipeError, ConnectionResetError):
                 pass
-        tasks = [asyncio.create_task(write()), asyncio.create_task(read(process.stdout, output_limit)),
-                 asyncio.create_task(read(process.stderr, 4 * 1024 * 1024)), asyncio.create_task(process.wait())]
+        tasks = [asyncio.create_task(write()), asyncio.create_task(read(process.stdout, output_limit, 'stdout')),
+                 asyncio.create_task(read(process.stderr, 4 * 1024 * 1024, 'stderr')), asyncio.create_task(process.wait())]
         try:
             _, out, err, code = await asyncio.wait_for(asyncio.gather(*tasks), timeout)
             return code, out, err
@@ -520,7 +597,8 @@ python3 -c 'import sys; print(sys.version)'
             if expected is not None and tuple(expected) != selected_openwrt_tools(original.optional_tools):
                 raise RuntimeError('Optional tools changed since this editor opened; refresh before applying.')
             self.config = replace(original, optional_tools=desired)
-            save_environment_config(self.workspace_root, self.config)
+            save_environment_config(self.workspace_root, self.config, preserve_user_metadata=True)
+            self.config = load_environment_config(self.workspace_root, self.config.id) or self.config
             if (await self.status()).running:
                 return await self.start(progress=progress)
             return await self.status()
@@ -943,7 +1021,8 @@ python3 -c {shlex.quote(_REPLACE_GUEST_TREE)} {shlex.quote(stage)} {shlex.quote(
                 raise RuntimeError('Stop this OpenWrt VM before changing its QEMU network policy.')
             self.config = replace(original, network=bool(enabled))
             self.controller.config['internet'] = self.config.network
-            save_environment_config(self.workspace_root, self.config)
+            save_environment_config(self.workspace_root, self.config, preserve_user_metadata=True)
+            self.config = load_environment_config(self.workspace_root, self.config.id) or self.config
             return await self.status()
         finally:
             release()
@@ -974,7 +1053,8 @@ python3 -c {shlex.quote(_REPLACE_GUEST_TREE)} {shlex.quote(stage)} {shlex.quote(
                 await self.controller.host_command([e2fs_binary('resize2fs'), disk])
             self.config = desired
             self.controller.config.update(cpu=desired.cpu, memory_mb=desired.memory_mb, disk_gb=desired.disk_gb)
-            save_environment_config(self.workspace_root, desired)
+            save_environment_config(self.workspace_root, desired, preserve_user_metadata=True)
+            self.config = load_environment_config(self.workspace_root, desired.id) or desired
             return await self.status()
         finally:
             release()

@@ -10,6 +10,11 @@ from typing import Any
 
 HELPER_DIRECTORY = Path(__file__).with_name('bluetooth_helpers')
 HELPER_VERSION = 'harnessy-test-bt1'
+BLUETOOTH_RADIO_PACKAGES = (
+    'kmod-bluetooth', 'kmod-crypto-user', 'kmod-crypto-cmac', 'kmod-crypto-ecb',
+    'dbus', 'bluez-daemon', 'bluez-utils', 'bluez-utils-extra',
+    'coreutils-base64', 'coreutils-sha256sum',
+)
 _ELF_ARCHITECTURES = {
     'x86_64': (62, 2, 'little'), 'arm64': (183, 2, 'little'),
     'mips': (8, 1, 'big'), 'mipsel': (8, 1, 'little'),
@@ -256,7 +261,7 @@ trap 'rm -rf "$work"' EXIT HUP INT TERM
 release="$(sed -n "s/^DISTRIB_RELEASE=['\"]\([^'\"]*\)['\"]$/\1/p" /etc/openwrt_release)"
 packages='kmod-bluetooth kmod-crypto-user kmod-crypto-cmac kmod-crypto-ecb dbus bluez-daemon bluez-utils bluez-utils-extra coreutils-base64 coreutils-sha256sum'
 case "$release" in
-    23.05.2) ;;
+    23.05.2|23.05.5) ;;
     25.12.5) packages="$packages kmod-hci-uart";;
     *) reason=stock_feeds_unavailable;;
 esac
@@ -309,6 +314,11 @@ if [ "$reason" != verified ]; then
         elif grep -Eiq 'connection.*(refused|failed|timed out)|failed to send request' "$work/install.log"; then detail=connection_failed
         elif grep -Eiq 'unknown package|no such package|unable to select packages|package.*not found' "$work/install.log"; then detail=package_unavailable
         fi
+        # Keep bounded package-manager failure evidence before the temporary
+        # directory is removed. The controller stores a sanitized setup receipt;
+        # the model receives only the fixed reason/detail fields below.
+        printf '[%s] ERROR Bluetooth package setup failed: release=%s reason=%s detail=%s\n' "$(date +%s)" "$release" "$reason" "$detail" >&2
+        tail -c 16384 "$work/install.log" >&2
     fi
 fi
 printf 'HX_RADIO_SETUP bluetooth=%s\nHX_RADIO_DETAIL bluetooth=%s\n' "$reason" "$detail"

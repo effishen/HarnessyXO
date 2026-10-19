@@ -291,8 +291,8 @@ class ManagedEnvironment(WorkspaceEnvironment):
             if state.ready:
                 await self._apply_network(enabled)
             changed = EnvironmentConfig.from_dict({**original.to_dict(), 'network': enabled})
-            save_environment_config(self.workspace_root, changed)
-            self.config = changed
+            save_environment_config(self.workspace_root, changed, preserve_user_metadata=True)
+            self.config = load_environment_config(self.workspace_root, changed.id) or changed
             return await self.status()
         finally:
             release()

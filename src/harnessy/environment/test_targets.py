@@ -226,12 +226,33 @@ class TestTargetManager:
 
     async def _radio_command(self, script: str, *, timeout: float = 20) -> str:
         from harnessy.agent.external_targets import ExternalTargetBroker
-        result = await ExternalTargetBroker(self.workspace)._run_ssh(
-            self.target, 'sh -s', input_bytes=script.encode('utf-8'), timeout=timeout,
-        )
-        if not result.ok:
-            raise RuntimeError('The optional guest radio command failed.')
-        return result.stdout
+        from harnessy.diagnostics.radio_setup import record_radio_setup_evidence
+        result, failure = None, None
+        try:
+            result = await ExternalTargetBroker(self.workspace)._run_ssh(
+                self.target, 'sh -s', input_bytes=script.encode('utf-8'), timeout=timeout,
+            )
+            if not result.ok:
+                raise RuntimeError('The optional guest radio command failed.')
+            return result.stdout
+        except (OSError, RuntimeError, TimeoutError, asyncio.CancelledError) as error:
+            failure = error
+            raise
+        finally:
+            if self.backend == 'qemu':
+                try:
+                    record_radio_setup_evidence(
+                        self.runtime_dir(), script,
+                        stdout=getattr(result, 'stdout', '').encode('utf-8'),
+                        stderr=getattr(result, 'stderr', '').encode('utf-8'),
+                        returncode=getattr(result, 'returncode', None), error=failure,
+                        timeout_seconds=timeout, command='sh -s',
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    pass  # A diagnostics write cannot change guest readiness.
+
+    def radio_repair_hint(self) -> str:
+        return 'Use Set up / repair radios on this running VM to retry.'
 
     async def inspect_radios(self) -> dict[str, Any]:
         from .test_radios import probe_radios
@@ -303,8 +324,8 @@ class TestTargetManager:
             raise TestTargetFailure(
                 'The VM shell is running, but requested radio setup is incomplete. '
                 + radio_summary(state)
-                + ' Use Set up / repair radios on this running VM to retry. '
-                'Inspect Wi-Fi with iw dev and iw phy; AP/station configuration remains yours. '
+                + ' ' + self.radio_repair_hint() + ' '
+                + 'Inspect Wi-Fi with iw dev and iw phy; AP/station configuration remains yours. '
                 'Bluetooth setup needs matching guest packages and the bundled software controller helper.',
                 'radio_setup_failed',
             )

@@ -729,6 +729,8 @@ WantedBy=multi-user.target
                 original = load_environment_config(self.workspace_root, self.config.id)
                 if original is None:
                     raise RuntimeError('The workspace environment definition is missing.')
+                if original.preset != preset.id:
+                    raise RuntimeError('The VM tool preset changed since this editor opened. Reopen Manage Optional Tools before applying.')
                 old_selected = tuple(
                     allowed if '*' in tuple(original.optional_tools or ())
                     else (tool for tool in allowed if tool in set(original.optional_tools or ()))
@@ -738,8 +740,7 @@ WantedBy=multi-user.target
 
                 status = await self.status()
                 changed = EnvironmentConfig.from_dict({**original.to_dict(), 'optional_tools': desired})
-                save_environment_config(self.workspace_root, changed)
-                self.config = changed
+                self._save_controller_config(changed)
                 await self._emit_progress(
                     progress, 'tools_saving', 'Saving optional tool selection…',
                     detail=f'{len(desired)}/{len(allowed)} optional tools selected.', stage_timeout_seconds=20.0,
@@ -752,6 +753,16 @@ WantedBy=multi-user.target
                     )
                     return await self.status()
 
+                missing_required = await self._missing_required_packages()
+                if changed.network and missing_required:
+                    await self._emit_progress(progress, 'tools_installing', 'Installing required packages for the selected tool preset…',
+                                              detail=', '.join(missing_required), stage_timeout_seconds=self.TIMEOUT_PROVISION)
+                    await self._run('shell', self.INSTANCE, 'sudo', '/bin/bash', '-lc',
+                                    self._provision_script(missing_required, optional_packages_override=(), supplemental_tools_override=()),
+                                    timeout=self.TIMEOUT_PROVISION, check=True)
+                    unresolved_required = await self._missing_required_packages()
+                    if unresolved_required:
+                        raise RuntimeError('Required tool-preset packages are still missing: ' + ', '.join(unresolved_required) + '. Existing installed tools were retained; Apply or Start again to retry.')
                 inspection = await self.optional_tool_status()
                 desired_set = set(desired)
                 missing_packages = tuple(
@@ -784,7 +795,7 @@ WantedBy=multi-user.target
                     await self._finalize_guest_provisioning()
                     await self._emit_progress(
                         progress, 'tools_pending', 'Optional tool downloads pending — public outbound is disabled.',
-                        detail=(f'{len(missing_packages) + len(missing_supplemental)} selected tool install/update action(s) are deferred. '
+                        detail=(f'{len(missing_required)} required preset package(s) and {len(missing_packages) + len(missing_supplemental)} optional tool install/update action(s) are deferred. '
                                 'Existing installed tools remain available. Enable public outbound and Apply again, or start after enabling it.'),
                         stage_timeout_seconds=10.0,
                     )
@@ -847,6 +858,11 @@ WantedBy=multi-user.target
                         detail=f'{len(desired)} selected optional tool(s) installed.', stage_progress_percent=100.0,
                         progress_source='tools', stage_timeout_seconds=10.0,
                     )
+                # A same-image preset update invalidates the old Ready marker.
+                # Applying its tools may restore readiness without restarting
+                # or replacing this VM disk.
+                await self._enforce_runtime_guard(progress=progress)
+                await self._record_verified_guest()
                 return await self.status()
         finally:
             from .manager import clear_environment_provider_cache
@@ -2910,7 +2926,7 @@ exit $rc
         # Readiness covers the command projection as well as network policy.
         # Otherwise a running pre-private-worktree VM can retain an identical
         # network guard hash while lacking the mounts required by new tools.
-        signature = self._network_guard_script() + '\n' + WORKSPACE_VIEW_REVISION
+        signature = self._network_guard_script() + '\n' + WORKSPACE_VIEW_REVISION + '\n' + self._provision_revision()
         return hashlib.sha256(signature.encode('utf-8')).hexdigest()
 
     def _read_readiness(self) -> dict[str, Any]:
@@ -3436,13 +3452,27 @@ print(json.dumps(facts))
         async with self._workspace_start_lock():
             return await self._start_locked(progress=progress)
 
+    def _save_controller_config(self, config: EnvironmentConfig) -> None:
+        save_environment_config(self.workspace_root, config, preserve_user_metadata=True)
+        saved = load_environment_config(self.workspace_root, config.id)
+        if saved is None:
+            raise RuntimeError('The selected VM environment no longer exists.')
+        self.config = saved
+
     def _refresh_saved_network_policy(self) -> None:
         saved = load_environment_config(self.workspace_root, self.config.id)
         if saved is None:
             raise RuntimeError('The selected VM environment no longer exists.')
-        self.config.network = saved.network
-        self.config.name = saved.name
-        self.config.enabled = saved.enabled
+        from .manager import EnvironmentManager
+        EnvironmentManager._validate_config(saved)
+        current_image = get_preset(self.config.preset).image_id
+        saved_image = get_preset(saved.preset).image_id
+        if (self.config.provider, current_image, self.config.architecture, self.config.files_mode, self.config.desktop) != (
+                saved.provider, saved_image, saved.architecture, saved.files_mode, saved.desktop):
+            raise RuntimeError('The VM identity changed outside its settings editor. Reload this environment before executing commands.')
+        # A retained toolbox/provider must observe a same-image tool-preset
+        # update as well as live ACL/name/network changes made by another tab.
+        self.config = saved
 
     async def _start_locked(self, progress=None) -> EnvironmentStatus:
         self._refresh_saved_network_policy()
@@ -3564,8 +3594,7 @@ print(json.dumps(facts))
                 changed = EnvironmentConfig.from_dict({**original.to_dict(), 'network': enabled})
                 try:
                     await self._emit_progress(progress, 'network_applying', 'Saving public outbound policy…')
-                    save_environment_config(self.workspace_root, changed)
-                    self.config = changed
+                    self._save_controller_config(changed)
                     self._clear_readiness('network_policy_changed')
                     self._write_template()
                     if status.running:
@@ -3585,8 +3614,7 @@ print(json.dumps(facts))
                         stopped = await self.stop()
                         if stopped.running:
                             raise RuntimeError('VM is still running')
-                        save_environment_config(self.workspace_root, original)
-                        self.config = original
+                        self._save_controller_config(original)
                         self._clear_readiness('network_policy_failed')
                         self._write_template()
                     except BaseException as rollback:
@@ -3666,7 +3694,7 @@ print(json.dumps(facts))
                 try:
                     self._write_template()
                     self._clear_readiness('resources_changed')
-                    save_environment_config(self.workspace_root, changed)
+                    self._save_controller_config(changed)
                 except BaseException as exc:
                     self.config = original
                     if isinstance(exc, asyncio.CancelledError):

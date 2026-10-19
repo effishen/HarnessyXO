@@ -6,9 +6,11 @@ from pathlib import Path
 import re
 import uuid
 import shutil
+import json
+import time
 
 from .base import (EnvironmentConfig, WorkspaceEnvironment, load_environment_config, save_environment_config,
-                   environment_root, config_path, ENVIRONMENT_ID_RE, _validate_registry_path)
+                   environment_root, config_path, ENVIRONMENT_ID_RE, _validate_registry_path, environment_config_lock)
 from .lima import LimaVMEnvironment
 from .presets import PRESETS
 
@@ -72,6 +74,8 @@ class EnvironmentManager:
                     continue
                 cfg = load_environment_config(self.workspace_root, entry.name)
                 if cfg is None:
+                    if not path.exists():
+                        continue  # A completed Remove may delete it during this scan.
                     raise RuntimeError(f'Cannot read VM environment definition: {entry.name}.')
                 self._validate_config(cfg)
                 configs.append(cfg)
@@ -178,17 +182,67 @@ class EnvironmentManager:
     def save(self, config: EnvironmentConfig) -> EnvironmentConfig:
         cfg = config.normalized()
         self._validate_config(cfg)
-        original = self.get(cfg.id)
-        if original is None:
-            raise ValueError('This VM environment no longer exists.')
-        if any(old.id != cfg.id and old.name.casefold() == cfg.name.casefold() for old in self.list()):
-            raise ValueError('A VM environment with this name already exists.')
-        if (original.provider, original.preset, original.architecture, original.files_mode, original.desktop) != (
-                cfg.provider, cfg.preset, cfg.architecture, cfg.files_mode, cfg.desktop):
-            raise ValueError('Create a separate VM to change its OS, architecture, provider, project-files mode or graphical configuration.')
-        save_environment_config(self.workspace_root, cfg)
-        clear_environment_provider_cache(self.workspace_root, cfg.id)
-        return cfg
+        with environment_config_lock(self.workspace_root, cfg.id):
+            original = self.get(cfg.id)
+            if original is None:
+                raise ValueError('This VM environment no longer exists.')
+            if any(old.id != cfg.id and old.name.casefold() == cfg.name.casefold() for old in self.list()):
+                raise ValueError('A VM environment with this name already exists.')
+            old_image = PRESETS[original.preset].image_id
+            new_image = PRESETS[cfg.preset].image_id
+            if (original.provider, old_image, original.architecture, original.files_mode, original.desktop) != (
+                    cfg.provider, new_image, cfg.architecture, cfg.files_mode, cfg.desktop):
+                raise ValueError('Create a separate VM to change its OS, architecture, provider, project-files mode or graphical configuration.')
+            preset_changed = cfg.preset != original.preset
+            release = lambda: None
+            if preset_changed:
+                from .activity import reserve_environment_change
+                from .operations import ENVIRONMENT_OPERATIONS
+                release = reserve_environment_change(self.workspace_root, 'tool preset', environment_id=cfg.id)
+                if ENVIRONMENT_OPERATIONS.state(self.workspace_root, environment_id=cfg.id).busy:
+                    release()
+                    raise RuntimeError('Wait for this VM operation to finish before changing its tool preset.')
+            try:
+                if preset_changed:
+                    old_available = PRESETS[original.preset].optional_tool_ids
+                    old_selected = set(old_available if '*' in original.optional_tools else original.optional_tools)
+                    requested = old_selected if '*' in cfg.optional_tools else set(cfg.optional_tools)
+                    retained = tuple(tool for tool in PRESETS[cfg.preset].optional_tool_ids
+                                     if tool in old_selected and tool in requested)
+                    cfg = EnvironmentConfig.from_dict({**cfg.to_dict(), 'optional_tools': retained})
+                    # This changes desired tooling only. Do not touch VM disks,
+                    # snapshots, source files, or already installed packages.
+                    self._mark_tools_pending(cfg)
+                save_environment_config(self.workspace_root, cfg)
+                clear_environment_provider_cache(self.workspace_root, cfg.id)
+                if preset_changed:
+                    from .status import ENVIRONMENT_STATUS
+                    ENVIRONMENT_STATUS.invalidate(self.workspace_root, environment_id=cfg.id)
+                return cfg
+            finally:
+                release()
+
+    def _mark_tools_pending(self, config: EnvironmentConfig) -> None:
+        path = environment_root(self.workspace_root, config.id) / 'state' / 'readiness.json'
+        _validate_registry_path(path, self.workspace_root)
+        if not path.exists():
+            return  # a VM which has never started remains Not created
+        if not path.is_file() or path.stat().st_size > 65536:
+            raise RuntimeError('Cannot safely update this VM readiness metadata; no tool preset was changed.')
+        try:
+            state = json.loads(path.read_text('utf-8'))
+        except json.JSONDecodeError:
+            state = {}
+        state = state if isinstance(state, dict) else {}
+        state.update({'ready': False, 'phase': 'tools_pending', 'error': '', 'updated_at': time.time()})
+        temporary = path.with_name('.readiness-' + uuid.uuid4().hex + '.tmp')
+        try:
+            with temporary.open('x', encoding='utf-8') as stream:
+                stream.write(json.dumps(state, indent=2, sort_keys=True) + '\n')
+                stream.flush()
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def remove(self, environment_id: str, *, verified_stopped: bool = False) -> None:
         """Delete only an explicitly selected environment's owned metadata.

@@ -1647,10 +1647,14 @@ class HarnessyPage:
                     pass
         subtabs = raw.get('environment_subtabs')
         if isinstance(subtabs, dict):
-            self.environment_subtabs = {
-                str(k): (str(v) if str(v) in {'Details', 'Snapshots', 'VM Environments', 'External Targets'} else 'VM Environments')
-                for k, v in subtabs.items()
-            }
+            self.environment_subtabs = {}
+            for key, value in subtabs.items():
+                key, value = str(key), str(value)
+                if key.endswith(':active_vm'):
+                    if key.removesuffix(':active_vm') in regs and re.fullmatch(r'[0-9a-f]{32}', value):
+                        self.environment_subtabs[key] = value
+                else:
+                    self.environment_subtabs[key] = value if value in {'Details', 'Snapshots', 'VM Environments', 'External Targets'} else 'VM Environments'
         selections = raw.get('vm_environment_selection')
         if isinstance(selections, dict):
             self.vm_environment_selection = {str(key): str(value) for key, value in selections.items() if str(key) in regs}
@@ -18842,14 +18846,19 @@ window.harnessyTerminalFocus = function(terminalId) {
         from harnessy.ui.vm_environments import render_vm_environments
         render_vm_environments(self, tab, ws)
 
-    def _render_vm_environment_details(self, tab: OpenTab, ws: WorkspaceStore, environment_id: str) -> None:
+    def _render_vm_environment_details(self, tab: OpenTab, ws: WorkspaceStore, environment_id: str, *, embedded: bool = True) -> None:
         manager = EnvironmentManager(ws.root, environment_id=environment_id)
         config = manager.config
-        with ui.column().classes('hy-tool-panel w-full no-wrap gap-0') as detail_panel:
-            with ui.row().classes('w-full items-center px-4 py-2 gap-2').style('border-bottom:1px solid var(--hy-border)'):
-                ui.icon('shield', size='20px')
-                ui.label(config.name if config else 'VM Environment').classes('font-semibold')
-            with ui.column().classes('w-full overflow-y-auto').style('flex:1'):
+        status_label = readiness_detail = None
+        operation_banner = None
+        open_terminal_button = start_button = stop_button = None
+        panel_classes = 'w-full min-w-0 gap-0' if embedded else 'hy-tool-panel w-full no-wrap gap-0'
+        with ui.column().classes(panel_classes) as detail_panel:
+            if not embedded:
+                with ui.row().classes('w-full items-center px-4 py-2 gap-2').style('border-bottom:1px solid var(--hy-border)'):
+                    ui.icon('shield', size='20px')
+                    ui.label(config.name if config else 'VM Environment').classes('font-semibold')
+            with ui.column().classes('w-full min-w-0' if embedded else 'w-full overflow-y-auto').style('' if embedded else 'flex:1'):
                 if not config:
                     ui.label('This VM environment is no longer registered.').classes('text-sm hy-muted')
                     return
@@ -18880,16 +18889,17 @@ window.harnessyTerminalFocus = function(terminalId) {
 
                 env_tabs.on_value_change(remember_subtab)
 
-                with ui.tab_panels(env_tabs, value=selected_subtab).classes('w-full bg-transparent') as environment_panels:
+                with ui.tab_panels(env_tabs, value=selected_subtab, animated=False).classes('w-full bg-transparent') as environment_panels:
                     with ui.tab_panel(details_tab).classes('p-0'):
                         with ui.column().classes('hy-env-width p-4 gap-4'):
                             with ui.row().classes('w-full gap-3 flex-wrap items-stretch'):
-                                with ui.card().classes('hy-env-card p-4 gap-1 min-w-0').style('flex:1 1 280px;max-width:100%'):
-                                    ui.label('Environment').classes('text-xs hy-muted')
-                                    status_label = ui.label('Checking…').classes('text-lg font-semibold')
-                                    ui.label(preset.name).classes('text-sm')
-                                    ui.label(f'{config.architecture} · CPU only · {guest_project_root}').classes('text-xs hy-muted')
-                                    readiness_detail = ui.label('').classes('text-xs hy-muted').style('white-space:pre-wrap;overflow-wrap:anywhere')
+                                if not embedded:
+                                    with ui.card().classes('hy-env-card p-4 gap-1 min-w-0').style('flex:1 1 280px;max-width:100%'):
+                                        ui.label('Environment').classes('text-xs hy-muted')
+                                        status_label = ui.label('Checking…').classes('text-lg font-semibold')
+                                        ui.label(preset.name).classes('text-sm')
+                                        ui.label(f'{config.architecture} · CPU only · {guest_project_root}').classes('text-xs hy-muted')
+                                        readiness_detail = ui.label('').classes('text-xs hy-muted').style('white-space:pre-wrap;overflow-wrap:anywhere')
                                 with ui.card().classes('hy-env-card p-4 gap-1 min-w-0').style('flex:1 1 280px;max-width:100%'):
                                     from .workspace_resources import WorkspaceResourceEditor
                                     resource_editor = WorkspaceResourceEditor(config, lambda **payload: queue_action('resources', **payload))
@@ -18917,26 +18927,28 @@ window.harnessyTerminalFocus = function(terminalId) {
                                     if config.provider == 'openwrt':
                                         ui.label('System administration is available in Separate project copy mode.' if config.files_mode != 'copy' else 'System administration is available inside this guest. Deploy and collect project files explicitly.').classes('text-xs hy-muted')
 
-                            with ui.row().classes('hy-env-status-banner w-full items-start gap-3 p-3') as operation_banner:
-                                operation_spinner = ui.spinner(size='20px').classes('hy-vm-busy-spinner')
-                                operation_icon = ui.icon('info', size='20px')
-                                with ui.column().classes('gap-1').style('flex:1;min-width:0'):
-                                    operation_message = ui.label('Checking environment…').classes('text-sm font-semibold')
-                                    operation_detail = ui.label('').classes('text-xs hy-muted').style('white-space:pre-wrap;overflow-wrap:anywhere')
-                                    operation_progress = ui.linear_progress(value=0).classes('hy-vm-busy-progress w-full').props('rounded size=6px')
-                                    operation_timing = ui.label('').classes('text-xs hy-muted').style('font-variant-numeric:tabular-nums')
-                                    operation_error = ui.label('').classes('text-xs hy-muted').style('white-space:pre-wrap;max-height:180px;overflow:auto')
+                            if not embedded:
+                                with ui.row().classes('hy-env-status-banner w-full items-start gap-3 p-3') as operation_banner:
+                                    operation_spinner = ui.spinner(size='20px').classes('hy-vm-busy-spinner')
+                                    operation_icon = ui.icon('info', size='20px')
+                                    with ui.column().classes('gap-1').style('flex:1;min-width:0'):
+                                        operation_message = ui.label('Checking environment…').classes('text-sm font-semibold')
+                                        operation_detail = ui.label('').classes('text-xs hy-muted').style('white-space:pre-wrap;overflow-wrap:anywhere')
+                                        operation_progress = ui.linear_progress(value=0).classes('hy-vm-busy-progress w-full').props('rounded size=6px')
+                                        operation_timing = ui.label('').classes('text-xs hy-muted').style('font-variant-numeric:tabular-nums')
+                                        operation_error = ui.label('').classes('text-xs hy-muted').style('white-space:pre-wrap;max-height:180px;overflow:auto')
 
-                            with ui.card().classes('hy-env-card w-full p-4 gap-3'):
-                                ui.label('Environment Controls').classes('font-semibold')
-                                ui.label('Terminals and model tools are available only when the environment is Ready.').classes('text-xs hy-muted')
-                                with ui.row().classes('gap-2 flex-wrap'):
-                                    open_terminal_button = ui.button(
-                                        'Open Terminal', icon='terminal',
-                                        on_click=lambda: self.open_tool_tab('terminal', self._find_reg(tab.workspace_id), environment_id=environment_id),
-                                    ).props('unelevated no-caps')
-                                    start_button = ui.button('Start', icon='play_arrow').props('flat no-caps')
-                                    stop_button = ui.button('Stop', icon='stop').props('flat no-caps')
+                            if not embedded:
+                                with ui.card().classes('hy-env-card w-full p-4 gap-3'):
+                                    ui.label('Environment Controls').classes('font-semibold')
+                                    ui.label('Terminals and model tools are available only when the environment is Ready.').classes('text-xs hy-muted')
+                                    with ui.row().classes('gap-2 flex-wrap'):
+                                        open_terminal_button = ui.button(
+                                            'Open Terminal', icon='terminal',
+                                            on_click=lambda: self.open_tool_tab('terminal', self._find_reg(tab.workspace_id), environment_id=environment_id),
+                                        ).props('unelevated no-caps')
+                                        start_button = ui.button('Start', icon='play_arrow').props('flat no-caps')
+                                        stop_button = ui.button('Stop', icon='stop').props('flat no-caps')
 
                             if preset.optional_tool_ids:
                                 with ui.card().classes('hy-env-card w-full p-4 gap-2'):
@@ -19111,9 +19123,14 @@ window.harnessyTerminalFocus = function(terminalId) {
                                 )
 
                                 def commit() -> None:
+                                    current_config = manager.config
+                                    if current_config is None or current_config.preset != dialog_preset.id:
+                                        ui.notify('This VM’s tool preset changed. Reopen Manage Optional Tools to review its current choices.', type='warning')
+                                        return
                                     dialog.close()
                                     queue_action(
                                         'tools', optional_tools=selected, expected=existing,
+                                        expected_preset=dialog_preset.id,
                                         remove_deselected_bundles=remove_owned,
                                     )
 
@@ -19227,8 +19244,9 @@ window.harnessyTerminalFocus = function(terminalId) {
                             ui.button('Restore', icon='restore', on_click=confirm).props('unelevated no-caps')
                     dialog.open()
 
-                start_button.on('click', lambda: queue_action('start'))
-                stop_button.on('click', lambda: queue_action('stop'))
+                if not embedded:
+                    start_button.on('click', lambda: queue_action('start'))
+                    stop_button.on('click', lambda: queue_action('stop'))
                 reset_button.on('click', lambda: destructive_dialog(
                     'reset', 'Factory Reset Environment',
                     'Reset the VM environment to its backend factory state, then start and verify it again?',
@@ -19261,79 +19279,80 @@ window.harnessyTerminalFocus = function(terminalId) {
                 def apply_operation_state() -> None:
                     op = ENVIRONMENT_OPERATIONS.state(ws.root, environment_id=environment_id)
                     busy = bool(op.busy)
-                    show_operation = busy or bool(op.error or op.success)
-                    operation_banner.set_visibility(show_operation)
-                    operation_spinner.set_visibility(busy)
-                    operation_icon.set_visibility(show_operation and not busy)
-                    operation_detail.set_visibility(busy and bool(op.detail))
-                    operation_progress.set_visibility(busy)
-                    operation_timing.set_visibility(busy)
-                    if busy:
-                        operation_icon.props('name=hourglass_top')
-                        operation_message.set_text(op.message or 'Working…')
-                        operation_detail.set_text(op.detail or '')
-                        operation_error.set_text('')
-                        status_label.set_text(op.message or {
-                            'start': 'Starting…',
-                            'stop': 'Stopping…',
-                            'snapshot': 'Snapshotting…',
-                            'restore': 'Restoring…',
-                            'reset': 'Resetting…',
-                            'rebuild': 'Rebuilding…',
-                            'tools': 'Updating optional tools…',
-                            'resources': 'Applying VM resources…',
-                        }.get(op.action, 'Working…'))
+                    if not embedded:
+                        show_operation = busy or bool(op.error or op.success)
+                        operation_banner.set_visibility(show_operation)
+                        operation_spinner.set_visibility(busy)
+                        operation_icon.set_visibility(show_operation and not busy)
+                        operation_detail.set_visibility(busy and bool(op.detail))
+                        operation_progress.set_visibility(busy)
+                        operation_timing.set_visibility(busy)
+                        if busy:
+                            operation_icon.props('name=hourglass_top')
+                            operation_message.set_text(op.message or 'Working…')
+                            operation_detail.set_text(op.detail or '')
+                            operation_error.set_text('')
+                            status_label.set_text(op.message or {
+                                'start': 'Starting…',
+                                'stop': 'Stopping…',
+                                'snapshot': 'Snapshotting…',
+                                'restore': 'Restoring…',
+                                'reset': 'Resetting…',
+                                'rebuild': 'Rebuilding…',
+                                'tools': 'Updating optional tools…',
+                                'resources': 'Applying VM resources…',
+                            }.get(op.action, 'Working…'))
 
-                        if op.progress_percent is None:
-                            operation_progress.props(add='indeterminate')
-                        else:
-                            operation_progress.props(remove='indeterminate')
-                            operation_progress.set_value(max(0.0, min(1.0, float(op.progress_percent) / 100.0)))
-
-                        now = time.time()
-                        elapsed = max(0.0, now - float(op.started_at or now))
-                        stage_elapsed = max(0.0, now - float(op.stage_started_at or op.started_at or now))
-                        timing_parts = [f'Elapsed {_format_operation_seconds(elapsed)}']
-                        if op.step_total and op.step_index:
-                            timing_parts.append(f'Stage {op.step_index}/{op.step_total}')
-                        if op.progress_percent is not None:
-                            timing_parts.append(f'Workflow {float(op.progress_percent):.0f}%')
-                        if op.stage_progress_percent is not None:
-                            timing_parts.append(f'Lima {float(op.stage_progress_percent):.0f}%')
-                        timing_parts.append(f'This stage {_format_operation_seconds(stage_elapsed)}')
-                        expected = float(op.expected_total_seconds or 0)
-                        if expected > 0:
-                            if elapsed < expected:
-                                timing_parts.append(f'ETA ~{_format_operation_seconds(expected - elapsed)}')
+                            if op.progress_percent is None:
+                                operation_progress.props(add='indeterminate')
                             else:
-                                timing_parts.append(f'Recent median {_format_operation_seconds(expected)}')
+                                operation_progress.props(remove='indeterminate')
+                                operation_progress.set_value(max(0.0, min(1.0, float(op.progress_percent) / 100.0)))
+
+                            now = time.time()
+                            elapsed = max(0.0, now - float(op.started_at or now))
+                            stage_elapsed = max(0.0, now - float(op.stage_started_at or op.started_at or now))
+                            timing_parts = [f'Elapsed {_format_operation_seconds(elapsed)}']
+                            if op.step_total and op.step_index:
+                                timing_parts.append(f'Stage {op.step_index}/{op.step_total}')
+                            if op.progress_percent is not None:
+                                timing_parts.append(f'Workflow {float(op.progress_percent):.0f}%')
+                            if op.stage_progress_percent is not None:
+                                timing_parts.append(f'Lima {float(op.stage_progress_percent):.0f}%')
+                            timing_parts.append(f'This stage {_format_operation_seconds(stage_elapsed)}')
+                            expected = float(op.expected_total_seconds or 0)
+                            if expected > 0:
+                                if elapsed < expected:
+                                    timing_parts.append(f'ETA ~{_format_operation_seconds(expected - elapsed)}')
+                                else:
+                                    timing_parts.append(f'Recent median {_format_operation_seconds(expected)}')
+                            else:
+                                timing_parts.append('ETA learning from completed runs')
+                            remaining_stage_deadline = max(0.0, float(op.stage_deadline or 0) - now) if op.stage_deadline else 0.0
+                            if remaining_stage_deadline:
+                                timing_parts.append(f'Stage timeout {_format_operation_seconds(remaining_stage_deadline)}')
+                            remaining_deadline = max(0.0, float(op.deadline or 0) - now) if op.deadline else 0.0
+                            if remaining_deadline:
+                                timing_parts.append(f'Operation timeout {_format_operation_seconds(remaining_deadline)}')
+                            operation_timing.set_text(' · '.join(timing_parts))
+                        elif op.error:
+                            operation_icon.props('name=error_outline color=negative')
+                            operation_message.set_text('Environment operation failed')
+                            operation_detail.set_text('')
+                            operation_error.set_text(op.error)
+                        elif op.success:
+                            operation_icon.props('name=check_circle color=primary')
+                            operation_message.set_text(op.success)
+                            operation_detail.set_text('')
+                            operation_error.set_text('')
                         else:
-                            timing_parts.append('ETA learning from completed runs')
-                        remaining_stage_deadline = max(0.0, float(op.stage_deadline or 0) - now) if op.stage_deadline else 0.0
-                        if remaining_stage_deadline:
-                            timing_parts.append(f'Stage timeout {_format_operation_seconds(remaining_stage_deadline)}')
-                        remaining_deadline = max(0.0, float(op.deadline or 0) - now) if op.deadline else 0.0
-                        if remaining_deadline:
-                            timing_parts.append(f'Operation timeout {_format_operation_seconds(remaining_deadline)}')
-                        operation_timing.set_text(' · '.join(timing_parts))
-                    elif op.error:
-                        operation_icon.props('name=error_outline color=negative')
-                        operation_message.set_text('Environment operation failed')
-                        operation_detail.set_text('')
-                        operation_error.set_text(op.error)
-                    elif op.success:
-                        operation_icon.props('name=check_circle color=primary')
-                        operation_message.set_text(op.success)
-                        operation_detail.set_text('')
-                        operation_error.set_text('')
-                    else:
-                        operation_icon.props('name=info color=primary')
-                        operation_message.set_text('Environment status')
-                        operation_detail.set_text('')
-                        operation_error.set_text('')
+                            operation_icon.props('name=info color=primary')
+                            operation_message.set_text('Environment status')
+                            operation_detail.set_text('')
+                            operation_error.set_text('')
 
                     saved_config = manager.config
-                    resource_editor.sync(saved_config, {**latest_status, 'resource_operation': op.action == 'resources'},
+                    resource_editor.sync(saved_config, {**latest_status, 'resource_operation': op.action == 'resources' and not embedded},
                                          busy=busy, active=bool(active_work(ws.root, environment_id=environment_id)))
                     if saved_config is not None:
                         saved_network = bool(saved_config.network)
@@ -19362,72 +19381,44 @@ window.harnessyTerminalFocus = function(terminalId) {
                     network_switch.disable() if busy else network_switch.enable()
                     if manage_tools_button is not None:
                         manage_tools_button.disable() if busy or bool(active_work(ws.root, environment_id=environment_id)) else manage_tools_button.enable()
-                        manage_tools_button.props(add='loading') if busy and op.action == 'tools' else manage_tools_button.props(remove='loading')
+                        manage_tools_button.props(add='loading') if busy and op.action == 'tools' and not embedded else manage_tools_button.props(remove='loading')
                     can_apply_network = not busy and not active_work(ws.root, environment_id=environment_id) and bool(network_switch.value) != network_state['saved']
                     network_apply.enable() if can_apply_network else network_apply.disable()
-                    network_apply.props(add='loading') if busy and op.action == 'network' else network_apply.props(remove='loading')
+                    network_apply.props(add='loading') if busy and op.action == 'network' and not embedded else network_apply.props(remove='loading')
 
                     known = bool(latest_status.get('known'))
                     running = bool(latest_status.get('running'))
                     ready = bool(latest_status.get('ready'))
-                    # Every environment-changing operation is exclusive. Disable
-                    # all conflicting controls immediately to make double-clicks
-                    # and button spamming harmless. The initiating control also
-                    # gets Quasar's loading treatment so the click has immediate
-                    # visual acknowledgement even before the next status poll.
+                    active = bool(active_work(ws.root, environment_id=environment_id))
                     action_buttons = {
-                        'start': start_button, 'stop': stop_button,
                         'reset': reset_button, 'rebuild': rebuild_button,
                         'snapshot': take_snapshot_button,
                     }
-                    for button in (start_button, stop_button, reset_button, rebuild_button, take_snapshot_button, *restore_buttons):
+                    if not embedded:
+                        action_buttons.update(start=start_button, stop=stop_button)
+                    for button in (*action_buttons.values(), *restore_buttons):
                         button.classes(add='hy-vm-busy-action')
                         button.props(remove='loading')
-                        button.disable() if busy else button.enable()
+                        button.set_enabled(known and not busy and not active)
                     active_button = action_buttons.get(op.action) if busy else None
-                    if active_button is not None:
+                    if active_button is not None and not embedded:
                         active_button.props(add='loading')
-                    if busy:
-                        open_terminal_button.disable()
-                        start_button.set_text('Starting…' if op.action == 'start' else 'Start')
-                        stop_button.set_text('Stopping…' if op.action == 'stop' else 'Stop')
-                        reset_button.set_text('Resetting…' if op.action == 'reset' else 'Factory Reset')
-                        rebuild_button.set_text('Rebuilding…' if op.action == 'rebuild' else 'Rebuild VM')
-                        take_snapshot_button.set_text('Creating…' if op.action == 'snapshot' else 'Take Snapshot')
-                    else:
-                        stop_button.set_text('Stop')
-                        reset_button.set_text('Factory Reset')
-                        rebuild_button.set_text('Rebuild VM')
-                        take_snapshot_button.set_text('Take Snapshot')
-                        if not known:
-                            for button in (open_terminal_button, start_button, stop_button, reset_button, rebuild_button, take_snapshot_button, *restore_buttons):
-                                button.disable()
-                            start_button.set_text('Checking…')
-                        else:
-                            if ready:
-                                open_terminal_button.enable()
-                            else:
-                                open_terminal_button.disable()
-                            if running and ready:
-                                start_button.disable()
-                                start_button.set_text('Start')
-                            elif running:
-                                start_button.enable()
-                                start_button.set_text('Retry Setup')
-                            else:
-                                start_button.enable()
-                                start_button.set_text('Start')
-                            if running:
-                                stop_button.enable()
-                            else:
-                                stop_button.disable()
+                    reset_button.set_text('Resetting…' if busy and op.action == 'reset' else 'Factory Reset')
+                    rebuild_button.set_text('Rebuilding…' if busy and op.action == 'rebuild' else 'Rebuild VM')
+                    take_snapshot_button.set_text('Creating…' if busy and op.action == 'snapshot' else 'Take Snapshot')
+                    if not embedded:
+                        open_terminal_button.set_enabled(known and ready and not busy)
+                        start_button.set_enabled(known and not busy and not active and not (running and ready))
+                        stop_button.set_enabled(known and running and not busy and not active)
+                        start_button.set_text('Starting…' if busy and op.action == 'start' else 'Checking…' if not known else 'Retry Setup' if running and not ready else 'Start')
+                        stop_button.set_text('Stopping…' if busy and op.action == 'stop' else 'Stop')
                     if busy and op.action == 'snapshot':
                         snapshot_bits = [op.message or 'Creating snapshot…']
                         if op.detail:
                             snapshot_bits.append(op.detail)
                         snapshot_operation_label.set_text(' · '.join(snapshot_bits))
                     else:
-                        snapshot_operation_label.set_text(op.error or op.success or '')
+                        snapshot_operation_label.set_text((op.error or op.success or '') if not embedded or op.action in {'snapshot', 'restore'} else '')
 
                 def render_snapshots(snapshots: list[str] | None, error: str = '') -> None:
                     signature = (tuple(snapshots or []), snapshots is None, error)
@@ -19473,21 +19464,23 @@ window.harnessyTerminalFocus = function(terminalId) {
                             status = dict(info.get('status') or {})
                             latest_status.clear()
                             latest_status.update(status)
-                            latest_status['known'] = True
+                            latest_status['known'] = not bool(info.get('_status_poll_error'))
                             running = bool(status.get('running'))
                             ready = bool(status.get('ready'))
-                            if ready:
-                                status_label.set_text('Ready')
-                            elif running:
-                                phase = str(status.get('phase') or 'running_not_ready').replace('_', ' ').title()
-                                status_label.set_text(f'Running · {phase}')
-                            else:
-                                status_label.set_text(str(status.get('state') or 'stopped').replace('_', ' ').title())
+                            if status_label is not None:
+                                if ready:
+                                    status_label.set_text('Ready')
+                                elif running:
+                                    phase = str(status.get('phase') or 'running_not_ready').replace('_', ' ').title()
+                                    status_label.set_text(f'Running · {phase}')
+                                else:
+                                    status_label.set_text(str(status.get('state') or 'stopped').replace('_', ' ').title())
                             detail = str(status.get('error') or status.get('detail') or '')
                             poll_error = str(info.get('_status_poll_error') or '')
                             if poll_error:
                                 detail = (detail + f'\nStatus refresh: {poll_error}').strip()
-                            readiness_detail.set_text(detail if detail not in {'Running', 'Stopped'} else '')
+                            if readiness_detail is not None:
+                                readiness_detail.set_text(detail if detail not in {'Running', 'Stopped'} else '')
                             disk_usage_label.set_text(f"VM storage on host: {_human_size(int(info.get('vm_storage_bytes') or 0))}")
                             raw_snapshots = info.get('snapshots')
                             render_snapshots(list(raw_snapshots) if isinstance(raw_snapshots, list) else None, str(info.get('_snapshot_list_error') or ''))
@@ -19495,20 +19488,24 @@ window.harnessyTerminalFocus = function(terminalId) {
                         if _is_stale_ui_error(exc):
                             return
                         latest_status.clear()
-                        latest_status['known'] = True
+                        latest_status['known'] = False
                         try:
-                            status_label.set_text('Unavailable')
-                            readiness_detail.set_text(str(exc))
+                            if status_label is not None:
+                                status_label.set_text('Unavailable')
+                            if readiness_detail is not None:
+                                readiness_detail.set_text(str(exc))
                         except RuntimeError as update_exc:
                             if _is_stale_ui_error(update_exc):
                                 return
                             raise
                     except Exception as exc:
                         latest_status.clear()
-                        latest_status['known'] = True
+                        latest_status['known'] = False
                         try:
-                            status_label.set_text('Unavailable')
-                            readiness_detail.set_text(str(exc))
+                            if status_label is not None:
+                                status_label.set_text('Unavailable')
+                            if readiness_detail is not None:
+                                readiness_detail.set_text(str(exc))
                         except RuntimeError as update_exc:
                             if _is_stale_ui_error(update_exc):
                                 return

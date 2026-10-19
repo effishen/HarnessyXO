@@ -25,9 +25,10 @@ from typing import Any
 from ..core.paths import settings_path
 from .technical import (MAX_TECHNICAL_CHARS, MAX_TECHNICAL_LINES,
                         technical_error_evidence, validate_technical_evidence)
+from .radio_setup import RADIO_SETUP_FILENAME, radio_setup_tail
 
 VM_LOG_FILENAMES = ('serial.log', 'serialp.log', 'serialv.log', 'ha.stderr.log', 'ha.stdout.log')
-NAMED_VM_LOG_FILENAMES = VM_LOG_FILENAMES + ('qemu.stderr.log', 'qemu.control-plane.log')
+NAMED_VM_LOG_FILENAMES = VM_LOG_FILENAMES + ('qemu.stderr.log', 'qemu.control-plane.log', RADIO_SETUP_FILENAME)
 MAX_WORKSPACES = 8
 MAX_ENVIRONMENTS = 32
 MAX_VM_FILES = MAX_ENVIRONMENTS * len(NAMED_VM_LOG_FILENAMES)
@@ -951,12 +952,12 @@ def collect_vm_diagnostics(latest: Path, include_content: bool = False) -> dict[
             if backend == 'qemu':
                 from .test_target_logs import _runtime, _qemu_technical_tail, _qemu_control_plane_tail
                 log_root = _runtime(runtime_root, 'qemu')
-                filenames = ('qemu.stderr.log', 'qemu.control-plane.log', 'serial.log')
+                filenames = ('qemu.stderr.log', 'qemu.control-plane.log', 'serial.log', RADIO_SETUP_FILENAME)
             else:
                 log_root = runtime_root / 'vm' / 'lima' / 'harnessy'
                 filenames = VM_LOG_FILENAMES
             for filename in filenames:
-                kind = 'qemu' if filename.startswith('qemu.') else 'hostagent' if filename.startswith('ha.') else 'serial'
+                kind = 'radio_setup' if filename == RADIO_SETUP_FILENAME else 'qemu' if filename.startswith('qemu.') else 'hostagent' if filename.startswith('ha.') else 'serial'
                 source: dict[str, Any] = {'filename': filename, 'environment_id': environment_id, 'kind': kind, 'bytes_read': 0, 'bytes_exported': 0,
                                           'line_count': 0, 'signals_count': 0, 'signals_exported': 0,
                                           'signals_limited': False, 'evidence_codes': []}
@@ -972,7 +973,8 @@ def collect_vm_diagnostics(latest: Path, include_content: bool = False) -> dict[
                 read_total += len(data)
                 if source['status'] == 'included':
                     source['tail_sha256'] = hashlib.sha256(data).hexdigest()
-                    technical, measurements = (_qemu_technical_tail(data, source['truncated'], deadline) if filename == 'qemu.stderr.log' else
+                    technical, measurements = (radio_setup_tail(data, source['truncated'], deadline) if filename == RADIO_SETUP_FILENAME else
+                                               _qemu_technical_tail(data, source['truncated'], deadline) if filename == 'qemu.stderr.log' else
                                                _qemu_control_plane_tail(data, source['truncated'], deadline) if kind == 'qemu' else
                                                _technical_tail(data, kind, source['truncated'], deadline))
                     source.update(measurements)
@@ -1087,7 +1089,7 @@ def validate_vm_report(report: Any) -> dict[str, Any]:
             seen_files.add(source_key)
             source_status = source.get('status')
             source_status = _enum(source_status, {'included', 'missing', 'unsafe', 'unreadable', 'limited'}, 'unreadable')
-            item = {'filename': filename, 'environment_id': environment_id, 'kind': 'qemu' if filename.startswith('qemu.') else 'hostagent' if filename.startswith('ha.') else 'serial', 'status': source_status}
+            item = {'filename': filename, 'environment_id': environment_id, 'kind': 'radio_setup' if filename == RADIO_SETUP_FILENAME else 'qemu' if filename.startswith('qemu.') else 'hostagent' if filename.startswith('ha.') else 'serial', 'status': source_status}
             for key, cap in {'bytes_available': 2**63 - 1, 'bytes_read': PER_FILE_TAIL_BYTES,
                              'bytes_exported': MAX_EXPORT_BYTES, 'line_count': PER_FILE_TAIL_BYTES,
                              'technical_bytes_exported': MAX_EXPORT_BYTES, 'raw_bytes_exported': PER_FILE_TAIL_BYTES,

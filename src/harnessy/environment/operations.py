@@ -15,6 +15,7 @@ from harnessy.diagnostics import log_event
 from .manager import EnvironmentManager, environment_operation_context
 from .base import environment_root, ENVIRONMENT_ID_RE, _validate_registry_path, EnvironmentModelAccessError
 from .activity import reserve_policy_change, reserve_environment_change
+from .base import environment_config_lock
 
 
 class _OperationDeadlineExpired(Exception):
@@ -349,11 +350,21 @@ class EnvironmentOperationRegistry:
         return float(cls.DEADLINE_SECONDS.get(action, 1800.0 if action == 'network' else 900.0))
 
     def start(self, workspace_root: str | Path, action: str, *, environment_id: str | None = None, **payload: Any) -> bool:
+        selected_id = EnvironmentManager(workspace_root, environment_id=environment_id).environment_id
+        # Serialize only synchronous enqueue/config writes. No lock is held
+        # while downloading packages or awaiting guest operations.
+        with environment_config_lock(workspace_root, selected_id):
+            return self._start_locked(workspace_root, action, environment_id=environment_id, **payload)
+
+    def _start_locked(self, workspace_root: str | Path, action: str, *, environment_id: str | None = None, **payload: Any) -> bool:
         if action == 'remove' and not environment_id:
             raise ValueError('Choose a specific VM environment to remove.')
         manager = EnvironmentManager(workspace_root, environment_id=environment_id)
         if manager.config is None:
             raise RuntimeError('Create a VM environment before starting an environment operation.')
+        if action == 'tools' and payload.get('expected_preset') is not None:
+            if payload['expected_preset'] != manager.config.preset:
+                raise RuntimeError('The VM tool preset changed since this editor opened. Reopen Manage Optional Tools before applying.')
         environment_id = manager.environment_id
         key = self._key(workspace_root, environment_id)
         if self.task(workspace_root, environment_id=environment_id) is not None:
@@ -628,6 +639,10 @@ class EnvironmentOperationRegistry:
                     progress=progress, reservation_held=True,
                 )
             if action == 'tools':
+                if payload.get('expected_preset') is not None:
+                    current = EnvironmentManager(workspace_root, environment_id=environment_id).config
+                    if current is None or current.preset != payload['expected_preset']:
+                        raise RuntimeError('The VM tool preset changed since this editor opened. Reopen Manage Optional Tools before applying.')
                 raw_expected = payload.get('expected')
                 return await provider.apply_optional_tools(
                     tuple(payload.get('optional_tools') or ()),

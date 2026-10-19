@@ -7,6 +7,7 @@ import re
 import os
 import uuid
 import hashlib
+import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,13 @@ from .presets import canonical_arch
 
 ENVIRONMENT_SCHEMA_VERSION = 3
 ENVIRONMENT_ID_RE = re.compile(r'^[0-9a-f]{32}$')
+_CONFIG_WRITE_LOCKS: dict[tuple[str, str], threading.RLock] = {}
+_USER_CONFIG_FIELDS = ('name', 'purpose', 'enabled', 'project_access', 'allowed_project_ids')
+
+
+def environment_config_lock(workspace_root: str | Path, environment_id: str) -> threading.RLock:
+    key = str(Path(workspace_root).expanduser().resolve()), str(environment_id)
+    return _CONFIG_WRITE_LOCKS.setdefault(key, threading.RLock())
 
 
 class EnvironmentModelAccessError(PermissionError):
@@ -382,8 +390,21 @@ def config_path(workspace_root: Path, environment_id: str | None = None) -> Path
     return environment_root(root) / 'environment.json'
 
 
-def save_environment_config(workspace_root: Path, config: EnvironmentConfig) -> Path:
+def save_environment_config(workspace_root: Path, config: EnvironmentConfig, *,
+                            preserve_user_metadata: bool = False) -> Path:
     cfg = config.normalized()
+    with environment_config_lock(workspace_root, cfg.id):
+        if preserve_user_metadata:
+            current = load_environment_config(workspace_root, cfg.id)
+            if current is None:
+                raise RuntimeError('The VM environment was removed; its old definition was not restored.')
+            latest = current.to_dict()
+            cfg = EnvironmentConfig.from_dict({**cfg.to_dict(),
+                                               **{key: latest[key] for key in _USER_CONFIG_FIELDS}})
+        return _save_environment_config_locked(workspace_root, cfg)
+
+
+def _save_environment_config_locked(workspace_root: Path, cfg: EnvironmentConfig) -> Path:
     path = config_path(workspace_root, cfg.id)
     _validate_registry_path(path, workspace_root)
     path.parent.mkdir(parents=True, exist_ok=True)

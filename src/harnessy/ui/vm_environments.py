@@ -42,11 +42,36 @@ def network_policy_text(provider: str) -> tuple[str, str]:
     return 'Public outbound network', 'The guest firewall filters host, LAN, private and reserved destinations. Disabling public outbound also skips downloadable optional tools.'
 
 
-def _elapsed(started: float) -> str:
-    value = max(0, int(time.time() - started)) if started else 0
-    minutes, seconds = divmod(value, 60)
+def _duration(seconds: float) -> str:
+    minutes, seconds = divmod(max(0, int(seconds)), 60)
     hours, minutes = divmod(minutes, 60)
-    return f'{hours}h {minutes:02d}m {seconds:02d}s' if hours else f'{minutes}m {seconds:02d}s'
+    return f'{hours}h {minutes:02d}m' if hours else f'{minutes}m {seconds:02d}s' if minutes else f'{seconds}s'
+
+
+def _operation_timing(op) -> str:
+    now = time.time()
+    elapsed = max(0, now - float(op.started_at or now))
+    stage_elapsed = max(0, now - float(op.stage_started_at or op.started_at or now))
+    parts = [f'Elapsed {_duration(elapsed)}']
+    if op.step_total and op.step_index:
+        parts.append(f'Stage {op.step_index}/{op.step_total}')
+    if op.progress_percent is not None:
+        parts.append(f'Workflow {float(op.progress_percent):.0f}%')
+    if op.stage_progress_percent is not None:
+        parts.append(f'Current stage {float(op.stage_progress_percent):.0f}%')
+    parts.append(f'This stage {_duration(stage_elapsed)}')
+    expected = float(op.expected_total_seconds or 0)
+    if expected > elapsed:
+        parts.append(f'ETA ~{_duration(expected - elapsed)}')
+    elif expected > 0:
+        parts.append(f'Recent median {_duration(expected)}')
+    else:
+        parts.append('ETA learning from completed runs')
+    if op.stage_deadline:
+        parts.append(f'Stage timeout {_duration(float(op.stage_deadline) - now)}')
+    if op.deadline:
+        parts.append(f'Operation timeout {_duration(float(op.deadline) - now)}')
+    return ' · '.join(parts)
 
 
 def tool_label(preset, tool_id: str) -> str:
@@ -288,6 +313,14 @@ def render_vm_environments(workbench, tab, workspace) -> None:
     manager = EnvironmentManager(workspace.root)
     if not hasattr(workbench, 'vm_environment_selection'):
         workbench.vm_environment_selection = {}
+    active_vm_key = f'{workspace.id}:active_vm'
+    ui.add_css('''
+        .hy-vm-tabs, .hy-vm-tabs .q-tabs__content { overflow:visible; }
+        .hy-vm-tabs .q-tabs__content { flex-wrap:wrap; gap:4px; }
+        .hy-vm-tabs .q-tabs__arrow { display:none; }
+        .hy-vm-tabs .q-tab { flex:0 1 auto; min-width:0; max-width:100%; }
+        .hy-vm-tabs .q-tab__label { white-space:normal; overflow-wrap:anywhere; }
+    ''')
     selected_tab = workbench.environment_subtabs.get(workspace.id, 'VM Environments')
     if selected_tab not in {'VM Environments', 'External Targets'}:
         selected_tab = 'VM Environments'
@@ -304,18 +337,17 @@ def render_vm_environments(workbench, tab, workspace) -> None:
         tabs.on_value_change(remember)
         with ui.tab_panels(tabs, value=selected_tab, animated=False).classes('w-full bg-transparent overflow-y-auto').style('flex:1;min-height:0;min-width:0'):
             with ui.tab_panel(local_tab).classes('p-4') as local_panel:
-                with ui.row().classes('w-full items-center gap-2 flex-wrap'):
-                    ui.label('VM Environments').classes('text-lg font-semibold grow')
-                    ui.button('Create VM Environment', icon='add', on_click=lambda: open_vm_creator(workbench, workspace, selected)).props('unelevated no-caps')
                 ui.label('Use named VMs for development, testing or both. The model can choose any enabled VM, and multiple VMs can run together.').classes('text-sm hy-muted')
                 summary = ui.label('').classes('text-xs hy-muted')
-                listing = ui.row().classes('w-full gap-3 flex-wrap items-stretch')
-                details_area = ui.column().classes('w-full gap-3 mt-3')
+                vm_tabs = ui.tabs().classes('hy-vm-tabs w-full').props('dense no-caps align=left')
+                empty_area = ui.column().classes('w-full gap-3')
+                listing = ui.tab_panels(vm_tabs, animated=False).classes('w-full bg-transparent')
             with ui.tab_panel(external_tab).classes('p-0'):
                 workbench._render_test_targets(workspace)
 
     def selected(environment_id: str) -> None:
         workbench.vm_environment_selection[workspace.id] = environment_id
+        workbench.environment_subtabs[active_vm_key] = environment_id
         workbench.environment_subtabs[workspace.id] = 'VM Environments'
         workbench._save_ui_session()
         if hasattr(workbench, 'refresh_sidebar'):
@@ -327,7 +359,21 @@ def render_vm_environments(workbench, tab, workspace) -> None:
             ui.label('VM Settings').classes('text-lg font-semibold')
             name = ui.input('VM name', value=config.name).classes('w-full')
             purpose = ui.textarea('Purpose / model instructions', value=config.purpose).props('autogrow').classes('w-full')
+            image_id = get_preset(config.preset).image_id
+            compatible_presets = {
+                item.id: TOOL_BUNDLES.get(item.tools_id, item.tools_id)
+                for item in PRESETS.values() if item.image_id == image_id
+            }
+            tool_preset = ui.select(compatible_presets, value=config.preset, label='Tool preset').props('outlined').classes('w-full')
+            ui.label('Changes the available optional-tool list. Installed tools stay in this VM. Review and install your choices in Manage Optional Tools; required packages are checked on the next Start.').classes('text-xs hy-muted')
+            if len(compatible_presets) == 1:
+                tool_preset.disable()
+                ui.label('This OS currently has one tool preset. You can still select its individual optional tools.').classes('text-xs hy-muted')
+            elif ENVIRONMENT_OPERATIONS.is_busy(workspace.root, environment_id=config.id) or active_work(workspace.root, environment_id=config.id):
+                tool_preset.disable()
+                ui.label('Finish this VM’s current operation and active work before changing its tool preset.').classes('text-xs hy-muted')
             project_access = ProjectAccessEditor(workspace, config)
+            opened_scope = (config.project_access, frozenset(config.allowed_project_ids))
             error = ui.label('').classes('text-sm text-negative')
             with ui.row().classes('w-full justify-end gap-2'):
                 ui.button('Cancel', on_click=editor.close).props('flat no-caps')
@@ -339,12 +385,35 @@ def render_vm_environments(workbench, tab, workspace) -> None:
                         value = str(name.value or '').strip()
                         if not value:
                             raise ValueError('Enter a VM name.')
+                        preset_id = latest.preset
+                        optional_tools = latest.optional_tools
+                        if tool_preset.value != config.preset:
+                            if latest.preset != config.preset:
+                                raise ValueError('This VM’s tool preset changed while Settings was open. Reopen Settings to use its current preset.')
+                            preset_id = str(tool_preset.value or '')
+                            if preset_id not in compatible_presets:
+                                raise ValueError('Choose a tool preset for this VM’s current OS.')
+                            previous_tools = get_preset(latest.preset).optional_tool_ids if '*' in latest.optional_tools else latest.optional_tools
+                            optional_tools = tuple(tool for tool in get_preset(preset_id).optional_tool_ids if tool in previous_tools)
+                        chosen_scope = (project_access.project_access, frozenset(project_access.allowed_project_ids))
+                        latest_scope = (latest.project_access, frozenset(latest.allowed_project_ids))
+                        if chosen_scope != opened_scope and latest_scope != opened_scope:
+                            raise ValueError('Project access changed while Settings was open. Reopen Settings before changing it.')
                         manager.save(replace(latest, name=value, purpose=str(purpose.value or '').strip(),
-                                             project_access=project_access.project_access,
-                                             allowed_project_ids=project_access.allowed_project_ids))
+                                             preset=preset_id, optional_tools=optional_tools,
+                                             project_access=project_access.project_access if chosen_scope != opened_scope else latest.project_access,
+                                             allowed_project_ids=project_access.allowed_project_ids if chosen_scope != opened_scope else latest.allowed_project_ids))
+                        if preset_id != config.preset:
+                            ui.notify(
+                                'Tool preset saved. Review choices in Manage Optional Tools, or use Start / Retry Setup to check required tools.'
+                                if get_preset(preset_id).optional_tool_ids else
+                                'Tool preset saved. Use Start / Retry Setup to check its required tools.',
+                                type='positive',
+                            )
                         editor.close(); selected(config.id)
                     except Exception as exc:
-                        error.set_text(str(exc))
+                        if not error.is_deleted:
+                            error.set_text(str(exc))
                 ui.button('Save', icon='save', on_click=save).props('unelevated no-caps')
         editor.open()
 
@@ -371,30 +440,84 @@ def render_vm_environments(workbench, tab, workspace) -> None:
         dialog.open()
 
     card_states: dict[str, dict[str, Any]] = {}
-    signature = {'ids': None}
+    signature = {'configs': None}
+    tab_syncing = {'value': False}
+
+    def change_vm(event) -> None:
+        if tab_syncing['value']:
+            return
+        environment_id = str(event.value or '')
+        if environment_id in card_states:
+            workbench.environment_subtabs[active_vm_key] = environment_id
+            workbench._save_ui_session()
+        else:
+            tab_syncing['value'] = True
+            previous = workbench.environment_subtabs.get(active_vm_key)
+            vm_tabs.set_value(previous if previous in card_states else None)
+            tab_syncing['value'] = False
+
+    vm_tabs.on_value_change(change_vm)
+
+    def toggle_manage(environment_id: str) -> None:
+        opened = workbench.vm_environment_selection.get(workspace.id)
+        if opened == environment_id:
+            workbench.vm_environment_selection.pop(workspace.id, None)
+        else:
+            workbench.vm_environment_selection[workspace.id] = environment_id
+        workbench._save_ui_session()
+        sync_details()
+
+    def sync_details() -> None:
+        chosen = workbench.vm_environment_selection.get(workspace.id)
+        for environment_id, controls in card_states.items():
+            expanded = chosen == environment_id
+            controls['details'].set_visibility(expanded)
+            controls['manage'].set_text('Hide details' if expanded else 'Manage')
+            controls['manage'].props(f'aria-expanded={str(expanded).lower()}')
+            if expanded and not controls.get('details_loaded'):
+                controls['details_loaded'] = True
+                with controls['details']:
+                    workbench._render_vm_environment_details(tab, workspace, environment_id, embedded=True)
 
     def render_cards() -> None:
         configs = manager.list()
-        signature['ids'] = tuple(item.id for item in configs)
-        card_states.clear(); listing.clear(); details_area.clear()
-        with listing:
-            if not configs:
+        signature['configs'] = tuple(item.to_dict() for item in configs)
+        if not any(item.id == workbench.vm_environment_selection.get(workspace.id) for item in configs):
+            workbench.vm_environment_selection.pop(workspace.id, None)
+        active_vm = workbench.environment_subtabs.get(active_vm_key)
+        if not any(item.id == active_vm for item in configs):
+            active_vm = configs[0].id if configs else None
+        tab_syncing['value'] = True
+        card_states.clear(); listing.clear(); vm_tabs.clear(); empty_area.clear()
+        with vm_tabs:
+            for config in configs:
+                ui.tab(config.id, label=config.name).props(f'data-hy-vm-tab={config.id}')
+            ui.tab('__create_vm__', label='+ Create VM').props('data-hy-vm-create=true').on('click', lambda: open_vm_creator(workbench, workspace, selected))
+        vm_tabs.set_value(active_vm)
+        if active_vm:
+            workbench.environment_subtabs[active_vm_key] = active_vm
+        listing.set_visibility(bool(configs))
+        empty_area.set_visibility(not configs)
+        if not configs:
+            with empty_area:
                 with ui.card().classes('w-full p-8 items-center gap-2'):
                     ui.icon('add_to_queue', size='40px').classes('hy-muted')
                     ui.label('No VM environments yet').classes('text-lg font-semibold')
                     ui.label('Files, chats and web research are available. Create a VM to run commands or tests.').classes('text-sm hy-muted text-center')
+        with listing:
             for config in configs:
-                with ui.card().classes('hy-env-card p-4 gap-2').style('flex:1 1 340px;min-width:0;max-width:100%'):
+                panel = ui.tab_panel(config.id).classes('p-0')
+                with panel, ui.card().classes('hy-env-card w-full p-4 gap-2').style('min-width:0;max-width:100%').props(f'data-hy-vm-card={config.id}') as vm_card:
                     with ui.row().classes('w-full items-start gap-2 no-wrap'):
                         with ui.column().classes('gap-1 grow min-w-0'):
                             ui.label(config.name).classes('text-lg font-semibold').style('overflow-wrap:anywhere')
                             preset = get_preset(config.preset)
                             ui.label(f'{preset.guest_os} · {config.architecture}').classes('text-xs hy-muted')
-                        spinner = ui.spinner(size='24px')
                         status = ui.badge('Checking…').props('color=grey').classes('text-sm px-3 py-2')
                     if config.purpose:
                         ui.label(config.purpose).classes('text-sm hy-muted').style('white-space:pre-wrap;overflow-wrap:anywhere')
                     ui.label(f'{config.cpu} vCPU · {config.memory_mb / 1024:g} GiB RAM · {config.disk_gb} GiB disk').classes('text-xs hy-muted')
+                    ui.label(f'Tool preset: {TOOL_BUNDLES.get(preset.tools_id, preset.tools_id)}').classes('text-xs hy-muted')
                     ui.label(FILE_MODES.get(config.files_mode, config.files_mode)).classes('text-xs hy-muted')
                     if config.project_access == 'all':
                         ui.label('Model project access: All projects / chats, including future ones').classes('text-xs hy-muted')
@@ -412,9 +535,15 @@ def render_vm_environments(workbench, tab, workspace) -> None:
                         except Exception as exc:
                             ui.notify(str(exc), type='negative')
                     availability.on_value_change(set_enabled)
-                    operation = ui.label('').classes('text-sm').style('white-space:pre-wrap;overflow-wrap:anywhere')
-                    timing = ui.label('').classes('text-xs hy-muted')
-                    with ui.row().classes('w-full gap-1 flex-wrap'):
+                    with ui.row().classes('hy-env-status-banner w-full items-start gap-3 p-3 no-wrap').props(f'data-hy-vm-progress={config.id}') as progress_panel:
+                        spinner = ui.spinner(size='20px').classes('hy-vm-busy-spinner shrink-0')
+                        progress_icon = ui.icon('info', size='20px').classes('shrink-0')
+                        with ui.column().classes('gap-1 grow min-w-0'):
+                            operation = ui.label('').classes('text-sm font-semibold').style('white-space:pre-wrap;overflow-wrap:anywhere')
+                            detail = ui.label('').classes('text-xs hy-muted').style('white-space:pre-wrap;overflow-wrap:anywhere')
+                            progress = ui.linear_progress(value=0, show_value=False).classes('hy-vm-busy-progress w-full').props('rounded size=6px')
+                            timing = ui.label('').classes('text-xs hy-muted').style('font-variant-numeric:tabular-nums;overflow-wrap:anywhere')
+                    with ui.row().classes('w-full gap-1 flex-wrap').props(f'data-hy-vm-controls={config.id}'):
                         def queue(action: str, environment_id=config.id) -> None:
                             try:
                                 ENVIRONMENT_OPERATIONS.start(workspace.root, action, environment_id=environment_id)
@@ -428,60 +557,82 @@ def render_vm_environments(workbench, tab, workspace) -> None:
                         if getattr(config, 'desktop', False):
                             graphical = ui.button('Web UI' if config.provider == 'openwrt' else 'Desktop', icon='desktop_windows',
                                       on_click=lambda _=None, eid=config.id: workbench.open_vm_tab(workspace, eid, 'desktop')).props('flat no-caps')
-                        ui.button('Manage', icon='tune', on_click=lambda _=None, eid=config.id: selected(eid)).props('outline no-caps')
+                        manage = ui.button('Manage', icon='tune', on_click=lambda _=None, eid=config.id: toggle_manage(eid)).props('outline no-caps')
                         ui.button('Settings', icon='settings', on_click=lambda _=None, item=config: edit(item)).props('flat dense no-caps aria-label="VM settings"')
                         delete = ui.button(icon='delete_outline', on_click=lambda _=None, item=config: remove(item)).props('flat round dense color=negative aria-label="Remove VM environment"')
-                    card_states[config.id] = dict(config=config, spinner=spinner, status=status, operation=operation, timing=timing, start=start_button, stop=stop_button, terminal=terminal, graphical=graphical, delete=delete, availability=availability, running=False)
-        chosen = workbench.vm_environment_selection.get(workspace.id)
-        chosen = chosen if any(item.id == chosen for item in configs) else (configs[0].id if configs else None)
-        if chosen:
-            workbench.vm_environment_selection[workspace.id] = chosen
-            with details_area:
-                workbench._render_vm_environment_details(tab, workspace, chosen)
-        total_ram = sum(item.memory_mb for item in configs) / 1024
-        summary.set_text(f'{len(configs)} configured · {sum(item.cpu for item in configs)} vCPU / {total_ram:g} GiB RAM allocated across all VMs')
+                    details = ui.column().classes('w-full gap-0 mt-2 pt-2').style('min-width:0;border-top:1px solid var(--hy-border)').props(f'data-hy-vm-details={config.id}')
+                    details.set_visibility(False)
+                    card_states[config.id] = dict(config=config, card=vm_card, spinner=spinner, status=status, operation=operation, detail=detail, timing=timing, progress=progress, progress_panel=progress_panel, progress_icon=progress_icon, start=start_button, stop=stop_button, terminal=terminal, graphical=graphical, manage=manage, details=details, delete=delete, availability=availability, running=False)
+        tab_syncing['value'] = False
+        sync_details()
 
     def sync_cards() -> None:
+        counts: dict[str, int] = {}
         for environment_id, controls in card_states.items():
             op = ENVIRONMENT_OPERATIONS.state(workspace.root, environment_id=environment_id)
             busy = bool(op.busy)
-            controls['spinner'].set_visibility(busy or not controls.get('status_attempted'))
+            checking = not controls.get('status_attempted')
+            error = op.error or controls.get('poll_error') or ''
+            status_detail = controls.get('status_detail') or ''
+            show_panel = busy or checking or bool(error or status_detail)
+            controls['progress_panel'].set_visibility(show_panel)
+            controls['spinner'].set_visibility(busy or checking)
+            controls['progress_icon'].set_visibility(show_panel and not (busy or checking))
+            controls['progress_icon'].props('name=error_outline color=negative' if error else 'name=info color=primary')
+            controls['progress'].set_visibility(busy)
+            controls['timing'].set_visibility(busy)
             if busy:
-                controls['status'].set_text('Starting…' if op.action == 'start' else (op.message or 'Working…'))
+                state_label = {'start': 'Starting…', 'stop': 'Stopping…', 'snapshot': 'Creating snapshot…',
+                               'restore': 'Restoring…', 'reset': 'Resetting…', 'rebuild': 'Rebuilding…',
+                               'tools': 'Updating tools…', 'resources': 'Applying resources…',
+                               'network': 'Applying network…', 'remove': 'Removing…'}.get(op.action, 'Working…')
+                controls['status'].set_text(state_label)
                 controls['status'].props('color=primary')
                 controls['operation'].set_text(op.message or 'Working…')
-                controls['timing'].set_text(f'Elapsed {_elapsed(float(op.started_at or 0))}')
+                controls['detail'].set_text(op.detail or '')
+                controls['timing'].set_text(_operation_timing(op))
+                if op.progress_percent is None:
+                    controls['progress'].props(add='indeterminate')
+                else:
+                    controls['progress'].props(remove='indeterminate')
+                    controls['progress'].set_value(max(0, min(1, float(op.progress_percent) / 100)))
+                summary_state = 'starting' if op.action in {'start', 'restore', 'reset', 'rebuild'} else 'stopping' if op.action == 'stop' else 'updating'
             else:
-                controls['operation'].set_text(op.error or controls.get('poll_error') or controls.get('status_detail') or '')
+                controls['operation'].set_text(
+                    'VM setup incomplete' if op.error and op.action == 'start' and controls.get('running') else
+                    'VM operation failed' if op.error else 'VM status unavailable' if controls.get('poll_error') else
+                    'Checking VM status…' if checking else 'VM status'
+                )
+                controls['detail'].set_text(error or status_detail)
                 controls['timing'].set_text('')
                 ready = bool(controls.get('ready'))
-                controls['status'].set_text('Ready' if ready else str(controls.get('state') or 'Checking…').replace('_', ' ').title())
-                controls['status'].props('color=positive' if ready else 'color=negative' if op.error else 'color=grey')
+                controls['status'].set_text('Ready' if ready else 'Setup incomplete' if controls.get('running') and error else str(controls.get('state') or 'Checking…').replace('_', ' ').title())
+                controls['status'].props('color=positive' if ready else 'color=negative' if error else 'color=grey')
+                summary_state = 'ready' if ready else 'checking' if checking else 'unavailable' if not controls.get('known') else 'needs setup' if controls.get('running') else 'stopped'
+            counts[summary_state] = counts.get(summary_state, 0) + 1
             active = bool(active_work(workspace.root, environment_id=environment_id))
             known = bool(controls.get('known'))
             for key in ('start', 'stop', 'delete'):
                 controls[key].set_enabled(known and not busy and not active)
-            controls['start'].set_enabled(known and not busy and not (controls.get('running') and controls.get('ready')))
+            controls['start'].set_enabled(known and not busy and not active and not (controls.get('running') and controls.get('ready')))
+            controls['start'].set_text('Retry Setup' if controls.get('running') and not controls.get('ready') else 'Start')
             controls['stop'].set_enabled(known and not busy and not active and bool(controls.get('running')))
             controls['terminal'].set_enabled(not busy and bool(controls.get('ready')))
             if controls['graphical'] is not None:
                 controls['graphical'].set_enabled(not busy and bool(controls.get('running')))
             controls['delete'].set_enabled(known and not busy and not active and not controls.get('running'))
-            controls['start'].props(add='loading') if busy and op.action == 'start' else controls['start'].props(remove='loading')
-            controls['stop'].props(add='loading') if busy and op.action == 'stop' else controls['stop'].props(remove='loading')
         configs = [value['config'] for value in card_states.values()]
-        running = [value['config'] for value in card_states.values() if value.get('running')]
-        summary.set_text(
-            f'{len(configs)} configured · {len(running)} running '
-            f'({sum(item.cpu for item in running)} vCPU / {sum(item.memory_mb for item in running) / 1024:g} GiB RAM) '
-            f'· total configured {sum(item.cpu for item in configs)} vCPU / {sum(item.memory_mb for item in configs) / 1024:g} GiB RAM'
-        )
+        parts = [f'{len(configs)} VM' + ('' if len(configs) == 1 else 's')]
+        parts.extend(f'{counts[state]} {state}' for state in ('starting', 'stopping', 'updating', 'ready', 'needs setup', 'stopped', 'checking', 'unavailable') if counts.get(state))
+        if configs:
+            parts.append(f'Allocated {sum(item.cpu for item in configs)} vCPU / {sum(item.memory_mb for item in configs) / 1024:g} GiB RAM')
+        summary.set_text(' · '.join(parts))
 
     async def refresh() -> None:
         if local_panel.is_deleted:
             poll.cancel(); return
         configs = manager.list()
-        if signature['ids'] != tuple(item.id for item in configs):
+        if signature['configs'] != tuple(item.to_dict() for item in configs):
             render_cards()
         for environment_id, controls in list(card_states.items()):
             try:

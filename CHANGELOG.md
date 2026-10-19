@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.7.1
+
+- Give each VM its own named tab inside **VM Environments**, with **+ Create VM** always last. Remember the active VM and wrap tab names on narrow screens. Each VM has one card; **Manage** expands Details and Snapshots inside it, with one header, one main control row and one startup-progress panel. Collapse it with **Hide details**.
+- Show a single animated startup indicator with the current stage, workflow progress, elapsed time, ETA and deadlines. Keep Start/Stop labels visible during work. The overview counts each VM once, for example **1 VM · 1 starting**.
+- Show **Retry Setup** for a running VM whose setup is incomplete, so setup can resume without resetting its disk. Preserve independent VM actions, project access, resource settings, snapshots and consoles.
+- Change **Tool preset** after creation in **VM Settings**, using presets for the current OS. Keep installed tools and compatible selections, review the new list in **Manage Optional Tools**, and check new required packages on the next Start. Preset changes preserve VM storage and project access and wait for active work to finish.
+- Send the OpenWrt Bluetooth controller helper through SSH input rather than an oversized command argument. Fetch matching radio packages through the verified host installer for supported opkg images, including with guest internet disabled. Retain actionable setup-failure stages and technical evidence while keeping default diagnostics content-free.
+- Leave README unchanged. Verified Linux browser flows, controlled provisioning/concurrency checks and real OpenWrt 23.05.2/23.05.5 MIPS radio setup with guest internet disabled, including repeated setup on running guests. The restricted test host used test-only TCP QMP; production keeps private UNIX sockets. Native Lima provisioning and Mac/Windows guest testing were unavailable.
+
 ## v0.7.0
 
 - Create the workspace first, then add named VMs under **Environments → Create VM Environment**. Development and testing share one interface; give each VM a name and optional purpose instead of choosing a fixed Dev/Test role.
