@@ -15,9 +15,10 @@ import stat
 from typing import Any
 
 LABEL_FIELDS = frozenset({'terminal_stop_reason', 'terminal_reason', 'backend_done_reason',
-    'completion_state', 'last_error_code', 'source', 'state', 'component', 'missing_dependency'})
+    'completion_state', 'last_error_code', 'source', 'state', 'component', 'missing_dependency', 'terminal_mode'})
 _LABEL = re.compile(r'[A-Za-z0-9_.:/-]{0,128}\Z')
 _EXTRA_LABELS = {
+    'terminal_mode': {'guest_console', 'project_files'},
     'terminal_stop_reason': {'workspace_infrastructure_failure', 'backend_stream_stalled',
         'completion_unconfirmed', 'backend_failure', 'missing_final_answer', 'user_cancelled', 'error', 'stopped'},
     'terminal_reason': {'workspace_infrastructure_failure', 'backend_stream_stalled',

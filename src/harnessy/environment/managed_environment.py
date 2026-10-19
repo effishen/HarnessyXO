@@ -478,6 +478,17 @@ finally {
         task.add_done_callback(self._process_tasks.discard)
         return process
 
+    async def open_guest_terminal(self):
+        """Open a human PowerShell console without deploying project files."""
+        with activity(self.workspace_root, 'Opening Windows guest console', environment_id=self.config.id):
+            await self._ensure_running()
+            setup = ("$ErrorActionPreference='Stop'; " + self._guest_work_path_powershell(None)
+                     + '; Set-Location -LiteralPath $env:USERPROFILE')
+            encoded = base64.b64encode(setup.encode('utf-16-le')).decode('ascii')
+            argv = [self.controller._binary(), 'shell', '--workdir', 'C:/', self.controller.instance,
+                    'powershell.exe', '-NoLogo', '-NoProfile', '-NoExit', '-EncodedCommand', encoded]
+            return argv, self.controller._env(), self.workspace_root
+
     async def open_terminal(self, *, active_root: Path | None = None):
         with activity(self.workspace_root, 'Opening Windows terminal', environment_id=self.config.id):
             await self._ensure_running()

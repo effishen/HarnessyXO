@@ -644,11 +644,18 @@ class EnvironmentOperationRegistry:
                     if current is None or current.preset != payload['expected_preset']:
                         raise RuntimeError('The VM tool preset changed since this editor opened. Reopen Manage Optional Tools before applying.')
                 raw_expected = payload.get('expected')
+                removal_guard = {}
+                if provider.config.provider == 'lima' and payload.get('remove_deselected_bundles'):
+                    raw_removals = payload.get('expected_removed_bundles')
+                    if raw_removals is not None:
+                        if not isinstance(raw_removals, (list, tuple)) or any(not isinstance(tool, str) for tool in raw_removals):
+                            raise ValueError('Invalid confirmed tool-bundle removal list. Reopen Manage Optional Tools.')
+                        removal_guard['expected_removed_bundles'] = tuple(raw_removals)
                 return await provider.apply_optional_tools(
                     tuple(payload.get('optional_tools') or ()),
                     expected=None if raw_expected is None else tuple(raw_expected),
                     remove_deselected_bundles=bool(payload.get('remove_deselected_bundles')),
-                    progress=progress, reservation_held=True,
+                    progress=progress, reservation_held=True, **removal_guard,
                 )
             if action == 'stop':
                 set_phase('stopping_vm', 'Stopping workspace VM…')

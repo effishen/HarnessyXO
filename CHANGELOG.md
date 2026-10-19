@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.7.3
+
+- Open OpenWrt, Windows and separate-copy VM terminals without first copying the whole workspace. Start these human-operated consoles in the guest home, so a large project cannot block access to the VM shell. No project files are automatically deployed or collected by these consoles.
+- Keep shared-source Lima terminals in their existing Files view. Preserve model project synchronization, access checks and transfer limits, along with each terminal's VM identity and activity tracking. Leave README unchanged.
+- Hide the managed-bundle uninstall option in OpenWrt's package list. For supported Linux presets, show the installed bundles actually deselected, confirm that list before removal and reject a stale removal list.
+- Include terminal startup failures in the diagnostic summary, with fixed transfer-limit reasons and the terminal mode while keeping project content out of standard exports.
+- Clean up retired terminal displays when switching tabs or reloading. Keep late resize/render callbacks from breaking the reopened display while retaining the same backend terminal session.
+- Verify the console on a real OpenWrt 23.05.5 MIPS guest with 768 MiB of canonical files, alongside Linux UI, source-preservation, access and stale-removal checks. Native Mac/Windows and Lima provisioning remain unverified; the restricted native test used TCP only for QMP, leaving production transport unchanged.
+
 ## v0.7.2
 
 - Keep VM editors open when background status/configuration refreshes rebuild a VM card. Preserve pending Settings, creation, optional-tool, resource and removal inputs instead of silently dismissing their dialogs.

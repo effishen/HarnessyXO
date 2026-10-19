@@ -709,7 +709,8 @@ WantedBy=multi-user.target
 
     async def apply_optional_tools(
         self, selected: tuple[str, ...], *, expected: tuple[str, ...] | None = None,
-        remove_deselected_bundles: bool = False, progress=None, reservation_held: bool = False,
+        remove_deselected_bundles: bool = False, expected_removed_bundles: tuple[str, ...] | None = None,
+        progress=None, reservation_held: bool = False,
     ) -> EnvironmentStatus:
         """Save and reconcile a workspace's post-creation optional-tool selection.
 
@@ -723,6 +724,20 @@ WantedBy=multi-user.target
         preset = get_preset(self.config.preset)
         allowed = tuple(preset.optional_tool_ids)
         desired = tuple(tool for tool in allowed if tool in set(selected))
+
+        def confirmed_removals(inspection: dict[str, dict[str, str]]) -> tuple[str, ...]:
+            candidates = tuple(
+                tool for tool in preset.supplemental_tools
+                if tool not in desired and inspection.get(tool, {}).get('state') in {'installed', 'partial'}
+            ) if remove_deselected_bundles else ()
+            if remove_deselected_bundles and expected_removed_bundles is not None:
+                if any(inspection.get(tool, {}).get('state') not in {'installed', 'partial', 'missing'}
+                       for tool in preset.supplemental_tools):
+                    raise RuntimeError('Some managed tool bundles could not be inspected. Reopen Manage Optional Tools after their installed state is available. No bundles were removed.')
+                if set(expected_removed_bundles) != set(candidates):
+                    raise RuntimeError('Installed tool bundles changed since removal was confirmed. Reopen Manage Optional Tools to review the current removal list. No bundles were removed.')
+            return candidates
+
         release = (lambda: None) if reservation_held else reserve_environment_change(self.workspace_root, 'optional tools', environment_id=self.config.id)
         try:
             async with self._workspace_start_lock():
@@ -739,6 +754,13 @@ WantedBy=multi-user.target
                     raise RuntimeError('Optional tool selection changed since this editor opened. Reopen Manage Optional Tools before applying.')
 
                 status = await self.status()
+                if remove_deselected_bundles and expected_removed_bundles is not None:
+                    if not status.running:
+                        raise RuntimeError('Start this VM and reopen Manage Optional Tools before uninstalling managed bundles. No settings or bundles were changed.')
+                    # Reject a stale/partial preview before saving selections
+                    # or installing any required packages. Recheck immediately
+                    # before removal as setup may change the installed state.
+                    confirmed_removals(await self.optional_tool_status())
                 changed = EnvironmentConfig.from_dict({**original.to_dict(), 'optional_tools': desired})
                 self._save_controller_config(changed)
                 await self._emit_progress(
@@ -773,10 +795,7 @@ WantedBy=multi-user.target
                     tool for tool in preset.supplemental_tools
                     if tool in desired_set and (tool == 'rea' or inspection.get(tool, {}).get('state') != 'installed')
                 )
-                remove_bundles = tuple(
-                    tool for tool in preset.supplemental_tools
-                    if tool not in desired_set and inspection.get(tool, {}).get('state') in {'installed', 'partial'}
-                ) if remove_deselected_bundles else ()
+                remove_bundles = confirmed_removals(inspection)
 
                 if remove_bundles:
                     await self._emit_progress(
@@ -4143,6 +4162,42 @@ print(json.dumps(facts))
         self.snapshots_root.mkdir(parents=True, exist_ok=True)
         self._record_lifecycle('destroyed')
         log_event('harnessy', 'vm_destroyed', workspace=str(self.workspace_root))
+
+    async def open_guest_terminal(self) -> tuple[list[str], dict[str, str], Path]:
+        """Open a human guest-home console without deploying project files."""
+        with activity(self.workspace_root, 'Opening VM guest console', environment_id=self.config.id):
+            await self.start()
+            return await asyncio.to_thread(self._guest_terminal_command)
+
+    def _guest_terminal_command(self) -> tuple[list[str], dict[str, str], Path]:
+        # Keep controller exports out of this human console just as they are
+        # detached from project commands. The empty /workspace also hides any
+        # legacy direct mount without changing other processes' mount views.
+        from harnessy.core.terminal import _GUEST_ACTIVITY_RC
+        console_rc = (_GUEST_ACTIVITY_RC + '\ncd -- "$HOME" || exit 72\n'
+                      + self._guest_work_path_exports())
+        command = 'exec /bin/bash --rcfile <(printf %s ' + shlex.quote(console_rc) + ') -i'
+        inner = f'''set -euo pipefail
+console_user=$1
+console_command=$2
+/usr/bin/mount --make-rprivate /
+for backing in {FILES_BACKING_GUEST_PATH} {PRIVATE_WORKTREES_GUEST_PATH}; do
+  /usr/bin/umount -l "$backing" 2>/dev/null || true
+  if /usr/bin/mountpoint -q "$backing"; then
+    printf '%s\\n' 'HarnessyXO could not detach workspace exports from the guest console.' >&2
+    exit 72
+  fi
+done
+/usr/bin/mkdir -p {WORKSPACE_VIEW_GUEST_PATH}
+/usr/bin/mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs {WORKSPACE_VIEW_GUEST_PATH}
+exec /usr/bin/sudo -n -H -u "$console_user" -- /bin/bash -c "$console_command"
+'''
+        view_command = ('console_user=$(id -un); exec /usr/bin/sudo -n /usr/bin/unshare '
+                        '--mount --propagation private --fork /bin/bash -c '
+                        + shlex.quote(inner) + ' harnessy-guest-console "$console_user" '
+                        + shlex.quote(command))
+        argv = [self._binary(), 'shell', '--workdir', '/', self.INSTANCE, '/bin/bash', '-lc', view_command]
+        return argv, self._host_env(), self.workspace_root
 
     def terminal_command(self, *, active_root: Path | None = None) -> tuple[list[str], dict[str, str], Path]:
         binary = self._binary()

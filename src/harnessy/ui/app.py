@@ -15742,72 +15742,119 @@ window.harnessyGoToTop = function() {
 };
 
 window.harnessyCreateTerminal = function(containerId, terminalId, workspaceId, attempt) {
-  attempt = attempt || 0;
   const el = document.getElementById(containerId);
   if (!el) return;
-  if (window.harnessyTerminals[terminalId]) {
-    const previous = window.harnessyTerminals[terminalId];
-    try { previous.observer.disconnect(); } catch (_) {}
-    try { if (previous.resizeHandler) window.removeEventListener('resize', previous.resizeHandler); } catch (_) {}
-    try { previous.term.dispose(); } catch (_) {}
-    delete window.harnessyTerminals[terminalId];
-  }
-  if (!window.Terminal || !window.FitAddon) {
-    if (attempt < 40) { setTimeout(() => window.harnessyCreateTerminal(containerId, terminalId, workspaceId, attempt + 1), 100); return; }
-    el.innerHTML = '<div style="color:#fff;padding:16px;font-family:monospace">Terminal frontend could not load. Check local browser assets and reload HarnessyXO.</div>';
-    return;
-  }
-  const term = new Terminal({
-    cursorBlink:true,
-    convertEol:false,
-    scrollback:10000,
-    fontSize:13,
-    fontFamily:'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
-    theme:{background:'#000000', foreground:'#f2f2f2', cursor:'#f2f2f2', selectionBackground:'#3a3a3a'}
-  });
-  const fit = new FitAddon.FitAddon();
-  term.loadAddon(fit);
-  term.open(el);
-  let fitTimer = null;
+  const previous = window.harnessyTerminals[terminalId];
+  if (previous && typeof previous.dispose === 'function') previous.dispose();
+  const item = {element:el, workspaceId, term:null, fit:null, observer:null,
+    domObserver:null, resizeHandler:null, input:null, fitTimer:null, loadTimer:null,
+    frames:new Set(), disposed:false};
+  const isLive = () => !item.disposed && window.harnessyTerminals[terminalId] === item &&
+    document.body.contains(el) && document.getElementById(containerId) === el;
+  item.isLive = isLive;
+  item.dispose = () => {
+    if (item.disposed) return;
+    item.disposed = true;
+    if (item.fitTimer !== null) clearTimeout(item.fitTimer);
+    if (item.loadTimer !== null) clearTimeout(item.loadTimer);
+    for (const frame of item.frames) cancelAnimationFrame(frame);
+    item.frames.clear();
+    if (item.observer) item.observer.disconnect();
+    if (item.domObserver) item.domObserver.disconnect();
+    if (item.resizeHandler) window.removeEventListener('resize', item.resizeHandler);
+    if (item.input) item.input.dispose();
+    if (window.harnessyTerminals[terminalId] === item) delete window.harnessyTerminals[terminalId];
+    if (item.term) {
+      const retired = item.term;
+      retired.options.cursorBlink = false;
+      if (retired.element) retired.element.remove();
+      // xterm 5.3 leaves viewport refresh callbacks queued when dispose() tears
+      // down its renderer. Stop application callbacks immediately, then let
+      // queued writes and renderer frames finish before disposing the frontend.
+      // The server-owned PTY remains independent of this browser lifecycle.
+      retired.write('', () => requestAnimationFrame(() => requestAnimationFrame(() => {
+        setTimeout(() => retired.dispose(), 0);
+      })));
+    }
+  };
+  window.harnessyTerminals[terminalId] = item;
+  const nextFrame = callback => {
+    const frame = requestAnimationFrame(() => {
+      item.frames.delete(frame);
+      if (isLive()) callback();
+    });
+    item.frames.add(frame);
+  };
   const doFit = () => {
-    if (!document.body.contains(el)) return;
-    if (fitTimer) clearTimeout(fitTimer);
-    fitTimer = setTimeout(() => {
+    if (!isLive() || !item.term) return;
+    if (item.fitTimer !== null) clearTimeout(item.fitTimer);
+    item.fitTimer = setTimeout(() => {
+      item.fitTimer = null;
+      if (!isLive() || !item.term) return;
       try {
         // CSS owns the terminal panel geometry. Never write a viewport-derived
         // height here: doing so can grow the panel and push the fixed toolbar
         // out of view when a full-screen TUI redraws.
         el.style.height = '';
         el.style.maxHeight = '';
-        fit.fit();
-        emitEvent('harnessy_terminal_resize', {terminal_id:terminalId, workspace_id:workspaceId, cols:term.cols, rows:term.rows});
+        item.fit.fit();
+        emitEvent('harnessy_terminal_resize', {terminal_id:terminalId, workspace_id:workspaceId, cols:item.term.cols, rows:item.term.rows});
       } catch (_) {}
     }, 0);
   };
-  term.onData(data => emitEvent('harnessy_terminal_input', {terminal_id:terminalId, workspace_id:workspaceId, data}));
-  const observer = new ResizeObserver(doFit);
-  observer.observe(el);
-  const panel = el.closest('.hy-terminal-panel');
-  if (panel) observer.observe(panel);
-  const resizeHandler = () => doFit();
-  window.addEventListener('resize', resizeHandler);
-  window.harnessyTerminals[terminalId] = {term, fit, observer, resizeHandler, workspaceId};
-  const pending = window.harnessyTerminalPending[terminalId] || '';
-  if (pending) { term.write(pending); window.harnessyTerminalPending[terminalId] = ''; }
-  requestAnimationFrame(() => requestAnimationFrame(() => { doFit(); term.focus(); }));
+  item.focus = () => {
+    if (!isLive() || !item.term) return;
+    doFit();
+    item.term.focus();
+  };
+  item.domObserver = new MutationObserver(() => { if (!isLive()) item.dispose(); });
+  item.domObserver.observe(document.body, {childList:true, subtree:true});
+  const loadFrontend = retries => {
+    item.loadTimer = null;
+    if (!isLive()) return;
+    if (!window.Terminal || !window.FitAddon) {
+      if (retries < 40) { item.loadTimer = setTimeout(() => loadFrontend(retries + 1), 100); return; }
+      el.innerHTML = '<div style="color:#fff;padding:16px;font-family:monospace">Terminal frontend could not load. Check local browser assets and reload HarnessyXO.</div>';
+      return;
+    }
+    const term = item.term = new Terminal({
+      cursorBlink:true,
+      convertEol:false,
+      scrollback:10000,
+      fontSize:13,
+      fontFamily:'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+      theme:{background:'#000000', foreground:'#f2f2f2', cursor:'#f2f2f2', selectionBackground:'#3a3a3a'}
+    });
+    item.fit = new FitAddon.FitAddon();
+    term.loadAddon(item.fit);
+    term.open(el);
+    item.input = term.onData(data => {
+      if (isLive()) emitEvent('harnessy_terminal_input', {terminal_id:terminalId, workspace_id:workspaceId, data});
+    });
+    item.observer = new ResizeObserver(doFit);
+    item.observer.observe(el);
+    const panel = el.closest('.hy-terminal-panel');
+    if (panel) item.observer.observe(panel);
+    item.resizeHandler = doFit;
+    window.addEventListener('resize', item.resizeHandler);
+    const pending = window.harnessyTerminalPending[terminalId] || '';
+    if (pending) { term.write(pending); window.harnessyTerminalPending[terminalId] = ''; }
+    nextFrame(() => nextFrame(item.focus));
+  };
+  loadFrontend(attempt || 0);
 };
 window.harnessyTerminalWrite = function(terminalId, data) {
   const item = window.harnessyTerminals[terminalId];
-  if (item) item.term.write(data);
+  if (item && item.term && item.isLive()) item.term.write(data);
   else window.harnessyTerminalPending[terminalId] = (window.harnessyTerminalPending[terminalId] || '') + data;
 };
 window.harnessyTerminalClear = function(terminalId) {
   const item = window.harnessyTerminals[terminalId];
-  if (item) item.term.clear();
+  if (item && item.term && item.isLive()) item.term.clear();
 };
 window.harnessyTerminalFocus = function(terminalId) {
   const item = window.harnessyTerminals[terminalId];
-  if (item) { try { item.fit.fit(); } catch (_) {} item.term.focus(); }
+  if (item && item.isLive()) item.focus();
 };
 </script>
 ''')
@@ -18664,6 +18711,7 @@ window.harnessyTerminalFocus = function(terminalId) {
         manager = EnvironmentManager(ws.root, environment_id=tab.environment_id) if isinstance(ws, WorkspaceStore) else None
         config = manager.config if manager is not None and tab.environment_id else None
         is_workspace_vm = isinstance(ws, WorkspaceStore) and config is not None
+        guest_console = bool(is_workspace_vm and (config.provider in {'openwrt', 'managed'} or config.files_mode == 'copy'))
         if isinstance(ws, WorkspaceStore) and config is None:
             # A saved terminal never attaches to an arbitrary replacement VM.
             session = None
@@ -18674,8 +18722,10 @@ window.harnessyTerminalFocus = function(terminalId) {
             with ui.column().classes('hy-tool-panel hy-terminal-panel w-full no-wrap gap-0'):
                 with ui.row().classes('hy-tool-toolbar w-full items-center py-2 no-wrap gap-2').style('border-bottom:1px solid var(--hy-border); min-width:0'):
                     ui.label(tab.title).classes('font-semibold')
-                    base_label = ui.label(f'🛡 {config.name} · Files at /workspace').classes('text-xs hy-muted')
+                    base_label = ui.label(f'🛡 {config.name} · Guest console' if guest_console else f'🛡 {config.name} · Files at /workspace').classes('text-xs hy-muted')
                     base_label.tooltip(
+                        'Starts in the VM’s home directory. Workspace files are not copied automatically.'
+                        if guest_console else
                         'This human-operated workspace terminal is scoped to the Files container. '
                         'Model commands receive only their canonical Project directory plus read-only inputs.'
                     )
@@ -18695,7 +18745,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                             ui.label(op.message or 'Waiting for environment operation…').classes('font-semibold')
                             ui.label('The terminal will attach after the workspace environment is Ready.').classes('text-xs hy-muted')
                         else:
-                            ui.label('Starting workspace VM terminal…').classes('font-semibold')
+                            ui.label('Starting guest console…' if guest_console else 'Starting workspace VM terminal…').classes('font-semibold')
                             ui.label('HarnessyXO will not fall back to the host shell if the VM is unavailable.').classes('text-xs hy-muted')
             if not error and not environment_busy and tab.key not in self.terminal_start_tasks:
                 async def boot_terminal() -> None:
@@ -18715,10 +18765,15 @@ window.harnessyTerminalFocus = function(terminalId) {
                         status = await provider.status()
                         if not status.running or not status.ready:
                             raise RuntimeError(status.error or status.detail or f'VM state is {status.state}')
-                        terminal_options = {'active_root': ws.files_root}
-                        if 'workspace' in inspect.signature(provider.open_terminal).parameters:
-                            terminal_options['workspace'] = ws
-                        argv, env, cwd = await provider.open_terminal(**terminal_options)
+                        if guest_console:
+                            # A human console must not deploy or synchronize the
+                            # workspace container just to open a guest shell.
+                            argv, env, cwd = await provider.open_guest_terminal()
+                        else:
+                            terminal_options = {'active_root': ws.files_root}
+                            if 'workspace' in inspect.signature(provider.open_terminal).parameters:
+                                terminal_options['workspace'] = ws
+                            argv, env, cwd = await provider.open_terminal(**terminal_options)
                         construction = asyncio.create_task(asyncio.to_thread(
                             TerminalSession, cwd, command_argv=argv, env=env,
                             workspace_root=ws.root, environment_id=config.id))
@@ -18729,7 +18784,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                             orphan.close()
                             raise
                         try:
-                            attach = getattr(provider, 'attach_terminal_session', None)
+                            attach = getattr(provider, 'attach_terminal_session', None) if not guest_console else None
                             if attach is not None:
                                 attached = attach(created, workspace=ws)
                                 if inspect.isawaitable(attached):
@@ -18739,7 +18794,9 @@ window.harnessyTerminalFocus = function(terminalId) {
                             raise
                         log_event(
                             'runtime', 'workspace_terminal_started', workspace=str(ws.root),
-                            provider=status.provider, environment_id=config.id, guest_cwd='/workspace', cpu_only=True,
+                            provider=status.provider, environment_id=config.id,
+                            guest_cwd='guest_home' if guest_console else '/workspace',
+                            terminal_mode='guest_console' if guest_console else 'project_files', cpu_only=True,
                         )
                         # The PTY is backend-owned. Closing the tab cancels this
                         # task explicitly; a browser reload merely destroys the
@@ -18750,7 +18807,8 @@ window.harnessyTerminalFocus = function(terminalId) {
                         raise
                     except Exception as exc:
                         self.terminal_errors[tab.key] = str(exc)
-                        log_event('harnessy', 'workspace_terminal_start_failed', workspace=str(ws.root), environment_id=config.id, error=str(exc))
+                        log_event('harnessy', 'workspace_terminal_start_failed', workspace=str(ws.root), environment_id=config.id,
+                                  terminal_mode='guest_console' if guest_console else 'project_files', error=str(exc))
                     finally:
                         self.terminal_start_tasks.pop(tab.key, None)
                 # Do not use NiceGUI's background task wrapper here: this job must
@@ -18800,11 +18858,13 @@ window.harnessyTerminalFocus = function(terminalId) {
                 ui.label(f'Cannot start terminal: {exc}').classes('text-negative p-4')
                 return
 
-        started_label = 'Files at /workspace (human workspace VM)' if is_workspace_vm else str(ws.root)
+        started_label = ('guest home (guest console)' if guest_console else 'Files at /workspace (human workspace VM)') if is_workspace_vm else str(ws.root)
         with ui.column().classes('hy-tool-panel hy-terminal-panel w-full no-wrap gap-0'):
             with ui.row().classes('hy-tool-toolbar w-full items-center py-2 no-wrap gap-2').style('border-bottom:1px solid var(--hy-border); min-width:0'):
                 ui.label(tab.title).classes('font-semibold')
-                ui.label(f'Started in {started_label}').classes('text-xs hy-muted hy-file-name').style('max-width:680px')
+                started_location = ui.label(f'Started in {started_label}').classes('text-xs hy-muted hy-file-name').style('max-width:680px')
+                if guest_console:
+                    started_location.tooltip('Starts in the VM’s home directory. Workspace files are not copied automatically.')
                 if is_workspace_vm:
                     ui.label(f'🛡 {config.name} · {config.architecture} · CPU only').classes('text-xs hy-muted')
                 ui.space()
@@ -19046,6 +19106,10 @@ window.harnessyTerminalFocus = function(terminalId) {
                     status_labels: dict[str, Any] = {}
                     checkboxes: dict[str, Any] = {}
                     state_label = None
+                    supplemental = tuple(dialog_preset.supplemental_tools)
+                    installed_bundles: set[str] = set()
+                    inspection_ready = False
+                    remove_bundles = removal_preview = None
 
                     def tool_label(tool_id: str) -> str:
                         return {
@@ -19054,6 +19118,24 @@ window.harnessyTerminalFocus = function(terminalId) {
                             'python-re': 'Python RE environments (angr, capa, FLOSS, firmware, Frida)',
                         }.get(tool_id, tool_id)
 
+                    def removal_candidates() -> tuple[str, ...]:
+                        return tuple(tool for tool in supplemental if tool in installed_bundles and tool not in chosen)
+
+                    def update_removal_preview() -> None:
+                        if remove_bundles is None:
+                            return
+                        candidates = removal_candidates()
+                        eligible = bool(inspection_ready and candidates)
+                        remove_bundles.set_enabled(eligible)
+                        remove_bundles.set_visibility(not inspection_ready or bool(candidates))
+                        if not eligible:
+                            remove_bundles.set_value(False)
+                        if inspection_ready:
+                            removal_preview.set_text(
+                                'Would uninstall: ' + ', '.join(tool_label(tool) for tool in candidates) + '.'
+                                if candidates else 'No installed managed bundles are deselected.'
+                            )
+
                     def set_choice(tool_id: str, enabled: bool) -> None:
                         if enabled:
                             chosen.add(tool_id)
@@ -19061,6 +19143,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                             chosen.discard(tool_id)
                         if state_label is not None:
                             state_label.set_text(f'{len(chosen)}/{len(available)} selected')
+                        update_removal_preview()
 
                     def set_all(values: tuple[str, ...]) -> None:
                         chosen.clear()
@@ -19069,6 +19152,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                             box.set_value(tool_id in chosen)
                         if state_label is not None:
                             state_label.set_text(f'{len(chosen)}/{len(available)} selected')
+                        update_removal_preview()
 
                     with make_details_dialog() as dialog, ui.card().classes('w-[760px] max-w-[96vw] gap-3').style('max-height:88vh'):
                         with ui.row().classes('w-full items-center gap-2'):
@@ -19104,7 +19188,6 @@ window.harnessyTerminalFocus = function(terminalId) {
                             inspection_label = ui.label('Checking installed state…').classes('text-xs hy-muted')
                         with ui.scroll_area().classes('w-full').style('height:480px;max-height:55vh'):
                             with ui.column().classes('w-full gap-1 pr-2'):
-                                supplemental = set(dialog_preset.supplemental_tools)
                                 for index, tool_id in enumerate(available):
                                     if index and tool_id in supplemental and available[index - 1] not in supplemental:
                                         ui.separator().classes('my-2')
@@ -19114,22 +19197,21 @@ window.harnessyTerminalFocus = function(terminalId) {
                                         checkboxes[tool_id] = box
                                         box.on_value_change(lambda e, tid=tool_id: set_choice(tid, bool(e.value)))
                                         status_labels[tool_id] = ui.label('Checking…').classes('text-xs hy-muted text-right').style('width:210px;white-space:pre-line')
-                        remove_bundles = ui.checkbox(
-                            'Remove deselected HarnessyXO supplemental bundles (Ghidra / Python RE environments / REA CLI)', value=False,
-                        ).classes('text-xs')
+                        if supplemental:
+                            remove_bundles = ui.checkbox('Uninstall deselected managed bundles', value=False).classes('text-xs')
+                            remove_bundles.disable()
+                            removal_preview = ui.label('Checking installed managed bundles…').classes('text-xs hy-muted').style('overflow-wrap:anywhere')
                         ui.label(
                             'For safety, deselecting distro package-manager tools does not automatically uninstall them or their dependencies. '
-                            'It stops HarnessyXO selecting/reinstalling them. The removal option above applies only to HarnessyXO-owned /opt bundles.'
+                            'It stops HarnessyXO selecting/reinstalling them.' +
+                            (' The uninstall option applies only to HarnessyXO-owned /opt bundles.' if supplemental else '')
                         ).classes('text-xs hy-muted')
                         with ui.row().classes('w-full justify-end gap-2'):
                             ui.button('Cancel', on_click=dialog.close).props('flat no-caps')
                             def apply_tools() -> None:
                                 selected = tuple(tool for tool in available if tool in chosen)
-                                remove_owned = bool(remove_bundles.value)
-                                removed_owned = tuple(
-                                    tool for tool in dialog_preset.supplemental_tools
-                                    if tool in existing and tool not in selected
-                                )
+                                removed_owned = removal_candidates()
+                                remove_owned = bool(remove_bundles is not None and remove_bundles.value and inspection_ready and removed_owned)
 
                                 def commit() -> None:
                                     current_config = manager.config
@@ -19137,10 +19219,12 @@ window.harnessyTerminalFocus = function(terminalId) {
                                         ui.notify('This VM’s tool preset changed. Reopen Manage Optional Tools to review its current choices.', type='warning')
                                         return
                                     dialog.close()
+                                    removal_options = {'expected_removed_bundles': removed_owned} if remove_owned else {}
                                     queue_action(
                                         'tools', optional_tools=selected, expected=existing,
                                         expected_preset=dialog_preset.id,
                                         remove_deselected_bundles=remove_owned,
+                                        **removal_options,
                                     )
 
                                 if remove_owned and removed_owned:
@@ -19168,8 +19252,21 @@ window.harnessyTerminalFocus = function(terminalId) {
                         current_status = await manager.provider().status()
                         if not current_status.running:
                             inspection_label.set_text('VM stopped · install status not probed')
+                            if removal_preview is not None:
+                                removal_preview.set_text('Uninstalling managed bundles requires a running VM and verified installed state.')
                         else:
                             inspection_label.set_text('Installed state read from running VM')
+                            installed_bundles.update(
+                                tool for tool in supplemental
+                                if str(inspection.get(tool, {}).get('state') or 'unknown') in {'installed', 'partial'}
+                            )
+                            inspection_ready = all(
+                                str(inspection.get(tool, {}).get('state') or 'unknown') in {'installed', 'partial', 'missing'}
+                                for tool in supplemental
+                            )
+                            update_removal_preview()
+                            if not inspection_ready and removal_preview is not None:
+                                removal_preview.set_text('Installed state unavailable for some managed bundles. Uninstalling is disabled.')
                         for tool_id in available:
                             row = inspection.get(tool_id, {})
                             state = str(row.get('state') or 'unknown')
@@ -19183,6 +19280,11 @@ window.harnessyTerminalFocus = function(terminalId) {
                             status_labels[tool_id].set_text(prefix + (f'\n{detail}' if detail else ''))
                     except Exception as exc:
                         inspection_label.set_text('Could not inspect installed tools')
+                        if remove_bundles is not None:
+                            inspection_ready = False
+                            installed_bundles.clear()
+                            update_removal_preview()
+                            removal_preview.set_text('Installed state unavailable. Uninstalling managed bundles is disabled.')
                         for label in status_labels.values():
                             label.set_text('Status unavailable')
                         log_event('runtime', 'optional_tool_inspection_failed', workspace=str(ws.root), error=str(exc))

@@ -1545,6 +1545,11 @@ def _safe_error_summary(value: Any) -> Any:
                  and isinstance(value.get('technical_error'), dict) else
                  validate_technical_evidence(value) if isinstance(value, dict)
                  and value.get('schema_version') == 1 else technical_error_evidence(value))
+    from .terminal_failures import terminal_failure_evidence
+    project_sync = terminal_failure_evidence(value)
+    if project_sync:
+        technical['reason_codes'] = sorted(set(technical.get('reason_codes', ())) | {project_sync['code']})
+        technical['project_sync_failure_basis'] = project_sync['basis']
     if isinstance(legacy, dict):
         legacy['technical_error'] = technical
         if isinstance(value, dict) and (fault := validate_fault_evidence(value.get('fault'))) is not None:
@@ -1594,6 +1599,10 @@ def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
         return validate_resource_snapshot(value)
     if lowered == 'environment_id':
         return value if isinstance(value, str) and re.fullmatch(r'[0-9a-f]{32}', value) else None
+    if lowered in {'terminal_failure_code', 'terminal_failure_basis'}:
+        from .terminal_failures import PROJECT_SYNC_FAILURE_CODES, PROJECT_SYNC_FAILURE_BASES
+        choices = PROJECT_SYNC_FAILURE_CODES if lowered == 'terminal_failure_code' else PROJECT_SYNC_FAILURE_BASES
+        return value if isinstance(value, str) and value in choices else None
     if lowered == 'project_access' and isinstance(value, str):
         return value if value in {'all', 'selected'} else _privacy_marker(value, label=lowered)
     if lowered == 'allowed_project_ids':

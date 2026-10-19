@@ -57,6 +57,7 @@ _ERROR_EVENTS = frozenset({
     'environment_command_timeout', 'workspace_environment_shutdown_stop_failed',
     'environment_command_spawn_failed', 'vm_failure_evidence_unavailable', 'run_blocked_by_infrastructure',
     'environment_operation_failed', 'environment_operation_timed_out',
+    'workspace_terminal_start_failed',
 })
 
 
@@ -80,11 +81,42 @@ def _bounded_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     queues = [row for row in rows if row.get('event') in QUEUE_EVENTS][-160:]
     access_restore = [row for row in rows if row.get('event') in _ACCESS_RESTORE_EVENTS][-120:]
     recovery = [row for row in rows if row.get('event') in _WORKSPACE_RECOVERY_EVENTS][-600:]
+    terminals = [row for row in rows if row.get('event') == 'workspace_terminal_start_failed'][-120:]
     recent = rows[-(_MAX_ROWS - len(targets) - len(permissions) - len(permission_acknowledgements)
-                    - len(startup) - len(models) - len(controllers) - len(queues) - len(access_restore) - len(recovery)):]
+                    - len(startup) - len(models) - len(controllers) - len(queues) - len(access_restore) - len(recovery) - len(terminals)):]
     retained = {id(row): row for row in targets + permissions + permission_acknowledgements
-                + startup + models + controllers + queues + access_restore + recovery + recent}
+                + startup + models + controllers + queues + access_restore + recovery + terminals + recent}
     return sorted(retained.values(), key=lambda row: row['timestamp'])
+
+
+def _terminal_failure_classification(row: dict[str, Any]) -> str | None:
+    if row.get('event') != 'workspace_terminal_start_failed':
+        return None
+    from .terminal_failures import terminal_failure_code
+    return terminal_failure_code(row) or 'workspace_terminal_start_failed'
+
+
+def _terminal_failure_evidence(row: dict[str, Any]) -> dict[str, Any]:
+    from .terminal_failures import TERMINAL_MODES, terminal_failure_evidence
+    from .technical import validate_technical_evidence
+    evidence = {key: row[key] for key in ('timestamp', 'channel', 'session_scope', 'event') if key in row}
+    environment_id = row.get('environment_id')
+    if isinstance(environment_id, str) and re.fullmatch(r'[0-9a-f]{32}', environment_id):
+        evidence['environment_id'] = environment_id
+    mode = row.get('terminal_mode')
+    if isinstance(mode, str) and mode in TERMINAL_MODES:
+        evidence['terminal_mode'] = mode
+    failure = terminal_failure_evidence(row)
+    if failure:
+        evidence['terminal_failure_code'] = failure['code']
+        evidence['terminal_failure_basis'] = failure['basis']
+    technical = row.get('technical_error')
+    error = row.get('error')
+    if not isinstance(technical, dict) and isinstance(error, dict):
+        technical = error.get('technical_error')
+    if isinstance(technical, dict):
+        evidence['technical_error'] = validate_technical_evidence(technical)
+    return evidence
 
 
 def _vm_failure_classification(row: dict[str, Any]) -> str | None:
@@ -697,6 +729,8 @@ def _is_lock(row: dict[str, Any]) -> bool:
 
 def _evidence(row: dict[str, Any]) -> dict[str, Any]:
     # Keep identifiers and reviewed diagnostic structures, never error bodies.
+    if row.get('event') == 'workspace_terminal_start_failed':
+        return _terminal_failure_evidence(row)
     if row.get('event') in _WORKSPACE_RECOVERY_EVENTS:
         return _recovery_evidence(row)
     if row.get('event') in _ACCESS_RESTORE_EVENTS:
@@ -1397,6 +1431,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         permission_classification = _permission_failure_classification(failure)
         startup_classification = _startup_failure_classification(failure)
         timeout_classification = _timeout_failure_classification(failure)
+        terminal_classification = _terminal_failure_classification(failure)
         access_restore_classification = _ACCESS_RESTORE_FAILURES.get(failure.get('event'))
         vm_cause = _kvm_permission_cause(failure, rows, safe_vm_report, host_kvm_facts)
         if vm_cause:
@@ -1433,7 +1468,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         stalls = [row for row in before if row.get('event') in {'event_loop_stall', 'event_loop_stall_sample'}]
         transcript_deferrals = [row for row in related if row.get('event') == 'transcript_refresh_deferred']
         missing: list[str] = []
-        if not vm_classification and not target_classification and not permission_classification and not startup_classification and not timeout_classification and not access_restore_classification and not _has_frames(failure) and not any(_has_frames(row) for row in database_errors):
+        if not vm_classification and not target_classification and not permission_classification and not startup_classification and not timeout_classification and not access_restore_classification and terminal_classification in {None, 'workspace_terminal_start_failed'} and not _has_frames(failure) and not any(_has_frames(row) for row in database_errors):
             missing.append('exception_traceback_unavailable')
         if vm_classification and not vm_cause and not any(
                 isinstance(row.get('controller_evidence'), dict) and any(
@@ -1454,7 +1489,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         identity = json.dumps(_evidence(failure), sort_keys=True)
         incidents.append({
             'incident_id': hashlib.sha256(identity.encode()).hexdigest()[:24],
-            'classification': database_classification or access_restore_classification or ('sqlite_lock_contention' if lock else startup_classification or permission_classification or target_classification or vm_classification or timeout_classification or 'operation_error'),
+            'classification': database_classification or access_restore_classification or ('sqlite_lock_contention' if lock else startup_classification or permission_classification or target_classification or vm_classification or timeout_classification or terminal_classification or 'operation_error'),
             'failure': _evidence(failure),
             'nearby_database_errors': [_evidence(row) for row in database_errors[-3:]],
             'last_successful_tool': successful_tool,
@@ -1481,6 +1516,9 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         'database_errors': sum(row.get('event') == 'sqlite_operation_error' or _is_lock(row) or bool(_database_condition(row)) for row in rows),
         'database_operation_errors': counts['sqlite_operation_error'],
         'workspace_database_health_failures': counts['workspace_database_health_failed'],
+        'workspace_terminal_start_failures': counts['workspace_terminal_start_failed'],
+        'project_sync_limit_failures': sum(_terminal_failure_classification(row) in {
+            'project_sync_byte_limit', 'project_sync_entry_limit', 'project_sync_limit_exceeded'} for row in rows),
         'database_corruption_observations': sum(_database_condition(row) == 'sqlite_database_corruption' for row in rows),
         'database_not_database_observations': sum(_database_condition(row) == 'sqlite_not_a_database' for row in rows),
         'incidents': incidents,
@@ -1597,6 +1635,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         *permission_acknowledgement_lines,
         *controller_lines,
         f'Recorded failures in examined logs: {len(failures)} (latest {len(incidents)} shown)',
+        f'Workspace terminal start failures: {index["workspace_terminal_start_failures"]}; project synchronization limit observations: {index["project_sync_limit_failures"]}.',
         f'Event-loop stalls: {counts["event_loop_stall"]}; maximum recorded delay: {max(durations, default=0):.3f}s',
         f'During-stall stack samples: {counts["event_loop_stall_sample"]}',
         f'Transcript refresh deferrals: {counts["transcript_refresh_deferred"]}', '',
@@ -1612,10 +1651,22 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
     for incident in reversed(incidents):
         failure = incident['failure']
         lines.append(f'{failure["timestamp"]}  {failure.get("event", "operation_error")}  [{incident["classification"]}; {failure["session_scope"]} session]')
-        for key in ('run_id', 'call_id', 'workspace_id', 'chat_id'):
+        for key in ('run_id', 'call_id', 'workspace_id', 'chat_id', 'environment_id'):
             if failure.get(key):
                 lines.append(f'  {key}: {failure[key]}')
         classification = incident['classification']
+        if failure.get('event') == 'workspace_terminal_start_failed':
+            descriptions = {
+                'project_sync_byte_limit': 'Project synchronization reached its byte limit before the terminal opened.',
+                'project_sync_entry_limit': 'Project synchronization reached its entry limit before the terminal opened.',
+                'project_sync_limit_exceeded': 'Project synchronization reached its byte or entry limit; this older message does not distinguish which.',
+                'workspace_terminal_start_failed': 'Workspace terminal setup failed; no reviewed fixed cause was recorded.',
+            }
+            lines.append('  ' + descriptions.get(classification, descriptions['workspace_terminal_start_failed']))
+            if failure.get('terminal_mode'):
+                lines.append('  terminal_mode: ' + failure['terminal_mode'])
+            if failure.get('terminal_failure_basis') == 'fixed_message_fingerprint':
+                lines.append('  Cause inferred from a known fixed-message fingerprint and matching character count; error plaintext was not captured.')
         if classification.startswith('workspace_recovery_'):
             lines.append('  Database recovery reported this outcome; private-copy checking, candidate creation, activation and rollback are distinct stages.')
             for key in ('recovery_stage', 'recovery_status', 'recovery_failure_code', 'elapsed_seconds',

@@ -76,7 +76,9 @@ _FAMILIES = {
     'archive': ('archive', 'checksum', 'sha256 mismatch', 'tar:', 'zip'),
     'process': ('exit status', 'exited', 'signal:', 'terminated', 'killed'),
 }
-REASON_CODES = frozenset(_FAMILIES)
+from .terminal_failures import (PROJECT_SYNC_FAILURE_BASES, PROJECT_SYNC_FAILURE_CODES,
+                                terminal_failure_evidence)
+REASON_CODES = frozenset(_FAMILIES) | PROJECT_SYNC_FAILURE_CODES
 
 
 def _path_label(match: re.Match[str]) -> str:
@@ -272,6 +274,10 @@ def technical_error_evidence(value: Any, *, source: str = 'exception') -> dict[s
     # Classification is safe for arbitrary errors: only fixed enums escape.
     lower = text[:MAX_INPUT_CHARS].lower()
     result['reason_codes'] = [code for code, tokens in _FAMILIES.items() if any(token in lower for token in tokens)]
+    project_sync = terminal_failure_evidence(value)
+    if project_sync:
+        result['reason_codes'].append(project_sync['code'])
+        result['project_sync_failure_basis'] = project_sync['basis']
     from .native_faults import native_fault_signature
     native = native_fault_signature(text)
     if native:
@@ -328,6 +334,10 @@ def validate_technical_evidence(value: Any, *, trusted_source: str | None = None
         result['native_fault_class'] = name
     codes = value.get('reason_codes')
     result['reason_codes'] = sorted({code for code in codes if isinstance(code, str) and code in REASON_CODES}) if isinstance(codes, list) else []
+    basis = value.get('project_sync_failure_basis')
+    if (isinstance(basis, str) and basis in PROJECT_SYNC_FAILURE_BASES
+            and any(code in PROJECT_SYNC_FAILURE_CODES for code in result['reason_codes'])):
+        result['project_sync_failure_basis'] = basis
     if source in _TRUSTED and source == trusted_source and isinstance(value.get('diagnostic_text'), str):
         text, omitted, truncated = _sanitize(value['diagnostic_text'], MAX_TECHNICAL_LINES, MAX_TECHNICAL_CHARS)
         if text:

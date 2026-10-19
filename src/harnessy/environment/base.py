@@ -246,6 +246,15 @@ class WorkspaceEnvironment(abc.ABC):
             await self.start()
             return await asyncio.to_thread(self.terminal_command, active_root=active_root)
 
+    async def open_guest_terminal(self) -> tuple[list[str], dict[str, str], Path]:
+        """Open an explicit human console without preparing project files.
+
+        This is separate from model execution and project terminals: callers
+        must not attach a project synchronization watcher to this console.
+        Providers must implement the guest transport; there is no host fallback.
+        """
+        raise RuntimeError('This VM provider does not support a guest console.')
+
     def runtime_identity(self) -> dict[str, Any]:
         """Return cheap, non-blocking lifecycle identity for tool provenance.
 

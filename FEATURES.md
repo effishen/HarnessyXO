@@ -1,4 +1,4 @@
-# HarnessyXO v0.7.2 Features
+# HarnessyXO v0.7.3 Features
 
 ## Named VM environments
 
@@ -12,11 +12,13 @@
 - Shared Linux guests retain the selected-project view and read-only References/ancestor grants. OpenWrt uses explicit project synchronization rather than a host mount; changed source files are checked for conflicts before merging. Independent guest copies never write back automatically; use deploy and collect tools to move project files and results deliberately.
 - The stock OpenWrt 23.05.5 Malta big-endian option uses `mips_24kc`, musl and Linux 5.15.167. Its pinned package feed supplies Python 3.11.7. MIPS uses software CPU emulation on ARM64 and x86-64 hosts; it does not reproduce a particular router's peripherals.
 - Expand optional tools during VM creation or manage them afterward. Show compatible package choices, required integration packages, installed/missing results and explanations for unavailable tools. A saved selection is not proof of a successful installation.
+- Show managed-bundle removal only for presets that support it. Preview the installed bundles currently deselected and confirm the same list before uninstalling them. Deselecting ordinary package-manager tools leaves their installations and dependencies intact.
 - **Enabled for model use** controls whether the model can select or start that VM. Human consoles remain available. Ordinary Shell, Processes, Git and file permissions continue to apply; a VM name or purpose never grants permission.
 - **External Targets** connects existing SSH machines and devices. It has its own access gate and selected-action controls; locally created VMs use VM Environments instead.
 - Set **Allowed projects / chats** on each VM or external target to **All projects / chats** or **Only selected projects / chats**. Selected mode shows individual checkboxes with project names and IDs; no selection blocks every model project. Parent/child and future projects are separate unless All is selected. Saved grants survive renames and ordinary settings changes.
 - The model discovers only VMs/targets available to its own project. Recheck grants for each operation and after approval waits; guessing an ID does not bypass them. Revoking access blocks new commands and process input, while human consoles and cleanup controls remain available. Existing guest data and already running work are not erased by changing grants.
 - Open VM terminals and supported guest graphical interfaces in named main-area tabs. Saved tabs retain their VM identity. Diagnostics retain opaque VM IDs and separate controller evidence for each VM.
+- Open a guest console for OpenWrt, Windows and VMs using separate project copies without copying the workspace first. It starts in the guest home and does not automatically copy files back. Use project tools to deploy or collect files when needed. Shared-source Lima terminals retain their Files view; model commands retain their project-specific views and transfer checks.
 
 ## Workspace startup and VM resources
 

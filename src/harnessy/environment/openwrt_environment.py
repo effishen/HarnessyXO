@@ -894,6 +894,17 @@ python3 -c {shlex.quote(_REPLACE_GUEST_TREE)} {shlex.quote(stage)} {shlex.quote(
             policy['_mutation_conflict_keys'] = ('workspace-terminal:' + workspace.id,)
         return policy
 
+    async def open_guest_terminal(self):
+        """Open a human guest console; never synchronize canonical source."""
+        from .activity import activity
+        with activity(self.workspace_root, 'Opening OpenWrt guest console', environment_id=self.config.id):
+            await self.start()
+            command = ('set -eu\ncd /root\n' + self._guest_work_path_exports()
+                       + '\nexec /bin/ash -i')
+            argv, env = self.controller.command(command)
+            argv[argv.index('-T')] = '-tt'
+            return argv, env, self.workspace_root
+
     async def open_terminal(self, *, active_root=None, output_policy=None, workspace=None):
         await self.start()
         if output_policy is None and workspace is not None:
