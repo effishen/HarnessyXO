@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.7.6
+
+- OpenWrt project terminals now show your username, VM name and current directory instead of the bare `bash-5.2$` prompt. The path updates as you use `cd`.
+- Keep existing custom Bash prompts working. The default applies only to newly opened OpenWrt Bash project terminals; guest consoles, ash-based guests and model command execution keep their existing behavior.
+- Treat VM names as display text, including quotes and shell characters, and remove terminal control characters from the label.
+
 ## v0.7.5
 
 - Keep a completed VM operation completed. Late progress from background file-sharing setup can no longer leave Start spinning on “Installing verified local OpenWrt packages” after the VM and its project files are ready.

@@ -1069,6 +1069,17 @@ python3 -c {shlex.quote(_REPLACE_GUEST_TREE)} {shlex.quote(stage)} {shlex.quote(
     async def open_terminal(self, *, active_root=None, output_policy=None, workspace=None):
         return await self.open_project_terminal(active_root=active_root, output_policy=output_policy, workspace=workspace)
 
+    def _project_terminal_shell(self) -> str:
+        if self._basic_copy:
+            return 'exec /bin/ash -i'
+        # Stock OpenWrt has no Bash rc file to replace its bare bash-5.x$
+        # fallback. Supply an interactive default, while allowing a user's
+        # own .bashrc to override it. Keep the VM label in a separate variable
+        # so prompt expansion never treats a name as shell code.
+        label = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', str(self.config.name)).strip()[:120] or 'OpenWrt'
+        return ('export HARNESSY_VM_NAME=' + shlex.quote(label)
+                + "\nexport PS1='\\u@${HARNESSY_VM_NAME}:\\w\\$ '\nexec /bin/bash -i")
+
     async def open_project_terminal(self, *, active_root=None, output_policy=None, workspace=None):
         self._refresh_file_config()
         await self.start()
@@ -1085,7 +1096,7 @@ python3 -c {shlex.quote(_REPLACE_GUEST_TREE)} {shlex.quote(stage)} {shlex.quote(
         await self._sync(projection)
         self._authorize_model(projection['policy'])
         cwd = '/workspace/' + projection['mounts'][0]['guest'] if projection['mounts'][0]['guest'] else '/workspace'
-        argv, env = self.controller.command(self._command(projection, 'exec /bin/ash -i' if self._basic_copy else 'exec /bin/bash -i', cwd))
+        argv, env = self.controller.command(self._command(projection, self._project_terminal_shell(), cwd))
         argv[argv.index('-T')] = '-tt'
         self._terminal_projections[tuple(argv)] = projection
         return argv, env, self.workspace_root

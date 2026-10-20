@@ -1,4 +1,4 @@
-# HarnessyXO v0.7.5 Features
+# HarnessyXO v0.7.6 Features
 
 ## Named VM environments
 
@@ -12,6 +12,7 @@
 - Use one shared file-access policy for model commands and project-files terminals: own files writable, parent/ancestor files read-only, direct Project Access sources read-only, and References read-only. Read-only VM mode also protects own files. VM selection stays exact per Project / Chat; children do not inherit VM permissions or their parent's extra Project Access grants. [VM_FILES.md](src/harnessy/environment/VM_FILES.md) records the complete contract for current and future providers.
 - Apply VM access, Project Access and parent changes to running VMs. Refresh an affected subtree after reparenting; retain sources still needed by other allowed projects. Show verified runtime state separately from saved access. Busy views show **Unmount pending** until their tasks finish and project terminals close; unrelated projects can continue. Access changes never delete canonical files or independent guest data, and never start a stopped VM.
 - Open a **Project files** terminal for an exact project, with the same file scope as model commands, or choose a **Guest console** for administration without automatic workspace export. Remember each terminal's VM, project and mode; a dead project terminal must be reopened against the current policy.
+- OpenWrt Bash project terminals show your username, VM name and current directory. The path follows `cd`, and an existing custom Bash prompt can override the default.
 - Use live bind views on supported Lima Linux guests and scoped SSHFS on compatible opkg-based OpenWrt guests. OpenWrt serves files on demand over existing SSH, avoiding a whole-project copy before opening the shell. The host enforces read-only inputs and rejects symlinks, multiply linked files and special files. Guest build/cache directories remain available for dependency trees requiring these entries. Windows and the APK-based OpenWrt image remain copy-only; independent copies never write back automatically, and explicit deployment/collection limits still apply.
 - The stock OpenWrt 23.05.5 Malta big-endian option uses `mips_24kc`, musl and Linux 5.15.167. Its pinned package feed supplies Python 3.11.7. MIPS uses software CPU emulation on ARM64 and x86-64 hosts; it does not reproduce a particular router's peripherals.
 - Expand optional tools during VM creation or manage them afterward. Show compatible package choices, required integration packages, installed/missing results and explanations for unavailable tools. A saved selection is not proof of a successful installation.
