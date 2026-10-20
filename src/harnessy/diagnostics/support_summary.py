@@ -58,6 +58,7 @@ _ERROR_EVENTS = frozenset({
     'environment_command_spawn_failed', 'vm_failure_evidence_unavailable', 'run_blocked_by_infrastructure',
     'environment_operation_failed', 'environment_operation_timed_out',
     'workspace_terminal_start_failed',
+    'file_view_reconciliation_failed',
 })
 
 

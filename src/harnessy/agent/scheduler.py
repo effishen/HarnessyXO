@@ -846,6 +846,47 @@ class ProjectMutationCoordinator:
                     self._drop_released_owner(borrowed)
                 self._condition.notify_all()
 
+    @asynccontextmanager
+    async def project_io(
+        self, *, workspace_id: str, project_chat_id: str, conflict_keys: Any,
+        label: str = 'Live project file write',
+    ):
+        """Coordinate a shared file channel by its trusted project origin.
+
+        A FUSE connection serves several guest processes and carries no caller
+        owner ID. Borrow only a current lease for this exact origin which covers
+        every required conflict key. Keep it alive until the file operation has
+        finished, including after its original run releases ownership.
+        """
+        workspace_id, project_chat_id = str(workspace_id), str(project_chat_id)
+        keys = frozenset(str(value) for value in (conflict_keys or ()) if str(value))
+        if not workspace_id or not project_chat_id or project_chat_id not in keys:
+            raise ValueError('Live project writes require an exact project and its conflict keys.')
+        token = uuid.uuid4().hex
+        independent = False
+        async with self._condition:
+            lease = next((candidate for candidate in self._owners.get(workspace_id, {}).values()
+                          if candidate.project_chat_id == project_chat_id
+                          and id(candidate) not in self._released_owners
+                          and keys <= candidate.conflict_keys), None)
+            if lease is not None:
+                self._borrowed[token] = lease
+        if lease is None:
+            lease = await self.acquire(workspace_id=workspace_id, owner_id='project-io-' + token,
+                label=label, conflict_keys=keys, project_chat_id=project_chat_id)
+            self._borrowed[token] = lease
+            independent = True
+        try:
+            yield lease
+        finally:
+            async with self._condition:
+                borrowed = self._borrowed.pop(token, None)
+                if borrowed is not None:
+                    if independent:
+                        self._released_owners.add(id(borrowed))
+                    self._drop_released_owner(borrowed)
+                self._condition.notify_all()
+
     def _drop_released_owner(self, lease: ProjectMutationLease) -> None:
         if id(lease) not in self._released_owners or any(value is lease for value in self._borrowed.values()):
             return

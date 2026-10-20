@@ -60,7 +60,8 @@ class RegistryViewManager:
         return self.controller.desktop_info()
 
     def acquire(self):
-        release = acquire_activity(self.workspace.root, 'VM graphical interface', environment_id=self.environment_id)
+        release = acquire_activity(self.workspace.root, 'VM graphical interface', environment_id=self.environment_id,
+                                   project_id='__guest_console__')
         try:
             release_controller = self.controller.acquire()
         except BaseException:

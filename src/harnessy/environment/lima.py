@@ -25,7 +25,7 @@ from typing import Any
 from harnessy.diagnostics import log_event
 from harnessy.core.outputs import CHAT_OUTPUT_DIR_RE
 
-from .base import EnvironmentConfig, EnvironmentStatus, ExecResult, WorkspaceEnvironment, _validate_registry_path
+from .base import EnvironmentConfig, EnvironmentStatus, ExecResult, WorkspaceEnvironment, _validate_registry_path, FileViewUnavailableError
 from .presets import (
     get_preset, execution_mode,
     GHIDRA_VERSION, GHIDRA_RELEASE_TAG, GHIDRA_RELEASE_FILE,
@@ -69,7 +69,8 @@ class _LimaDesktopView:
         return (await self.provider.status()).to_dict()
 
     def acquire(self):
-        return acquire_activity(self.provider.workspace_root, 'VM graphical view', environment_id=self.environment_id)
+        return acquire_activity(self.provider.workspace_root, 'VM graphical view',
+                                environment_id=self.environment_id, project_id='__guest_console__')
 
     def desktop_info(self):
         if not self.provider.config.desktop:
@@ -217,6 +218,9 @@ def _lifecycle_diagnostics(action: str):
                 log_event('runtime', 'vm_lifecycle_finished', workspace=str(self.workspace_root),
                           provider='lima', lifecycle_action=action, outcome='completed',
                           elapsed_seconds=max(0.0, time.monotonic() - started), **fields)
+                if action in {'create', 'start', 'stop', 'reset', 'rebuild', 'restore', 'destroy'}:
+                    from .file_views import FILE_VIEWS
+                    FILE_VIEWS.request(self.workspace_root, reason='vm_' + action, environment_id=self.config.id)
                 return result
         return observed
     return decorate
@@ -3766,13 +3770,21 @@ print(json.dumps(facts))
         if not str(command or '').strip():
             raise ValueError('command must not be empty')
         self._authorize_model_project(output_policy)
-        with activity(self.workspace_root, 'Guest command', environment_id=self.config.id):
+        project_id = (output_policy or {}).get('_model_project_id') or (output_policy or {}).get('_human_project_id')
+        owner_id = str((output_policy or {}).get('_file_view_owner_id') or '')
+        with activity(self.workspace_root, 'Guest command', environment_id=self.config.id, project_id=project_id, owner_id=owner_id):
+            await self._ensure_running()
+            if project_id:
+                from .file_views import FILE_VIEWS
+                verified = await FILE_VIEWS.ensure_project(self.workspace_root, environment_id=self.config.id,
+                    project_id=project_id, owner_id=owner_id, human='_human_project_id' in output_policy)
+                if verified['policy_revision'] != output_policy.get('policy_revision'):
+                    raise FileViewUnavailableError('Project file policy changed before this command could start.', 'FILE_VIEW_POLICY_CHANGED')
             if self.config.files_mode == 'copy':
                 await asyncio.to_thread(self._prepare_project_copy, active_root, output_policy)
             view_command = self._workspace_view_command(
                 command, cwd=cwd, active_root=active_root, output_policy=output_policy,
             )
-            await self._ensure_running()
             self._authorize_model_project(output_policy)
             started = time.perf_counter()
             rc, stdout, stderr = await self._run(
@@ -3800,14 +3812,24 @@ print(json.dumps(facts))
         if not str(command or '').strip():
             raise ValueError('command must not be empty')
         self._authorize_model_project(output_policy)
-        release = acquire_activity(self.workspace_root, 'Guest process', environment_id=self.config.id)
+        project_id = (output_policy or {}).get('_model_project_id') or (output_policy or {}).get('_human_project_id')
+        owner_id = str((output_policy or {}).get('_file_view_owner_id') or '')
+        # A running job must never be exempted by a later call from this run.
+        release = acquire_activity(self.workspace_root, 'Guest process', environment_id=self.config.id,
+                                   project_id=project_id, owner_id=owner_id)
         try:
+            await self._ensure_running()
+            if project_id:
+                from .file_views import FILE_VIEWS
+                verified = await FILE_VIEWS.ensure_project(self.workspace_root, environment_id=self.config.id,
+                    project_id=project_id, owner_id=owner_id, human='_human_project_id' in output_policy)
+                if verified['policy_revision'] != output_policy.get('policy_revision'):
+                    raise FileViewUnavailableError('Project file policy changed before this process could start.', 'FILE_VIEW_POLICY_CHANGED')
             if self.config.files_mode == 'copy':
                 await asyncio.to_thread(self._prepare_project_copy, active_root, output_policy)
             view_command = self._workspace_view_command(
                 command, cwd=cwd, active_root=active_root, output_policy=output_policy,
             )
-            await self._ensure_running()
             self._authorize_model_project(output_policy)
             binary = self._binary()
             argv = [
@@ -3819,6 +3841,10 @@ print(json.dumps(facts))
                 *argv, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE, env=self._host_env(),
             )
+            process_release = acquire_activity(self.workspace_root, 'Running guest process',
+                environment_id=self.config.id, project_id=project_id, owner_id=uuid.uuid4().hex)
+            release()
+            release = process_release
         except BaseException:
             release()
             raise
@@ -4163,9 +4189,195 @@ print(json.dumps(facts))
         self._record_lifecycle('destroyed')
         log_event('harnessy', 'vm_destroyed', workspace=str(self.workspace_root))
 
+    def file_view_capabilities(self) -> dict[str, Any]:
+        return {'supported_modes': ('live', 'readonly', 'copy'),
+                'transport': 'copy' if self.config.files_mode == 'copy' else 'bind',
+                'runtime_mounts': self.config.files_mode != 'copy', 'project_isolation': True,
+                'readonly_inputs': True, 'reconcile': True, 'project_terminal': True, 'composite': True,
+                'persistent_project_namespace': self.config.files_mode != 'copy'}
+
+    def _file_view_records(self) -> dict[str, Any]:
+        path = self.state_root / 'lima-file-views.json'
+        _validate_registry_path(path, self.workspace_root)
+        try:
+            if path.stat().st_size > 1024 * 1024:
+                raise RuntimeError('Lima file-view metadata is oversized.')
+            value = json.loads(path.read_text())
+            return value if isinstance(value, dict) else {}
+        except FileNotFoundError:
+            return {}
+
+    def _save_file_view_records(self, records):
+        path = self.state_root / 'lima-file-views.json'
+        _validate_registry_path(path, self.workspace_root)
+        temporary = path.with_name('.lima-file-views-' + uuid.uuid4().hex + '.tmp')
+        try:
+            with temporary.open('x', encoding='utf-8') as stream:
+                json.dump(records, stream, sort_keys=True)
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    async def _retire_project_view(self, folder: str):
+        if not CHAT_OUTPUT_DIR_RE.fullmatch(folder):
+            raise RuntimeError('Invalid project file-view identity.')
+        digest = hashlib.sha256(f'{self.environment_root.resolve()}\0{folder}'.encode()).hexdigest()[:16]
+        state_key = folder.lower() + '-' + digest
+        script = f'''set -euo pipefail
+state_dir={PERSISTENT_VIEW_STATE_GUEST_PATH}/{state_key}
+[ ! -L "$state_dir" ] || exit 72
+[ -d "$state_dir" ] || exit 0
+for name in pid token signature ready; do [ ! -L "$state_dir/$name" ] || exit 72; done
+if [ -s "$state_dir/pid" ] && [ -s "$state_dir/token" ]; then
+  old_pid=$(cat "$state_dir/pid"); old_token=$(cat "$state_dir/token")
+  case "$old_pid" in *[!0-9]*|'') exit 72 ;; esac
+  if [ -r "/proc/$old_pid/cmdline" ]; then
+    first=$(tr '\\000' '\\n' <"/proc/$old_pid/cmdline" | head -n 1)
+    [ "$first" = "harnessy-project-view-$old_token" ] || exit 72
+    kill -TERM "$old_pid" 2>/dev/null || true
+    for attempt in $(seq 1 40); do kill -0 "$old_pid" 2>/dev/null || break; sleep 0.05; done
+    if kill -0 "$old_pid" 2>/dev/null; then
+      first=$(tr '\\000' '\\n' <"/proc/$old_pid/cmdline" | head -n 1)
+      [ "$first" = "harnessy-project-view-$old_token" ] || exit 72
+      kill -KILL "$old_pid"
+    fi
+  fi
+fi
+rm -f "$state_dir/pid" "$state_dir/token" "$state_dir/signature" "$state_dir/ready" "$state_dir/start.failure"
+'''
+        await self._run('shell', '--workdir', '/', self.INSTANCE, 'sudo', '/bin/bash', '-c', script, timeout=15, check=True)
+
+    async def _probe_project_view(self, policy: dict[str, Any]) -> bool:
+        """Verify a retained view without repairing or interrupting its work."""
+        folder = policy['writable_folder']
+        digest = hashlib.sha256(f'{self.environment_root.resolve()}\0{folder}'.encode()).hexdigest()[:16]
+        paths = ['/workspace/Files/' + folder, '/workspace/Files/References']
+        paths.extend('/workspace/Files/' + folder + '/' + row['nested_path'] for row in policy['ancestors'])
+        paths.extend('/workspace/Files/' + row['folder'] for row in policy['access_projects'] if row['direct_mount'])
+        probe = ('set -eu\n' + '\n'.join('/usr/bin/mountpoint -q ' + shlex.quote(path) for path in paths)
+                 + '\n! /usr/bin/mountpoint -q ' + FILES_BACKING_GUEST_PATH
+                 + '\n! /usr/bin/mountpoint -q ' + PRIVATE_WORKTREES_GUEST_PATH)
+        script = f'''set -euo pipefail
+state_dir={PERSISTENT_VIEW_STATE_GUEST_PATH}/{folder.lower()}-{digest}
+[ ! -L "$state_dir" ] || exit 72
+for name in pid token signature; do [ -s "$state_dir/$name" ] && [ ! -L "$state_dir/$name" ] || exit 72; done
+pid=$(cat "$state_dir/pid"); token=$(cat "$state_dir/token")
+case "$pid" in *[!0-9]*|'') exit 72 ;; esac
+first=$(tr '\\000' '\\n' <"/proc/$pid/cmdline" | head -n 1)
+[ "$first" = "harnessy-project-view-$token" ] || exit 72
+exec /usr/bin/nsenter --target "$pid" --mount --pid -- /bin/bash -c {shlex.quote(probe)}
+'''
+        rc, _, _ = await self._run('shell', '--workdir', '/', self.INSTANCE, 'sudo', '/bin/bash', '-c',
+                                   script, timeout=12, check=False)
+        return rc == 0
+
+    async def reconcile_file_views(self, plan: dict[str, Any]) -> dict[str, Any]:
+        from .activity import reserve_project_view_change
+        from harnessy.core.project_mounts import build_project_policy
+        from .file_views import FILE_VIEWS, finish_file_view_work
+        workspace = FILE_VIEWS.cached_workspace(self.workspace_root)
+        if workspace is None or plan.get('environment_id') != self.config.id:
+            raise RuntimeError('Project file plan identity could not be verified.')
+        records = self._file_view_records()
+        boot_id = str(self._read_readiness().get('boot_id') or '')
+        if records.get('boot_id') != boot_id:
+            records = {'boot_id': boot_id, 'projects': {}}
+        actual = records.setdefault('projects', {})
+        desired = {row['project_id']: row for row in plan['projects']}
+        known = {row['project_id']: row for row in plan['known_projects']}
+        rows, pending, errors = [], [], []
+        verified = getattr(self, '_verified_file_views', set())
+        self._verified_file_views = verified
+        for project_id, row in known.items():
+            target = desired.get(project_id)
+            policy = target['policy'] if target else None
+            previous = actual.get(project_id, {})
+            revision = policy['policy_revision'] if policy else ''
+            if self.config.files_mode == 'copy':
+                # Preserve independent copies; selecting access never refreshes
+                # or deletes them. Explicit project operations deploy as before.
+                rows.append({'project_id': project_id, 'folder': row['folder'],
+                             'state': 'ready' if target else 'removed',
+                             'policy_revision': revision,
+                             'detail': 'Independent project copy; deployment and collection are explicit.'})
+                continue
+            marker = (project_id, revision, boot_id)
+            if target and previous.get('policy_revision') == revision and boot_id:
+                try:
+                    present = marker in verified or await self._probe_project_view(policy)
+                except Exception:
+                    present = False
+                if present:
+                    verified.add(marker)
+                    rows.append({'project_id': project_id, 'folder': row['folder'], 'state': 'ready', 'policy_revision': revision})
+                    continue
+            if not target and previous.get('removed') and boot_id:
+                rows.append({'project_id': project_id, 'folder': row['folder'], 'state': 'removed'})
+                continue
+            try:
+                release = reserve_project_view_change(self.workspace_root, environment_id=self.config.id,
+                    project_id=project_id, owner_id=str(plan.get('_owner_id') or ''))
+            except RuntimeError as exc:
+                pending.append(project_id)
+                rows.append({'project_id': project_id, 'folder': row['folder'], 'state': 'pending', 'detail': str(exc)})
+                continue
+            try:
+                if target:
+                    fresh = await finish_file_view_work(build_project_policy, workspace, project_id)
+                    if fresh['policy_revision'] != revision:
+                        raise RuntimeError('Project source policy changed while preparing its mount view.')
+                    command = self._workspace_view_command(':', cwd='/workspace/Files/' + row['folder'],
+                        active_root=Path(policy['project_root']), output_policy=policy)
+                    await self._run('shell', '--workdir', '/', self.INSTANCE, '/bin/bash', '-lc',
+                                    command, timeout=45, check=True)
+                    fresh = await finish_file_view_work(build_project_policy, workspace, project_id)
+                    if fresh['policy_revision'] != revision:
+                        raise RuntimeError('Project source identities changed while mounting its view.')
+                    actual[project_id] = {'folder': row['folder'], 'policy_revision': revision}
+                    verified.add(marker)
+                    rows.append({'project_id': project_id, 'folder': row['folder'], 'state': 'ready', 'policy_revision': revision})
+                else:
+                    await self._retire_project_view(row['folder'])
+                    actual[project_id] = {'folder': row['folder'], 'removed': True}
+                    verified.difference_update(item for item in tuple(verified) if item[0] == project_id)
+                    rows.append({'project_id': project_id, 'folder': row['folder'], 'state': 'removed'})
+            except Exception as exc:
+                errors.append(project_id)
+                rows.append({'project_id': project_id, 'folder': row['folder'], 'state': 'error',
+                             'error_code': 'FILE_VIEW_MOUNT_FAILED', 'detail': str(exc)[:500]})
+            finally:
+                release()
+        self._save_file_view_records(records)
+        return {'state': 'error' if errors else 'pending' if pending else 'ready', 'revision': plan['revision'],
+                'projects': rows, 'pending_project_ids': pending,
+                'error_code': 'FILE_VIEW_MOUNT_FAILED' if errors else '',
+                'detail': 'Unmount pending: finish affected project work.' if pending else 'Project file views verified.'}
+
+    async def open_project_terminal(self, *, active_root: Path, output_policy: dict[str, Any], workspace=None):
+        self._authorize_model_project(output_policy)
+        await self._ensure_running()
+        from .file_views import FILE_VIEWS
+        project_id = output_policy.get('_human_project_id') or output_policy.get('_model_project_id')
+        if not project_id:
+            raise RuntimeError('A project-files terminal requires an authoritative project identity.')
+        verified = await FILE_VIEWS.ensure_project(self.workspace_root, environment_id=self.config.id,
+            project_id=project_id, owner_id=str(output_policy.get('_file_view_owner_id') or ''),
+            human='_human_project_id' in output_policy)
+        if verified['policy_revision'] != output_policy.get('policy_revision'):
+            raise FileViewUnavailableError('Project file policy changed before this terminal could start.', 'FILE_VIEW_POLICY_CHANGED')
+        if self.config.files_mode == 'copy':
+            await asyncio.to_thread(self._prepare_project_copy, active_root, output_policy)
+        self._authorize_model_project(output_policy)
+        from harnessy.core.terminal import guest_activity_shell_command
+        command = self._workspace_view_command(guest_activity_shell_command(),
+            cwd='/workspace/Files/' + output_policy['writable_folder'], active_root=active_root, output_policy=output_policy)
+        return ([self._binary(), 'shell', '--workdir', '/', self.INSTANCE, '/bin/bash', '-lc', command],
+                self._host_env(), self.workspace_root)
+
     async def open_guest_terminal(self) -> tuple[list[str], dict[str, str], Path]:
         """Open a human guest-home console without deploying project files."""
-        with activity(self.workspace_root, 'Opening VM guest console', environment_id=self.config.id):
+        with activity(self.workspace_root, 'Opening VM guest console', environment_id=self.config.id,
+                      project_id='__guest_console__'):
             await self.start()
             return await asyncio.to_thread(self._guest_terminal_command)
 

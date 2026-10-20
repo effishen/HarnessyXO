@@ -57,6 +57,8 @@ class EnvironmentManager:
     def __init__(self, workspace_root: str | Path, environment_id: str | None = None) -> None:
         self.workspace_root = Path(workspace_root).expanduser().resolve()
         self._selection = str(environment_id) if environment_id is not None else None
+        from .file_views import FILE_VIEWS
+        FILE_VIEWS.observe(self.workspace_root)
 
     def list(self) -> list[EnvironmentConfig]:
         registry = self.workspace_root / '.harnessy' / 'environments'
@@ -215,6 +217,9 @@ class EnvironmentManager:
                     self._mark_tools_pending(cfg)
                 save_environment_config(self.workspace_root, cfg)
                 clear_environment_provider_cache(self.workspace_root, cfg.id)
+                if (cfg.enabled, cfg.project_access, cfg.allowed_project_ids) != (original.enabled, original.project_access, original.allowed_project_ids):
+                    from .file_views import FILE_VIEWS
+                    FILE_VIEWS.request(self.workspace_root, reason='vm_project_access_changed', environment_id=cfg.id)
                 if preset_changed:
                     from .status import ENVIRONMENT_STATUS
                     ENVIRONMENT_STATUS.invalidate(self.workspace_root, environment_id=cfg.id)
@@ -264,6 +269,8 @@ class EnvironmentManager:
         if not verified_stopped and ((root / 'vm' / 'lima' / 'harnessy').exists()
                                      or (root / 'vm' / 'qemu.pid').exists()):
             raise RuntimeError('Stop and destroy the selected VM before removing its environment.')
+        from .file_views import FILE_VIEWS
+        FILE_VIEWS.forget_environment(self.workspace_root, environment_id=cfg.id)
         shutil.rmtree(root)
         clear_environment_provider_cache(self.workspace_root, cfg.id)
 

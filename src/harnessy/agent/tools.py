@@ -45,6 +45,9 @@ from .external_targets import ExternalTargetBroker, ExternalTargetError, target_
 from harnessy.core.target_policy import TARGET_ACTION_LABELS
 
 ToolHandler = Callable[[dict[str, Any]], Awaitable[str]]
+_FILE_VIEW_OWNER: ContextVar[str] = ContextVar('tool_file_view_owner', default='')
+_FILE_VIEW_ERRORS = frozenset({'FILE_VIEW_PENDING', 'FILE_VIEW_UNSUPPORTED',
+                              'FILE_VIEW_FAILED', 'FILE_VIEW_POLICY_CHANGED'})
 
 
 @dataclass(frozen=True, slots=True)
@@ -397,7 +400,13 @@ class WorkspaceToolbox:
             raise VMEnvironmentAccessError('This VM environment is unavailable for model use.', 'VM_ENVIRONMENT_DISABLED')
         if not config.allows_project(self.chat_id):
             raise VMEnvironmentAccessError('This VM environment is not available to this Project/Chat. Only the user can change its allowed projects.')
-        return manager.provider(config)
+        provider = manager.provider(config)
+        capabilities = provider.file_view_capabilities()
+        if config.files_mode not in capabilities.get('supported_modes', ()):
+            raise VMEnvironmentAccessError(
+                'This VM provider has not implemented the requested project-files mode. '
+                'Choose a supported mode or another VM.', 'VM_FILE_VIEW_UNSUPPORTED')
+        return provider
 
     def _refresh_project_namespace(self) -> None:
         self.output_folders = set(self.output_policy.get('folders') or ())
@@ -435,7 +444,7 @@ class WorkspaceToolbox:
         cwd: str,
         timeout: float | None,
     ):
-        """Run in the selected workspace view while preserving old providers."""
+        """Run in the selected workspace view with its required source policy."""
         if self.environment is None:
             raise RuntimeError('Workspace environment is unavailable')
         self._resolve_vm_environment(self.environment_id)
@@ -443,25 +452,19 @@ class WorkspaceToolbox:
             'cwd': cwd,
             'timeout': timeout,
             'active_root': self.root,
+            'output_policy': self._environment_output_policy(),
         }
-        try:
-            parameters = inspect.signature(self.environment.exec).parameters.values()
-            accepts_policy = any(
-                parameter.name == 'output_policy'
-                or parameter.kind is inspect.Parameter.VAR_KEYWORD
-                for parameter in parameters
-            )
-        except (TypeError, ValueError):
-            accepts_policy = True
-        if accepts_policy:
-            kwargs['output_policy'] = self._environment_output_policy()
         return await self.environment.exec(command, **kwargs)
 
     def _environment_output_policy(self) -> dict[str, Any]:
         # Private synchronization provenance. A provider returning guest edits
         # must coordinate against the same project writer as canonical tools.
+        # Do not retain a run-start grant or ancestor chain for a later VM call.
+        self.output_policy = self.workspace.output_policy(self.chat_id)
+        self._refresh_project_namespace()
         return {**self.output_policy,
                 '_model_project_id': self.chat_id,
+                '_file_view_owner_id': _FILE_VIEW_OWNER.get(),
                 '_mutation_workspace_id': self.workspace.id,
                 '_mutation_owner_id': self._mutation_owner_id,
                 '_mutation_conflict_keys': sorted(self.workspace.project_conflict_ids(self.chat_id)),
@@ -470,12 +473,15 @@ class WorkspaceToolbox:
 
     def _execution_view(self) -> dict[str, Any]:
         environment = self.environment
-        persistent_mounts = environment is not None and environment.config.provider == 'lima'
+        capabilities = environment.file_view_capabilities() if environment is not None else {}
+        persistent_mounts = bool(capabilities.get('runtime_mounts'))
+        persistent_namespace = bool(capabilities.get('persistent_project_namespace'))
         mode = environment.config.files_mode if environment is not None else None
         runtime = self._runtime_identity()
         return {
             'working_directory_enforced': True,
-            'mount_namespace': 'project-persistent' if persistent_mounts else 'provider-specific',
+            'mount_namespace': ('project-persistent' if persistent_namespace else
+                                'project-per-command' if capabilities.get('project_isolation') else 'guest-disk'),
             'bridge_mode': runtime.get('bridge_mode', 'mounted-project' if persistent_mounts else 'guest-project-bridge'),
             'project_files_mode': mode,
             'canonical_source_shared': mode in {'live', 'readonly'},
@@ -483,6 +489,7 @@ class WorkspaceToolbox:
             'guest_access_scope': 'whole-vm-administration' if mode == 'copy' else 'authorized-project-view',
             'guest_data_persists_between_projects': mode == 'copy',
             'mounts_persist_across_commands': persistent_mounts,
+            'file_view_capabilities': capabilities,
             'mounts_survive_vm_restart': False,
             'runtime_mount_visibility': 'vm-shell-only-overlay' if persistent_mounts else 'guest-runtime-only',
         }
@@ -1626,16 +1633,20 @@ class WorkspaceToolbox:
                 record['result'] = blocked
                 return blocked
             execution_started = time.perf_counter()
+            file_view_owner = uuid.uuid4().hex
+            file_view_token = _FILE_VIEW_OWNER.set(file_view_owner)
             try:
                 lifecycle_tool = name in {'vm_environment_control', 'vm_deploy_project'}
                 tool_activity = (nullcontext() if lifecycle_tool else activity(
-                    self.workspace.root, f'Tool · {name}', environment_id=self.environment_id or '__project_files__'))
+                    self.workspace.root, f'Tool · {name}', environment_id=self.environment_id or '__project_files__',
+                    project_id=self.chat_id, owner_id=file_view_owner))
                 with tool_activity, memory_origin(
                     self.workspace.root, chat_id=self.chat_id, run_id=self.run_id,
                     tool=name, tool_call_id=self.tool_call_id,
                 ) as memory_scope:
                     result = await handler(arguments)
             finally:
+                _FILE_VIEW_OWNER.reset(file_view_token)
                 record['execution_duration_seconds'] = max(0.0, time.perf_counter() - execution_started)
             record['memory_event_ids'] = [event['id'] for event in memory_scope['events']]
             ok = True
@@ -1655,7 +1666,7 @@ class WorkspaceToolbox:
             record.update(status='cancelled')
             raise
         except Exception as exc:
-            if getattr(exc, 'error_code', '') in {'VM_PROJECT_ACCESS_DENIED', 'VM_ENVIRONMENT_DISABLED'}:
+            if getattr(exc, 'error_code', '') in _FILE_VIEW_ERRORS | {'VM_PROJECT_ACCESS_DENIED', 'VM_ENVIRONMENT_DISABLED', 'VM_FILE_VIEW_UNSUPPORTED'}:
                 error_code = exc.error_code
             elif isinstance(exc, WorkspaceMappingError):
                 error_code = str(exc.details.get('error_code') or 'WORKSPACE_MAPPING_PROBE_FAILED')
@@ -1676,9 +1687,21 @@ class WorkspaceToolbox:
             payload: dict[str, Any] = {
                 'ok': False, 'error_code': error_code, 'error': f'{type(exc).__name__}: {exc}',
             }
-            if error_code in {'VM_PROJECT_ACCESS_DENIED', 'VM_ENVIRONMENT_DISABLED'}:
+            if error_code in {'VM_PROJECT_ACCESS_DENIED', 'VM_ENVIRONMENT_DISABLED', 'VM_FILE_VIEW_UNSUPPORTED'}:
                 payload.update(command_started=False, policy_denied=True,
                                environment_id=self.environment_id)
+            if error_code in _FILE_VIEW_ERRORS:
+                payload.update(command_started=False, write_applied=False, environment_id=self.environment_id,
+                               retry_after_reconciliation=error_code in {'FILE_VIEW_PENDING', 'FILE_VIEW_POLICY_CHANGED'})
+                payload['next_model_action'] = (
+                    'Finish or stop this project’s owned jobs and close its project-files terminals, then retry after its file view is ready.'
+                    if error_code == 'FILE_VIEW_PENDING' else
+                    'Wait for the current file policy to finish reconciling, then retry.'
+                    if error_code == 'FILE_VIEW_POLICY_CHANGED' else
+                    'Choose a VM which supports the required project file scope.'
+                    if error_code == 'FILE_VIEW_UNSUPPORTED' else
+                    'Report the file-view setup error and use Retry file views in this VM’s environment card.'
+                )
             if isinstance(exc, WorkspaceMappingError):
                 payload.update(exc.details)
                 payload['infrastructure_ok'] = False
@@ -2101,6 +2124,7 @@ class WorkspaceToolbox:
             getattr(getattr(self.environment, 'config', None), 'files_mode', None),
             runtime.get('vm_generation'),
             runtime.get('vm_boot_id'),
+            self.output_policy.get('policy_revision'),
         )
 
     def _file_identity_args(self, path: Path) -> dict[str, Any]:
@@ -2423,7 +2447,8 @@ class WorkspaceToolbox:
                     'message': 'Commands use this VM\'s independent project copy. File tools use canonical workspace files. Deploy/collect explicitly.',
                     'workspace_state': self._workspace_state(view='independent-vm-copy', mapping_verified=False)}
 
-        synchronized = self.environment.config.provider == 'openwrt'
+        synchronized = (self.environment.config.provider == 'openwrt'
+                        and self._runtime_identity().get('files_bridge') not in {'sshfs', 'sshfs-passive'})
         success_status = 'VERIFIED_SYNCHRONIZED_PROJECT' if synchronized else 'VERIFIED_SAME_STORAGE'
 
         cache_key = self._mapping_cache_identity()
@@ -2478,7 +2503,7 @@ class WorkspaceToolbox:
                     )
                     break
                 except Exception as exc:
-                    if getattr(exc, 'error_code', '') in {'VM_PROJECT_ACCESS_DENIED', 'VM_ENVIRONMENT_DISABLED'}:
+                    if getattr(exc, 'error_code', '') in _FILE_VIEW_ERRORS | {'VM_PROJECT_ACCESS_DENIED', 'VM_ENVIRONMENT_DISABLED'}:
                         raise
                     probe_error = (
                         'WORKSPACE_MAPPING_PROBE_FAILED',
@@ -3489,13 +3514,28 @@ class WorkspaceToolbox:
             raise ValueError('Select environment_id explicitly.')
         from harnessy.environment.operations import ENVIRONMENT_OPERATIONS
         from harnessy.environment.status import ENVIRONMENT_STATUS
+        from harnessy.environment.file_views import FILE_VIEWS
         inspection = await ENVIRONMENT_STATUS.get(self.workspace.root, environment_id=self.environment_id) or {}
+        file_status = FILE_VIEWS.status(self.workspace.root, environment_id=self.environment_id)
+        own_view = next((row for row in file_status.get('projects', ())
+                         if row.get('project_id') == self.chat_id), {})
+        # Other projects may be mounting or pending independently. Do not
+        # expose their IDs/details or let their state replace this origin's.
+        scoped_file_status = {key: own_view[key] for key in
+                              ('state', 'policy_revision', 'detail', 'error_code') if key in own_view}
+        if not own_view:
+            scoped_file_status['state'] = file_status.get('state') or 'unavailable'
+        elif (own_view.get('state') == 'ready'
+              and own_view.get('policy_revision') != self.output_policy.get('policy_revision')):
+            scoped_file_status['state'] = 'pending'
+        scoped_file_status['capabilities'] = self.environment.file_view_capabilities()
         safe_fields = {'status', 'guest', 'capabilities', 'guest_identity', 'verified_guest', 'tool_status',
                        'optional_tools', 'unavailable_tools', 'files_bridge',
                        'hardware_emulation', 'bridge_mode', 'shared_files', 'readiness'}
         return json.dumps({'ok': True,
                            'verified_observations': {key: value for key, value in inspection.items() if key in safe_fields},
                            'runtime_identity': self._runtime_identity(),
+                           'project_file_view': scoped_file_status,
                            'operation': ENVIRONMENT_OPERATIONS.state(
                                self.workspace.root, environment_id=self.environment_id).to_dict()}, ensure_ascii=False)
 

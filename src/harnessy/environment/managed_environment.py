@@ -17,6 +17,7 @@ import shutil
 import tarfile
 import time
 import unicodedata
+import uuid
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any
@@ -29,6 +30,10 @@ from .test_catalog import guest_os
 from .test_targets import TestTargetManager, normalize_vm_config
 
 _LOCKS: dict[tuple[str, int], asyncio.Lock] = {}
+
+
+class _UnsupportedProjectFiles(RuntimeError):
+    error_code = 'VM_FILE_VIEW_UNSUPPORTED'
 
 
 class _ManagedController(TestTargetManager):
@@ -89,7 +94,7 @@ class _ManagedController(TestTargetManager):
 
     def acquire(self):
         release_environment = acquire_activity(self.owner.workspace_root, 'Windows graphical view',
-                                               environment_id=self.environment_id)
+                                               environment_id=self.environment_id, project_id='__guest_console__')
         try:
             release_controller = super().acquire()
         except BaseException:
@@ -111,6 +116,32 @@ class _ManagedController(TestTargetManager):
 
 class ManagedEnvironment(WorkspaceEnvironment):
     TIMEOUT_START = 120.0
+
+    def file_view_capabilities(self) -> dict[str, Any]:
+        # A deployed Windows tree is not a revocable live share. Keep this
+        # explicit so a new UI or model path cannot mistake it for one.
+        return {'transport': 'copy', 'supported_modes': ('copy',),
+                'runtime_mounts': False, 'reconcile': False,
+                'project_isolation': False, 'readonly_inputs': False,
+                'project_terminal': False, 'composite': False}
+
+    async def reconcile_file_views(self, plan: dict[str, Any]) -> dict[str, Any]:
+        # Retained guest copies are deliberate user data. An ACL change never
+        # removes or relabels them as an unmounted source.
+        return {'state': 'unsupported', 'error_code': 'FILE_VIEW_UNSUPPORTED',
+                'detail': 'Windows uses independent guest copies. Live project views and runtime unmounting are unavailable.',
+                'projects': [], 'pending_project_ids': []}
+
+    def _require_copy_policy(self, policy: dict[str, Any] | None) -> None:
+        if not policy:
+            return
+        references = self.files_root / 'References'
+        has_references = next(references.iterdir(), None) is not None
+        if policy.get('ancestors') or policy.get('access_projects') or has_references:
+            raise _UnsupportedProjectFiles(
+                'This Windows integration can deploy only the owned project copy. '
+                'It cannot provide this project’s read-only References, ancestor or Project Access inputs. '
+                'Use a VM with scoped project views, or prepare an independent project containing the required inputs.')
 
     def __init__(self, workspace_root: Path, config: EnvironmentConfig) -> None:
         super().__init__(workspace_root, config)
@@ -379,6 +410,7 @@ class ManagedEnvironment(WorkspaceEnvironment):
 
     async def _deploy(self, active_root: Path, *, refresh: bool, output_policy: dict[str, Any] | None = None) -> dict[str, Any]:
         self._authorize_model_project(output_policy)
+        self._require_copy_policy(output_policy)
         destination = self.project_guest_root(active_root)
         key = str(self.environment_root) + '|' + destination, id(asyncio.get_running_loop())
         async with _LOCKS.setdefault(key, asyncio.Lock()):
@@ -448,7 +480,9 @@ finally {
             raise ValueError('command must not be empty')
         self._authorize_model_project(output_policy)
         root = Path(active_root or self.files_root)
-        with activity(self.workspace_root, 'Windows command', environment_id=self.config.id):
+        with activity(self.workspace_root, 'Windows command', environment_id=self.config.id,
+                      project_id=(output_policy or {}).get('_model_project_id'),
+                      owner_id=str((output_policy or {}).get('_file_view_owner_id') or '')):
             await self._deploy(root, refresh=False, output_policy=output_policy)
             script = self._command_script(command, cwd, root)
             self._authorize_model_project(output_policy)
@@ -460,7 +494,8 @@ finally {
                     output_policy: dict[str, Any] | None = None) -> asyncio.subprocess.Process:
         self._authorize_model_project(output_policy)
         root = Path(active_root or self.files_root)
-        release = acquire_activity(self.workspace_root, 'Windows process', environment_id=self.config.id)
+        release = acquire_activity(self.workspace_root, 'Windows process', environment_id=self.config.id,
+                                   project_id=(output_policy or {}).get('_model_project_id'), owner_id=uuid.uuid4().hex)
         try:
             await self._deploy(root, refresh=False, output_policy=output_policy)
             script = self._command_script(command, cwd, root)
@@ -480,7 +515,8 @@ finally {
 
     async def open_guest_terminal(self):
         """Open a human PowerShell console without deploying project files."""
-        with activity(self.workspace_root, 'Opening Windows guest console', environment_id=self.config.id):
+        with activity(self.workspace_root, 'Opening Windows guest console', environment_id=self.config.id,
+                      project_id='__guest_console__'):
             await self._ensure_running()
             setup = ("$ErrorActionPreference='Stop'; " + self._guest_work_path_powershell(None)
                      + '; Set-Location -LiteralPath $env:USERPROFILE')
@@ -558,6 +594,7 @@ finally {
         state = await self.status()
         return {'environment_id': self.config.id, 'environment_name': self.config.name,
                 'config': self.config.to_dict(), 'status': state.to_dict(),
+                'file_view_capabilities': self.file_view_capabilities(),
                 'runtime_identity': self.runtime_identity(), 'snapshots': await self.list_snapshots(),
                 'durable_vm_root': str(self.controller.home), 'guest_files_root': 'C:/harnessy/workspace',
                 'vm_type': 'qemu', 'mount_type': 'separate-copy',

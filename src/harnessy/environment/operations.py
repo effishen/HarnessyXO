@@ -623,6 +623,8 @@ class EnvironmentOperationRegistry:
                     raise RuntimeError('Stop this VM and verify that it is stopped before removing it.')
                 check_model_access()
                 set_phase('removal_destroying', 'Removing this VM’s disk, snapshots and configuration…')
+                from .file_views import FILE_VIEWS
+                await FILE_VIEWS.close_environment(workspace_root, environment_id=environment_id)
                 await provider.destroy()
                 EnvironmentManager(workspace_root).remove(environment_id)
                 return None
@@ -754,6 +756,9 @@ class EnvironmentOperationRegistry:
                 duration_seconds=duration_seconds, **fields,
             )
             log_event('harnessy', 'environment_action_complete', workspace=str(workspace_root), environment_id=environment_id, action=action)
+            if action in {'create', 'start', 'stop', 'reset', 'rebuild', 'restore'}:
+                from .file_views import FILE_VIEWS
+                FILE_VIEWS.request(workspace_root, reason='vm_operation_' + action, environment_id=environment_id)
         except EnvironmentModelAccessError as exc:
             state = self._update(
                 workspace_root, environment_id=environment_id, busy=False,

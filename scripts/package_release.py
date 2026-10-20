@@ -32,7 +32,7 @@ SKILLS = {
     'large-attachment-analysis', 'project-handover', 'refactor',
     'release-packaging', 'web-research',
 }
-EXPECTED_MARKDOWN = {'README.md', 'FEATURES.md', 'CHANGELOG.md'} | {
+EXPECTED_MARKDOWN = {'README.md', 'FEATURES.md', 'CHANGELOG.md', 'src/harnessy/environment/VM_FILES.md'} | {
     f'skills/{name}/SKILL.md' for name in SKILLS
 }
 MAX_FILE_BYTES = 16 * 1024 * 1024
@@ -108,7 +108,7 @@ def committed_files(commit: str) -> dict[str, tuple[bytes, int, str]]:
         raise ReleaseError('Required application files are missing: ' + ', '.join(sorted(missing)))
     markdown = {name for name in files if name.lower().endswith('.md')}
     if markdown != EXPECTED_MARKDOWN:
-        raise ReleaseError('Package must contain the three living documents and eight functional skills.')
+        raise ReleaseError('Package must contain the three living documents, the VM file-access contract and eight functional skills.')
     if not files['run_harnessy.sh'][1] & stat.S_IXUSR:
         raise ReleaseError('run_harnessy.sh must be executable in the Git tree.')
     return files
@@ -346,17 +346,21 @@ def main() -> int:
     arguments = parser.parse_args()
     try:
         if arguments.command == 'build':
+            print(f'[{int(time.time())}] BUILD Read committed application source at {ROOT}; '
+                  f'write and verify the release package in {arguments.output.resolve()}', flush=True)
             result = build(arguments.output.resolve(), arguments.commit, arguments.expected_commit)
-            print(f'Built {result["zip_name"]}: {result["file_count"]} files, '
+            print(f'[{int(time.time())}] VERIFY {arguments.output.resolve() / result["zip_name"]}: {result["file_count"]} files, '
                   f'{result["markdown_count"]} Markdown, SHA-256 {result["zip_sha256"]}.')
         else:
             if not arguments.expected_commit:
                 raise ReleaseError('Publication requires --expected-commit.')
+            print(f'[{int(time.time())}] PUBLISH Verify package and notes at {arguments.output.resolve()}; '
+                  f'publish and read back {arguments.repository}', flush=True)
             result = publish(arguments.output.resolve(), arguments.repository, arguments.expected_commit)
-            print(f'Verified public release: {result["release"]["url"]}')
+            print(f'[{int(time.time())}] VERIFY Public release: {result["release"]["url"]}')
     except (ReleaseError, OSError, ValueError, KeyError, SyntaxError,
             subprocess.SubprocessError) as error:
-        parser.exit(1, f'Release stopped: {error}\n')
+        parser.exit(1, f'[{int(time.time())}] FAILED Release operation at {ROOT}: {error}\n')
     return 0
 
 

@@ -1,10 +1,4 @@
-"""Named OpenWrt QEMU environments with explicit project synchronization.
-
-Stock Malta kernels do not publish 9p modules. Project files therefore travel
-through a bounded, conflict-checked SSH bridge, rather than claiming a shared
-mount. Source changes synchronize at command boundaries and periodically while
-processes/terminals run. Independent-copy mode never writes back implicitly.
-"""
+"""Named OpenWrt VMs with scoped live SSHFS mounts or explicit guest copies."""
 from __future__ import annotations
 
 import asyncio
@@ -26,7 +20,8 @@ from typing import Any
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 
-from .activity import acquire_activity, reserve_environment_change, active_work
+from .activity import (acquire_activity, reserve_environment_change, active_work,
+                       reserve_project_view_change, active_project_work)
 from .base import EnvironmentConfig, EnvironmentStatus, ExecResult, WorkspaceEnvironment
 from .host_prerequisites import discover_binary
 from .openwrt_target import OpenWrtTargetManager, OPENWRT_READINESS_SECONDS
@@ -34,6 +29,7 @@ from .openwrt_tools import OPENWRT_REQUIRED_PACKAGES, OPENWRT_TOOL_BY_ID, OPENWR
 from .project_sync import Entry, archive_tree, read_archive, scan_tree, signatures, merge_guest_changes, relative_path
 from .test_catalog import guest_os, OPENWRT_RELEASE_IMAGES
 from .test_images import download_verified, finish_thread as _finish_thread
+from .openwrt_mounts import close_workspace_live_mounts, close_environment_live_mounts, LiveMountBusyError
 from functools import partial
 
 
@@ -254,6 +250,11 @@ class OpenWrtEnvironment(WorkspaceEnvironment):
         from harnessy.diagnostics.vm_logs import register_workspace_runtime
         register_workspace_runtime(self.workspace_root, environment_id=self.config.id, runtime_root=self.environment_root)
 
+    @property
+    def _live_mounts(self):
+        from .openwrt_mounts import live_mounts
+        return live_mounts(self)
+
     async def _emit(self, phase: str, message: str, **metadata):
         phase = {'prerequisites': 'checking_host_dependencies', 'preparing': 'creating_vm', 'starting': 'starting_vm', 'waiting_ssh': 'waiting_for_guest', 'provisioning': 'provisioning_packages', 'optional_tool_failed': 'provisioning_optional_packages'}.get(phase, phase)
         progress = self._progress_context.get()
@@ -324,7 +325,7 @@ class OpenWrtEnvironment(WorkspaceEnvironment):
                 'vm_ready': row.get('ready', False), 'vm_generation': row.get('generation', 0),
                 'vm_boot_id': row.get('boot_id', ''), 'vm_lifecycle_event': row.get('event', 'unknown'),
                 'vm_lifecycle_updated_at': row.get('updated_at'), 'vm_readiness_updated_at': row.get('updated_at'),
-                'files_bridge': 'synchronized_project', 'files_mode': self.config.files_mode,
+                'files_bridge': 'copy' if self.config.files_mode == 'copy' else 'sshfs', 'files_mode': self.config.files_mode,
                 'administrative_guest_commands': self.config.files_mode == 'copy',
                 'egress_scope': 'public_and_private_nat' if self.config.network else 'qemu_wan_restricted',
                 'guest_disk_scope': 'all_previously_deployed_copies' if self.config.files_mode == 'copy' else 'authorized_project_namespace'}
@@ -350,7 +351,7 @@ class OpenWrtEnvironment(WorkspaceEnvironment):
             created=created, running=running, ready=ready, phase='ready' if ready else state, error=error,
             guest_architecture=self.config.architecture, guest_os=guest_os(self.config.preset).label,
             environment_id=self.config.id, environment_name=self.config.name,
-            files_mount='/workspace', detail='Project files synchronize through SSH; this image has no shared host mount.')
+            files_mount='/workspace', detail='Independent guest copies.' if self.config.files_mode == 'copy' else 'Scoped live SSHFS source mounts; host-enforced read-only inputs.')
 
     async def create(self, progress=None) -> EnvironmentStatus:
         return await self.start(progress=progress)
@@ -358,7 +359,10 @@ class OpenWrtEnvironment(WorkspaceEnvironment):
     async def start(self, progress=None) -> EnvironmentStatus:
         token = self._progress_context.set(progress)
         try:
-            return await self._start_locked()
+            result = await self._start_locked()
+            from .file_views import FILE_VIEWS
+            FILE_VIEWS.request(self.workspace_root, reason='vm_start', environment_id=self.config.id)
+            return result
         finally:
             self._progress_context.reset(token)
 
@@ -611,6 +615,8 @@ python3 -c 'import sys; print(sys.version)'
         if root != files and files not in root.parents and private not in root.parents:
             raise ValueError('Selected project is outside this workspace.')
         policy = dict(policy or {})
+        if self.config.files_mode != 'copy' and int(policy.get('namespace_version', 0)) != 2:
+            raise ValueError('Choose an exact Project / Chat file view; the whole workspace is not exported.')
         key = hashlib.sha256(str(root).encode()).hexdigest()[:24]
         mounts = []
         if int(policy.get('namespace_version', 0)) == 2:
@@ -640,7 +646,150 @@ python3 -c 'import sys; print(sys.version)'
                 mounts.append({'host': host, 'guest': 'Files/' + folder, 'writable': False, 'excluded': ()})
         else:
             mounts.append({'host': root, 'guest': '', 'writable': self.config.files_mode != 'readonly', 'excluded': ()})
-        return {'key': key, 'root': root, 'mounts': mounts, 'remote': '/opt/harnessy-private/projections/' + key, 'policy': policy}
+        if self.config.files_mode != 'copy':
+            # Synthetic, read-only directories are provided by SFTP for nested
+            # ancestor mount points; creating them never modifies host source.
+            for row in mounts:
+                prefix = row['guest'] + '/'
+                row['excluded'] = tuple(sorted(set(row['excluded']) | {
+                    item['guest'][len(prefix):] for item in mounts
+                    if item is not row and item['guest'].startswith(prefix)}))
+        remote = '/opt/harnessy-private/' + ('projections/' if self.config.files_mode == 'copy' else 'live/') + key
+        return {'key': key, 'root': root, 'mounts': mounts, 'remote': remote, 'policy': policy, 'files_mode': self.config.files_mode}
+
+    def file_view_capabilities(self):
+        supported = not self._basic_copy
+        return {'supported_modes': ('live', 'readonly', 'copy') if supported else ('copy',),
+                'transport': 'sshfs' if supported and self.config.files_mode != 'copy' else 'copy',
+                'runtime_mounts': supported and self.config.files_mode != 'copy',
+                'project_isolation': supported, 'readonly_inputs': supported,
+                'reconcile': supported, 'project_terminal': True, 'composite': supported,
+                'whole_project_deployment': self.config.files_mode == 'copy',
+                'file_backed_mmap': True}
+
+    async def _projection_writer_context(self, projection, *, owner_id=''):
+        policy = projection['policy']
+        if not policy.get('_mutation_workspace_id') or not policy.get('_mutation_conflict_keys'):
+            from .file_views import FILE_VIEWS
+            workspace = await FILE_VIEWS.workspace(self.workspace_root)
+            project_id = str(policy.get('project_id') or policy.get('_model_project_id') or policy.get('_human_project_id') or '')
+            if not project_id:
+                raise ValueError('A live file view needs its exact Project / Chat identity.')
+            keys = await finish_thread(workspace.project_conflict_ids, project_id)
+            policy.update(_mutation_workspace_id=workspace.id, _mutation_conflict_keys=tuple(keys),
+                          _mutation_chat_id=project_id)
+        if owner_id:
+            policy['_mutation_owner_id'] = owner_id
+        return projection
+
+    def _refresh_file_config(self):
+        from .base import load_environment_config
+        current = load_environment_config(self.workspace_root, self.config.id)
+        if current is None:
+            raise RuntimeError('The selected VM no longer exists.')
+        if (current.preset, current.architecture) != (self.config.preset, self.config.architecture):
+            raise RuntimeError('This VM image changed; reopen its environment before using project files.')
+        self.config = current
+        return current
+
+    async def reconcile_file_views(self, plan):
+        current = self._refresh_file_config()
+        if plan.get('environment_id') != current.id:
+            raise ValueError('Project file plan belongs to a different VM.')
+        if plan.get('files_mode') != current.files_mode:
+            raise RuntimeError('The VM file mode changed while its plan was prepared; request its current plan.')
+        errors = [dict(row) for row in plan.get('errors', ())]
+        if current.files_mode == 'copy':
+            return {'state': 'error' if errors else 'ready', 'revision': plan['revision'], 'projects': [
+                {'project_id': row['project_id'], 'folder': row['folder'], 'state': 'ready',
+                 'policy_revision': row['policy']['policy_revision'],
+                 'detail': 'Independent guest copy; explicit deployment limits apply.'} for row in plan['projects']] + errors,
+                'pending_project_ids': []}
+        if self._basic_copy:
+            return {'state': 'unsupported', 'revision': plan['revision'], 'projects': [], 'pending_project_ids': [],
+                    'detail': 'Verified live SSHFS integration is unavailable for this OpenWrt release.'}
+        if not (await self.status()).running:
+            return {'state': 'stopped', 'revision': plan['revision'], 'projects': [], 'pending_project_ids': []}
+        requested = {row['project_id']: row for row in plan['projects']}
+        known = {row['project_id']: row for row in plan.get('known_projects', ())}
+        known.update(requested)
+        # Permanently removed chats no longer occur in the database plan, but
+        # their owned live transports must still be retired.
+        for view in tuple(self._live_mounts.views.values()):
+            known.setdefault(view.project_id, {'project_id': view.project_id,
+                'folder': view.projection['policy'].get('writable_folder', '')})
+        rows, pending = list(errors), []
+        invalid = {row['project_id'] for row in errors}
+        for project_id, row in known.items():
+            wanted = requested.get(project_id)
+            result = {'project_id': project_id, 'folder': row.get('folder', '')}
+            if wanted:
+                result['policy_revision'] = wanted['policy']['policy_revision']
+            projection = None
+            try:
+                if wanted:
+                    policy = dict(wanted['policy'])
+                    projection = self._projection(Path(policy['project_root']), policy)
+                    await self._projection_writer_context(projection)
+                    existing = self._live_mounts.views.get(projection['key'])
+                    if existing and existing.signature == self._live_mounts.signature(projection) and all(
+                            not item.serving.done() and item.process.returncode is None for item in existing.exports):
+                        await self._live_mounts.ensure(projection, project_id=project_id)
+                        rows.append({**result, 'state': 'ready'})
+                        continue
+                try:
+                    release = reserve_project_view_change(self.workspace_root, environment_id=current.id,
+                        project_id=project_id, owner_id=str(plan.get('_owner_id') or ''))
+                except RuntimeError as busy:
+                    pending.append(project_id)
+                    rows.append({**result, 'state': 'pending', 'detail': str(busy)[:500]})
+                    continue
+                try:
+                    await self._live_mounts.retire_project(project_id)
+                    if projection is not None:
+                        await self._live_mounts.ensure(projection, project_id=project_id)
+                    elif project_id not in invalid:
+                        await self._live_mounts.retire_stale(row.get('folder', ''))
+                    if project_id not in invalid:
+                        rows.append({**result, 'state': 'ready' if wanted else 'unmounted'})
+                finally:
+                    release()
+            except LiveMountBusyError as error:
+                pending.append(project_id)
+                rows.append({**result, 'state': 'pending', 'detail': str(error)[:500]})
+            except Exception as error:
+                from harnessy.diagnostics import log_event
+                log_event('runtime', 'file_view_reconciliation_failed', environment_id=current.id,
+                          project_id=project_id, error_code='FILE_VIEW_TRANSPORT_FAILED', error=error)
+                # Setup/package/transport failures need an actionable retry;
+                # only a known activity reservation is classified as pending.
+                rows.append({**result, 'state': 'error', 'error_code': 'FILE_VIEW_TRANSPORT_FAILED',
+                             'detail': str(error)[:1000]})
+        failed = any(row['state'] == 'error' for row in rows)
+        return {'state': 'error' if failed else 'pending' if pending else 'ready',
+                'revision': plan['revision'], 'projects': rows,
+                'pending_project_ids': pending,
+                **({'error_code': 'FILE_VIEW_TRANSPORT_FAILED'} if failed else {})}
+
+    async def _live_projection(self, active_root, policy, *, human=False):
+        self._refresh_file_config()
+        policy = dict(policy or {})
+        view_owner = str(policy.get('_file_view_owner_id') or uuid.uuid4().hex)
+        project_id = str(policy.get('project_id') or policy.get('_model_project_id') or policy.get('_human_project_id') or '')
+        if not project_id:
+            raise ValueError('Choose an exact Project / Chat before opening its VM files.')
+        if project_id:
+            from .file_views import FILE_VIEWS
+            fresh = await FILE_VIEWS.ensure_project(self.workspace_root, environment_id=self.config.id,
+                project_id=project_id, owner_id=view_owner, human=human)
+            # Preserve the trusted active-run lease context, never caller ACLs.
+            fresh.update({key: value for key, value in policy.items() if key.startswith('_mutation_')})
+            policy = fresh
+        policy['_file_view_owner_id'] = view_owner
+        projection = self._projection(active_root, policy)
+        await self._projection_writer_context(projection)
+        self._live_mounts.verified(projection)
+        return projection
 
     def _destination(self, projection, index):
         if self._basic_copy:
@@ -655,25 +804,34 @@ python3 -c 'import sys; print(sys.version)'
 
     @asynccontextmanager
     async def _host_writer(self, projection):
-        self._authorize_model(projection['policy'])
-        if self.config.files_mode != 'live':
+        # A retained writable export must keep its writer coordination even
+        # while a newer mode change is waiting for active work to finish.
+        if projection.get('files_mode') == 'copy':
             yield
             return
         policy = projection['policy']
+        project_id = str(policy.get('project_id') or policy.get('_mutation_chat_id') or '')
+        # Mounts are shared by human and model sessions. Model enablement is
+        # enforced on command admission; the source server enforces exact
+        # current Project access and policy for every canonical write.
+        source_policy = {**policy, '_human_project_id': project_id}
+        self._authorize_model(source_policy)
         workspace_id = str(policy.get('_mutation_workspace_id') or '')
         keys = tuple(policy.get('_mutation_conflict_keys') or ())
         if not workspace_id or not keys:
-            raise RuntimeError('Project synchronization is missing its shared writer context; no source changes were applied.')
+            raise RuntimeError('Live project files are missing their shared writer context; source files were preserved.')
         from harnessy.agent.scheduler import WORKSPACE_MUTATIONS
-        async with WORKSPACE_MUTATIONS.borrow(
-            workspace_id=workspace_id, owner_id=str(policy.get('_mutation_owner_id') or ''),
-            label='OpenWrt project synchronization', conflict_keys=keys,
+        async with WORKSPACE_MUTATIONS.project_io(
+            workspace_id=workspace_id, label='OpenWrt live project file write', conflict_keys=keys,
             project_chat_id=str(policy.get('_mutation_chat_id') or ''),
         ):
-            self._authorize_model(policy)
+            self._authorize_model(source_policy)
             yield
 
     async def _sync(self, projection: dict, *, refresh: bool = False):
+        if projection.get('files_mode', self.config.files_mode) != 'copy':
+            self._live_mounts.verified(projection)
+            return
         async with self._host_writer(projection), _SYNC_LOCKS.setdefault(str(self.environment_root) + projection['key'], asyncio.Lock()):
             for index, mount in enumerate(projection['mounts']):
                 destination = self._destination(projection, index)
@@ -728,21 +886,9 @@ python3 -c {shlex.quote(_REPLACE_GUEST_TREE)} {shlex.quote(stage)} {shlex.quote(
         await self._checked(script, data=archive, timeout=300)
 
     async def _collect(self, projection: dict):
-        if self.config.files_mode != 'live':
-            return
-        async with self._host_writer(projection), _SYNC_LOCKS.setdefault(str(self.environment_root) + projection['key'], asyncio.Lock()):
-            for index, mount in enumerate(projection['mounts']):
-                if not mount['writable']:
-                    continue
-                marker = self._baseline_path(projection, index)
-                baseline = json.loads(marker.read_text())
-                raw = await self._checked('tar -cf - -C ' + projection['remote'] + '/' + str(index) + ' .', timeout=120)
-                guest = await finish_thread(read_archive, raw)
-                self._authorize_model(projection['policy'])
-                host = await finish_thread(merge_guest_changes, mount['host'], baseline, guest, excluded=mount['excluded'])
-                # A host edit during a running command remains a host edit;
-                # don't mark it as delivered to the guest until the next push.
-                _atomic_json(marker, signatures(guest))
+        # Live writes are served directly to canonical source; independent
+        # copies are never collected implicitly.
+        return
 
     def _command(self, projection: dict, command: str, cwd: str) -> str:
         path = PurePosixPath(str(cwd))
@@ -753,13 +899,14 @@ python3 -c {shlex.quote(_REPLACE_GUEST_TREE)} {shlex.quote(stage)} {shlex.quote(
             return 'cd ' + shlex.quote(str(path)) + ' && exec /bin/ash -c ' + shlex.quote(command)
         lines = ['set -e', 'mount --make-rprivate /', 'mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /workspace']
         own_guest = projection['mounts'][0]['guest']
-        for row in projection['mounts'][1:]:
-            if own_guest and row['guest'].startswith(own_guest + '/'):
-                lines.append('mkdir -p ' + shlex.quote(projection['remote'] + '/0/' + row['guest'][len(own_guest) + 1:]))
+        if self.config.files_mode == 'copy':
+            for row in projection['mounts'][1:]:
+                if own_guest and row['guest'].startswith(own_guest + '/'):
+                    lines.append('mkdir -p ' + shlex.quote(projection['remote'] + '/0/' + row['guest'][len(own_guest) + 1:]))
         for index, row in enumerate(projection['mounts']):
             target = '/workspace' + ('/' + row['guest'] if row['guest'] else '')
             source = projection['remote'] + '/' + str(index)
-            lines += ['mkdir -p ' + shlex.quote(target), 'mount --bind ' + shlex.quote(source) + ' ' + shlex.quote(target)]
+            lines += ['[ -d ' + shlex.quote(target) + ' ] || mkdir -p ' + shlex.quote(target), 'mount --bind ' + shlex.quote(source) + ' ' + shlex.quote(target)]
             if not row['writable']:
                 lines.append('mount -o remount,bind,ro ' + shlex.quote(target))
         # Neither backing projections nor host controller paths are available
@@ -770,17 +917,21 @@ python3 -c {shlex.quote(_REPLACE_GUEST_TREE)} {shlex.quote(stage)} {shlex.quote(
         return 'exec unshare --mount --pid --fork --mount-proc /bin/bash -c ' + shlex.quote('\n'.join(lines))
 
     async def exec(self, command: str, *, cwd='/workspace', timeout=None, active_root=None, output_policy=None) -> ExecResult:
+        self._refresh_file_config()
         if not str(command).strip():
             raise ValueError('Command must not be empty.')
         self._authorize_model(output_policy)
         if not self._ready:
             await self.start()
-        projection = self._projection(active_root, output_policy)
-        release = acquire_activity(self.workspace_root, 'OpenWrt guest command', environment_id=self.config.id)
+        projection = (self._projection(active_root, output_policy) if self.config.files_mode == 'copy'
+                      else await self._live_projection(active_root, output_policy))
+        project_id = str(projection['policy'].get('project_id') or projection['policy'].get('_model_project_id') or projection['policy'].get('_mutation_chat_id') or '')
+        release = acquire_activity(self.workspace_root, 'OpenWrt guest command', environment_id=self.config.id,
+            project_id=project_id or None, owner_id=str(projection['policy'].get('_file_view_owner_id') or uuid.uuid4().hex))
         started = time.monotonic()
         try:
             await self._sync(projection)
-            self._authorize_model(output_policy)
+            self._authorize_model(projection['policy'])
             try:
                 rc, out, err = await self._raw(self._command(projection, command, cwd), timeout=timeout or 3600)
             except BaseException:
@@ -801,15 +952,19 @@ python3 -c {shlex.quote(_REPLACE_GUEST_TREE)} {shlex.quote(stage)} {shlex.quote(
             release()
 
     async def spawn(self, command: str, *, cwd='/workspace', active_root=None, output_policy=None):
+        self._refresh_file_config()
         if not str(command).strip():
             raise ValueError('Command must not be empty.')
         self._authorize_model(output_policy)
         if not self._ready:
             await self.start()
-        projection = self._projection(active_root, output_policy)
+        projection = (self._projection(active_root, output_policy) if self.config.files_mode == 'copy'
+                      else await self._live_projection(active_root, output_policy))
         await self._sync(projection)
-        self._authorize_model(output_policy)
-        release = acquire_activity(self.workspace_root, 'OpenWrt guest process', environment_id=self.config.id)
+        self._authorize_model(projection['policy'])
+        project_id = str(projection['policy'].get('project_id') or projection['policy'].get('_model_project_id') or projection['policy'].get('_mutation_chat_id') or '')
+        release = acquire_activity(self.workspace_root, 'OpenWrt guest process', environment_id=self.config.id,
+            project_id=project_id or None, owner_id=uuid.uuid4().hex)
         argv, env = self.controller.command(self._command(projection, command, cwd))
         try:
             process = await asyncio.create_subprocess_exec(*argv, env=env, cwd=self.environment_root,
@@ -837,6 +992,7 @@ python3 -c {shlex.quote(_REPLACE_GUEST_TREE)} {shlex.quote(stage)} {shlex.quote(
         return process
 
     async def refresh_project_copy(self, active_root=None, output_policy=None):
+        self._refresh_file_config()
         self._authorize_model(output_policy)
         if self.config.files_mode != 'copy':
             raise ValueError('Explicit deployment refresh is for independent-copy mode.')
@@ -853,13 +1009,16 @@ python3 -c {shlex.quote(_REPLACE_GUEST_TREE)} {shlex.quote(stage)} {shlex.quote(
             release()
 
     async def collect_file(self, relative_path: str, destination: Path, *, active_root=None, output_policy=None):
+        self._refresh_file_config()
         self._authorize_model(output_policy)
         from .project_sync import relative_path as checked_relative
         name = checked_relative(str(relative_path))
-        projection = self._projection(active_root, output_policy)
         if not self._ready:
             await self.start()
+        projection = (self._projection(active_root, output_policy) if self.config.files_mode == 'copy'
+                      else await self._live_projection(active_root, output_policy))
         await self._sync(projection)
+        self._authorize_model(projection['policy'])
         source = self._destination(projection, 0) + '/' + name
         if self._basic_copy:
             # No guest interpreter is assumed. A tar member is inspected on
@@ -887,6 +1046,8 @@ python3 -c {shlex.quote(_REPLACE_GUEST_TREE)} {shlex.quote(stage)} {shlex.quote(
         chats = workspace.list_chats(archived=None)
         own = next((chat for chat in chats if Path(workspace.active_root_path(chat.id)).resolve() == root), None)
         policy = workspace.output_policy(own.id) if own else {}
+        if own:
+            policy.update(project_id=own.id, _human_project_id=own.id)
         policy.update(_mutation_workspace_id=workspace.id,
                       _mutation_conflict_keys=tuple(dict.fromkeys(key for chat in (own,) if chat for key in workspace.project_conflict_ids(chat.id))) if own else tuple(dict.fromkeys(key for chat in chats for key in workspace.project_conflict_ids(chat.id))),
                       _mutation_chat_id=own.id if own else '', _mutation_owner_id='')
@@ -906,6 +1067,10 @@ python3 -c {shlex.quote(_REPLACE_GUEST_TREE)} {shlex.quote(stage)} {shlex.quote(
             return argv, env, self.workspace_root
 
     async def open_terminal(self, *, active_root=None, output_policy=None, workspace=None):
+        return await self.open_project_terminal(active_root=active_root, output_policy=output_policy, workspace=workspace)
+
+    async def open_project_terminal(self, *, active_root=None, output_policy=None, workspace=None):
+        self._refresh_file_config()
         await self.start()
         if output_policy is None and workspace is not None:
             output_policy = self._human_policy(active_root, workspace)
@@ -915,8 +1080,10 @@ python3 -c {shlex.quote(_REPLACE_GUEST_TREE)} {shlex.quote(stage)} {shlex.quote(
             from harnessy.core.workspace import WorkspaceStore
             store = await finish_thread(WorkspaceStore, self.workspace_root)
             output_policy = await finish_thread(self._human_policy, active_root, store)
-        projection = self._projection(active_root, output_policy)
+        projection = (self._projection(active_root, output_policy) if self.config.files_mode == 'copy'
+                      else await self._live_projection(active_root, output_policy, human=True))
         await self._sync(projection)
+        self._authorize_model(projection['policy'])
         cwd = '/workspace/' + projection['mounts'][0]['guest'] if projection['mounts'][0]['guest'] else '/workspace'
         argv, env = self.controller.command(self._command(projection, 'exec /bin/ash -i' if self._basic_copy else 'exec /bin/bash -i', cwd))
         argv[argv.index('-T')] = '-tt'
@@ -930,6 +1097,10 @@ python3 -c {shlex.quote(_REPLACE_GUEST_TREE)} {shlex.quote(stage)} {shlex.quote(
         projection = self._terminal_projections.pop(tuple(session.command_argv or ()), None)
         if projection is None:
             raise RuntimeError('Terminal does not belong to this prepared OpenWrt project view.')
+        if self.config.files_mode != 'copy':
+            # TerminalSession owns the project-scoped lifecycle token. Live
+            # source writes are served on demand and need no copy collector.
+            return None
         if workspace is not None:
             projection['policy'].update(self._human_policy(projection['root'], workspace))
         release = acquire_activity(self.workspace_root, 'OpenWrt terminal synchronization', environment_id=self.config.id)
@@ -953,6 +1124,8 @@ python3 -c {shlex.quote(_REPLACE_GUEST_TREE)} {shlex.quote(stage)} {shlex.quote(
         self._validate_private_runtime()
         if not force and active_work(self.workspace_root, environment_id=self.config.id):
             raise RuntimeError("Finish this VM’s commands and close its terminals before stopping it.")
+        if not force:
+            await self._live_mounts.close()
         if force and (await self.controller.status())['running']:
             await self.controller.qmp('quit')
             deadline = time.monotonic() + 10
@@ -967,7 +1140,11 @@ python3 -c {shlex.quote(_REPLACE_GUEST_TREE)} {shlex.quote(stage)} {shlex.quote(
                 raise RuntimeError('Could not verify that this VM stopped; its disk was preserved.')
         else:
             await self.controller.stop()
+        if force:
+            await self._live_mounts.close(force=True)
         self._record(ready=False, running=False, event='stopped')
+        from .file_views import FILE_VIEWS
+        FILE_VIEWS.request(self.workspace_root, reason='vm_stop', environment_id=self.config.id)
         return await self.status()
 
     async def snapshot(self, tag, progress=None) -> list[str]:
@@ -1082,13 +1259,15 @@ python3 -c {shlex.quote(_REPLACE_GUEST_TREE)} {shlex.quote(stage)} {shlex.quote(
         return {'config': self.config.to_dict(), 'status': status.to_dict(), 'snapshots': await self.list_snapshots(),
                 'files_root': str(self.files_root), 'guest_files_root': '/workspace',
                 'durable_vm_root': str(self.vm_root), 'runtime_qemu_root': str(self.controller.runtime_dir()),
-                'vm_type': 'qemu', 'mount_type': 'synchronized-project', 'snapshot_strategy': 'stopped-disk-copy',
+                'vm_type': 'qemu', 'mount_type': 'separate-copy' if self.config.files_mode == 'copy' else 'sshfs', 'snapshot_strategy': 'stopped-disk-copy',
                 'guest_identity': identity, 'optional_tools': await self.optional_tool_status(),
                 'unavailable_tools': OPENWRT_UNAVAILABLE_TOOLS,
-                'capabilities': {'administrative_guest_commands': self.config.files_mode == 'copy', 'project_files': 'separate_guest_copy' if self.config.files_mode == 'copy' else 'synchronized_authorized_view'},
+                'capabilities': {'administrative_guest_commands': self.config.files_mode == 'copy', 'project_files': 'separate_guest_copy' if self.config.files_mode == 'copy' else 'live_authorized_view'},
                 'hardware_emulation': self.controller.radio_state(),
-                'files_bridge': {'kind': 'synchronized_project', 'mode': self.config.files_mode,
-                    'note': 'SSH synchronization at command boundaries and periodic guest output collection while processes or terminals run; conflicts preserve both copies.'}}
+                'files_bridge': {'kind': 'copy' if self.config.files_mode == 'copy' else 'sshfs', 'mode': self.config.files_mode,
+                    'capabilities': self.file_view_capabilities(),
+                    'note': 'Explicit bounded deployment and artifact collection.' if self.config.files_mode == 'copy' else
+                    'Exact host sources served on demand over owned SSHFS channels. New opens see host edits; existing descriptors and mapped pages follow network filesystem cache semantics.'}}
 
 
 _REPLACE_GUEST_TREE = r'''

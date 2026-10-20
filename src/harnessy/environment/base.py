@@ -22,6 +22,15 @@ _CONFIG_WRITE_LOCKS: dict[tuple[str, str], threading.RLock] = {}
 _USER_CONFIG_FIELDS = ('name', 'purpose', 'enabled', 'project_access', 'allowed_project_ids')
 
 
+class FileViewUnavailableError(RuntimeError):
+    """A requested view is not ready; no guest payload has started."""
+    def __init__(self, message: str, error_code: str = 'FILE_VIEW_FAILED'):
+        super().__init__(message)
+        self.error_code = error_code if error_code in {
+            'FILE_VIEW_PENDING', 'FILE_VIEW_UNSUPPORTED', 'FILE_VIEW_FAILED', 'FILE_VIEW_POLICY_CHANGED'
+        } else 'FILE_VIEW_FAILED'
+
+
 def environment_config_lock(workspace_root: str | Path, environment_id: str) -> threading.RLock:
     key = str(Path(workspace_root).expanduser().resolve()), str(environment_id)
     return _CONFIG_WRITE_LOCKS.setdefault(key, threading.RLock())
@@ -255,6 +264,20 @@ class WorkspaceEnvironment(abc.ABC):
         """
         raise RuntimeError('This VM provider does not support a guest console.')
 
+    def file_view_capabilities(self) -> dict[str, Any]:
+        return {'supported_modes': (), 'transport': 'unsupported', 'runtime_mounts': False,
+                'project_isolation': False, 'readonly_inputs': False, 'reconcile': False,
+                'project_terminal': False, 'composite': False, 'persistent_project_namespace': False}
+
+    async def reconcile_file_views(self, plan: dict[str, Any]) -> dict[str, Any]:
+        return {'state': 'unsupported', 'revision': plan['revision'], 'pending_project_ids': [],
+                'detail': 'This VM provider cannot enforce the requested project file view.',
+                'projects': [{'project_id': row['project_id'], 'folder': row['folder'], 'state': 'unsupported'}
+                             for row in plan['projects']]}
+
+    async def open_project_terminal(self, *, active_root: Path, output_policy: dict[str, Any], workspace=None):
+        raise FileViewUnavailableError('This VM provider cannot enforce a project-files terminal.', 'FILE_VIEW_UNSUPPORTED')
+
     def runtime_identity(self) -> dict[str, Any]:
         """Return cheap, non-blocking lifecycle identity for tool provenance.
 
@@ -332,11 +355,26 @@ unset _harnessy_home
         Human terminals omit this controller-internal key. Model tool payloads
         never choose their own project ID; the toolbox supplies its chat ID.
         """
-        if not isinstance(output_policy, dict) or '_model_project_id' not in output_policy:
+        if not isinstance(output_policy, dict):
+            return
+        human = '_human_project_id' in output_policy
+        project_id = output_policy.get('_human_project_id') if human else output_policy.get('_model_project_id')
+        if not project_id:
             return
         current = load_environment_config(self.workspace_root, self.config.id)
-        if current is None or not current.enabled or not current.allows_project(output_policy['_model_project_id']):
+        if current is None or (not human and not current.enabled) or not current.allows_project(project_id):
             raise EnvironmentModelAccessError('This VM is no longer enabled for model use by this project/chat.')
+        from .file_views import FILE_VIEWS
+        from harnessy.core.project_mounts import build_project_policy
+        workspace = FILE_VIEWS.cached_workspace(self.workspace_root)
+        if workspace is None:
+            raise FileViewUnavailableError('Workspace file policy must be reverified before using this VM.')
+        try:
+            fresh = build_project_policy(workspace, project_id)
+        except Exception as exc:
+            raise FileViewUnavailableError('Project file sources could not be safely verified: ' + str(exc)) from exc
+        if output_policy.get('policy_revision') != fresh['policy_revision']:
+            raise FileViewUnavailableError('This project file view changed. Request its current plan before running another command.', 'FILE_VIEW_POLICY_CHANGED')
 
     @abc.abstractmethod
     async def snapshot(self, tag: str, progress=None) -> list[str]: ...

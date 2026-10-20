@@ -72,11 +72,18 @@ class ProjectAccessEditor:
     def _sync(self) -> None:
         selected = self.project_access == 'selected'
         self.selection.set_visibility(selected)
-        self.description.set_text(
-            f'The model can use this {self.subject} from every project / chat in this workspace, including future ones. Manual controls remain available.'
-            if not selected else
-            f'The model can use this {self.subject} only from individually checked projects / chats. Manual controls remain available.'
-        )
+        if self.subject == 'VM':
+            self.description.set_text(
+                'Project-files terminals and model tools can use this VM from every project / chat, including future ones. Guest console controls remain available.'
+                if not selected else
+                'Project-files terminals and model tools can use this VM only from individually checked projects / chats. Guest console controls remain available.'
+            )
+        else:
+            self.description.set_text(
+                f'The model can use this {self.subject} from every project / chat in this workspace, including future ones. Manual controls remain available.'
+                if not selected else
+                f'The model can use this {self.subject} only from individually checked projects / chats. Manual controls remain available.'
+            )
         selected_count = len(self.chosen.intersection(self.rows))
         missing = len(self.chosen.difference(self.rows))
         text = f'{selected_count} / {len(self.rows)} available projects / chats selected'

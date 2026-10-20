@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.7.4
+
+- Record the VM mounting contract in `src/harnessy/environment/VM_FILES.md` and use one shared policy builder for model commands and project terminals. Keep owned files writable, ancestors and direct Project Access sources read-only, and References read-only. Preserve exact VM membership and non-transitive grants.
+- Apply access and hierarchy changes to running VMs without rebooting them. Keep sources still needed by allowed children or other recipients. Show an in-use view as Unmount pending until its tasks finish and project terminals close; never start a stopped VM or delete source/guest data when access changes.
+- Add real on-demand OpenWrt SSHFS sharing through the existing VM SSH connection. Install matching FUSE/SSHFS packages for supported opkg images. Opening live project files no longer requires scanning/copying the entire project, and read-only inputs are enforced on the host. Symlinks, multiply linked files and special files remain unavailable through this scoped transport; use guest-local dependency/build directories for those entries.
+- Choose a project-files terminal or a guest console from the VM Terminal menu. Keep each project terminal attached to its exact VM and project, and recheck policy before reopening an ended terminal. Guest consoles open in the guest home without automatic workspace export.
+- Show preparing, mounted, pending, stopped, unsupported and failed file-view states separately from saved checkboxes. Include content-free `FILE_VIEWS.json` receipts and useful failure stages in diagnostics. An expected pending view no longer becomes a workspace-mapping infrastructure stop.
+- Revalidate saved mount receipts after restart, preserve live transports across VM settings changes, and drain reconciliation/file-sharing work before workspace or VM removal. A missing disk or changed database cannot make the mount service initialize a replacement workspace.
+- Keep Windows and the APK-based OpenWrt image copy-only. Windows guest consoles and owned-project deployment remain available; required References/ancestor/Project Access inputs which its copy integration cannot supply produce an explicit unsupported-scope error before deployment.
+- Verify hierarchy, access changes, source preservation, runtime reconciliation, diagnostics, scoped terminal leases and production browser flows, including narrow screens. Verify real OpenWrt 23.05.5 MIPS live read/write sharing with a 768 MiB canonical file and read-only inputs. Native Mac/Windows and Lima boot validation remain unavailable; the restricted native test changes only its QMP transport to TCP.
+
 ## v0.7.3
 
 - Open OpenWrt, Windows and separate-copy VM terminals without first copying the whole workspace. Start these human-operated consoles in the guest home, so a large project cannot block access to the VM shell. No project files are automatically deployed or collected by these consoles.

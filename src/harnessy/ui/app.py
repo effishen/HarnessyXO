@@ -94,7 +94,7 @@ from harnessy.core.transcript import (  # noqa: E402
     assistant_stream_groups, locate_transcript_window, reconcile_transcript_window, shift_transcript_window,
 )
 from harnessy.core.textfiles import TextFileDraft
-from harnessy.environment.activity import active_work
+from harnessy.environment.activity import active_work, acquire_activity
 from harnessy.core.instructions import DEFAULT_GLOBAL_INSTRUCTIONS
 from harnessy.core.chat_export import CONTENT_DETAIL, EXPORT_TYPES, ExportOptions
 from harnessy.agent.chat_exports import ExportJob, EXPORT_JOBS
@@ -195,6 +195,8 @@ TRANSCRIPT_LIVE_COMPACT_EVENTS = 12
 _TERMINAL_SESSIONS: dict[str, TerminalSession] = {}
 _TERMINAL_START_TASKS: dict[str, asyncio.Task[Any]] = {}
 _TERMINAL_ERRORS: dict[str, str] = {}
+_TERMINAL_ERROR_CODES: dict[str, str] = {}
+_TERMINAL_START_STAGES: dict[str, str] = {}
 _FILE_OPERATION_TASKS: set[asyncio.Task[Any]] = set()
 _NOTIFICATION_TASKS: set[asyncio.Task[Any]] = set()
 _NTFY_REPLY_SUPERVISOR_TASK: asyncio.Task[Any] | None = None
@@ -1320,6 +1322,7 @@ class OpenTab:
     file_path: str | None = None
     target_id: str | None = None
     environment_id: str | None = None
+    terminal_mode: str = 'guest_console'
 
 
 @dataclass
@@ -1417,6 +1420,8 @@ class HarnessyPage:
         self.terminal_sessions = _TERMINAL_SESSIONS
         self.terminal_start_tasks = _TERMINAL_START_TASKS
         self.terminal_errors = _TERMINAL_ERRORS
+        self.terminal_error_codes = _TERMINAL_ERROR_CODES
+        self.terminal_start_stages = _TERMINAL_START_STAGES
         self.terminal_counters: dict[str, int] = {}
         self.home_scope = ToolScope(HOME_SCOPE_ID, 'Home', Path.home().resolve())
         self.file_paths: dict[str, Path] = {}
@@ -1559,6 +1564,7 @@ class HarnessyPage:
             file_path = str(item.get('file_path') or '') or None
             target_id = None
             environment_id = str(item.get('environment_id') or '') or None
+            terminal_mode = 'project_files' if item.get('terminal_mode') == 'project_files' else 'guest_console'
             if kind == 'vm_desktop' and workspace_id == HOME_SCOPE_ID:
                 continue
             if kind in {'terminal', 'vm_desktop'} and workspace_id != HOME_SCOPE_ID:
@@ -1569,6 +1575,9 @@ class HarnessyPage:
                         environment_id = configs[0].id if len(configs) == 1 else None
                     if environment_id is None or manager.get(environment_id) is None:
                         continue
+                    if kind == 'terminal' and terminal_mode == 'project_files':
+                        if not chat_id:
+                            continue
                     if kind == 'vm_desktop':
                         from harnessy.ui.vm_views import vm_view_key
                         if key != vm_view_key(workspace_id, environment_id):
@@ -1620,7 +1629,7 @@ class HarnessyPage:
                 log_event('harnessy', 'saved_tab_restore_failed', kind=kind, error_class=type(exc).__name__)
                 continue
             restored.append(OpenTab(
-                key, kind, workspace_id, str(chat_id) if chat_id else None, title or kind.title(), file_path=file_path, target_id=target_id, environment_id=environment_id,
+                key, kind, workspace_id, str(chat_id) if chat_id else None, title or kind.title(), file_path=file_path, target_id=target_id, environment_id=environment_id, terminal_mode=terminal_mode,
             ))
         self.open_tabs = restored
         active = str(raw.get('active_tab_key') or '')
@@ -1671,6 +1680,7 @@ class HarnessyPage:
                     'file_path': tab.file_path,
                     'target_id': tab.target_id,
                     'environment_id': tab.environment_id,
+                    'terminal_mode': tab.terminal_mode,
                 }
                 for tab in self.open_tabs
             ],
@@ -4090,6 +4100,8 @@ class HarnessyPage:
                                 task.cancel()
                                 pending_terminal_starts.append(task)
                             self.terminal_errors.pop(tab.key, None)
+                            self.terminal_error_codes.pop(tab.key, None)
+                            self.terminal_start_stages.pop(tab.key, None)
                             session = self.terminal_sessions.pop(tab.key, None)
                             if session:
                                 session.close()
@@ -4104,6 +4116,8 @@ class HarnessyPage:
                     if self.active_tab_key in removed_keys:
                         self.active_tab_key = self.open_tabs[-1].key if self.open_tabs else None
 
+                    from harnessy.environment.file_views import FILE_VIEWS
+                    await FILE_VIEWS.close(workspace_path)
                     if removed_ws is not None:
                         from harnessy.environment.test_targets import stop_workspace_test_targets
                         await stop_workspace_test_targets(removed_ws)
@@ -4327,7 +4341,7 @@ class HarnessyPage:
         self.refresh_sidebar()
         self.open_chat_tab(chat.id)
 
-    def open_tool_tab(self, kind: str, reg: WorkspaceRegistration | None = None, *, environment_id: str | None = None) -> None:
+    def open_tool_tab(self, kind: str, reg: WorkspaceRegistration | None = None, *, environment_id: str | None = None, project_id: str | None = None, terminal_mode: str | None = None) -> None:
         reg = reg or self.registration
         if not reg:
             ui.notify('Choose a workspace first', type='warning')
@@ -4346,7 +4360,7 @@ class HarnessyPage:
                     for config in configs:
                         def choose(selected=config.id):
                             choose_vm.close()
-                            self.open_tool_tab('terminal', reg, environment_id=selected)
+                            self.open_tool_tab('terminal', reg, environment_id=selected, project_id=project_id, terminal_mode=terminal_mode)
                         ui.button(config.name, icon='terminal', on_click=choose).props('outline no-caps')
                     ui.button('Cancel', on_click=choose_vm.close).props('flat no-caps')
                 choose_vm.open()
@@ -4355,15 +4369,96 @@ class HarnessyPage:
             if config is None:
                 ui.notify('This VM environment is no longer registered.', type='warning')
                 return
+            ws = self._load_workspace(reg)
+            try:
+                project_terminal_supported = bool(manager.provider(config).file_view_capabilities().get('project_terminal'))
+            except Exception:
+                project_terminal_supported = False
+            if terminal_mode is None:
+                active = next((item for item in self.open_tabs if item.key == self.active_tab_key and item.workspace_id == reg.id and item.chat_id), None)
+                candidate_id = project_id or (active.chat_id if active is not None else self.sidebar_selected_chat[1] if self.sidebar_selected_chat and self.sidebar_selected_chat[0] == reg.id else None)
+                candidate = ws.get_chat(candidate_id) if candidate_id else None
+                if not project_terminal_supported:
+                    project_id, terminal_mode = None, 'guest_console'
+                elif candidate is not None and candidate.archived_at is None and config.allows_project(candidate.id):
+                    project_id, terminal_mode = candidate.id, 'project_files'
+                else:
+                    self._choose_vm_terminal(reg, config.id)
+                    return
+            if terminal_mode not in {'project_files', 'guest_console'}:
+                ui.notify('Choose Project files or Guest console.', type='warning')
+                return
+            if terminal_mode == 'project_files' and not project_terminal_supported:
+                ui.notify('This VM does not support scoped Project files terminals. Guest console is available.', type='warning')
+                return
+            project = ws.get_chat(project_id) if terminal_mode == 'project_files' and project_id else None
+            if terminal_mode == 'project_files' and (project is None or project.archived_at is not None or not config.allows_project(project.id)):
+                ui.notify('Choose an active project allowed to use this VM.', type='warning')
+                return
             number = self.terminal_counters.get(reg.id, 0) + 1
             self.terminal_counters[reg.id] = number
             key = f'terminal:{reg.id}:{config.id}:{uuid.uuid4().hex}'
-            self.open_tabs.append(OpenTab(key, kind, reg.id, None, f'{config.name} · Terminal {number}', environment_id=config.id))
+            label = f'{project.public_id} · Project files' if project is not None else 'Guest console'
+            self.open_tabs.append(OpenTab(key, kind, reg.id, project.id if project is not None else None,
+                                         f'{config.name} · {label} {number}', environment_id=config.id, terminal_mode=terminal_mode))
         else:
             key = self._tool_tab_key(kind, reg.id)
             if not any(t.key == key for t in self.open_tabs):
                 self.open_tabs.append(OpenTab(key, kind, reg.id, None, labels[kind]))
         self.activate_tab(key)
+
+    def _choose_vm_terminal(self, reg: WorkspaceRegistration, environment_id: str) -> None:
+        ws = self._load_workspace(reg)
+        config = EnvironmentManager(ws.root).get(environment_id)
+        if config is None:
+            ui.notify('This VM environment is no longer registered.', type='warning')
+            return
+        try:
+            project_terminal_supported = bool(EnvironmentManager(ws.root, environment_id=environment_id).provider().file_view_capabilities().get('project_terminal'))
+        except Exception:
+            project_terminal_supported = False
+        projects = {str(chat.id): f'{"  " * min(6, depth)}{chat.title} · {chat.public_id}'
+                    for chat, depth, _lineage in ws.list_chat_tree(archived=False) if config.allows_project(chat.id)}
+        active = next((item for item in self.open_tabs if item.key == self.active_tab_key and item.workspace_id == reg.id and item.chat_id in projects), None)
+        default_project = active.chat_id if active is not None else self.sidebar_selected_chat[1] if self.sidebar_selected_chat and self.sidebar_selected_chat[0] == reg.id and self.sidebar_selected_chat[1] in projects else None
+        with ui.context.client.layout:
+            dialog = ui.dialog()
+        with dialog, ui.card().classes('w-[600px] max-w-[94vw] gap-3'):
+            ui.label(f'Open terminal · {config.name}').classes('text-lg font-semibold').style('overflow-wrap:anywhere')
+            modes = {'project_files': 'Project files', 'guest_console': 'Guest console'} if project_terminal_supported else {'guest_console': 'Guest console'}
+            mode = ui.radio(modes, value='project_files' if default_project and project_terminal_supported else 'guest_console').props('inline aria-label="Terminal mode"')
+            if not project_terminal_supported:
+                ui.label('This VM does not support scoped Project files terminals. Guest console remains available.').classes('text-xs hy-muted')
+            project = ui.select(projects, value=default_project, label='Project / Chat').props('outlined use-input clearable').classes('w-full')
+            description = ui.label('').classes('text-sm hy-muted').style('overflow-wrap:anywhere')
+            error = ui.label('').classes('text-sm text-negative').style('overflow-wrap:anywhere')
+            def sync_mode() -> None:
+                is_project = mode.value == 'project_files'
+                project.set_visibility(is_project)
+                description.set_text(
+                    'Opens this project’s own files with its read-only ancestors, direct Project Access sources and References. VM project access still applies.'
+                    if is_project and projects else
+                    'No active projects are allowed to use this VM. Choose them in VM Settings first.'
+                    if is_project else
+                    'Starts in the VM’s home directory. Workspace files are not exported or copied automatically.'
+                )
+                open_button.set_enabled(not is_project or project.value in projects)
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('Cancel', on_click=dialog.close).props('flat no-caps')
+                def open_selected() -> None:
+                    latest = EnvironmentManager(ws.root).get(environment_id)
+                    chosen = ws.get_chat(str(project.value or '')) if mode.value == 'project_files' else None
+                    if latest is None or mode.value == 'project_files' and (chosen is None or chosen.archived_at is not None or not latest.allows_project(chosen.id)):
+                        error.set_text('The selected project or VM access changed. Reopen the terminal chooser.')
+                        return
+                    dialog.close()
+                    self.open_tool_tab('terminal', reg, environment_id=environment_id,
+                                       terminal_mode=str(mode.value), project_id=chosen.id if chosen is not None else None)
+                open_button = ui.button('Open terminal', icon='terminal', on_click=open_selected).props('unelevated no-caps')
+            mode.on_value_change(lambda _event: sync_mode())
+            project.on_value_change(lambda _event: sync_mode())
+            sync_mode()
+        dialog.open()
 
     def open_vm_tab(self, ws: WorkspaceStore, environment_id: str, kind: str = 'desktop') -> None:
         from harnessy.ui.vm_views import vm_view_key
@@ -4526,6 +4621,8 @@ class HarnessyPage:
             if task and not task.done():
                 task.cancel()
             self.terminal_errors.pop(tab.key, None)
+            self.terminal_error_codes.pop(tab.key, None)
+            self.terminal_start_stages.pop(tab.key, None)
             session = self.terminal_sessions.pop(tab.key, None)
             if session:
                 session.close()
@@ -16432,7 +16529,10 @@ window.harnessyTerminalFocus = function(terminalId) {
             return
         session = self.terminal_sessions.get(terminal_id)
         if session:
-            session.send(str(data.get('data') or ''))
+            try:
+                session.send(str(data.get('data') or ''))
+            except RuntimeError as exc:
+                ui.notify(str(exc), type='warning')
 
     def _terminal_resize(self, e) -> None:
         data = e.args if isinstance(e.args, dict) else {}
@@ -18711,33 +18811,45 @@ window.harnessyTerminalFocus = function(terminalId) {
         manager = EnvironmentManager(ws.root, environment_id=tab.environment_id) if isinstance(ws, WorkspaceStore) else None
         config = manager.config if manager is not None and tab.environment_id else None
         is_workspace_vm = isinstance(ws, WorkspaceStore) and config is not None
-        guest_console = bool(is_workspace_vm and (config.provider in {'openwrt', 'managed'} or config.files_mode == 'copy'))
+        guest_console = bool(is_workspace_vm and getattr(tab, 'terminal_mode', 'guest_console') != 'project_files')
+        project = ws.get_chat(tab.chat_id) if is_workspace_vm and not guest_console and tab.chat_id else None
+        project_label = f'{project.title} · {project.public_id}' if project is not None else 'Unavailable project'
         if isinstance(ws, WorkspaceStore) and config is None:
             # A saved terminal never attaches to an arbitrary replacement VM.
             session = None
 
         if session is None and is_workspace_vm:
             error = self.terminal_errors.get(tab.key)
+            error_code = self.terminal_error_codes.get(tab.key, '')
+            pending_view = error_code in {'FILE_VIEW_PENDING', 'FILE_VIEW_POLICY_CHANGED'}
             environment_busy = ENVIRONMENT_OPERATIONS.is_busy(ws.root, environment_id=config.id)
             with ui.column().classes('hy-tool-panel hy-terminal-panel w-full no-wrap gap-0'):
-                with ui.row().classes('hy-tool-toolbar w-full items-center py-2 no-wrap gap-2').style('border-bottom:1px solid var(--hy-border); min-width:0'):
-                    ui.label(tab.title).classes('font-semibold')
-                    base_label = ui.label(f'🛡 {config.name} · Guest console' if guest_console else f'🛡 {config.name} · Files at /workspace').classes('text-xs hy-muted')
+                with ui.row().classes('hy-tool-toolbar w-full items-center py-2 flex-wrap gap-2').style('border-bottom:1px solid var(--hy-border); min-width:0'):
+                    ui.label(tab.title).classes('font-semibold').style('min-width:0;max-width:100%;overflow-wrap:anywhere')
+                    base_label = ui.label(f'🛡 {config.name} · Guest console' if guest_console else f'🛡 {config.name} · {project_label}').classes('text-xs hy-muted').style('overflow-wrap:anywhere')
                     base_label.tooltip(
                         'Starts in the VM’s home directory. Workspace files are not copied automatically.'
                         if guest_console else
-                        'This human-operated workspace terminal is scoped to the Files container. '
-                        'Model commands receive only their canonical Project directory plus read-only inputs.'
+                        'Uses the same project file view as model commands: own files, read-only ancestors, '
+                        'direct Project Access sources and References.'
                     )
                 with ui.column().classes('w-full h-full items-center justify-center gap-3'):
                     if error:
-                        ui.icon('error_outline', size='34px').classes('text-negative')
-                        ui.label('Workspace VM terminal could not start').classes('font-semibold text-negative')
+                        ui.icon('schedule' if pending_view else 'error_outline', size='34px').classes('text-warning' if pending_view else 'text-negative')
+                        ui.label('Project file access changed' if error_code == 'FILE_VIEW_POLICY_CHANGED' else 'Waiting for project files' if pending_view else 'Workspace VM terminal could not start').classes('font-semibold text-warning' if pending_view else 'font-semibold text-negative')
                         ui.label(error).classes('text-sm hy-muted').style('max-width:760px;white-space:pre-wrap')
+                        if pending_view:
+                            ui.label(
+                                'Retry to prepare this project’s files using the current saved access. A Guest console is available in Terminal options.'
+                                if error_code == 'FILE_VIEW_POLICY_CHANGED' else
+                                'Retry after the file-view update completes. If a view is in use, finish its work or close its project-files terminals first. A Guest console is available in Terminal options.'
+                            ).classes('text-xs hy-muted').style('max-width:760px;overflow-wrap:anywhere')
                         def retry() -> None:
                             self.terminal_errors.pop(tab.key, None)
+                            self.terminal_error_codes.pop(tab.key, None)
                             self.refresh_tabs()
                         ui.button('Retry', icon='refresh', on_click=retry).props('unelevated no-caps')
+                        ui.button('Terminal options', icon='terminal', on_click=lambda: self._choose_vm_terminal(self._find_reg(ws.id), config.id)).props('flat no-caps')
                     else:
                         ui.spinner(size='34px')
                         if environment_busy:
@@ -18745,11 +18857,23 @@ window.harnessyTerminalFocus = function(terminalId) {
                             ui.label(op.message or 'Waiting for environment operation…').classes('font-semibold')
                             ui.label('The terminal will attach after the workspace environment is Ready.').classes('text-xs hy-muted')
                         else:
-                            ui.label('Starting guest console…' if guest_console else 'Starting workspace VM terminal…').classes('font-semibold')
+                            stage_label = ui.label(self.terminal_start_stages.get(tab.key) or ('Starting guest console…' if guest_console else 'Preparing project files terminal…')).classes('font-semibold').style('overflow-wrap:anywhere')
                             ui.label('HarnessyXO will not fall back to the host shell if the VM is unavailable.').classes('text-xs hy-muted')
+                    if not guest_console:
+                        from harnessy.ui.project_file_views import render_file_view_status
+                        render_file_view_status(ws, config.id, project_id=str(tab.chat_id or ''), compact=True)
             if not error and not environment_busy and tab.key not in self.terminal_start_tasks:
                 async def boot_terminal() -> None:
+                    preparation_release = None
                     try:
+                        current = manager.config
+                        if current is None:
+                            raise RuntimeError('This VM environment is no longer registered.')
+                        if not guest_console:
+                            selected_project = ws.get_chat(str(tab.chat_id or ''))
+                            if selected_project is None or selected_project.archived_at is not None or not current.allows_project(selected_project.id):
+                                raise RuntimeError('This project is no longer allowed to use this VM. Choose an allowed project or open a Guest console.')
+                        self.terminal_start_stages[tab.key] = 'Starting VM…'
                         # Terminal boot uses the same process-owned Environment
                         # operation manager as the Environment page. The job keeps
                         # running across a browser reload and carries a total
@@ -18768,49 +18892,61 @@ window.harnessyTerminalFocus = function(terminalId) {
                         if guest_console:
                             # A human console must not deploy or synchronize the
                             # workspace container just to open a guest shell.
+                            self.terminal_start_stages[tab.key] = 'Opening guest console…'
                             argv, env, cwd = await provider.open_guest_terminal()
                         else:
-                            terminal_options = {'active_root': ws.files_root}
-                            if 'workspace' in inspect.signature(provider.open_terminal).parameters:
-                                terminal_options['workspace'] = ws
-                            argv, env, cwd = await provider.open_terminal(**terminal_options)
+                            from harnessy.environment.file_views import FILE_VIEWS
+                            self.terminal_start_stages[tab.key] = 'Preparing this project’s file view…'
+                            preparation_release = acquire_activity(
+                                ws.root, 'Opening project terminal', environment_id=config.id,
+                                project_id=str(tab.chat_id), owner_id=tab.key,
+                            )
+                            policy = await FILE_VIEWS.ensure_project(
+                                ws.root, environment_id=config.id, project_id=str(tab.chat_id), owner_id=tab.key, human=True,
+                            )
+                            policy = {**policy, '_file_view_owner_id': tab.key}
+                            active_root = ws.active_root_path(str(tab.chat_id))
+                            self.terminal_start_stages[tab.key] = 'Opening project files terminal…'
+                            argv, env, cwd = await provider.open_project_terminal(
+                                active_root=active_root, output_policy=policy, workspace=ws,
+                            )
                         construction = asyncio.create_task(asyncio.to_thread(
                             TerminalSession, cwd, command_argv=argv, env=env,
-                            workspace_root=ws.root, environment_id=config.id))
+                            workspace_root=ws.root, environment_id=config.id,
+                            project_id='__guest_console__' if guest_console else str(tab.chat_id), owner_id=tab.key))
                         try:
                             created = await asyncio.shield(construction)
                         except asyncio.CancelledError:
                             orphan = await construction
                             orphan.close()
                             raise
-                        try:
-                            attach = getattr(provider, 'attach_terminal_session', None) if not guest_console else None
-                            if attach is not None:
-                                attached = attach(created, workspace=ws)
-                                if inspect.isawaitable(attached):
-                                    await attached
-                        except BaseException:
-                            created.close()
-                            raise
                         log_event(
                             'runtime', 'workspace_terminal_started', workspace=str(ws.root),
                             provider=status.provider, environment_id=config.id,
                             guest_cwd='guest_home' if guest_console else '/workspace',
                             terminal_mode='guest_console' if guest_console else 'project_files', cpu_only=True,
+                            project_id=None if guest_console else tab.chat_id,
                         )
                         # The PTY is backend-owned. Closing the tab cancels this
                         # task explicitly; a browser reload merely destroys the
                         # old NiceGUI page and must not destroy the terminal.
                         self.terminal_sessions[tab.key] = created
                         self.terminal_errors.pop(tab.key, None)
+                        self.terminal_error_codes.pop(tab.key, None)
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
                         self.terminal_errors[tab.key] = str(exc)
+                        code = str(getattr(exc, 'error_code', '') or '')
+                        self.terminal_error_codes[tab.key] = code if code in {'FILE_VIEW_PENDING', 'FILE_VIEW_UNSUPPORTED', 'FILE_VIEW_FAILED', 'FILE_VIEW_POLICY_CHANGED'} else ''
                         log_event('harnessy', 'workspace_terminal_start_failed', workspace=str(ws.root), environment_id=config.id,
-                                  terminal_mode='guest_console' if guest_console else 'project_files', error=str(exc))
+                                  terminal_mode='guest_console' if guest_console else 'project_files',
+                                  error_code=self.terminal_error_codes[tab.key], error=str(exc))
                     finally:
+                        if preparation_release is not None:
+                            preparation_release()
                         self.terminal_start_tasks.pop(tab.key, None)
+                        self.terminal_start_stages.pop(tab.key, None)
                 # Do not use NiceGUI's background task wrapper here: this job must
                 # outlive the page/client which happened to request the terminal.
                 self.terminal_start_tasks[tab.key] = asyncio.create_task(
@@ -18818,6 +18954,8 @@ window.harnessyTerminalFocus = function(terminalId) {
                 )
             if not error:
                 async def watch_terminal_start() -> None:
+                    if not environment_busy and not stage_label.is_deleted:
+                        stage_label.set_text(self.terminal_start_stages.get(tab.key) or ('Starting guest console…' if guest_console else 'Preparing project files terminal…'))
                     if environment_busy:
                         if ENVIRONMENT_OPERATIONS.is_busy(ws.root, environment_id=config.id):
                             return
@@ -18840,8 +18978,8 @@ window.harnessyTerminalFocus = function(terminalId) {
             # host PTY. Backward compatibility is less important than preserving
             # the VM-first host isolation invariant.
             with ui.column().classes('hy-tool-panel hy-terminal-panel w-full no-wrap gap-0'):
-                with ui.row().classes('hy-tool-toolbar w-full items-center py-2 no-wrap gap-2').style('border-bottom:1px solid var(--hy-border); min-width:0'):
-                    ui.label(tab.title).classes('font-semibold')
+                with ui.row().classes('hy-tool-toolbar w-full items-center py-2 flex-wrap gap-2').style('border-bottom:1px solid var(--hy-border); min-width:0'):
+                    ui.label(tab.title).classes('font-semibold').style('min-width:0;max-width:100%;overflow-wrap:anywhere')
                     ui.label('Workspace environment unavailable').classes('text-xs text-negative')
                 with ui.column().classes('w-full h-full items-center justify-center gap-3'):
                     ui.icon('shield', size='34px').classes('text-negative')
@@ -18858,21 +18996,25 @@ window.harnessyTerminalFocus = function(terminalId) {
                 ui.label(f'Cannot start terminal: {exc}').classes('text-negative p-4')
                 return
 
-        started_label = ('guest home (guest console)' if guest_console else 'Files at /workspace (human workspace VM)') if is_workspace_vm else str(ws.root)
+        started_label = ('guest home (guest console)' if guest_console else f'{project_label} (project files)') if is_workspace_vm else str(ws.root)
         with ui.column().classes('hy-tool-panel hy-terminal-panel w-full no-wrap gap-0'):
-            with ui.row().classes('hy-tool-toolbar w-full items-center py-2 no-wrap gap-2').style('border-bottom:1px solid var(--hy-border); min-width:0'):
-                ui.label(tab.title).classes('font-semibold')
+            with ui.row().classes('hy-tool-toolbar w-full items-center py-2 flex-wrap gap-2').style('border-bottom:1px solid var(--hy-border); min-width:0'):
+                ui.label(tab.title).classes('font-semibold').style('min-width:0;max-width:100%;overflow-wrap:anywhere')
                 started_location = ui.label(f'Started in {started_label}').classes('text-xs hy-muted hy-file-name').style('max-width:680px')
                 if guest_console:
                     started_location.tooltip('Starts in the VM’s home directory. Workspace files are not copied automatically.')
                 if is_workspace_vm:
                     ui.label(f'🛡 {config.name} · {config.architecture} · CPU only').classes('text-xs hy-muted')
+                    ui.button('New terminal…', icon='add', on_click=lambda: self._choose_vm_terminal(self._find_reg(ws.id), config.id)).props('flat dense no-caps')
                 ui.space()
                 with ui.row().classes('items-center no-wrap gap-1'):
                     ui.button('Ctrl+C', on_click=session.interrupt).props('flat dense no-caps')
                     safe_dom_id = re.sub(r'[^A-Za-z0-9_-]+', '-', tab.key)
                     term_dom_id = f'hy-xterm-{safe_dom_id}'
                     clear_button = ui.button('Clear').props('flat dense no-caps')
+            if is_workspace_vm and not guest_console:
+                from harnessy.ui.project_file_views import render_file_view_status
+                render_file_view_status(ws, config.id, project_id=str(tab.chat_id or ''), compact=True)
             terminal_el = ui.element('div').classes('hy-terminal-shell hy-xterm').props(f'id={term_dom_id}')
             clear_button.on('click', js_handler=f"() => window.harnessyTerminalClear && window.harnessyTerminalClear({json.dumps(tab.key)})")
             client = terminal_el.client
@@ -18981,16 +19123,15 @@ window.harnessyTerminalFocus = function(terminalId) {
                                     else:
                                         optional_tools_summary_label = None
                                 with ui.card().classes('hy-env-card p-4 gap-1 min-w-0').style('flex:1.5 1 340px;max-width:100%'):
-                                    ui.label('Guest filesystem access' if config.files_mode == 'copy' and config.provider in {'openwrt', 'managed'} else 'Isolated project view').classes('text-xs hy-muted')
+                                    ui.label('Project file view').classes('text-xs hy-muted')
                                     ui.label(guest_project_root).classes('text-sm font-semibold')
                                     ui.label('Workspace source location').classes('text-xs hy-muted')
                                     ui.label(str(ws.files_root)).classes('text-xs hy-muted').style('max-width:100%;min-width:0;white-space:normal;overflow-wrap:anywhere')
                                     from harnessy.ui.vm_environments import FILE_MODES
                                     ui.label(FILE_MODES.get(config.files_mode, config.files_mode)).classes('text-sm font-semibold')
-                                    if config.files_mode == 'copy' and config.provider in {'openwrt', 'managed'}:
-                                        ui.label('Commands have access to this VM filesystem, including previously deployed copies. Canonical workspace source is not mounted.').classes('text-xs hy-muted')
-                                    else:
-                                        ui.label('Commands and terminals see one selected project root; controller metadata and sibling roots are detached.').classes('text-xs hy-muted')
+                                    ui.label('Project commands and Project files terminals use the same view: own files plus read-only ancestors, direct Project Access sources and References. Guest console starts in guest home.').classes('text-xs hy-muted')
+                                    if config.files_mode == 'copy':
+                                        ui.label('These are independent copies. Access updates cannot recall files already deployed or read; existing guest files are preserved.').classes('text-xs hy-muted')
                                     ui.label('Workspace source files are preserved when this VM is reset or rebuilt.').classes('text-xs hy-muted')
                                     if config.provider == 'openwrt':
                                         ui.label('System administration is available in Separate project copy mode.' if config.files_mode != 'copy' else 'System administration is available inside this guest. Deploy and collect project files explicitly.').classes('text-xs hy-muted')
@@ -23240,6 +23381,8 @@ def run_app() -> None:
                 pass
         _TERMINAL_SESSIONS.clear()
         _TERMINAL_ERRORS.clear()
+        _TERMINAL_ERROR_CODES.clear()
+        _TERMINAL_START_STAGES.clear()
         replacement_tasks = []
         for job in _TIMELINE_REPLACEMENT_JOBS.values():
             if job.task is not None and not job.task.done():
@@ -23271,6 +23414,8 @@ def run_app() -> None:
         _NOTIFICATION_TASKS.clear()
         from harnessy.ui.test_targets import close_target_tab_views
         await close_target_tab_views()
+        from harnessy.environment.file_views import FILE_VIEWS
+        await FILE_VIEWS.shutdown()
         # Finish/cancel owned lifecycle jobs before asking their controllers to
         # stop; otherwise shutdown can race a pending Start in another VM.
         await ENVIRONMENT_OPERATIONS.cancel_all()

@@ -30,10 +30,6 @@ TOOL_LABELS = {
 }
 
 
-def _copy_only(image) -> bool:
-    return image.integration == 'managed' or image.id == 'openwrt-25.12.5'
-
-
 def network_policy_text(provider: str) -> tuple[str, str]:
     if provider == 'openwrt':
         return 'Outbound network', 'QEMU NAT provides guest networking. When enabled, the guest can reach destinations permitted by the host network; this backend has no public-only destination filter. Verified setup downloads run through HarnessyXO even when guest outbound is off.'
@@ -144,21 +140,12 @@ def open_vm_creator(workbench, workspace, on_saved) -> None:
             values.add(tool_id) if selected else values.discard(tool_id)
 
         def update_file_note(_event=None) -> None:
-            integration = IMAGES[str(image.value)].integration
-            is_openwrt = integration == 'openwrt'
             if files.value == 'copy':
-                text = 'The first use deploys an independent project copy. Changes remain separate from workspace source and are never written back automatically. Commands retain an isolated project view.'
-                if integration == 'openwrt':
-                    text = 'The first use deploys an independent project copy into this VM. Previously deployed guest files remain available there. Guest administration is allowed; canonical workspace source is never mounted or written back automatically.'
-                if integration == 'managed':
-                    text = 'Guest administration and previously deployed guest copies are available. Deploy selected project files explicitly; canonical workspace source is never mounted or written back automatically.'
+                text = 'Deploys independent project copies. Changes are not written back to workspace source automatically. Permission updates cannot recall files already copied or read; existing guest files remain intact. Refresh and artifact collection are explicit.'
             elif files.value == 'readonly':
-                text = 'The VM can read the selected project source. Save builds and working data in its own writable directories.'
+                text = 'Reads canonical project files on demand. Own files, ancestors, direct Project Access sources and References are read-only. Save builds and working data in this VM’s own writable directories.'
             else:
-                text = 'Changes inside the selected project source are shared between VMs. Keep dependencies, builds and caches in this VM’s own directories.'
-            if is_openwrt and files.value != 'copy':
-                text += ' OpenWrt uses a synchronized guest projection for each command rather than a live host mount.'
-                text += ' Guest system administration requires Separate project copy mode.'
+                text = 'Reads and writes canonical project files on demand, without deploying the whole folder first. Ancestors, direct Project Access sources and References stay read-only. Keep dependencies, builds and caches in this VM’s own directories.'
             file_note.set_text(text)
 
         def preview(_event=None) -> None:
@@ -239,10 +226,9 @@ def open_vm_creator(workbench, workspace, on_saved) -> None:
                 cpu.props('max=64'); ram.props('max=256'); disk.props('max=4096')
                 limits.set_text('Sparse storage sets maximum capacity. Multiple VMs can run together; leave resources for your model and host.')
             managed = selected.integration == 'managed'
-            copy_only = _copy_only(selected)
-            files.options = {'copy': FILE_MODES['copy']} if copy_only else FILE_MODES
-            if copy_only or files.value not in files.options:
-                files.set_value('copy' if copy_only else 'live')
+            files.options = {key: FILE_MODES[key] for key in selected.file_modes if key in FILE_MODES}
+            if files.value not in files.options:
+                files.set_value(next(iter(files.options), None))
             files.update()
             installer_iso.set_visibility(managed and selected.id.startswith('windows'))
             desktop.set_visibility(managed or selected.integration == 'openwrt' or selected.id.startswith('kali'))
@@ -383,6 +369,11 @@ def render_vm_environments(workbench, tab, workspace) -> None:
                 tool_preset.disable()
                 ui.label('Finish this VM’s current operation and active work before changing its tool preset.').classes('text-xs hy-muted')
             project_access = ProjectAccessEditor(workspace, config)
+            ui.label(
+                'Saving rechecks project access. Independent copies already deployed or read cannot be recalled; guest files are preserved. A stopped VM stays stopped.'
+                if config.files_mode == 'copy' else
+                'Saving updates this VM’s project file views while it is running. In-use views show Unmount pending until their project tasks and terminals finish. A stopped VM stays stopped.'
+            ).classes('text-xs hy-muted').style('overflow-wrap:anywhere')
             opened_scope = (config.project_access, frozenset(config.allowed_project_ids))
             error = ui.label('').classes('text-sm text-negative')
             with ui.row().classes('w-full justify-end gap-2'):
@@ -530,12 +521,14 @@ def render_vm_environments(workbench, tab, workspace) -> None:
                     ui.label(f'Tool preset: {TOOL_BUNDLES.get(preset.tools_id, preset.tools_id)}').classes('text-xs hy-muted')
                     ui.label(FILE_MODES.get(config.files_mode, config.files_mode)).classes('text-xs hy-muted')
                     if config.project_access == 'all':
-                        ui.label('Model project access: All projects / chats, including future ones').classes('text-xs hy-muted')
+                        ui.label('Project access: All projects / chats, including future ones').classes('text-xs hy-muted')
                     else:
                         count = len(config.allowed_project_ids)
-                        ui.label(f'Model project access: {count} selected' if count else 'Model project access: None · model use is blocked for all projects / chats').classes('text-xs hy-muted' if count else 'text-xs text-negative')
+                        ui.label(f'Project access: {count} selected' if count else 'Project access: None · project-files terminals and model use are blocked').classes('text-xs hy-muted' if count else 'text-xs text-negative')
+                    from harnessy.ui.project_file_views import render_file_view_status
+                    render_file_view_status(workspace, config.id)
                     availability = ui.switch('Enabled for model use', value=config.enabled).props('dense')
-                    availability.tooltip('Off prevents the model from starting or using this VM. Manual controls remain available.')
+                    availability.tooltip('Off prevents the model from starting or using this VM. Guest console and allowed Project files terminals remain available.')
                     def set_enabled(event, environment_id=config.id) -> None:
                         try:
                             latest = manager.get(environment_id)
@@ -563,6 +556,8 @@ def render_vm_environments(workbench, tab, workspace) -> None:
                         start_button = ui.button('Start', icon='play_arrow', on_click=lambda _=None, callback=queue: callback('start')).props('flat no-caps')
                         stop_button = ui.button('Stop', icon='stop', on_click=lambda _=None, callback=queue: callback('stop')).props('flat no-caps')
                         terminal = ui.button('Terminal', icon='terminal', on_click=lambda _=None, eid=config.id: workbench.open_tool_tab('terminal', workbench._find_reg(workspace.id), environment_id=eid)).props('flat no-caps')
+                        terminal_options = ui.button(icon='arrow_drop_down', on_click=lambda _=None, eid=config.id: workbench._choose_vm_terminal(workbench._find_reg(workspace.id), eid)).props('flat dense aria-label="Choose terminal mode and project"')
+                        terminal_options.tooltip('Choose Project files or Guest console')
                         graphical = None
                         if getattr(config, 'desktop', False):
                             graphical = ui.button('Web UI' if config.provider == 'openwrt' else 'Desktop', icon='desktop_windows',
@@ -572,7 +567,7 @@ def render_vm_environments(workbench, tab, workspace) -> None:
                         delete = ui.button(icon='delete_outline', on_click=lambda _=None, item=config: remove(item)).props('flat round dense color=negative aria-label="Remove VM environment"')
                     details = ui.column().classes('w-full gap-0 mt-2 pt-2').style('min-width:0;border-top:1px solid var(--hy-border)').props(f'data-hy-vm-details={config.id}')
                     details.set_visibility(False)
-                    card_states[config.id] = dict(config=config, card=vm_card, spinner=spinner, status=status, operation=operation, detail=detail, timing=timing, progress=progress, progress_panel=progress_panel, progress_icon=progress_icon, start=start_button, stop=stop_button, terminal=terminal, graphical=graphical, manage=manage, details=details, delete=delete, availability=availability, running=False)
+                    card_states[config.id] = dict(config=config, card=vm_card, spinner=spinner, status=status, operation=operation, detail=detail, timing=timing, progress=progress, progress_panel=progress_panel, progress_icon=progress_icon, start=start_button, stop=stop_button, terminal=terminal, terminal_options=terminal_options, graphical=graphical, manage=manage, details=details, delete=delete, availability=availability, running=False)
         tab_syncing['value'] = False
         sync_details()
 
@@ -628,6 +623,7 @@ def render_vm_environments(workbench, tab, workspace) -> None:
             controls['start'].set_text('Retry Setup' if controls.get('running') and not controls.get('ready') else 'Start')
             controls['stop'].set_enabled(known and not busy and not active and bool(controls.get('running')))
             controls['terminal'].set_enabled(not busy and bool(controls.get('ready')))
+            controls['terminal_options'].set_enabled(not busy and bool(controls.get('ready')))
             if controls['graphical'] is not None:
                 controls['graphical'].set_enabled(not busy and bool(controls.get('running')))
             controls['delete'].set_enabled(known and not busy and not active and not controls.get('running'))

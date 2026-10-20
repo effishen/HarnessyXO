@@ -2306,6 +2306,10 @@ def _privacy_manifest(*, include_content: bool = False) -> str:
         'arbitrary guest lines, paths, names and message bodies are omitted. These tails can contain observations '
         'from earlier boots and do not establish an underlying cause by themselves. VM collection reads existing '
         'files only: it opens no database and runs no VM/controller commands.\n\n'
+        'FILE_VIEWS.json records bounded persisted VM file-view observations: requested and applied policy '
+        'revisions, per-project states, fixed stages and failure codes, pending project IDs and transport '
+        'capabilities. It excludes names, paths and file content. These receipts describe retained observations; '
+        'export does not inspect live mounts, open a database or run guest commands.\n\n'
         'TARGET_LOGS.json records separately bounded managed test-target QEMU serial and Lima log coverage, '
         'including unavailable/unsafe sources. target-logs/ contains fixed technical signals; raw tails require '
         'content-rich export. Test-target operation stages, elapsed time, probe attempts, and fixed failure '
@@ -2459,6 +2463,13 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
             vm_report, vm_members = _collect_vm_export(latest, include_content=include_content)
             target_report, target_members = _collect_test_target_export(latest, include_content=include_content)
             try:
+                from .file_views import collect_file_view_diagnostics
+                file_view_report = collect_file_view_diagnostics(latest)
+            except Exception as exc:
+                from .technical import technical_error_evidence
+                file_view_report = {'schema_version': 1, 'status': 'collector_failed',
+                                    'environments': [], 'technical_error': technical_error_evidence(exc)}
+            try:
                 from .host_state import collect_host_diagnostics, validate_host_diagnostics
                 host_report = validate_host_diagnostics(collect_host_diagnostics(application_root=app_root))
             except Exception as exc:
@@ -2478,7 +2489,10 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
                 summary = ('HarnessyXO support summary\n\n'
                            'The incident summary could not be generated. Remaining diagnostic evidence is included.\n'
                            'VM_LOGS.json records VM log source coverage; available retained VM evidence is under vm-logs/.\n')
+            from .file_views import summary_lines as file_view_summary_lines
+            summary += file_view_summary_lines(file_view_report)
             zf.writestr('SUMMARY.txt', summary)
+            zf.writestr('FILE_VIEWS.json', json.dumps(file_view_report, ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('INCIDENTS.json', json.dumps(incidents, ensure_ascii=False, indent=2))
             zf.writestr('PERMISSIONS.json', json.dumps(incidents.get('permission_audit', {
                 'schema_version': 1, 'status': 'unavailable', 'reason': 'summary_generation_failed',
@@ -2505,7 +2519,8 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
             }, ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('COLLECTOR_ERRORS.json', json.dumps({
                 'schema_version': 1, 'collectors': {name: value for name, value in
-                    (('summary', incidents), ('workspace_vm', vm_report), ('test_targets', target_report), ('host', host_report))
+                    (('summary', incidents), ('workspace_vm', vm_report), ('test_targets', target_report), ('host', host_report),
+                     ('file_views', file_view_report))
                     if value.get('technical_error')},
             }, ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('VM_LOGS.json', json.dumps(vm_report, ensure_ascii=False, indent=2, allow_nan=False))

@@ -21,6 +21,7 @@ class GuestImage:
     architectures: tuple[str, ...] = ('arm64', 'x86_64')
     qemu_mount: str = '9p'
     experimental: bool = True
+    file_modes: tuple[str, ...] = ('live', 'readonly', 'copy')
     capabilities: tuple[str, ...] = ('Terminal / command execution', 'Isolated selected root → /workspace', 'CPU only', 'VM snapshots')
 
 
@@ -41,14 +42,14 @@ IMAGES = {
         'Verified official Kali generic cloud image; isolated project files and optional desktop.'),
     'windows-11': GuestImage('windows-11', 'Windows 11', 'windows-11', 'windows',
         'Install from your own English (United States) ISO. PowerShell, graphical console and explicit project copies.',
-        integration='managed', qemu_mount='separate-copy',
+        integration='managed', qemu_mount='separate-copy', file_modes=('copy',),
         capabilities=('PowerShell command execution', 'Separate deployed project copies', 'Graphical installer / desktop', 'Stopped VM snapshots')),
 }
 IMAGES['openwrt-23.05.5'] = GuestImage(
     'openwrt-23.05.5', 'OpenWrt 23.05.5 (MIPS big-endian)', '', 'opkg',
     'Malta mips_24kc, big-endian, musl, Linux 5.15.167; Python 3.11.7. Software CPU emulation.',
-    integration='openwrt', architectures=('mips',), qemu_mount='synchronized-project',
-    capabilities=('Terminal / command execution', 'Authorized project synchronization', 'CPU only', 'Stopped VM snapshots'),
+    integration='openwrt', architectures=('mips',), qemu_mount='sshfs',
+    capabilities=('Terminal / command execution', 'Live host project files over scoped SSHFS', 'CPU only', 'Stopped VM snapshots'),
 )
 FUTURE_IMAGES = {
     'windows': 'Windows as the primary working VM is a future integration. Windows test VMs are available in External/Test Targets.',
@@ -205,9 +206,11 @@ for _release in ('openwrt-23.05.2', 'openwrt-25.12.5'):
     _version = _release.removeprefix('openwrt-')
     IMAGES[_release] = GuestImage(
         _release, 'OpenWrt ' + _version, '', 'apk' if _version.startswith('25.') else 'opkg',
-        'Official OpenWrt image; package versions follow this release. Project files use explicit SSH synchronization.',
+        ('Official OpenWrt image with explicit independent project copies; automatic APK live sharing is unavailable.' if _version.startswith('25.') else 'Official OpenWrt image; matching FUSE and SSHFS provide scoped live host project files.'),
         integration='openwrt', architectures=tuple(_OPENWRT_RELEASE_IMAGES[_release]),
-        qemu_mount='synchronized-project', capabilities=IMAGES['openwrt-23.05.5'].capabilities,
+        qemu_mount='separate-copy' if _version.startswith('25.') else 'sshfs',
+        file_modes=('copy',) if _version.startswith('25.') else ('live', 'readonly', 'copy'),
+        capabilities=('Guest command execution', 'Explicit independent project copies', 'Stopped VM snapshots') if _version.startswith('25.') else IMAGES['openwrt-23.05.5'].capabilities,
     )
     PRESETS[_release] = EnvironmentPreset(
         _release, 'OpenWrt ' + _version, IMAGES[_release].description, 'OpenWrt ' + _version,

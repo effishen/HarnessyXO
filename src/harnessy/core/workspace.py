@@ -181,6 +181,8 @@ class WorkspaceStore:
                 self._workspace_generation = workspace_generation(self.root)
             finally:
                 self._workspace_initializing = False
+        from ..environment.file_views import FILE_VIEWS
+        FILE_VIEWS.register_workspace(self)
 
     def _initialize(self, name: str | None, *, database_admission: str) -> None:
 
@@ -319,6 +321,8 @@ class WorkspaceStore:
         store.metadata = metadata
         store._workspace_generation = workspace_generation(root)
         store._workspace_initializing = False
+        from ..environment.file_views import FILE_VIEWS
+        FILE_VIEWS.register_workspace(store)
         return store
 
     @property
@@ -2564,6 +2568,7 @@ class WorkspaceStore:
             con.commit()
         if parent_chat_id:
             self._ensure_dependency_mountpoints(cid)
+        self._request_file_views('project_created', (cid,))
         return Chat(cid, title, now, now, folder_name, None, public_id=public_id)
 
     def create_chat(self, title: str = 'New chat') -> Chat:
@@ -2830,6 +2835,7 @@ class WorkspaceStore:
             except BaseException:
                 con.rollback()
                 raise
+        self._request_file_views('project_access_changed', (destination_id,))
         return {
             'chat_id': destination_id,
             'source_chat_ids': self.project_access_source_ids(destination_id),
@@ -2995,6 +3001,7 @@ class WorkspaceStore:
             raise
 
         self._ensure_dependency_mountpoints(child_id)
+        self._request_file_views('project_parent_changed', subtree)
         return {
             'chat_id': child_id, 'old_parent_chat_id': old_parent_id,
             'parent_chat_id': new_parent_id, 'subtree_chat_ids': subtree,
@@ -3002,70 +3009,14 @@ class WorkspaceStore:
         }
 
     def output_policy(self, chat_id: str) -> dict[str, Any]:
-        """Return the exact model-visible project namespace for one chat."""
-        chat = self.get_chat(chat_id)
-        if chat is None or not valid_chat_output_id(chat.public_id):
-            raise ValueError('Project / Chat has no valid output ID')
-        if chat.archived_at is not None:
-            raise ValueError('Archived Projects / Chats are permanently read-only')
-        own = chat_output_folder_name(chat.public_id)
-        if chat.active_root != own:
-            raise HistoryError('Project active root is not its canonical Files/Project-<ID> directory')
-        self.output_directory(chat_id)
-        self._ensure_dependency_mountpoints(chat_id)
-        ancestors: list[dict[str, str]] = []
-        ancestor_by_chat_id: dict[str, dict[str, str]] = {}
-        nested_parts: list[str] = []
-        for ancestor in self.ancestor_chats(chat_id):
-            folder = chat_output_folder_name(ancestor.public_id)
-            path = self.output_directory_for_public_id(ancestor.public_id)
-            nested_parts.append(folder)
-            row = {
-                'chat_id': ancestor.id,
-                'project_chat_id': ancestor.public_id,
-                'folder': folder,
-                'nested_path': '/'.join(nested_parts),
-                'title': ancestor.title,
-                'host_path': str(path),
-            }
-            ancestors.append(row)
-            ancestor_by_chat_id[ancestor.id] = row
-        access_projects: list[dict[str, Any]] = []
-        for source in self.project_access_sources(chat_id):
-            inherited = ancestor_by_chat_id.get(source.id)
-            folder = chat_output_folder_name(source.public_id)
-            access_projects.append({
-                'chat_id': source.id,
-                'project_chat_id': source.public_id,
-                'folder': folder,
-                'title': source.title,
-                'host_path': str(self.output_directory_for_public_id(source.public_id)),
-                'files_path': (
-                    f'{FILES_DIR_NAME}/{own}/{inherited["nested_path"]}'
-                    if inherited is not None else f'{FILES_DIR_NAME}/{folder}'
-                ),
-                'direct_mount': inherited is None,
-                'history_access': True,
-                'attachment_access': True,
-                'memory_access': True,
-                'task_state_access': True,
-            })
-        direct_access_folders = [
-            str(row['folder']) for row in access_projects if bool(row.get('direct_mount'))
-        ]
-        return {
-            'namespace_version': 2,
-            'project_chat_id': chat.public_id,
-            'writable_folder': own,
-            'folders': tuple(dict.fromkeys([
-                own, *(row['folder'] for row in ancestors), *direct_access_folders,
-            ])),
-            'project_root': str(self.output_directory(chat_id)),
-            'references_folder': REFERENCES_DIR_NAME,
-            'references_root': str(self.references_dir),
-            'ancestors': tuple(ancestors),
-            'access_projects': tuple(access_projects),
-        }
+        from .project_mounts import build_project_policy
+        return build_project_policy(self, chat_id)
+
+    def _request_file_views(self, reason: str, project_ids=None) -> None:
+        # Called only after metadata transactions commit. Runtime work belongs
+        # to the process service, never to this SQLite connection/UI request.
+        from ..environment.file_views import FILE_VIEWS
+        FILE_VIEWS.request(self.root, reason=reason, project_ids=project_ids)
 
     def list_chats(self, *, archived: bool | None = False) -> list[Chat]:
         where = ''
@@ -5713,6 +5664,7 @@ class WorkspaceStore:
             # Attachment rows disappear from the rewound chat, but the private
             # bytes stay in place so an undo can restore them losslessly.
             self._ensure_dependency_mountpoints(chat_id)
+            self._request_file_views('project_root_replaced')
             updated = self.get_chat(chat_id)
             if updated is None:
                 raise HistoryError('Project / Chat disappeared after rewind.')
@@ -5985,6 +5937,7 @@ class WorkspaceStore:
             raise
 
         self._ensure_dependency_mountpoints(chat_id)
+        self._request_file_views('project_root_replaced')
         return {
             'rewind_id': str(rewind['rewind_id']),
             'chat_id': str(chat_id),
@@ -6303,6 +6256,7 @@ class WorkspaceStore:
             raise
 
         self._finalize_archived_directories(family_id=family_id)
+        self._request_file_views('project_archived')
         return {**preview, 'family_id': family_id, 'archive_path': str(final)}
 
     def _finalize_archived_directories(self, *, family_id: str | None = None) -> None:
@@ -6555,6 +6509,7 @@ class WorkspaceStore:
         if project_root.exists():
             destination = self.trash_dir / f'deleted-project-{chat.public_id}-{uuid.uuid4().hex}'
             os.replace(project_root, destination)
+        self._request_file_views('project_removed')
 
     @staticmethod
     def _message_from_row(row: sqlite3.Row) -> Message:

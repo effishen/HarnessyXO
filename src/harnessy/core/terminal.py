@@ -74,9 +74,13 @@ class TerminalSession:
         command_argv: list[str] | None = None, env: dict[str, str] | None = None,
         workspace_root: Path | None = None,
         environment_id: str = '',
+        project_id: str | None = None,
+        owner_id: str = '',
     ) -> None:
         self.workspace_root = workspace_root
         self.environment_id = environment_id
+        self.project_id = project_id
+        self.owner_id = owner_id
         self._activity_release = None
         self.cwd = cwd.resolve()
         self.command_argv = list(command_argv) if command_argv else None
@@ -107,7 +111,8 @@ class TerminalSession:
         self._release_activity()
         root = getattr(self, 'workspace_root', None)
         release = acquire_activity(root, 'VM terminal (close it before changing this VM)',
-                                   environment_id=self.environment_id) if root else None
+                                   environment_id=self.environment_id,
+                                   project_id=getattr(self, 'project_id', None), owner_id=getattr(self, 'owner_id', '')) if root else None
         self._activity_release = release
         try:
             self._start_child()
@@ -200,6 +205,8 @@ class TerminalSession:
 
     def send_bytes(self, data: bytes) -> None:
         if self.master_fd is None or not self._alive():
+            if getattr(self, 'project_id', None) not in {None, '__guest_console__'}:
+                raise RuntimeError('This project terminal has ended. Reopen it to prepare the current project file view.')
             self.start()
         assert self.master_fd is not None
         os.write(self.master_fd, data)

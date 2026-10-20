@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import inspect
 import json
 import re
 import shlex
@@ -32,19 +31,10 @@ _IDENTIFIER_RE = re.compile(r'[A-Za-z_$][A-Za-z0-9_$]*')
 
 
 def _output_policy_kwargs(method: Any, output_policy: dict[str, Any] | None) -> dict[str, Any]:
-    """Keep legacy providers usable without dropping policy on current ones."""
+    """A VM integration must accept the shared policy; never silently drop it."""
     if output_policy is None:
         return {}
-    try:
-        parameters = inspect.signature(method).parameters.values()
-        supported = any(
-            (parameter.name == 'output_policy' and parameter.kind is not inspect.Parameter.POSITIONAL_ONLY)
-            or parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters
-        )
-    except (TypeError, ValueError):
-        supported = True
-    return {'output_policy': output_policy} if supported else {}
+    return {'output_policy': output_policy}
 
 
 @dataclass(slots=True)

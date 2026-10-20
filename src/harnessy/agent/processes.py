@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import atexit
-import inspect
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -154,26 +153,26 @@ class ProcessJobManager:
         if current is None or not current.enabled or not current.allows_project(origin_chat_id):
             raise EnvironmentModelAccessError('This Project/Chat does not have model access to this VM environment.')
         release_activity = acquire_activity(environment.workspace_root, 'Process · ' + command[:80],
-                                            environment_id=environment_id)
+                                            environment_id=environment_id, project_id=origin_chat_id,
+                                            owner_id=str((output_policy or {}).get('_file_view_owner_id') or ''))
+        process = None
         try:
             spawn_kwargs: dict[str, Any] = {
                 'cwd': cwd_label,
                 'active_root': active_root,
+                'output_policy': output_policy,
             }
-            try:
-                parameters = inspect.signature(environment.spawn).parameters.values()
-                accepts_policy = any(
-                    parameter.name == 'output_policy'
-                    or parameter.kind is inspect.Parameter.VAR_KEYWORD
-                    for parameter in parameters
-                )
-            except (TypeError, ValueError):
-                accepts_policy = True
-            if accepts_policy:
-                spawn_kwargs['output_policy'] = output_policy
             process = await environment.spawn(command, **spawn_kwargs)
+            # Preparation belongs to this tool call. The running job must keep
+            # a distinct lease so another tool in the same run cannot exempt it.
+            release_running = acquire_activity(environment.workspace_root, 'Process · ' + command[:80],
+                environment_id=environment_id, project_id=origin_chat_id, owner_id=uuid.uuid4().hex)
+            release_activity()
+            release_activity = release_running
         except BaseException:
             release_activity()
+            if process is not None and process.returncode is None:
+                await environment.terminate(process)
             raise
         try:
             runtime_identity = dict(environment.runtime_identity() or {})
