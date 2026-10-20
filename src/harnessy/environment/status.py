@@ -56,6 +56,9 @@ class EnvironmentStatusRegistry:
         for entry in entries:
             entry.updated_at = 0.0
             entry.generation += 1
+        if environment_id:
+            from .storage import VM_STORAGE
+            VM_STORAGE.request(workspace_root, environment_id=environment_id)
 
     def publish_snapshots(self, workspace_root: str | Path, snapshots: list[str], *, environment_id: str | None = None) -> None:
         """Publish a verified operation result before exposing completion.
@@ -71,7 +74,18 @@ class EnvironmentStatusRegistry:
 
     def peek(self, workspace_root: str | Path, *, environment_id: str | None = None) -> dict[str, Any] | None:
         entry = self._entry(workspace_root, environment_id)
-        return entry.data
+        selected = self._key(workspace_root, environment_id)[1]
+        return self._with_storage(workspace_root, selected, entry.data)
+
+    @staticmethod
+    def _with_storage(root, environment_id, info, *, lifecycle_busy=False):
+        if info is None or not ENVIRONMENT_ID_RE.fullmatch(environment_id):
+            return info
+        from .storage import VM_STORAGE
+        status = info.get('status') or {}
+        VM_STORAGE.observe(root, environment_id=environment_id, running=bool(status.get('running')),
+                           lifecycle_busy=lifecycle_busy)
+        return {**info, 'storage_usage': VM_STORAGE.status(root, environment_id=environment_id)}
 
     def stats(self, workspace_root: str | Path, *, environment_id: str | None = None) -> dict[str, Any]:
         entry = self._entry(workspace_root, environment_id)
@@ -105,7 +119,7 @@ class EnvironmentStatusRegistry:
                 duration_seconds=max(0.0, time.monotonic() - started),
                 refresh_count=entry.refresh_count,
             )
-            return info
+            return self._with_storage(workspace_root, environment_id, info)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -146,7 +160,7 @@ class EnvironmentStatusRegistry:
         try:
             from .operations import ENVIRONMENT_OPERATIONS
             if ENVIRONMENT_OPERATIONS.is_busy(root, environment_id=environment_id):
-                return entry.data
+                return self._with_storage(root, environment_id, entry.data, lifecycle_busy=True)
         except Exception:
             pass
 
@@ -154,7 +168,7 @@ class EnvironmentStatusRegistry:
         recent = bool(entry.updated_at and (time.monotonic() - entry.updated_at) < ttl)
         if not force and recent:
             if entry.data is not None:
-                return entry.data
+                return self._with_storage(root, environment_id, entry.data)
             if entry.error:
                 # The last refresh failed recently. Surface the same bounded
                 # failure without issuing another controller command until the
@@ -169,7 +183,10 @@ class EnvironmentStatusRegistry:
             )
             entry.task = task
         try:
-            return await asyncio.shield(task)
+            info = await asyncio.shield(task)
+            if self._entries.get((str(root), environment_id)) is not entry:
+                return None  # This workspace/VM observer was closed while awaiting inspect.
+            return self._with_storage(root, environment_id, info)
         except asyncio.CancelledError:
             # Cancelling a page observer must not cancel the process-owned status
             # request being shared with another page/client.
@@ -180,17 +197,25 @@ class EnvironmentStatusRegistry:
                 # as metadata. Callers can show it without destroying controls.
                 stale = dict(entry.data)
                 stale['_status_poll_error'] = entry.error
-                return stale
+                return self._with_storage(root, environment_id, stale)
             raise
 
-    async def close(self) -> None:
-        tasks = [entry.task for entry in self._entries.values() if entry.task and not entry.task.done()]
+    async def close(self, workspace_root: str | Path | None = None, *, environment_id: str | None = None) -> None:
+        root = str(Path(workspace_root).expanduser().absolute()) if workspace_root is not None else None
+        keys = [key for key in self._entries if (root is None or key[0] == root)
+                and (environment_id is None or key[1] == environment_id)]
+        entries = [self._entries.pop(key) for key in keys]
+        for entry in entries:
+            entry.generation += 1
+        tasks = [entry.task for entry in entries if entry.task and not entry.task.done()]
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        for entry in self._entries.values():
+        for entry in entries:
             entry.task = None
+        from .storage import VM_STORAGE
+        await VM_STORAGE.close(root, environment_id=environment_id)
 
 
 ENVIRONMENT_STATUS = EnvironmentStatusRegistry()

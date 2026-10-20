@@ -636,6 +636,9 @@ def environment_claim_diagnostics(text: str) -> list[str]:
 
 
 _ERROR_PATTERNS = (
+    (re.compile(r'no space left on device|\bENOSPC\b', re.I), 'StorageFull', 'ENOSPC', 'No space left on device'),
+    (re.compile(r'disk quota exceeded|\bEDQUOT\b', re.I), 'StorageQuotaExceeded', 'EDQUOT', 'Disk quota exceeded'),
+    (re.compile(r'no (?:free|available) inodes|out of inodes|inode(?:s)? (?:exhausted|table full)', re.I), 'InodesExhausted', '', 'No available inodes'),
     (re.compile(r'permission denied', re.I), 'PermissionDenied', 'EACCES', 'Permission denied'),
     (re.compile(r'operation not permitted', re.I), 'OperationNotPermitted', 'EPERM', 'Operation not permitted'),
     (re.compile(r'no such file or directory', re.I), 'FileNotFound', 'ENOENT', 'No such file or directory'),
@@ -2310,6 +2313,11 @@ def _privacy_manifest(*, include_content: bool = False) -> str:
         'revisions, per-project states, fixed stages and failure codes, pending project IDs and transport '
         'capabilities. It excludes names, paths and file content. These receipts describe retained observations; '
         'export does not inspect live mounts, open a database or run guest commands.\n\n'
+        'VM_STORAGE.json records bounded persisted guest root/temporary filesystem capacity, used/available '
+        'bytes, inodes and read-only state, plus host disk-image allocation. Unknown values remain null; '
+        'timestamps, freshness and explicitly last-known observations distinguish old readings from current '
+        'failures. Fixed roles replace guest paths; file names and content are excluded. Export only reads '
+        'receipts and never starts a VM, runs SSH or scans project files.\n\n'
         'TARGET_LOGS.json records separately bounded managed test-target QEMU serial and Lima log coverage, '
         'including unavailable/unsafe sources. target-logs/ contains fixed technical signals; raw tails require '
         'content-rich export. Test-target operation stages, elapsed time, probe attempts, and fixed failure '
@@ -2470,6 +2478,13 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
                 file_view_report = {'schema_version': 1, 'status': 'collector_failed',
                                     'environments': [], 'technical_error': technical_error_evidence(exc)}
             try:
+                from .vm_storage import collect_storage_diagnostics
+                storage_report = collect_storage_diagnostics(latest)
+            except Exception as exc:
+                from .technical import technical_error_evidence
+                storage_report = {'schema_version': 1, 'status': 'collector_failed',
+                                  'environments': [], 'technical_error': technical_error_evidence(exc)}
+            try:
                 from .host_state import collect_host_diagnostics, validate_host_diagnostics
                 host_report = validate_host_diagnostics(collect_host_diagnostics(application_root=app_root))
             except Exception as exc:
@@ -2490,9 +2505,12 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
                            'The incident summary could not be generated. Remaining diagnostic evidence is included.\n'
                            'VM_LOGS.json records VM log source coverage; available retained VM evidence is under vm-logs/.\n')
             from .file_views import summary_lines as file_view_summary_lines
+            from .vm_storage import summary_lines as storage_summary_lines
             summary += file_view_summary_lines(file_view_report)
+            summary += storage_summary_lines(storage_report)
             zf.writestr('SUMMARY.txt', summary)
             zf.writestr('FILE_VIEWS.json', json.dumps(file_view_report, ensure_ascii=False, indent=2, allow_nan=False))
+            zf.writestr('VM_STORAGE.json', json.dumps(storage_report, ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('INCIDENTS.json', json.dumps(incidents, ensure_ascii=False, indent=2))
             zf.writestr('PERMISSIONS.json', json.dumps(incidents.get('permission_audit', {
                 'schema_version': 1, 'status': 'unavailable', 'reason': 'summary_generation_failed',
@@ -2520,7 +2538,7 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
             zf.writestr('COLLECTOR_ERRORS.json', json.dumps({
                 'schema_version': 1, 'collectors': {name: value for name, value in
                     (('summary', incidents), ('workspace_vm', vm_report), ('test_targets', target_report), ('host', host_report),
-                     ('file_views', file_view_report))
+                     ('file_views', file_view_report), ('vm_storage', storage_report))
                     if value.get('technical_error')},
             }, ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('VM_LOGS.json', json.dumps(vm_report, ensure_ascii=False, indent=2, allow_nan=False))

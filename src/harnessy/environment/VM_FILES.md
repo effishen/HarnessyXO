@@ -162,6 +162,26 @@ working directories, memory mappings or data a process already read.
 
 ## Failure and data preservation
 
+Storage reporting must keep configured virtual capacity, guest filesystem free
+space and host image-file allocation separate. A sparse disk's configured size
+is not its free space; a qcow2 image's file length is not its virtual capacity.
+Missing or inaccessible measurements must remain unknown, never zero.
+
+Providers report only fixed root and temporary filesystem roles and reviewed
+numeric metadata. Identify memory-backed temporary storage from the actual
+filesystem, rather than assuming every `/tmp` is tmpfs. Check only known
+controller-owned disk images on the host; never recursively scan canonical
+Files, References, project directories or guest file contents to count usage.
+
+Guest checks are bounded, deduplicated per VM and owned by the application,
+independent of browser/model task context. They must not start a stopped VM,
+install a package, repair a filesystem or change a file view. Pause checks while
+a lifecycle operation is active. Retain timestamps and distinguish stale or
+last-known readings from a failed current probe. Drain observers on VM removal,
+workspace removal and shutdown, and reject writes after admission or generation
+changes. Diagnostic exports read bounded sanitized receipts only and never
+require a live guest or database.
+
 The UI and diagnostics distinguish requested policy from verified runtime
 state: preparing, mounted, pending, stopped, unsupported or failed. References
 status is separate from project status: a References failure must not block

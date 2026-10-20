@@ -1,4 +1,4 @@
-# HarnessyXO v0.7.7 Features
+# HarnessyXO v0.7.8 Features
 
 ## Named VM environments
 
@@ -36,6 +36,7 @@
 - Review a verified index repair and choose **Use repaired database**, then **Open workspace** to restore saved tabs. Require full integrity, relationship, schema and row-by-row checks before offering activation. Keep uncertain salvage separate for review; preserve original database and journal files, project files, VM disks and workspace identity.
 - Pause work only in the workspace being recovered. If queued jobs remain after recovery, choose **Resume queued work** after reviewing them. Existing completion and backend holds remain in effect. If an activation was interrupted, choose **Restore original database** before checking or opening that workspace again.
 - Open **Environments → select a VM → Details → Edit VM Resources** to change CPU, RAM and storage. Stop the VM and finish active workspace work first. CPU and RAM can increase or decrease; storage can only grow. Start the VM afterward to use the new values and expand its disk capacity. Existing files, installed tools and VM disks are retained.
+- In the same Details panel, see measured guest disk used, total and free space with a usage bar, low-space/inode warnings and a timestamp. `/tmp` is separate and labelled memory-backed only when verified. Host disk-image allocation and image file length are separate from configured virtual capacity. Checks run in the background for running supported Linux guests, pause during VM operations and can be refreshed manually; stale readings remain explicitly last-known, and unavailable values never become zero. Windows guest reporting is unsupported; host allocation remains available. Diagnostics retain these content-free observations in `VM_STORAGE.json` without contacting a guest during export.
 - Check the current VM identity, stopped state and settings before applying an edit, then verify the controller's reported values before saving. An uncertain edit keeps the saved definition unchanged and explains how to retry without shrinking the disk.
 - Keep VM resource settings and an explicit **Stop VM** control available on a workspace-open error, independently of the workspace database.
 - Diagnostics distinguish SQLite corruption from locks, record bounded workspace worker failures and native signals, and label collector resource/version observations separately from recorded application state.

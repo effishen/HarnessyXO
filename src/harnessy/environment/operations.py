@@ -634,6 +634,8 @@ class EnvironmentOperationRegistry:
                 set_phase('removal_destroying', 'Removing this VM’s disk, snapshots and configuration…')
                 from .file_views import FILE_VIEWS
                 await FILE_VIEWS.close_environment(workspace_root, environment_id=environment_id)
+                from .status import ENVIRONMENT_STATUS
+                await ENVIRONMENT_STATUS.close(workspace_root, environment_id=environment_id)
                 await provider.destroy()
                 EnvironmentManager(workspace_root).remove(environment_id)
                 return None

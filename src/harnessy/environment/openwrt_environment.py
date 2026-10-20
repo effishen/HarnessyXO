@@ -265,8 +265,12 @@ class OpenWrtEnvironment(WorkspaceEnvironment):
                 await result
 
     async def _raw(self, command: str, *, data: bytes | None = None, timeout: float = 120, output_limit: int = 16 * 1024 * 1024,
-                   failure_capture: dict[str, bytes] | None = None) -> tuple[int, bytes, bytes]:
+                   failure_capture: dict[str, bytes] | None = None, login_shell: bool = True) -> tuple[int, bytes, bytes]:
         argv, env = self.controller.command(command)
+        if not login_shell:
+            # Metadata probes must not execute a guest login profile. Keep the
+            # existing model, lifecycle, and interactive transports unchanged.
+            argv[-1] = '/bin/ash -c ' + shlex.quote(command)
         process = await asyncio.create_subprocess_exec(*argv, env=env, cwd=self.environment_root,
             stdin=asyncio.subprocess.PIPE if data is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -353,6 +357,30 @@ class OpenWrtEnvironment(WorkspaceEnvironment):
             guest_architecture=self.config.architecture, guest_os=guest_os(self.config.preset).label,
             environment_id=self.config.id, environment_name=self.config.name,
             files_mount='/workspace', detail='Independent guest copies.' if self.config.files_mode == 'copy' else 'Scoped live SSHFS source mounts; host-enforced read-only inputs.')
+
+    def _host_storage_usage(self):
+        from .storage_probe import host_disk_usage
+        return host_disk_usage(self.controller.instance_dir, ('rootfs.raw',))
+
+    async def storage_usage(self) -> dict[str, Any]:
+        from .storage_probe import (OPENWRT_STORAGE_SCRIPT, MAX_OUTPUT, parse_openwrt_storage,
+                                    storage_result, unavailable_guest)
+        host = await finish_thread(self._host_storage_usage)
+        try:
+            status = await asyncio.wait_for(self.controller.status(), 2)
+        except (OSError, RuntimeError, ValueError, asyncio.TimeoutError):
+            return storage_result(unavailable_guest(), host)
+        if not status.get('running'):
+            state = str(status.get('state', ''))
+            guest = unavailable_guest('GUEST_STORAGE_STOPPED', state='stopped') if state in {'stopped', 'not_created'} else unavailable_guest()
+            return storage_result(guest, host)
+        try:
+            rc, output, _ = await self._raw(OPENWRT_STORAGE_SCRIPT, timeout=5, output_limit=MAX_OUTPUT,
+                                          login_shell=False)
+            guest = parse_openwrt_storage(output) if rc == 0 else unavailable_guest('GUEST_STORAGE_PROBE_FAILED')
+        except (OSError, RuntimeError, ValueError, asyncio.TimeoutError):
+            guest = unavailable_guest('GUEST_STORAGE_PROBE_FAILED')
+        return storage_result(guest, host)
 
     async def create(self, progress=None) -> EnvironmentStatus:
         return await self.start(progress=progress)
@@ -1378,11 +1406,18 @@ python3 -c {shlex.quote(_REPLACE_GUEST_TREE)} {shlex.quote(stage)} {shlex.quote(
 
     async def inspect(self) -> dict[str, Any]:
         status = await self.status()
+        host_storage = await finish_thread(self._host_storage_usage)
+        storage_compat = {}
+        if host_storage['allocated_bytes'] is not None:
+            storage_compat['vm_storage_bytes'] = host_storage['allocated_bytes']
+        if host_storage['logical_bytes'] is not None:
+            storage_compat['vm_storage_logical_bytes'] = host_storage['logical_bytes']
         try:
             identity = json.loads((self.state_root / 'guest.json').read_text())
         except (OSError, ValueError):
             identity = {'observation': 'not_probed'}
         return {'config': self.config.to_dict(), 'status': status.to_dict(), 'snapshots': await self.list_snapshots(),
+                **storage_compat,
                 'files_root': str(self.files_root), 'guest_files_root': '/workspace',
                 'durable_vm_root': str(self.vm_root), 'runtime_qemu_root': str(self.controller.runtime_dir()),
                 'vm_type': 'qemu', 'mount_type': 'separate-copy' if self.config.files_mode == 'copy' else 'sshfs', 'snapshot_strategy': 'stopped-disk-copy',

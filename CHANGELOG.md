@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.8
+
+- Show measured guest disk used, total and available space in VM Details, with a usage bar and low-space warnings. Show `/tmp` separately and identify memory-backed temporary storage only when verified. Keep inode exhaustion and read-only filesystem state visible.
+- Replace the misleading missing-value “VM storage on host: 0 B” with separately labelled host disk-image allocation and image file length. Keep configured sparse disk capacity distinct from both guest free space and host allocation. Missing measurements stay unavailable.
+- Measure supported OpenWrt and Lima Linux guests in the background without starting a VM, installing tools, scanning project files or blocking normal status refresh. Deduplicate checks per VM, pause during VM operations, and show timestamps and explicitly last-known readings after failures or stops. Windows guest usage remains explicitly unsupported; host disk allocation is still measured.
+- Include bounded, content-free `VM_STORAGE.json` receipts and readable storage observations in diagnostic exports. Keep collection independent of guest connectivity. Recognize full-storage, quota and inode-exhaustion errors without retaining tool output or file paths.
+- Preserve VM disks, project/References mounts, access controls and existing resource editors. Leave README unchanged. Verify storage parsing, sparse allocation, observer lifecycle, diagnostics and browser layouts, including a real OpenWrt 23.05.5 MIPS guest. Native Lima and Windows boot validation remains unavailable.
+
 ## v0.7.7
 
 - Automatically mount workspace References read-only at `/workspace/Files/References` in supported Linux Guest consoles. OpenWrt opkg guests and Lima use a separate verified console view, including when project files use independent copies. No project's files are automatically exported by this console.

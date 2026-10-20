@@ -590,9 +590,35 @@ finally {
                 'vm_ready': bool(marker.get('ready')), 'vm_boot_id': str(marker.get('boot_id') or ''),
                 'vm_generation': int(marker.get('generation') or 0), 'vm_readiness_updated_at': marker.get('updated_at')}
 
+    def _host_storage_usage(self):
+        from .storage_probe import host_disk_usage, WINDOWS_DISK_NAMES
+        return host_disk_usage(self.controller.instance_dir, WINDOWS_DISK_NAMES)
+
+    async def storage_usage(self) -> dict[str, Any]:
+        from .storage_probe import storage_result, unavailable_guest
+        host = await asyncio.to_thread(self._host_storage_usage)
+        try:
+            status = await asyncio.wait_for(self.controller.status(), 2)
+        except (OSError, RuntimeError, ValueError, asyncio.TimeoutError):
+            return storage_result(unavailable_guest(), host)
+        if status.get('running'):
+            guest = unavailable_guest('GUEST_STORAGE_UNSUPPORTED', state='unsupported')
+        elif status.get('state') in {'stopped', 'not_created'}:
+            guest = unavailable_guest('GUEST_STORAGE_STOPPED', state='stopped')
+        else:
+            guest = unavailable_guest()
+        return storage_result(guest, host)
+
     async def inspect(self) -> dict[str, Any]:
         state = await self.status()
+        host_storage = await asyncio.to_thread(self._host_storage_usage)
+        storage_compat = {}
+        if host_storage['allocated_bytes'] is not None:
+            storage_compat['vm_storage_bytes'] = host_storage['allocated_bytes']
+        if host_storage['logical_bytes'] is not None:
+            storage_compat['vm_storage_logical_bytes'] = host_storage['logical_bytes']
         return {'environment_id': self.config.id, 'environment_name': self.config.name,
+                **storage_compat,
                 'config': self.config.to_dict(), 'status': state.to_dict(),
                 'file_view_capabilities': self.file_view_capabilities(),
                 'runtime_identity': self.runtime_identity(), 'snapshots': await self.list_snapshots(),

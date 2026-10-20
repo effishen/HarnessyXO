@@ -86,6 +86,7 @@ EVIDENCE_CODES = frozenset({
     'network_unreachable', 'network_timeout', 'broken_pipe',
     'ssh_authentication_failed', 'ssh_host_key_failed', 'ssh_connection_closed',
     'ssh_kex_failed', 'kernel_panic', 'guest_out_of_memory', 'storage_full',
+    'storage_quota_exceeded', 'inodes_exhausted',
     'storage_io_error', 'service_failed', 'cloud_init_stage', 'cloud_init_complete',
     'network_device_ready', 'network_online', 'dhcp_lease_lost', 'dns_failure',
     'shell_hostname_unavailable', 'ssh_legacy_kex_warning', 'openwrt_preinit_started',
@@ -537,6 +538,8 @@ def _signals(line: str, kind: str, line_number: int) -> list[dict[str, Any]]:
         'host key verification failed': 'ssh_host_key_failed', 'kex_exchange_identification': 'ssh_kex_failed',
         'kernel panic': 'kernel_panic', 'out of memory:': 'guest_out_of_memory',
         'oom-kill:': 'guest_out_of_memory', 'no space left on device': 'storage_full',
+        'disk quota exceeded': 'storage_quota_exceeded', 'out of inodes': 'inodes_exhausted',
+        'no free inodes': 'inodes_exhausted', 'no available inodes': 'inodes_exhausted',
         'i/o error': 'storage_io_error', 'network is online': 'network_online',
         'dhcp lease lost': 'dhcp_lease_lost', 'temporary failure in name resolution': 'dns_failure',
     }

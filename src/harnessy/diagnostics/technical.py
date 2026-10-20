@@ -61,7 +61,8 @@ _PUBLIC_FILES = {'AAVMF_CODE.fd', 'AAVMF_VARS.fd', 'OVMF_CODE.fd', 'OVMF_VARS.fd
                  'qmp.sock', 'ha.sock', 'diffdisk', 'basedisk', 'cidata.iso', 'lima.yaml'}
 _FAMILIES = {
     'permission': ('permission denied', 'operation not permitted', 'access denied', 'eacces', 'eperm'),
-    'storage': ('no space left', 'read-only file system', 'input/output error', 'i/o error',
+    'storage': ('no space left', 'disk quota exceeded', 'enospc', 'edquot', 'out of inodes',
+                'no free inodes', 'no available inodes', 'read-only file system', 'input/output error', 'i/o error',
                 'disk', 'qcow', 'pflash', 'block device'),
     'resource': ('cannot allocate memory', 'out of memory', 'cannot set up guest memory',
                  'resource temporarily unavailable', 'too many open files'),

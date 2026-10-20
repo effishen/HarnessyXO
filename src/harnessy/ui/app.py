@@ -4124,6 +4124,7 @@ class HarnessyPage:
                         self.active_tab_key = self.open_tabs[-1].key if self.open_tabs else None
 
                     from harnessy.environment.file_views import FILE_VIEWS
+                    await ENVIRONMENT_STATUS.close(workspace_path)
                     await FILE_VIEWS.close(workspace_path)
                     if removed_ws is not None:
                         from harnessy.environment.test_targets import stop_workspace_test_targets
@@ -19167,7 +19168,6 @@ window.harnessyTerminalFocus = function(terminalId) {
                                 with ui.card().classes('hy-env-card p-4 gap-1 min-w-0').style('flex:1 1 280px;max-width:100%'):
                                     from .workspace_resources import WorkspaceResourceEditor
                                     resource_editor = WorkspaceResourceEditor(config, lambda **payload: queue_action('resources', **payload), dialog_parent=dialog_parent)
-                                    disk_usage_label = ui.label('VM storage on host: checking…').classes('text-xs hy-muted')
                                     network_status_label = ui.label(f'{network_prefix} enabled' if config.network else f'{network_prefix} disabled').classes('text-xs hy-muted')
                                     if preset.optional_tool_ids:
                                         optional_tools_summary_label = ui.label(
@@ -19189,6 +19189,9 @@ window.harnessyTerminalFocus = function(terminalId) {
                                     ui.label('Workspace source files are preserved when this VM is reset or rebuilt.').classes('text-xs hy-muted')
                                     if config.provider == 'openwrt':
                                         ui.label('System administration is available in Separate project copy mode.' if config.files_mode != 'copy' else 'System administration is available inside this guest. Deploy and collect project files explicitly.').classes('text-xs hy-muted')
+
+                            from .vm_storage import VMStorageUsage
+                            storage_usage = VMStorageUsage(ws.root, environment_id)
 
                             if not embedded:
                                 with ui.row().classes('hy-env-status-banner w-full items-start gap-3 p-3') as operation_banner:
@@ -19787,7 +19790,8 @@ window.harnessyTerminalFocus = function(terminalId) {
                                 detail = (detail + f'\nStatus refresh: {poll_error}').strip()
                             if readiness_detail is not None:
                                 readiness_detail.set_text(detail if detail not in {'Running', 'Stopped'} else '')
-                            disk_usage_label.set_text(f"VM storage on host: {_human_size(int(info.get('vm_storage_bytes') or 0))}")
+                            storage_usage.sync(info.get('storage_usage'), busy=ENVIRONMENT_OPERATIONS.is_busy(ws.root, environment_id=environment_id),
+                                               running=bool(status.get('running')) if latest_status.get('known') else None)
                             raw_snapshots = info.get('snapshots')
                             render_snapshots(list(raw_snapshots) if isinstance(raw_snapshots, list) else None, str(info.get('_snapshot_list_error') or ''))
                     except RuntimeError as exc:

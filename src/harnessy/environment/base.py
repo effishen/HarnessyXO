@@ -304,6 +304,13 @@ class WorkspaceEnvironment(abc.ABC):
             'vm_readiness_updated_at': None,
         }
 
+    async def storage_usage(self) -> dict[str, Any]:
+        """One read-only observation; providers must never start a VM here."""
+        from .storage_probe import storage_result, unavailable_guest
+        return storage_result(unavailable_guest('GUEST_STORAGE_UNSUPPORTED', state='unsupported'),
+            {'state': 'unavailable', 'allocated_bytes': None, 'logical_bytes': None,
+             'error_code': 'HOST_STORAGE_UNAVAILABLE'})
+
     def resize_tty(self, _cols: int, _rows: int) -> None:
         # PTY resize is applied to the fixed controller process by TerminalSession
         # and propagated to the guest terminal transport.

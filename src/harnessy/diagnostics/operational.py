@@ -147,7 +147,7 @@ class ExportCoverage:
             'file_limit_reached': len(self.sources) >= APP_MAX_FILES,
             'sources_omitted_after_file_limit': self.sources_omitted_after_file_limit,
             'counts_are_bounded_source_observations': True,
-            'separate_collectors': ['VM_LOGS.json', 'FILE_VIEWS.json', 'TARGET_LOGS.json', 'HOST_STATE.json', 'CONTEXT_TUNING_RETENTION.json'],
+            'separate_collectors': ['VM_LOGS.json', 'FILE_VIEWS.json', 'VM_STORAGE.json', 'TARGET_LOGS.json', 'HOST_STATE.json', 'CONTEXT_TUNING_RETENTION.json'],
             'discovery_bounds': {'latest_entries': 2048, 'session_directory_entries': 256,
                                  'session_directories': 20, 'entries_per_session': 2048, 'crashes': 20},
             'retention': {'session_directories_kept': 20, 'session_storage_cap_bytes': 750 * 1024 * 1024,

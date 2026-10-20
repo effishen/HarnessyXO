@@ -4698,6 +4698,33 @@ exec /usr/bin/nsenter --target "$pid" --mount --pid -- /bin/bash -c {shlex.quote
     def desktop_manager(self, workspace):
         return _LimaDesktopView(self, workspace)
 
+    def _host_storage_usage(self):
+        from .storage_probe import host_disk_usage, LIMA_DISK_NAMES
+        return host_disk_usage(self.vm_root / self.INSTANCE, LIMA_DISK_NAMES)
+
+    async def storage_usage(self) -> dict[str, Any]:
+        from .storage_probe import (LINUX_STORAGE_PYTHON, parse_linux_storage,
+                                    storage_result, unavailable_guest)
+        host = await asyncio.to_thread(self._host_storage_usage)
+        try:
+            row = await asyncio.wait_for(self._instance_row(), 2)
+        except (OSError, RuntimeError, ValueError, asyncio.TimeoutError):
+            return storage_result(unavailable_guest(), host)
+        if not row:
+            guest = unavailable_guest() if (self.vm_root / self.INSTANCE).exists() else unavailable_guest('GUEST_STORAGE_STOPPED', state='stopped')
+            return storage_result(guest, host)
+        state = str(row.get('status') or row.get('Status') or '').lower()
+        if state != 'running':
+            guest = unavailable_guest('GUEST_STORAGE_STOPPED', state='stopped') if state == 'stopped' else unavailable_guest()
+            return storage_result(guest, host)
+        try:
+            rc, output, _ = await self._run('shell', '--workdir', '/', self.INSTANCE, '/bin/sh', '-c',
+                'python3 -I -S -B -c ' + shlex.quote(LINUX_STORAGE_PYTHON), timeout=5, check=False)
+            guest = parse_linux_storage(output) if rc == 0 else unavailable_guest('GUEST_STORAGE_PROBE_FAILED')
+        except (OSError, RuntimeError, ValueError, asyncio.TimeoutError):
+            guest = unavailable_guest('GUEST_STORAGE_PROBE_FAILED')
+        return storage_result(guest, host)
+
     async def inspect(self) -> dict[str, Any]:
         status = await self.status()
         snapshot_error = ''
@@ -4706,19 +4733,12 @@ exec /usr/bin/nsenter --target "$pid" --mount --pid -- /bin/bash -c {shlex.quote
         except Exception as exc:
             snapshots = None
             snapshot_error = str(exc)
-        vm_logical_bytes = 0
-        vm_allocated_bytes = 0
-        for path in self.vm_root.rglob('*'):
-            try:
-                if path.is_file():
-                    stat = path.stat()
-                    vm_logical_bytes += stat.st_size
-                    # VM disks are sparse. st_size may be the configured maximum,
-                    # while st_blocks reflects host storage actually allocated.
-                    blocks = int(getattr(stat, 'st_blocks', 0) or 0)
-                    vm_allocated_bytes += (blocks * 512) if blocks else stat.st_size
-            except OSError:
-                pass
+        host_storage = await asyncio.to_thread(self._host_storage_usage)
+        storage_compat = {}
+        if host_storage['allocated_bytes'] is not None:
+            storage_compat['vm_storage_bytes'] = host_storage['allocated_bytes']
+        if host_storage['logical_bytes'] is not None:
+            storage_compat['vm_storage_logical_bytes'] = host_storage['logical_bytes']
         return {
             'environment_id': self.config.id,
             'environment_name': self.config.name,
@@ -4728,8 +4748,7 @@ exec /usr/bin/nsenter --target "$pid" --mount --pid -- /bin/bash -c {shlex.quote
             'status': status.to_dict(),
             'snapshots': snapshots,
             '_snapshot_list_error': snapshot_error,
-            'vm_storage_bytes': vm_allocated_bytes,
-            'vm_storage_logical_bytes': vm_logical_bytes,
+            **storage_compat,
             'files_root': str(self.files_root),
             'guest_files_root': '/workspace',
             'durable_vm_root': str(self.vm_root),
