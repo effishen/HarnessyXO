@@ -382,6 +382,36 @@ class OpenWrtEnvironment(WorkspaceEnvironment):
             guest = unavailable_guest('GUEST_STORAGE_PROBE_FAILED')
         return storage_result(guest, host)
 
+    async def usage_snapshot(self, *, include_storage: bool = False) -> dict[str, Any]:
+        from .resource_probe import (MAX_OUTPUT, build_usage_script, parse_usage_output,
+                                     unavailable_resources)
+        from .storage_probe import (OPENWRT_STORAGE_SCRIPT, MAX_OUTPUT as STORAGE_MAX,
+                                    parse_openwrt_storage, storage_result, unavailable_guest)
+        host = await finish_thread(self._host_storage_usage) if include_storage else None
+
+        def result(resources, guest=None):
+            return {'schema_version': 1, 'resources': resources,
+                    'storage': storage_result(guest, host) if include_storage else None}
+
+        try:
+            status = await asyncio.wait_for(self.controller.status(), 2)
+        except (OSError, RuntimeError, ValueError, asyncio.TimeoutError):
+            return result(unavailable_resources(), unavailable_guest())
+        if not status.get('running'):
+            stopped = status.get('state') in {'stopped', 'not_created'}
+            return result(unavailable_resources('GUEST_RESOURCES_STOPPED', state='stopped') if stopped else unavailable_resources(),
+                          unavailable_guest('GUEST_STORAGE_STOPPED', state='stopped') if stopped else unavailable_guest())
+        try:
+            script = build_usage_script(OPENWRT_STORAGE_SCRIPT if include_storage else None)
+            rc, output, _ = await self._raw(script, timeout=5,
+                output_limit=MAX_OUTPUT + (STORAGE_MAX if include_storage else 0), login_shell=False)
+            if rc != 0:
+                return result(unavailable_resources('GUEST_RESOURCES_PROBE_FAILED'), unavailable_guest('GUEST_STORAGE_PROBE_FAILED'))
+            resources, guest = parse_usage_output(output, include_storage=include_storage, storage_parser=parse_openwrt_storage)
+            return result(resources, guest)
+        except (OSError, RuntimeError, ValueError, asyncio.TimeoutError):
+            return result(unavailable_resources('GUEST_RESOURCES_PROBE_FAILED'), unavailable_guest('GUEST_STORAGE_PROBE_FAILED'))
+
     async def create(self, progress=None) -> EnvironmentStatus:
         return await self.start(progress=progress)
 

@@ -311,6 +311,13 @@ class WorkspaceEnvironment(abc.ABC):
             {'state': 'unavailable', 'allocated_bytes': None, 'logical_bytes': None,
              'error_code': 'HOST_STORAGE_UNAVAILABLE'})
 
+    async def usage_snapshot(self, *, include_storage: bool = False) -> dict[str, Any]:
+        """Read-only guest resources, optionally with a storage observation."""
+        from .resource_probe import unavailable_resources
+        return {'schema_version': 1,
+                'resources': unavailable_resources('GUEST_RESOURCES_UNSUPPORTED', state='unsupported'),
+                'storage': await self.storage_usage() if include_storage else None}
+
     def resize_tty(self, _cols: int, _rows: int) -> None:
         # PTY resize is applied to the fixed controller process by TerminalSession
         # and propagated to the guest terminal transport.

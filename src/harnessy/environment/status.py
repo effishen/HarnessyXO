@@ -58,7 +58,7 @@ class EnvironmentStatusRegistry:
             entry.generation += 1
         if environment_id:
             from .storage import VM_STORAGE
-            VM_STORAGE.request(workspace_root, environment_id=environment_id)
+            VM_STORAGE.invalidate_baseline(workspace_root, environment_id=environment_id)
 
     def publish_snapshots(self, workspace_root: str | Path, snapshots: list[str], *, environment_id: str | None = None) -> None:
         """Publish a verified operation result before exposing completion.

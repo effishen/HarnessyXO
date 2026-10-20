@@ -182,6 +182,21 @@ workspace removal and shutdown, and reject writes after admission or generation
 changes. Diagnostic exports read bounded sanitized receipts only and never
 require a live guest or database.
 
+CPU and memory observations share the same per-VM worker as storage. A short
+resource cadence must not repeat full filesystem probes at that cadence or
+create a second observer for each browser. Resource and storage timestamps,
+pending states and freshness remain separate. Read fixed guest system counters
+only; never enumerate guest processes or inspect project content for telemetry.
+
+CPU rates require two valid counter samples from the same running guest and
+CPU configuration. Discard the baseline after a reset, interrupted monitoring
+or incompatible counters. Normalize active usage across all guest vCPUs and
+keep I/O wait and stolen time separate. The first sample is pending, not zero.
+RAM used is total minus available memory; distinguish a kernel-provided
+availability value from a fallback estimate. Unknown and unsupported metrics
+remain unknown. Raw CPU counters and private baselines stay in memory and
+must not appear in persisted receipts or diagnostic exports.
+
 The UI and diagnostics distinguish requested policy from verified runtime
 state: preparing, mounted, pending, stopped, unsupported or failed. References
 status is separate from project status: a References failure must not block

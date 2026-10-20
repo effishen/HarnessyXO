@@ -609,6 +609,14 @@ finally {
             guest = unavailable_guest()
         return storage_result(guest, host)
 
+    async def usage_snapshot(self, *, include_storage: bool = False) -> dict[str, Any]:
+        from .resource_probe import unavailable_resources
+        # Windows guest resource sampling is deliberately unsupported until a
+        # fixed, verified metadata transport exists; retain host disk readings.
+        return {'schema_version': 1,
+                'resources': unavailable_resources('GUEST_RESOURCES_UNSUPPORTED', state='unsupported'),
+                'storage': await self.storage_usage() if include_storage else None}
+
     async def inspect(self) -> dict[str, Any]:
         state = await self.status()
         host_storage = await asyncio.to_thread(self._host_storage_usage)

@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.7.9
+
+- See guest CPU usage, RAM used/available, system load, swap and uptime in **VM → Manage → Details**, alongside the existing storage readings. Keep the display readable on narrow screens.
+- Measure active CPU across all guest vCPUs on a 0–100% scale. Show a collecting state until two valid observations are available, and start a new sample after a restart or interrupted monitoring. Keep I/O wait and stolen CPU time separate from active CPU use.
+- Base RAM use on memory available to applications, with cache and buffers shown separately. Mark fallback availability estimates. Show disabled swap and unavailable measurements explicitly.
+- Refresh CPU and memory about every five seconds while the VM is running, keeping full storage checks about thirty seconds apart. Share one background observer per VM, pause checks during VM operations, and keep dated last-known readings after failures or stops. Refresh controls only queue checks.
+- Include bounded, content-free `VM_RESOURCES.json` and resource observations in diagnostics. Exclude raw CPU counters, paths, commands and process names. Exports read saved observations without contacting the VM.
+- Support OpenWrt and Lima Linux guest readings. Windows guest resource reporting remains explicitly unsupported. Preserve VM storage, file views, project access and resource editors. Leave README unchanged.
+- Verify readings under controlled load on a real OpenWrt 23.05.5 MIPS guest, plus desktop and narrow-screen browser flows. Native Lima validation remains unavailable.
+
 ## v0.7.8
 
 - Show measured guest disk used, total and available space in VM Details, with a usage bar and low-space warnings. Show `/tmp` separately and identify memory-backed temporary storage only when verified. Keep inode exhaustion and read-only filesystem state visible.

@@ -4725,6 +4725,39 @@ exec /usr/bin/nsenter --target "$pid" --mount --pid -- /bin/bash -c {shlex.quote
             guest = unavailable_guest('GUEST_STORAGE_PROBE_FAILED')
         return storage_result(guest, host)
 
+    async def usage_snapshot(self, *, include_storage: bool = False) -> dict[str, Any]:
+        from .resource_probe import build_usage_script, parse_usage_output, unavailable_resources
+        from .storage_probe import LINUX_STORAGE_PYTHON, parse_linux_storage, storage_result, unavailable_guest
+        host = await asyncio.to_thread(self._host_storage_usage) if include_storage else None
+
+        def result(resources, guest=None):
+            return {'schema_version': 1, 'resources': resources,
+                    'storage': storage_result(guest, host) if include_storage else None}
+
+        try:
+            row = await asyncio.wait_for(self._instance_row(), 2)
+        except (OSError, RuntimeError, ValueError, asyncio.TimeoutError):
+            return result(unavailable_resources(), unavailable_guest())
+        if not row:
+            stopped = not (self.vm_root / self.INSTANCE).exists()
+            return result(unavailable_resources('GUEST_RESOURCES_STOPPED', state='stopped') if stopped else unavailable_resources(),
+                          unavailable_guest('GUEST_STORAGE_STOPPED', state='stopped') if stopped else unavailable_guest())
+        state = str(row.get('status') or row.get('Status') or '').lower()
+        if state != 'running':
+            stopped = state == 'stopped'
+            return result(unavailable_resources('GUEST_RESOURCES_STOPPED', state='stopped') if stopped else unavailable_resources(),
+                          unavailable_guest('GUEST_STORAGE_STOPPED', state='stopped') if stopped else unavailable_guest())
+        try:
+            storage_script = 'python3 -I -S -B -c ' + shlex.quote(LINUX_STORAGE_PYTHON) if include_storage else None
+            rc, output, _ = await self._run('shell', '--workdir', '/', self.INSTANCE, '/bin/sh', '-c',
+                build_usage_script(storage_script), timeout=5, check=False)
+            if rc != 0:
+                return result(unavailable_resources('GUEST_RESOURCES_PROBE_FAILED'), unavailable_guest('GUEST_STORAGE_PROBE_FAILED'))
+            resources, guest = parse_usage_output(output, include_storage=include_storage, storage_parser=parse_linux_storage)
+            return result(resources, guest)
+        except (OSError, RuntimeError, ValueError, asyncio.TimeoutError):
+            return result(unavailable_resources('GUEST_RESOURCES_PROBE_FAILED'), unavailable_guest('GUEST_STORAGE_PROBE_FAILED'))
+
     async def inspect(self) -> dict[str, Any]:
         status = await self.status()
         snapshot_error = ''

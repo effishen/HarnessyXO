@@ -1,4 +1,4 @@
-# HarnessyXO v0.7.8 Features
+# HarnessyXO v0.7.9 Features
 
 ## Named VM environments
 
@@ -37,6 +37,7 @@
 - Pause work only in the workspace being recovered. If queued jobs remain after recovery, choose **Resume queued work** after reviewing them. Existing completion and backend holds remain in effect. If an activation was interrupted, choose **Restore original database** before checking or opening that workspace again.
 - Open **Environments → select a VM → Details → Edit VM Resources** to change CPU, RAM and storage. Stop the VM and finish active workspace work first. CPU and RAM can increase or decrease; storage can only grow. Start the VM afterward to use the new values and expand its disk capacity. Existing files, installed tools and VM disks are retained.
 - In the same Details panel, see measured guest disk used, total and free space with a usage bar, low-space/inode warnings and a timestamp. `/tmp` is separate and labelled memory-backed only when verified. Host disk-image allocation and image file length are separate from configured virtual capacity. Checks run in the background for running supported Linux guests, pause during VM operations and can be refreshed manually; stale readings remain explicitly last-known, and unavailable values never become zero. Windows guest reporting is unsupported; host allocation remains available. Diagnostics retain these content-free observations in `VM_STORAGE.json` without contacting a guest during export.
+- See guest CPU usage, RAM used/available, cache and buffers, system load over 1/5/15 minutes, swap and uptime alongside storage. CPU usage is normalized across all guest vCPUs and needs two valid samples; I/O wait and stolen CPU time are separate. RAM use accounts for reusable memory, and fallback estimates are labelled. CPU and memory update about every five seconds through the same background observer while storage keeps its slower cadence. Stopped or unreachable guests retain clearly dated last-known readings. OpenWrt and Lima Linux are supported; Windows guest readings remain explicitly unsupported. Content-free resource observations are included in `VM_RESOURCES.json`.
 - Check the current VM identity, stopped state and settings before applying an edit, then verify the controller's reported values before saving. An uncertain edit keeps the saved definition unchanged and explains how to retry without shrinking the disk.
 - Keep VM resource settings and an explicit **Stop VM** control available on a workspace-open error, independently of the workspace database.
 - Diagnostics distinguish SQLite corruption from locks, record bounded workspace worker failures and native signals, and label collector resource/version observations separately from recorded application state.

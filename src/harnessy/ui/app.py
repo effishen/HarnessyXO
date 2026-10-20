@@ -19191,6 +19191,8 @@ window.harnessyTerminalFocus = function(terminalId) {
                                         ui.label('System administration is available in Separate project copy mode.' if config.files_mode != 'copy' else 'System administration is available inside this guest. Deploy and collect project files explicitly.').classes('text-xs hy-muted')
 
                             from .vm_storage import VMStorageUsage
+                            from .vm_resources import VMResourceUsage
+                            resource_usage = VMResourceUsage(ws.root, environment_id)
                             storage_usage = VMStorageUsage(ws.root, environment_id)
 
                             if not embedded:
@@ -19792,6 +19794,8 @@ window.harnessyTerminalFocus = function(terminalId) {
                                 readiness_detail.set_text(detail if detail not in {'Running', 'Stopped'} else '')
                             storage_usage.sync(info.get('storage_usage'), busy=ENVIRONMENT_OPERATIONS.is_busy(ws.root, environment_id=environment_id),
                                                running=bool(status.get('running')) if latest_status.get('known') else None)
+                            resource_usage.sync(info.get('storage_usage'), busy=ENVIRONMENT_OPERATIONS.is_busy(ws.root, environment_id=environment_id),
+                                                running=bool(status.get('running')) if latest_status.get('known') else None)
                             raw_snapshots = info.get('snapshots')
                             render_snapshots(list(raw_snapshots) if isinstance(raw_snapshots, list) else None, str(info.get('_snapshot_list_error') or ''))
                     except RuntimeError as exc:
