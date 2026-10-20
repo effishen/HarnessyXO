@@ -176,7 +176,7 @@ class OpenWrtLiveMounts:
         # caller-provided mutation owner is retained by the shared channel.
         serving = asyncio.create_task(serve_sftp(process.stdout, process.stdin, row['host'],
             writable=bool(row['writable']), excluded=tuple(row['excluded']), revoked=revoked,
-            mutation=lambda: self.owner._host_writer(view.projection)))
+            mutation=(lambda: self.owner._host_writer(view.projection)) if row['writable'] else None))
         item = Export(path, process, revoked, serving, asyncio.create_task(drain()), errors)
         def channel_finished(task):
             if item.closing or item.revoked.is_set():

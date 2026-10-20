@@ -94,7 +94,7 @@ from harnessy.core.transcript import (  # noqa: E402
     assistant_stream_groups, locate_transcript_window, reconcile_transcript_window, shift_transcript_window,
 )
 from harnessy.core.textfiles import TextFileDraft
-from harnessy.environment.activity import active_work, acquire_activity
+from harnessy.environment.activity import active_work
 from harnessy.core.instructions import DEFAULT_GLOBAL_INSTRUCTIONS
 from harnessy.core.chat_export import CONTENT_DETAIL, EXPORT_TYPES, ExportOptions
 from harnessy.agent.chat_exports import ExportJob, EXPORT_JOBS
@@ -1310,6 +1310,13 @@ class ToolScope:
     hidden_root_names: tuple[str, ...] = ()
     live_links: tuple[tuple[str, str], ...] = ()
     archived: bool = False
+
+
+def _guest_console_files_text(capabilities: dict[str, Any]) -> str:
+    if capabilities.get('guest_references'):
+        path = str(capabilities.get('guest_references_path') or '/workspace/Files/References')
+        return f'Starts in the VM’s home directory with References mounted read-only at {path}. Project folders remain in scoped Project files terminals.'
+    return 'Starts in the VM’s home directory. Live References are unavailable in this VM’s Guest console. Project folders remain in scoped Project files terminals where supported.'
 
 
 @dataclass
@@ -4414,8 +4421,10 @@ class HarnessyPage:
             ui.notify('This VM environment is no longer registered.', type='warning')
             return
         try:
-            project_terminal_supported = bool(EnvironmentManager(ws.root, environment_id=environment_id).provider().file_view_capabilities().get('project_terminal'))
+            file_capabilities = dict(EnvironmentManager(ws.root, environment_id=environment_id).provider().file_view_capabilities())
+            project_terminal_supported = bool(file_capabilities.get('project_terminal'))
         except Exception:
+            file_capabilities = {}
             project_terminal_supported = False
         projects = {str(chat.id): f'{"  " * min(6, depth)}{chat.title} · {chat.public_id}'
                     for chat, depth, _lineage in ws.list_chat_tree(archived=False) if config.allows_project(chat.id)}
@@ -4440,7 +4449,7 @@ class HarnessyPage:
                     if is_project and projects else
                     'No active projects are allowed to use this VM. Choose them in VM Settings first.'
                     if is_project else
-                    'Starts in the VM’s home directory. Workspace files are not exported or copied automatically.'
+                    _guest_console_files_text(file_capabilities)
                 )
                 open_button.set_enabled(not is_project or project.value in projects)
             with ui.row().classes('w-full justify-end gap-2'):
@@ -18812,6 +18821,10 @@ window.harnessyTerminalFocus = function(terminalId) {
         config = manager.config if manager is not None and tab.environment_id else None
         is_workspace_vm = isinstance(ws, WorkspaceStore) and config is not None
         guest_console = bool(is_workspace_vm and getattr(tab, 'terminal_mode', 'guest_console') != 'project_files')
+        try:
+            guest_file_capabilities = dict(manager.provider().file_view_capabilities()) if guest_console else {}
+        except Exception:
+            guest_file_capabilities = {}
         project = ws.get_chat(tab.chat_id) if is_workspace_vm and not guest_console and tab.chat_id else None
         project_label = f'{project.title} · {project.public_id}' if project is not None else 'Unavailable project'
         if isinstance(ws, WorkspaceStore) and config is None:
@@ -18828,7 +18841,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                     ui.label(tab.title).classes('font-semibold').style('min-width:0;max-width:100%;overflow-wrap:anywhere')
                     base_label = ui.label(f'🛡 {config.name} · Guest console' if guest_console else f'🛡 {config.name} · {project_label}').classes('text-xs hy-muted').style('overflow-wrap:anywhere')
                     base_label.tooltip(
-                        'Starts in the VM’s home directory. Workspace files are not copied automatically.'
+                        _guest_console_files_text(guest_file_capabilities)
                         if guest_console else
                         'Uses the same project file view as model commands: own files, read-only ancestors, '
                         'direct Project Access sources and References.'
@@ -18836,10 +18849,12 @@ window.harnessyTerminalFocus = function(terminalId) {
                 with ui.column().classes('w-full h-full items-center justify-center gap-3'):
                     if error:
                         ui.icon('schedule' if pending_view else 'error_outline', size='34px').classes('text-warning' if pending_view else 'text-negative')
-                        ui.label('Project file access changed' if error_code == 'FILE_VIEW_POLICY_CHANGED' else 'Waiting for project files' if pending_view else 'Workspace VM terminal could not start').classes('font-semibold text-warning' if pending_view else 'font-semibold text-negative')
+                        ui.label('References access changed' if guest_console and error_code == 'FILE_VIEW_POLICY_CHANGED' else 'Waiting for References' if guest_console and pending_view else 'Project file access changed' if error_code == 'FILE_VIEW_POLICY_CHANGED' else 'Waiting for project files' if pending_view else 'Workspace VM terminal could not start').classes('font-semibold text-warning' if pending_view else 'font-semibold text-negative')
                         ui.label(error).classes('text-sm hy-muted').style('max-width:760px;white-space:pre-wrap')
                         if pending_view:
                             ui.label(
+                                'Close other Guest consoles using the previous References view, then Retry to prepare the current read-only References.'
+                                if guest_console else
                                 'Retry to prepare this project’s files using the current saved access. A Guest console is available in Terminal options.'
                                 if error_code == 'FILE_VIEW_POLICY_CHANGED' else
                                 'Retry after the file-view update completes. If a view is in use, finish its work or close its project-files terminals first. A Guest console is available in Terminal options.'
@@ -18862,6 +18877,9 @@ window.harnessyTerminalFocus = function(terminalId) {
                     if not guest_console:
                         from harnessy.ui.project_file_views import render_file_view_status
                         render_file_view_status(ws, config.id, project_id=str(tab.chat_id or ''), compact=True)
+                    elif guest_file_capabilities.get('guest_references'):
+                        from harnessy.ui.project_file_views import render_file_view_status
+                        render_file_view_status(ws, config.id, compact=True, references=True)
             if not error and not environment_busy and tab.key not in self.terminal_start_tasks:
                 async def boot_terminal() -> None:
                     preparation_release = None
@@ -18889,17 +18907,25 @@ window.harnessyTerminalFocus = function(terminalId) {
                         status = await provider.status()
                         if not status.running or not status.ready:
                             raise RuntimeError(status.error or status.detail or f'VM state is {status.state}')
+                        from harnessy.environment.file_views import FILE_VIEWS
                         if guest_console:
-                            # A human console must not deploy or synchronize the
-                            # workspace container just to open a guest shell.
-                            self.terminal_start_stages[tab.key] = 'Opening guest console…'
-                            argv, env, cwd = await provider.open_guest_terminal()
+                            # Keep the References namespace stable through PTY
+                            # construction. Only this preparation owner may be
+                            # exempted; existing Guest consoles still hold it.
+                            console_capabilities = dict(provider.file_view_capabilities())
+                            self.terminal_start_stages[tab.key] = 'Preparing read-only References…' if console_capabilities.get('guest_references') else 'Opening guest console…'
+                            preparation_release = await FILE_VIEWS.acquire_terminal_activity(
+                                ws.root, environment_id=config.id,
+                                project_id='__guest_console__', owner_id=tab.key,
+                                label='Opening guest console',
+                            )
+                            argv, env, cwd = await provider.open_guest_terminal(workspace=ws, owner_id=tab.key)
                         else:
-                            from harnessy.environment.file_views import FILE_VIEWS
                             self.terminal_start_stages[tab.key] = 'Preparing this project’s file view…'
-                            preparation_release = acquire_activity(
-                                ws.root, 'Opening project terminal', environment_id=config.id,
+                            preparation_release = await FILE_VIEWS.acquire_terminal_activity(
+                                ws.root, environment_id=config.id,
                                 project_id=str(tab.chat_id), owner_id=tab.key,
+                                label='Opening project terminal',
                             )
                             policy = await FILE_VIEWS.ensure_project(
                                 ws.root, environment_id=config.id, project_id=str(tab.chat_id), owner_id=tab.key, human=True,
@@ -18917,9 +18943,27 @@ window.harnessyTerminalFocus = function(terminalId) {
                         try:
                             created = await asyncio.shield(construction)
                         except asyncio.CancelledError:
-                            orphan = await construction
-                            orphan.close()
+                            # Repeated close/shutdown requests must not cancel
+                            # the future while its thread still creates a PTY.
+                            # Keep the preparation lease until that handle can
+                            # be retrieved and closed.
+                            while not construction.done():
+                                try:
+                                    await asyncio.shield(construction)
+                                except asyncio.CancelledError:
+                                    continue
+                                except Exception:
+                                    break
+                            if not construction.cancelled():
+                                try:
+                                    orphan = construction.result()
+                                except Exception:
+                                    pass
+                                else:
+                                    orphan.close()
                             raise
+                        if guest_console:
+                            created.guest_references_path = str(console_capabilities.get('guest_references_path') or '/workspace/Files/References') if console_capabilities.get('guest_references') else ''
                         log_event(
                             'runtime', 'workspace_terminal_started', workspace=str(ws.root),
                             provider=status.provider, environment_id=config.id,
@@ -19002,7 +19046,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                 ui.label(tab.title).classes('font-semibold').style('min-width:0;max-width:100%;overflow-wrap:anywhere')
                 started_location = ui.label(f'Started in {started_label}').classes('text-xs hy-muted hy-file-name').style('max-width:680px')
                 if guest_console:
-                    started_location.tooltip('Starts in the VM’s home directory. Workspace files are not copied automatically.')
+                    started_location.tooltip(_guest_console_files_text(guest_file_capabilities))
                 if is_workspace_vm:
                     ui.label(f'🛡 {config.name} · {config.architecture} · CPU only').classes('text-xs hy-muted')
                     ui.button('New terminal…', icon='add', on_click=lambda: self._choose_vm_terminal(self._find_reg(ws.id), config.id)).props('flat dense no-caps')
@@ -19012,6 +19056,16 @@ window.harnessyTerminalFocus = function(terminalId) {
                     safe_dom_id = re.sub(r'[^A-Za-z0-9_-]+', '-', tab.key)
                     term_dom_id = f'hy-xterm-{safe_dom_id}'
                     clear_button = ui.button('Clear').props('flat dense no-caps')
+            if is_workspace_vm and guest_console:
+                verified_references = str(getattr(session, 'guest_references_path', '') or '')
+                ui.label(
+                    f'References read-only · {verified_references}' if verified_references else
+                    'References are not verified for this open console. Reopen it to prepare read-only References.' if guest_file_capabilities.get('guest_references') else
+                    'Live References are unavailable in this VM’s Guest console.'
+                ).classes('text-xs hy-muted px-4 py-1').style('overflow-wrap:anywhere;min-width:0;max-width:100%')
+                if guest_file_capabilities.get('guest_references'):
+                    from harnessy.ui.project_file_views import render_file_view_status
+                    render_file_view_status(ws, config.id, compact=True, references=True)
             if is_workspace_vm and not guest_console:
                 from harnessy.ui.project_file_views import render_file_view_status
                 render_file_view_status(ws, config.id, project_id=str(tab.chat_id or ''), compact=True)
@@ -19129,7 +19183,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                                     ui.label(str(ws.files_root)).classes('text-xs hy-muted').style('max-width:100%;min-width:0;white-space:normal;overflow-wrap:anywhere')
                                     from harnessy.ui.vm_environments import FILE_MODES
                                     ui.label(FILE_MODES.get(config.files_mode, config.files_mode)).classes('text-sm font-semibold')
-                                    ui.label('Project commands and Project files terminals use the same view: own files plus read-only ancestors, direct Project Access sources and References. Guest console starts in guest home.').classes('text-xs hy-muted')
+                                    ui.label('Project commands and Project files terminals use the same view: own files plus read-only ancestors, direct Project Access sources and References. Guest console uses a separate home view, with live read-only References where supported.').classes('text-xs hy-muted')
                                     if config.files_mode == 'copy':
                                         ui.label('These are independent copies. Access updates cannot recall files already deployed or read; existing guest files are preserved.').classes('text-xs hy-muted')
                                     ui.label('Workspace source files are preserved when this VM is reset or rebuilt.').classes('text-xs hy-muted')

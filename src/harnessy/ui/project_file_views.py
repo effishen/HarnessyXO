@@ -26,11 +26,16 @@ def file_view_label(state: str, *, copy_mode: bool = False) -> str:
     }.get(state, 'Checking…')
 
 
+def references_view_label(state: str) -> str:
+    return {'ready': 'Mounted read-only', 'pending': 'Update pending',
+            'unsupported': 'Unavailable'}.get(state, file_view_label(state))
+
+
 def render_file_view_status(workspace, environment_id: str, *, project_id: str | None = None,
-                            compact: bool = False) -> Any:
+                            compact: bool = False, references: bool = False) -> Any:
     with ui.column().classes('w-full gap-1 min-w-0').props(f'data-hy-file-views={environment_id}') as panel:
         with ui.row().classes('w-full items-center gap-2 flex-wrap'):
-            ui.label('Project files').classes('text-sm font-semibold')
+            ui.label('Guest console References' if references else 'Project files').classes('text-sm font-semibold')
             badge = ui.badge('Checking…').props('color=grey')
             spinner = ui.spinner(size='16px')
             ui.space()
@@ -56,29 +61,39 @@ def render_file_view_status(workspace, environment_id: str, *, project_id: str |
                 raise ValueError('This VM environment is no longer registered.')
             status = FILE_VIEWS.status(workspace.root, environment_id=environment_id)
             state = str(status.get('state') or 'preparing')
+            references_row = dict(status.get('references') or {})
+            if references:
+                state = str(references_row.get('state') or ('stopped' if state == 'stopped' else 'preparing'))
             projects = [dict(row) for row in status.get('projects') or () if isinstance(row, dict)]
+            if references:
+                projects = []
             if project_id is not None:
                 projects = [row for row in projects if row.get('project_id') == project_id]
                 selected_row = projects[0] if projects else {}
                 state = str(selected_row.get('state') or state)
-            copy_mode = config.files_mode == 'copy'
+            copy_mode = not references and config.files_mode == 'copy'
             stage = str(status.get('stage') or '')
             requested = status.get('requested_revision')
             applied = status.get('applied_revision')
-            waiting = state in {'preparing', 'reconciling'} or project_id is None and (bool(status.get('busy')) or state == 'ready' and requested != applied)
+            waiting = state in {'preparing', 'reconciling'} or not references and project_id is None and (bool(status.get('busy')) or state == 'ready' and requested != applied)
             effective_state = 'preparing' if waiting else state
             pending_ids = set(status.get('pending_project_ids') or ())
-            in_use = stage == 'in_use' or not stage and bool(pending_ids)
-            badge.set_text('Update pending' if effective_state == 'pending' and not in_use else file_view_label(effective_state, copy_mode=copy_mode))
+            in_use = state == 'pending' if references else stage == 'in_use' or not stage and bool(pending_ids)
+            badge.set_text(references_view_label(effective_state) if references else 'Update pending' if effective_state == 'pending' and not in_use else file_view_label(effective_state, copy_mode=copy_mode))
             badge.props('color=negative' if state in {'error', 'failed', 'unsupported'} else 'color=warning' if state == 'pending' else 'color=positive' if effective_state in {'ready', 'mounted'} else 'color=grey')
             spinner.set_visibility(waiting)
-            if project_id is not None and projects and state in {'ready', 'mounted'}:
+            if references:
+                detail.set_text(str(references_row.get('detail') or ''))
+                error.set_text('')
+            elif project_id is not None and projects and state in {'ready', 'mounted'}:
                 detail.set_text(str(projects[0].get('detail') or ''))
                 error.set_text(str(projects[0].get('error') or ''))
             else:
                 detail.set_text(str((projects[0].get('detail') if project_id is not None and projects else '') or status.get('detail') or ''))
                 error.set_text(str(status.get('error') or ''))
             pending.set_text(
+                'If another Guest console is using the previous References view, close it before retrying.'
+                if references else
                 'Finish this project’s tasks and close its project-files terminals, then retry. Unrelated projects can continue.'
                 if project_id is not None else
                 'Finish the affected projects’ tasks and close their project-files terminals, then retry. Unrelated projects can continue.'
@@ -92,11 +107,14 @@ def render_file_view_status(workspace, environment_id: str, *, project_id: str |
                 labels[ident] = f'{chat.title} · {chat.public_id}' if chat is not None else str(row.get('folder') or 'Unavailable project')
             signature = tuple((str(row.get('project_id') or ''), str(row.get('folder') or ''),
                                str(row.get('state') or ''), str(row.get('detail') or ''), labels[str(row.get('project_id') or '')]) for row in projects)
+            if project_id is None and references_row:
+                signature += (('guest_references', str(references_row.get('state') or ''),
+                               str(references_row.get('policy_revision') or ''), str(references_row.get('detail') or '')),)
             if signature != previous['rows']:
                 previous['rows'] = signature
                 rows.clear()
                 with rows:
-                    if not projects:
+                    if not projects and not references:
                         ui.label('No project views are currently recorded.').classes('text-xs hy-muted')
                     for row in projects:
                         ident = str(row.get('project_id') or '')
@@ -107,6 +125,13 @@ def render_file_view_status(workspace, environment_id: str, *, project_id: str |
                                 ui.label(file_view_label(str(row.get('state') or ''), copy_mode=copy_mode)).classes('text-xs font-semibold shrink-0')
                             if row.get('detail'):
                                 ui.label(str(row['detail'])).classes('text-xs hy-muted').style('white-space:pre-wrap;overflow-wrap:anywhere')
+                    if project_id is None and references_row and not references:
+                        with ui.column().classes('w-full gap-0 min-w-0').props(f'data-hy-guest-references={environment_id}'):
+                            with ui.row().classes('w-full items-start gap-2 no-wrap'):
+                                ui.label('Guest console References').classes('text-xs grow min-w-0').style('overflow-wrap:anywhere')
+                                ui.label(references_view_label(str(references_row.get('state') or ''))).classes('text-xs font-semibold shrink-0')
+                            if references_row.get('detail'):
+                                ui.label(str(references_row['detail'])).classes('text-xs hy-muted').style('white-space:pre-wrap;overflow-wrap:anywhere')
         except Exception as exc:
             badge.set_text('Status unavailable')
             badge.props('color=negative')

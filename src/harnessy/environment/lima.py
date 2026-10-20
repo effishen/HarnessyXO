@@ -142,6 +142,9 @@ async def _bounded_diagnostic_io(function, *args, timeout: float, **kwargs):
 
 FILES_BACKING_GUEST_PATH = '/mnt/harnessyxo-files'
 PRIVATE_WORKTREES_GUEST_PATH = '/mnt/harnessyxo-worktrees'
+# This separate host read-only parent export supplies live References only;
+# scoped namespaces detach the parent. It also keeps copy-mode Projects separate.
+REFERENCES_BACKING_GUEST_PATH = '/mnt/harnessyxo-reference-source'
 WORKSPACE_VIEW_GUEST_PATH = '/workspace'
 PERSISTENT_VIEW_STATE_GUEST_PATH = '/run/harnessy/project-views'
 WORKSPACE_VIEW_REVISION = '0.6.125-named-vm-project-views'
@@ -264,6 +267,7 @@ class LimaVMEnvironment(WorkspaceEnvironment):
         super().__init__(workspace_root, config)
         self.canonical_files_root = self.files_root
         self.canonical_worktrees_root = self.private_worktrees_root
+        _validate_registry_path(self.canonical_files_root, self.workspace_root)
         if self.config.files_mode == 'copy':
             self.files_root = self.environment_root / 'project-copy' / 'Files'
             self.private_worktrees_root = self.environment_root / 'project-copy' / 'worktrees'
@@ -367,7 +371,8 @@ class LimaVMEnvironment(WorkspaceEnvironment):
         return env
 
     def _desired_runtime_binding(self) -> dict[str, Any]:
-        return {
+        _validate_registry_path(self.canonical_files_root, self.workspace_root)
+        binding = {
             'version': 4,
             'environment_id': self.config.id,
             'files_mode': self.config.files_mode,
@@ -382,13 +387,42 @@ class LimaVMEnvironment(WorkspaceEnvironment):
             # reset, never as part of an ordinary Stop -> Start.
             'boot_provisioning': 'explicit-once',
         }
+        parent = self.canonical_files_root.stat()
+        binding.update(references_host_path=str(self.canonical_files_root.resolve()),
+                       references_backing_guest_path=REFERENCES_BACKING_GUEST_PATH,
+                       references_parent_device=parent.st_dev, references_parent_inode=parent.st_ino)
+        return binding
+
+    def _references_backing_guest_path(self) -> str:
+        return REFERENCES_BACKING_GUEST_PATH
+
+    def _references_binding_matches(self) -> bool:
+        try:
+            _validate_registry_path(self.runtime_binding_path, self.workspace_root)
+            _validate_registry_path(self.canonical_files_root, self.workspace_root)
+            raw = json.loads(self.runtime_binding_path.read_text('utf-8'))
+            parent = self.canonical_files_root.stat()
+        except (OSError, ValueError):
+            return False
+        return (isinstance(raw, dict) and raw.get('references_host_path') == str(self.canonical_files_root.resolve())
+                and raw.get('references_backing_guest_path') == REFERENCES_BACKING_GUEST_PATH
+                and raw.get('references_parent_device') == parent.st_dev
+                and raw.get('references_parent_inode') == parent.st_ino)
 
     def _runtime_binding_matches(self) -> bool:
         try:
             raw = json.loads(self.runtime_binding_path.read_text('utf-8'))
         except (OSError, json.JSONDecodeError):
             return False
-        return isinstance(raw, dict) and raw == self._desired_runtime_binding()
+        # The console-only References export may be pending an explicit
+        # Stop/Start on an otherwise usable older running VM. It cannot revoke
+        # readiness of independent, already verified Project views.
+        references_fields = {'references_host_path', 'references_backing_guest_path',
+                             'references_parent_device', 'references_parent_inode'}
+        return (isinstance(raw, dict)
+                and {key: value for key, value in raw.items() if key not in references_fields}
+                == {key: value for key, value in self._desired_runtime_binding().items()
+                    if key not in references_fields})
 
     def _write_runtime_binding(self) -> None:
         _validate_registry_path(self.runtime_binding_path, self.workspace_root)
@@ -402,6 +436,7 @@ class LimaVMEnvironment(WorkspaceEnvironment):
         # `limactl edit --set` uses yq syntax. JSON is valid YAML/yq input and
         # lets us preserve the fixed guest mount point while safely encoding
         # spaces/unicode in the host workspace path.
+        _validate_registry_path(self.canonical_files_root, self.workspace_root)
         mounts = [
             {
                 'location': str(self.files_root.resolve()),
@@ -414,6 +449,8 @@ class LimaVMEnvironment(WorkspaceEnvironment):
                 'writable': self.config.files_mode != 'readonly',
             },
         ]
+        mounts.append({'location': str(self.canonical_files_root.resolve()),
+                       'mountPoint': REFERENCES_BACKING_GUEST_PATH, 'writable': False})
         return '.mounts=' + json.dumps(mounts, ensure_ascii=False, separators=(',', ':'))
 
     async def _reconcile_runtime_binding(self, *, force: bool = False) -> None:
@@ -426,7 +463,7 @@ class LimaVMEnvironment(WorkspaceEnvironment):
         host-specific bindings are repaired while the instance is stopped and
         tracked only under state/.
         """
-        if not force and self._runtime_binding_matches():
+        if not force and self._runtime_binding_matches() and self._references_binding_matches():
             return
         await self._run(
             'edit', self.INSTANCE,
@@ -1326,11 +1363,14 @@ printf '%s\\n' HARNESSY_PROVISION_STAGE=required_packages
         return self._vm_type() == 'vz'
 
     def _template_text(self) -> str:
+        _validate_registry_path(self.canonical_files_root, self.workspace_root)
         preset = get_preset(self.config.preset)
         vm_type = self._vm_type()
         mount_type = self._mount_type()
         files = str(self.files_root.resolve())
         worktrees = str(self.private_worktrees_root.resolve())
+        references_mount = (f'- location: {self._q(str(self.canonical_files_root.resolve()))}\n'
+                            f'  mountPoint: {self._q(REFERENCES_BACKING_GUEST_PATH)}\n  writable: false\n')
         image_spec = (f'images:\n- location: {self._q(str(self.environment_root / "images" / "kali.img"))}\n  arch: {"aarch64" if self.config.architecture == "arm64" else "x86_64"}'
                       if preset.image_id == 'kali-2026.2' else f'base:\n- template:{preset.image.template}')
         video_spec = ('video:\n  display: vnc\n  vnc:\n    display: "127.0.0.1:0,to=99"' if self.config.desktop else 'video:\n  display: none')
@@ -1351,6 +1391,7 @@ mounts:
 - location: {self._q(worktrees)}
   mountPoint: {self._q(PRIVATE_WORKTREES_GUEST_PATH)}
   writable: {"false" if self.config.files_mode == "readonly" else "true"}
+{references_mount.rstrip()}
 mountInotify: false
 ssh:
 {"  overVsock: false" if preset.image_id.startswith("fedora") else ""}
@@ -1879,7 +1920,8 @@ if [ -n "$output_names" ]; then
 fi
 /usr/bin/umount -l {FILES_BACKING_GUEST_PATH} 2>/dev/null || true
 /usr/bin/umount -l {PRIVATE_WORKTREES_GUEST_PATH} 2>/dev/null || true
-if /usr/bin/mountpoint -q {FILES_BACKING_GUEST_PATH} || /usr/bin/mountpoint -q {PRIVATE_WORKTREES_GUEST_PATH}; then
+/usr/bin/umount -l {REFERENCES_BACKING_GUEST_PATH} 2>/dev/null || true
+if /usr/bin/mountpoint -q {FILES_BACKING_GUEST_PATH} || /usr/bin/mountpoint -q {PRIVATE_WORKTREES_GUEST_PATH} || /usr/bin/mountpoint -q {REFERENCES_BACKING_GUEST_PATH}; then
   view_failure RAW_MOUNT_DETACH_FAILED "HarnessyXO could not detach private workspace backing mounts"
 fi
 case "$view_cwd" in
@@ -2034,7 +2076,8 @@ fi
 /usr/bin/chmod 0555 {WORKSPACE_VIEW_GUEST_PATH} {WORKSPACE_VIEW_GUEST_PATH}/Files
 /usr/bin/umount -l {FILES_BACKING_GUEST_PATH} 2>/dev/null || true
 /usr/bin/umount -l {PRIVATE_WORKTREES_GUEST_PATH} 2>/dev/null || true
-if /usr/bin/mountpoint -q {FILES_BACKING_GUEST_PATH} || /usr/bin/mountpoint -q {PRIVATE_WORKTREES_GUEST_PATH}; then
+/usr/bin/umount -l {REFERENCES_BACKING_GUEST_PATH} 2>/dev/null || true
+if /usr/bin/mountpoint -q {FILES_BACKING_GUEST_PATH} || /usr/bin/mountpoint -q {PRIVATE_WORKTREES_GUEST_PATH} || /usr/bin/mountpoint -q {REFERENCES_BACKING_GUEST_PATH}; then
   view_failure RAW_MOUNT_DETACH_FAILED "HarnessyXO could not detach private workspace backing mounts"
 fi
 case "$view_cwd" in
@@ -2213,7 +2256,8 @@ fi
 /usr/bin/chmod 0555 {WORKSPACE_VIEW_GUEST_PATH} {WORKSPACE_VIEW_GUEST_PATH}/Files
 /usr/bin/umount -l {FILES_BACKING_GUEST_PATH} 2>/dev/null || true
 /usr/bin/umount -l {PRIVATE_WORKTREES_GUEST_PATH} 2>/dev/null || true
-if /usr/bin/mountpoint -q {FILES_BACKING_GUEST_PATH} || /usr/bin/mountpoint -q {PRIVATE_WORKTREES_GUEST_PATH}; then
+/usr/bin/umount -l {REFERENCES_BACKING_GUEST_PATH} 2>/dev/null || true
+if /usr/bin/mountpoint -q {FILES_BACKING_GUEST_PATH} || /usr/bin/mountpoint -q {PRIVATE_WORKTREES_GUEST_PATH} || /usr/bin/mountpoint -q {REFERENCES_BACKING_GUEST_PATH}; then
   view_failure RAW_MOUNT_DETACH_FAILED "HarnessyXO could not detach private workspace backing mounts"
 fi
 printf '%s\n' "$view_token" >"$state_dir/ready"
@@ -2236,6 +2280,8 @@ probe_failure() {{
   || probe_failure FILES_BACKING_EXPOSED "The private Files backing mount is still exposed"
 ! /usr/bin/mountpoint -q {PRIVATE_WORKTREES_GUEST_PATH} \
   || probe_failure WORKTREES_BACKING_EXPOSED "The private worktree backing mount is still exposed"
+! /usr/bin/mountpoint -q {REFERENCES_BACKING_GUEST_PATH} \
+  || probe_failure FILES_BACKING_EXPOSED "The private References source mount is still exposed"
 if [ -n "$2" ]; then
   old_ifs=$IFS
   IFS=','
@@ -3521,7 +3567,7 @@ print(json.dumps(facts))
             await self.stop()
             status = await self.status()
         if not status.running:
-            if binding_needs_reconcile:
+            if binding_needs_reconcile or not self._references_binding_matches():
                 await report(
                     'reconciling_environment', 'Updating workspace VM configuration…',
                     detail='Rebinding working roots and removing legacy per-boot provisioning before startup.',
@@ -4194,7 +4240,223 @@ print(json.dumps(facts))
                 'transport': 'copy' if self.config.files_mode == 'copy' else 'bind',
                 'runtime_mounts': self.config.files_mode != 'copy', 'project_isolation': True,
                 'readonly_inputs': True, 'reconcile': True, 'project_terminal': True, 'composite': True,
-                'persistent_project_namespace': self.config.files_mode != 'copy'}
+                'persistent_project_namespace': self.config.files_mode != 'copy',
+                'guest_references': True, 'guest_references_path': '/workspace/Files/References'}
+
+    def _references_view_key(self) -> str:
+        digest = hashlib.sha256(str(self.environment_root.resolve()).encode()).hexdigest()[:16]
+        return 'guest-console-' + digest
+
+    @staticmethod
+    def _references_view_probe() -> str:
+        return f'''set -euo pipefail
+/usr/bin/mountpoint -q {WORKSPACE_VIEW_GUEST_PATH}/Files/References
+case ",$(/usr/bin/findmnt -rn -M {WORKSPACE_VIEW_GUEST_PATH}/Files/References -o VFS-OPTIONS)," in
+  *,ro,*) ;; *) exit 72 ;; esac
+[ "$(/usr/bin/find {WORKSPACE_VIEW_GUEST_PATH}/Files -mindepth 1 -maxdepth 1 -printf '%f\\n')" = References ]
+for backing in {FILES_BACKING_GUEST_PATH} {PRIVATE_WORKTREES_GUEST_PATH} {REFERENCES_BACKING_GUEST_PATH}; do
+  ! /usr/bin/mountpoint -q "$backing"
+done
+'''
+
+    def _references_view_command(self, policy: dict[str, Any], command: str = ':', *, prepare: bool = False) -> str:
+        """Prepare or enter the independent, read-only human References view.
+
+        Only reconciliation may replace its keeper after acquiring the console
+        activity barrier. Terminal entry verifies an existing keeper and never
+        repairs/kills it, closing the prepare-to-PTY race without touching any
+        Project namespace or source file.
+        """
+        from harnessy.core.project_mounts import GUEST_CONSOLE_VIEW_ID
+        revision = str(policy.get('policy_revision') or '')
+        if (policy.get('view_id') != GUEST_CONSOLE_VIEW_ID or policy.get('readonly') is not True
+                or not re.fullmatch('[a-f0-9]{64}', revision)):
+            raise ValueError('Invalid read-only References file-view policy.')
+        backing = self._references_backing_guest_path()
+        signature = hashlib.sha256((revision + '\0' + backing + '\0references-console-v1').encode()).hexdigest()
+        probe = self._references_view_probe()
+        keeper = f'''set -euo pipefail
+state_dir=$1; view_token=$2
+/usr/bin/mount --make-rprivate /
+/usr/bin/mountpoint -q {backing}
+[ -d {backing}/References ] && [ ! -L {backing}/References ]
+/usr/bin/mkdir -p {WORKSPACE_VIEW_GUEST_PATH}
+/usr/bin/mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs {WORKSPACE_VIEW_GUEST_PATH}
+/usr/bin/mkdir -p {WORKSPACE_VIEW_GUEST_PATH}/Files/References
+/usr/bin/mount --bind {backing}/References {WORKSPACE_VIEW_GUEST_PATH}/Files/References
+/usr/bin/mount -o remount,bind,ro {WORKSPACE_VIEW_GUEST_PATH}/Files/References
+/usr/bin/chmod 0555 {WORKSPACE_VIEW_GUEST_PATH} {WORKSPACE_VIEW_GUEST_PATH}/Files
+for raw in {FILES_BACKING_GUEST_PATH} {PRIVATE_WORKTREES_GUEST_PATH} {REFERENCES_BACKING_GUEST_PATH}; do
+  /usr/bin/umount -l "$raw" 2>/dev/null || true
+  ! /usr/bin/mountpoint -q "$raw"
+done
+{probe}
+printf '%s\\n' "$view_token" >"$state_dir/ready"
+/usr/bin/mount -t tmpfs -o mode=0700,nosuid,nodev tmpfs {PERSISTENT_VIEW_STATE_GUEST_PATH}
+exec -a "harnessy-references-view-$view_token" /bin/sleep infinity
+'''
+        supervisor = f'''set -euo pipefail
+signature=$1; keeper_script=$2; probe_script=$3; user_command=$4; prepare=$5; console_user=$6
+state_root={PERSISTENT_VIEW_STATE_GUEST_PATH}
+state_dir="$state_root/{self._references_view_key()}"
+failure() {{ printf '%s\\n' 'HarnessyXO read-only References view is unavailable; retry its file-view setup.' >&2; exit 72; }}
+[ ! -L "$state_root" ] && [ ! -L "$state_dir" ] || failure
+/usr/bin/mkdir -p "$state_dir"
+/usr/bin/chmod 0700 "$state_root" "$state_dir"
+for name in lock pid token signature ready; do [ ! -L "$state_dir/$name" ] || failure; done
+exec 9>"$state_dir/lock"
+/usr/bin/flock -x 9
+identity_valid() {{
+  [ -s "$state_dir/pid" ] && [ -s "$state_dir/token" ] && [ -s "$state_dir/signature" ] || return 1
+  keeper_pid=$(cat "$state_dir/pid"); token=$(cat "$state_dir/token")
+  case "$keeper_pid" in *[!0-9]*|'') return 1 ;; esac
+  case "$token" in *[!a-zA-Z0-9._-]*|'') return 1 ;; esac
+  [ "$(cat "$state_dir/signature")" = "$signature" ] || return 1
+  /bin/kill -0 "$keeper_pid" 2>/dev/null || return 1
+  first=$(tr '\\000' '\\n' <"/proc/$keeper_pid/cmdline" | /usr/bin/head -n 1)
+  [ "$first" = "harnessy-references-view-$token" ]
+}}
+view_valid() {{
+  identity_valid && /usr/bin/nsenter --target "$keeper_pid" --mount --pid -- /bin/bash -c "$probe_script"
+}}
+if ! view_valid; then
+  [ "$prepare" = 1 ] || failure
+  if [ -s "$state_dir/pid" ] && [ -s "$state_dir/token" ]; then
+    old_pid=$(cat "$state_dir/pid"); old_token=$(cat "$state_dir/token")
+    case "$old_pid" in *[!0-9]*|'') failure ;; esac
+    if [ -r "/proc/$old_pid/cmdline" ]; then
+      old_first=$(tr '\\000' '\\n' <"/proc/$old_pid/cmdline" | /usr/bin/head -n 1)
+      [ "$old_first" = "harnessy-references-view-$old_token" ] || failure
+      /bin/kill -TERM "$old_pid" 2>/dev/null || true
+      for attempt in $(/usr/bin/seq 1 40); do /bin/kill -0 "$old_pid" 2>/dev/null || break; /bin/sleep 0.05; done
+      if /bin/kill -0 "$old_pid" 2>/dev/null; then
+        old_first=$(tr '\\000' '\\n' <"/proc/$old_pid/cmdline" | /usr/bin/head -n 1)
+        [ "$old_first" = "harnessy-references-view-$old_token" ] || failure
+        /bin/kill -KILL "$old_pid"
+      fi
+    fi
+  fi
+  /bin/rm -f "$state_dir/pid" "$state_dir/token" "$state_dir/signature" "$state_dir/ready"
+  token="$signature-$$-$(/bin/date +%s%N)"
+  /usr/bin/setsid --fork /usr/bin/unshare --mount --pid --fork --mount-proc --propagation private \\
+    /bin/bash -c "$keeper_script" harnessy-references-keeper "$state_dir" "$token" \\
+    </dev/null >"$state_dir/start.stdout" 2>"$state_dir/start.stderr"
+  keeper_pid=''
+  for attempt in $(/usr/bin/seq 1 160); do
+    if [ "$(cat "$state_dir/ready" 2>/dev/null || true)" = "$token" ]; then
+      for candidate in /proc/[0-9]*; do
+        [ -r "$candidate/cmdline" ] || continue
+        first=$(tr '\\000' '\\n' <"$candidate/cmdline" 2>/dev/null | /usr/bin/head -n 1 || true)
+        if [ "$first" = "harnessy-references-view-$token" ]; then keeper_pid=${{candidate##*/}}; break; fi
+      done
+      [ -z "$keeper_pid" ] || break
+    fi
+    /bin/sleep 0.05
+  done
+  [ -n "$keeper_pid" ] || failure
+  printf '%s\\n' "$keeper_pid" >"$state_dir/pid"
+  printf '%s\\n' "$token" >"$state_dir/token"
+  printf '%s\\n' "$signature" >"$state_dir/signature"
+  view_valid || failure
+fi
+/usr/bin/flock -u 9
+exec /usr/bin/nsenter --target "$keeper_pid" --mount --pid -- \\
+  /usr/bin/sudo -n -H -u "$console_user" -- /bin/bash -c "$user_command"
+'''
+        args = ' '.join(shlex.quote(value) for value in ('harnessy-references-supervisor', signature, keeper,
+                                                       probe, str(command), '1' if prepare else '0'))
+        return ('console_user=$(id -un); exec /usr/bin/sudo -n /bin/bash -c '
+                + shlex.quote(supervisor) + ' ' + args + ' "$console_user"')
+
+    async def _probe_references_view(self, policy: dict[str, Any]) -> bool:
+        command = self._references_view_command(policy)
+        rc, _, _ = await self._run('shell', '--workdir', '/', self.INSTANCE, '/bin/bash', '-lc',
+                                   command, timeout=12, check=False)
+        return rc == 0
+
+    async def _retire_references_view(self) -> None:
+        """Retire only the signed console keeper, never its source directory."""
+        script = f'''set -euo pipefail
+state_dir={PERSISTENT_VIEW_STATE_GUEST_PATH}/{self._references_view_key()}
+[ ! -L "$state_dir" ] || exit 72
+[ -d "$state_dir" ] || exit 0
+for name in lock pid token signature ready; do [ ! -L "$state_dir/$name" ] || exit 72; done
+exec 9>"$state_dir/lock"
+/usr/bin/flock -x 9
+if [ -s "$state_dir/pid" ] && [ -s "$state_dir/token" ]; then
+  pid=$(cat "$state_dir/pid"); token=$(cat "$state_dir/token")
+  case "$pid" in *[!0-9]*|'') exit 72 ;; esac
+  case "$token" in *[!a-zA-Z0-9._-]*|'') exit 72 ;; esac
+  if [ -r "/proc/$pid/cmdline" ]; then
+    first=$(tr '\\000' '\\n' <"/proc/$pid/cmdline" | /usr/bin/head -n 1)
+    [ "$first" = "harnessy-references-view-$token" ] || exit 72
+    /bin/kill -TERM "$pid" 2>/dev/null || true
+    for attempt in $(/usr/bin/seq 1 40); do /bin/kill -0 "$pid" 2>/dev/null || break; /bin/sleep 0.05; done
+    if /bin/kill -0 "$pid" 2>/dev/null; then
+      first=$(tr '\\000' '\\n' <"/proc/$pid/cmdline" | /usr/bin/head -n 1)
+      [ "$first" = "harnessy-references-view-$token" ] || exit 72
+      /bin/kill -KILL "$pid"
+    fi
+  fi
+fi
+/bin/rm -f "$state_dir/pid" "$state_dir/token" "$state_dir/signature" "$state_dir/ready" "$state_dir/start.failure"
+'''
+        await self._run('shell', '--workdir', '/', self.INSTANCE, 'sudo', '/bin/bash', '-c',
+                        script, timeout=15, check=True)
+
+    async def _reconcile_references_view(self, plan: dict[str, Any], records: dict[str, Any], workspace) -> dict[str, Any]:
+        from harnessy.core.project_mounts import build_references_policy, GUEST_CONSOLE_VIEW_ID
+        from .activity import reserve_project_view_change
+        from .file_views import finish_file_view_work
+        policy = plan.get('references_policy')
+        if policy is None:
+            failure = dict(plan.get('references_error') or {'project_id': GUEST_CONSOLE_VIEW_ID,
+                           'folder': 'References', 'state': 'error', 'error_code': 'FILE_VIEW_SOURCE_INVALID'})
+            try:
+                release = reserve_project_view_change(self.workspace_root, environment_id=self.config.id,
+                    project_id=GUEST_CONSOLE_VIEW_ID, owner_id=str(plan.get('_owner_id') or ''))
+            except RuntimeError as exc:
+                return {**failure, 'state': 'pending', 'detail': str(exc)}
+            try:
+                await self._retire_references_view()
+                records.pop('references', None)
+                return failure
+            except Exception as exc:
+                return {**failure, 'error_code': 'FILE_VIEW_MOUNT_FAILED', 'detail': str(exc)[:500]}
+            finally:
+                release()
+        revision = policy['policy_revision']
+        row = {'project_id': GUEST_CONSOLE_VIEW_ID, 'folder': 'References', 'policy_revision': revision}
+        if not self._references_binding_matches():
+            return {**row, 'state': 'pending', 'detail': 'Stop and start this VM once to add its read-only live References export.'}
+        previous = records.get('references', {})
+        if previous.get('policy_revision') == revision:
+            try:
+                if await self._probe_references_view(policy):
+                    return {**row, 'state': 'ready'}
+            except Exception:
+                pass
+        try:
+            release = reserve_project_view_change(self.workspace_root, environment_id=self.config.id,
+                project_id=GUEST_CONSOLE_VIEW_ID, owner_id=str(plan.get('_owner_id') or ''))
+        except RuntimeError as exc:
+            return {**row, 'state': 'pending', 'detail': str(exc)}
+        try:
+            fresh = await finish_file_view_work(build_references_policy, workspace)
+            if fresh['policy_revision'] != revision:
+                raise FileViewUnavailableError('References changed while preparing its console view.', 'FILE_VIEW_POLICY_CHANGED')
+            await self._run('shell', '--workdir', '/', self.INSTANCE, '/bin/bash', '-lc',
+                            self._references_view_command(policy, prepare=True), timeout=45, check=True)
+            fresh = await finish_file_view_work(build_references_policy, workspace)
+            if fresh['policy_revision'] != revision:
+                raise FileViewUnavailableError('References changed while mounting its console view.', 'FILE_VIEW_POLICY_CHANGED')
+            records['references'] = {'policy_revision': revision}
+            return {**row, 'state': 'ready'}
+        except Exception as exc:
+            return {**row, 'state': 'error', 'error_code': getattr(exc, 'error_code', 'FILE_VIEW_MOUNT_FAILED'),
+                    'detail': str(exc)[:500]}
+        finally:
+            release()
 
     def _file_view_records(self) -> dict[str, Any]:
         path = self.state_root / 'lima-file-views.json'
@@ -4256,7 +4518,8 @@ rm -f "$state_dir/pid" "$state_dir/token" "$state_dir/signature" "$state_dir/rea
         paths.extend('/workspace/Files/' + row['folder'] for row in policy['access_projects'] if row['direct_mount'])
         probe = ('set -eu\n' + '\n'.join('/usr/bin/mountpoint -q ' + shlex.quote(path) for path in paths)
                  + '\n! /usr/bin/mountpoint -q ' + FILES_BACKING_GUEST_PATH
-                 + '\n! /usr/bin/mountpoint -q ' + PRIVATE_WORKTREES_GUEST_PATH)
+                 + '\n! /usr/bin/mountpoint -q ' + PRIVATE_WORKTREES_GUEST_PATH
+                 + '\n! /usr/bin/mountpoint -q ' + REFERENCES_BACKING_GUEST_PATH)
         script = f'''set -euo pipefail
 state_dir={PERSISTENT_VIEW_STATE_GUEST_PATH}/{folder.lower()}-{digest}
 [ ! -L "$state_dir" ] || exit 72
@@ -4347,11 +4610,16 @@ exec /usr/bin/nsenter --target "$pid" --mount --pid -- /bin/bash -c {shlex.quote
                              'error_code': 'FILE_VIEW_MOUNT_FAILED', 'detail': str(exc)[:500]})
             finally:
                 release()
+        references = await self._reconcile_references_view(plan, records, workspace)
         self._save_file_view_records(records)
-        return {'state': 'error' if errors else 'pending' if pending else 'ready', 'revision': plan['revision'],
-                'projects': rows, 'pending_project_ids': pending,
-                'error_code': 'FILE_VIEW_MOUNT_FAILED' if errors else '',
-                'detail': 'Unmount pending: finish affected project work.' if pending else 'Project file views verified.'}
+        references_state = references.get('state')
+        failed = bool(errors) or references_state not in ('ready', 'pending')
+        waiting = bool(pending) or references_state == 'pending'
+        return {'state': 'error' if failed else 'pending' if waiting else 'ready', 'revision': plan['revision'],
+                'projects': rows, 'references': references, 'pending_project_ids': pending,
+                'error_code': (references.get('error_code') or 'FILE_VIEW_MOUNT_FAILED') if failed else '',
+                'detail': ('Unmount pending: finish affected project work.' if pending else references.get('detail'))
+                           if waiting else 'Project file views verified.'}
 
     async def open_project_terminal(self, *, active_root: Path, output_policy: dict[str, Any], workspace=None):
         self._authorize_model_project(output_policy)
@@ -4374,40 +4642,44 @@ exec /usr/bin/nsenter --target "$pid" --mount --pid -- /bin/bash -c {shlex.quote
         return ([self._binary(), 'shell', '--workdir', '/', self.INSTANCE, '/bin/bash', '-lc', command],
                 self._host_env(), self.workspace_root)
 
-    async def open_guest_terminal(self) -> tuple[list[str], dict[str, str], Path]:
-        """Open a human guest-home console without deploying project files."""
-        with activity(self.workspace_root, 'Opening VM guest console', environment_id=self.config.id,
-                      project_id='__guest_console__'):
+    async def open_guest_terminal(self, *, workspace=None, owner_id: str = '') -> tuple[list[str], dict[str, str], Path]:
+        """Open guest home with live RO References and no Project exports."""
+        from .file_views import FILE_VIEWS, finish_file_view_work
+        from harnessy.core.project_mounts import build_references_policy
+        if workspace is not None:
+            if Path(workspace.root).resolve() != self.workspace_root.resolve():
+                raise ValueError('The guest console workspace identity does not match this VM.')
+        if FILE_VIEWS.cached_workspace(self.workspace_root) is None:
+            raise FileViewUnavailableError('Open the workspace again before opening its References console.', 'FILE_VIEW_FAILED')
+        owner_id = str(owner_id or uuid.uuid4().hex)
+        release = await FILE_VIEWS.acquire_terminal_activity(self.workspace_root, environment_id=self.config.id,
+            project_id='__guest_console__', owner_id=owner_id, label='Opening VM guest console')
+        try:
             await self.start()
-            return await asyncio.to_thread(self._guest_terminal_command)
+            policy = await FILE_VIEWS.ensure_references(self.workspace_root, environment_id=self.config.id,
+                                                       owner_id=owner_id)
+            admitted = FILE_VIEWS.cached_workspace(self.workspace_root)
+            if admitted is None:
+                raise FileViewUnavailableError('Open the workspace again before opening its References console.', 'FILE_VIEW_FAILED')
+            try:
+                fresh = await finish_file_view_work(build_references_policy, admitted)
+            except (OSError, ValueError) as exc:
+                raise FileViewUnavailableError('References changed before this console could open.', 'FILE_VIEW_POLICY_CHANGED') from exc
+            if (FILE_VIEWS.cached_workspace(self.workspace_root) is not admitted
+                    or fresh['policy_revision'] != policy['policy_revision']):
+                raise FileViewUnavailableError('References changed before this console could open.', 'FILE_VIEW_POLICY_CHANGED')
+            return await asyncio.to_thread(self._guest_terminal_command, policy)
+        finally:
+            release()
 
-    def _guest_terminal_command(self) -> tuple[list[str], dict[str, str], Path]:
-        # Keep controller exports out of this human console just as they are
-        # detached from project commands. The empty /workspace also hides any
-        # legacy direct mount without changing other processes' mount views.
+    def _guest_terminal_command(self, policy: dict[str, Any]) -> tuple[list[str], dict[str, str], Path]:
+        # Enter only the independently verified console namespace; never deploy
+        # a Project or rebuild a stale keeper while a PTY is being created.
         from harnessy.core.terminal import _GUEST_ACTIVITY_RC
         console_rc = (_GUEST_ACTIVITY_RC + '\ncd -- "$HOME" || exit 72\n'
                       + self._guest_work_path_exports())
         command = 'exec /bin/bash --rcfile <(printf %s ' + shlex.quote(console_rc) + ') -i'
-        inner = f'''set -euo pipefail
-console_user=$1
-console_command=$2
-/usr/bin/mount --make-rprivate /
-for backing in {FILES_BACKING_GUEST_PATH} {PRIVATE_WORKTREES_GUEST_PATH}; do
-  /usr/bin/umount -l "$backing" 2>/dev/null || true
-  if /usr/bin/mountpoint -q "$backing"; then
-    printf '%s\\n' 'HarnessyXO could not detach workspace exports from the guest console.' >&2
-    exit 72
-  fi
-done
-/usr/bin/mkdir -p {WORKSPACE_VIEW_GUEST_PATH}
-/usr/bin/mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs {WORKSPACE_VIEW_GUEST_PATH}
-exec /usr/bin/sudo -n -H -u "$console_user" -- /bin/bash -c "$console_command"
-'''
-        view_command = ('console_user=$(id -un); exec /usr/bin/sudo -n /usr/bin/unshare '
-                        '--mount --propagation private --fork /bin/bash -c '
-                        + shlex.quote(inner) + ' harnessy-guest-console "$console_user" '
-                        + shlex.quote(command))
+        view_command = self._references_view_command(policy, command)
         argv = [self._binary(), 'shell', '--workdir', '/', self.INSTANCE, '/bin/bash', '-lc', view_command]
         return argv, self._host_env(), self.workspace_root
 

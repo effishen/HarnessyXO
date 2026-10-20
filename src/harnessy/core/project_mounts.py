@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 _FOLDER = re.compile(r'^Project-[A-Za-z0-9]{4}$')
+GUEST_CONSOLE_VIEW_ID = '__guest_console__'
 
 
 def _identity(workspace, path: Path, label: str, project_id: str = '') -> dict[str, Any]:
@@ -32,6 +33,22 @@ def _identity(workspace, path: Path, label: str, project_id: str = '') -> dict[s
 
 def _revision(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def build_references_policy(workspace) -> dict[str, Any]:
+    """Describe the workspace-wide, read-only human console input.
+
+    This view has no Project origin and never inherits Project VM access,
+    hierarchy or explicit grants. Planning validates the canonical directory
+    without creating it or traversing its contents.
+    """
+    references = Path(workspace.root).resolve() / 'Files' / 'References'
+    policy = {'namespace_version': 2, 'view_id': GUEST_CONSOLE_VIEW_ID,
+              'project_id': GUEST_CONSOLE_VIEW_ID, 'references_folder': 'References',
+              'references_root': str(references), 'readonly': True,
+              'source_identities': (_identity(workspace, references, 'references'),)}
+    policy['policy_revision'] = _revision(policy)
+    return policy
 
 
 def build_project_policy(workspace, chat_id: str) -> dict[str, Any]:
@@ -100,9 +117,17 @@ def build_environment_plan(workspace, config) -> dict[str, Any]:
             except Exception as exc:
                 errors.append({'project_id': chat.id, 'folder': 'Project-' + str(chat.public_id),
                                'state': 'error', 'error_code': 'FILE_VIEW_SOURCE_INVALID', 'detail': str(exc)[:500]})
+    references_policy, references_error = None, None
+    try:
+        references_policy = build_references_policy(workspace)
+    except Exception as exc:
+        references_error = {'project_id': GUEST_CONSOLE_VIEW_ID, 'folder': 'References',
+                            'state': 'error', 'error_code': 'FILE_VIEW_SOURCE_INVALID',
+                            'detail': str(exc)[:500]}
     plan = {'schema': 1, 'environment_id': config.id, 'files_mode': config.files_mode,
             'model_enabled': config.enabled, 'projects': projects, 'known_projects': known,
-            'errors': errors}
+            'errors': errors, 'references_policy': references_policy,
+            'references_error': references_error}
     plan['revision'] = _revision({**plan, 'projects': [
         {'project_id': row['project_id'], 'policy_revision': row['policy']['policy_revision']} for row in projects]})
     return plan

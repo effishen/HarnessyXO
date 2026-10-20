@@ -255,11 +255,13 @@ class WorkspaceEnvironment(abc.ABC):
             await self.start()
             return await asyncio.to_thread(self.terminal_command, active_root=active_root)
 
-    async def open_guest_terminal(self) -> tuple[list[str], dict[str, str], Path]:
-        """Open an explicit human console without preparing project files.
+    async def open_guest_terminal(self, *, workspace=None, owner_id: str = '') -> tuple[list[str], dict[str, str], Path]:
+        """Open an explicit human console without preparing Project files.
 
         This is separate from model execution and project terminals: callers
         must not attach a project synchronization watcher to this console.
+        Providers advertising guest_references must verify the workspace-wide
+        read-only References view before returning a console command.
         Providers must implement the guest transport; there is no host fallback.
         """
         raise RuntimeError('This VM provider does not support a guest console.')
@@ -267,7 +269,8 @@ class WorkspaceEnvironment(abc.ABC):
     def file_view_capabilities(self) -> dict[str, Any]:
         return {'supported_modes': (), 'transport': 'unsupported', 'runtime_mounts': False,
                 'project_isolation': False, 'readonly_inputs': False, 'reconcile': False,
-                'project_terminal': False, 'composite': False, 'persistent_project_namespace': False}
+                'project_terminal': False, 'composite': False, 'persistent_project_namespace': False,
+                'guest_references': False, 'guest_references_path': ''}
 
     async def reconcile_file_views(self, plan: dict[str, Any]) -> dict[str, Any]:
         return {'state': 'unsupported', 'revision': plan['revision'], 'pending_project_ids': [],

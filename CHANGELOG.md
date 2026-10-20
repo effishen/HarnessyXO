@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.7.7
+
+- Automatically mount workspace References read-only at `/workspace/Files/References` in supported Linux Guest consoles. OpenWrt opkg guests and Lima use a separate verified console view, including when project files use independent copies. No project's files are automatically exported by this console.
+- Keep human console References independent of model enable settings, selected Project / Chat permissions and project hierarchy, including workspaces with no projects. Preserve project-specific model views and existing guest root/sudo privileges.
+- Use a dedicated read-only OpenWrt SFTP capability and a read-only Lima host export. Existing Lima VMs require one explicit Stop/Start to add that export; running VMs are never restarted automatically. Windows and APK-based OpenWrt consoles remain available and explicitly report that live References are unsupported.
+- Hold the console preparation lease until the terminal session takes over. Revalidate replaced sources, keep in-use changes pending, and fail a new console closed rather than entering an outdated namespace. Unrelated project access changes do not retire console References.
+- Show Guest console References separately in VM status and retain its state, policy revision and fixed failure code in content-free diagnostics. Leave README unchanged.
+- Verify policy/admission, source replacement, read-only SFTP enforcement, queued terminal startup, repeated cancellation and production browser flows, including narrow screens. Native Lima boot remains unverified.
+
 ## v0.7.6
 
 - OpenWrt project terminals now show your username, VM name and current directory instead of the bare `bash-5.2$` prompt. The path updates as you use `cd`.

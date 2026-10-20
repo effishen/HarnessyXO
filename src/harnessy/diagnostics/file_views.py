@@ -13,7 +13,7 @@ _STATES = frozenset({'idle', 'requested', 'preparing', 'mounted', 'ready', 'pend
                      'stopped', 'unsupported', 'failed', 'error', 'copy', 'revoked',
                      'unmounted', 'removed', 'retired', 'not_created', 'busy', 'unavailable'})
 _CODES = frozenset({'', 'FILE_VIEW_PENDING', 'FILE_VIEW_BUSY', 'FILE_VIEW_UNSUPPORTED',
-                    'FILE_VIEW_FAILED', 'FILE_VIEW_RECONCILE_FAILED', 'FILE_VIEW_RECONCILIATION_FAILED', 'FILE_VIEW_POLICY_CHANGED',
+                    'FILE_VIEW_FAILED', 'FILE_VIEW_MOUNT_FAILED', 'FILE_VIEW_RECONCILE_FAILED', 'FILE_VIEW_RECONCILIATION_FAILED', 'FILE_VIEW_POLICY_CHANGED',
                     'FILE_VIEW_SOURCE_CHANGED', 'FILE_VIEW_TRANSPORT_FAILED',
                     'FILE_VIEW_SOURCE_INVALID', 'FILE_VIEW_STATUS_WRITE_FAILED',
                     'FILE_VIEW_REGISTRY_INVALID',
@@ -26,7 +26,7 @@ _REV = re.compile(r'^[0-9a-f]{64}$')
 _STAGES = _STATES | {'queued', 'planning', 'waiting_for_vm_operation', 'waiting_for_ready', 'reconciling', 'in_use'}
 _BOOL_CAPS = ('live', 'readonly', 'copy', 'runtime_mounts', 'runtime_reconcile', 'reconcile',
               'project_isolation', 'readonly_enforced', 'project_views', 'live_mounts',
-              'readonly_inputs', 'project_terminal', 'composite')
+              'readonly_inputs', 'project_terminal', 'composite', 'guest_references')
 
 
 def project_status(value: Any) -> dict[str, Any]:
@@ -83,6 +83,17 @@ def project_status(value: Any) -> dict[str, Any]:
     output['pending_project_ids'] = [item for item in pending[:512]
         if isinstance(item, str) and _ID.fullmatch(item)] if isinstance(pending, list) else []
     output['pending_limited'] = isinstance(pending, list) and len(pending) > 512
+    references = value.get('references')
+    if isinstance(references, dict):
+        state = references.get('state')
+        clean = {'state': state if isinstance(state, str) and state in _STATES else 'unavailable'}
+        code = references.get('error_code')
+        if isinstance(code, str) and code in _CODES:
+            clean['error_code'] = code
+        revision = references.get('policy_revision')
+        if isinstance(revision, str) and _REV.fullmatch(revision):
+            clean['policy_revision'] = revision
+        output['references'] = clean
     return output
 
 
@@ -126,7 +137,9 @@ def collect_file_view_diagnostics(latest: Path) -> dict[str, Any]:
 
 def summary_lines(report: dict[str, Any]) -> str:
     rows = report.get('environments', [])
-    noteworthy = [row for row in rows if row.get('state') in {'pending', 'busy', 'unsupported', 'failed', 'error'}]
+    attention = {'pending', 'busy', 'unsupported', 'failed', 'error'}
+    noteworthy = [row for row in rows if row.get('state') in attention
+                   or (row.get('references') or {}).get('state') in attention]
     if not noteworthy:
         return '\nVM file views: see FILE_VIEWS.json for retained mount-state observations.\n'
     lines = ['\nVM file views needing attention (retained observations):']
@@ -134,4 +147,8 @@ def summary_lines(report: dict[str, Any]) -> str:
         lines.append('  VM ' + (row['environment_id'] or 'legacy') + ': ' + row['state']
                      + (' (' + row['error_code'] + ')' if row.get('error_code') else '')
                      + '; pending projects=' + str(len(row.get('pending_project_ids', []))))
+        references = row.get('references') or {}
+        if references:
+            lines.append('    Guest console References: ' + references['state']
+                         + (' (' + references['error_code'] + ')' if references.get('error_code') else ''))
     return '\n'.join(lines) + '\n'

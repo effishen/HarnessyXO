@@ -513,7 +513,7 @@ finally {
         task.add_done_callback(self._process_tasks.discard)
         return process
 
-    async def open_guest_terminal(self):
+    async def open_guest_terminal(self, *, workspace=None, owner_id: str = ''):
         """Open a human PowerShell console without deploying project files."""
         with activity(self.workspace_root, 'Opening Windows guest console', environment_id=self.config.id,
                       project_id='__guest_console__'):

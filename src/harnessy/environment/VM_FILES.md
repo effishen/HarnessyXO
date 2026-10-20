@@ -4,7 +4,8 @@ This is the file-access contract for every HarnessyXO VM provider. A new guest
 OS or transport must use the shared project policy and declare its supported
 file modes. It must report an unsupported mode instead of quietly exposing a
 larger directory, omitting required sources, or falling back to the host shell.
-The policy lives in `harnessy.core.project_mounts`; runtime changes go through
+The project and References policies live in `harnessy.core.project_mounts`;
+runtime changes go through
 `harnessy.environment.file_views.FILE_VIEWS`. Provider transport code consumes
 that plan. It must not invent its own hierarchy or Project Access rules.
 
@@ -49,9 +50,20 @@ Linux guest paths are stable:
   view. It does not acquire another writable alias.
 
 Every model command and project-files terminal must use the same shared plan.
-An explicit guest console opens the guest's home and does not automatically
-export the whole workspace. A human can administer their guest through that
-console; project views are not a security boundary against a guest administrator.
+A supported Linux Guest console opens the guest's home and mounts workspace
+References read-only at `/workspace/Files/References`. It does not automatically
+mount any project's files. This human console view uses the separate
+`build_references_policy` plan; it is independent of VM Project membership,
+model enable/disable and the project's live, read-only or copy mode. It also
+works in a workspace with no projects. Planning never inventories or copies
+the directory's contents.
+
+Mount access and Linux privileges are separate. OpenWrt live/read-only project
+commands run as the unprivileged `harnessy` user; its human Guest console runs
+as root. Lima uses its normal guest user, which can use sudo. Independent-copy
+guests retain their existing administration privileges. Project views are not
+a security boundary against a guest administrator. Mounting References does
+not grant or remove root access.
 
 Build directories, virtual environments and caches belong to the selected VM
 and project. They do not move into another VM or project when access changes.
@@ -70,13 +82,17 @@ are explicit operations. The transport's size and format limits still apply.
 Changing permission cannot recall an independent copy or data already read.
 
 A provider must declare its transport, supported modes, project isolation,
-read-only enforcement and runtime reconciliation support. Unsupported providers
+read-only enforcement and runtime reconciliation support. The separate
+`guest_references` capability and verified `references` runtime receipt are
+required before a Guest console can claim that its References mount is ready.
+The console's status must not be mixed into the Project list. Unsupported providers
 must not report a successful live mount. Windows currently uses independent
 copies; live Windows mounting requires its own verified integration.
 Its current copy integration deploys the owned project only. If References
 contains files, or the project needs ancestor or Project Access inputs, command
 execution reports that unsupported scope before deployment. The guest console
-remains available. It must not silently pretend those read-only inputs exist.
+remains available without live References. It must not silently pretend those
+read-only inputs exist.
 
 OpenWrt live sharing uses a separate scoped SSHFS/SFTP connection for each
 source, over the existing VM SSH transport. No host SSH server or listening
@@ -84,7 +100,18 @@ file-sharing port is needed. The host serves regular files and directories on
 demand and enforces read-only inputs. Symlinks, multiply linked files and special
 files are rejected; keep dependency trees requiring those entries on the guest
 disk. Compatible opkg-based guests install matching FUSE/SSHFS packages
-automatically. The APK-based OpenWrt image remains copy-only.
+automatically. Their Guest console uses a dedicated read-only SFTP capability,
+including in independent-copy mode; guest root cannot write through that
+capability. The APK-based OpenWrt image remains copy-only and its plain Guest
+console reports that live References are unavailable.
+
+Lima Guest consoles use a dedicated host read-only export of the canonical
+Files parent, exposing only its References child in the console's namespace.
+This allows a replaced References directory to be revalidated without retaining
+a stale export of its old inode. An existing running VM without this backing
+requires one explicit Stop/Start; it remains pending until then. No automatic
+stop, reset or rebuild is allowed. The read-only channel does not remove the
+guest administrator's ability to reach other existing Lima exports.
 
 ## Updating running VMs
 
@@ -108,6 +135,17 @@ overwrite a newer operation.
 | Replace a project root or References directory | Every view using the replaced source |
 | Restart HarnessyXO or a VM | Rebuild and verify required views from current policy |
 
+Guest console References has its own tracked view and source identity. Editing
+an unrelated project's access or hierarchy must not retire its connection.
+Replacing References invalidates this view as well as every project view using
+that source. An active console can leave retirement pending; a new console
+must not enter the stale namespace. Close affected consoles, then retry. The
+preparation lease must remain held until the terminal session has acquired its
+own lease, with only the same owner's preparation exempted during reconciliation.
+Acquire this lease under the reconciliation lock after any ongoing mount work
+finishes, so opening a console immediately after Start queues instead of racing
+the background first mount. Cancelling that wait must not create a terminal.
+
 Source use is tracked per consuming view. Removing A's VM permission must not
 detach A's read-only files from an allowed child B. Removing B's grant to C
 must not detach C from another project which still has its own valid grant.
@@ -125,7 +163,10 @@ working directories, memory mappings or data a process already read.
 ## Failure and data preservation
 
 The UI and diagnostics distinguish requested policy from verified runtime
-state: preparing, mounted, pending, stopped, unsupported or failed. A saved
+state: preparing, mounted, pending, stopped, unsupported or failed. References
+status is separate from project status: a References failure must not block
+an otherwise verified project, and a broken project must not block the human
+References console. A saved
 checkbox is not proof that a mount operation succeeded. Failures retain a
 useful cause and can be retried.
 

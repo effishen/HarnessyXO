@@ -38,6 +38,7 @@ async def finish_thread(function, *args, **kwargs):
 
 _START_LOCKS: dict[str, asyncio.Lock] = {}
 _SYNC_LOCKS: dict[str, asyncio.Lock] = {}
+_GUEST_CONSOLE_VIEW_ID = '__guest_console__'
 
 
 def _atomic_json(path: Path, value: dict) -> None:
@@ -657,6 +658,22 @@ python3 -c 'import sys; print(sys.version)'
         remote = '/opt/harnessy-private/' + ('projections/' if self.config.files_mode == 'copy' else 'live/') + key
         return {'key': key, 'root': root, 'mounts': mounts, 'remote': remote, 'policy': policy, 'files_mode': self.config.files_mode}
 
+    def _references_projection(self, policy: dict) -> dict:
+        """The human root console receives only this read-only capability."""
+        policy = dict(policy or {})
+        references = self.files_root.resolve() / 'References'
+        if (policy.get('namespace_version') != 2 or
+                policy.get('view_id') != _GUEST_CONSOLE_VIEW_ID or
+                policy.get('project_id') != _GUEST_CONSOLE_VIEW_ID or
+                policy.get('references_folder') != 'References' or
+                Path(policy.get('references_root', '')) != references or
+                policy.get('readonly') is not True or not policy.get('policy_revision')):
+            raise ValueError('The guest console needs the current read-only References policy.')
+        key = hashlib.sha256(('guest-console-references\0' + str(self.workspace_root)).encode()).hexdigest()[:24]
+        return {'key': key, 'root': references,
+                'mounts': [{'host': references, 'guest': 'Files/References', 'writable': False, 'excluded': ()}],
+                'remote': '/opt/harnessy-private/live/' + key, 'policy': policy, 'files_mode': 'readonly'}
+
     def file_view_capabilities(self):
         supported = not self._basic_copy
         return {'supported_modes': ('live', 'readonly', 'copy') if supported else ('copy',),
@@ -665,7 +682,50 @@ python3 -c 'import sys; print(sys.version)'
                 'project_isolation': supported, 'readonly_inputs': supported,
                 'reconcile': supported, 'project_terminal': True, 'composite': supported,
                 'whole_project_deployment': self.config.files_mode == 'copy',
-                'file_backed_mmap': True}
+                'file_backed_mmap': True, 'guest_references': supported,
+                'guest_references_path': '/workspace/Files/References' if supported else ''}
+
+    async def _reconcile_references(self, plan):
+        # Older callers which do not plan the console view must leave an
+        # existing console capability alone. Production plans always include
+        # both fields, independently of Project membership and file mode.
+        if 'references_policy' not in plan:
+            return None
+        if self._basic_copy:
+            return {'state': 'unsupported',
+                    'detail': 'Verified live References support is unavailable for this OpenWrt release.'}
+        policy, invalid = plan.get('references_policy'), plan.get('references_error')
+        result = {'policy_revision': str((policy or {}).get('policy_revision') or '')}
+        projection = None
+        try:
+            if policy is not None and not invalid:
+                projection = self._references_projection(policy)
+                existing = self._live_mounts.views.get(projection['key'])
+                if existing and existing.signature == self._live_mounts.signature(projection) and all(
+                        not item.serving.done() and item.process.returncode is None for item in existing.exports):
+                    await self._live_mounts.ensure(projection, project_id=_GUEST_CONSOLE_VIEW_ID)
+                    return {**result, 'state': 'ready'}
+            try:
+                release = reserve_project_view_change(self.workspace_root, environment_id=self.config.id,
+                    project_id=_GUEST_CONSOLE_VIEW_ID, owner_id=str(plan.get('_owner_id') or ''))
+            except RuntimeError as busy:
+                return {**result, 'state': 'pending', 'detail': str(busy)[:500]}
+            try:
+                await self._live_mounts.retire_project(_GUEST_CONSOLE_VIEW_ID)
+                if projection is None:
+                    return {**result, 'state': 'error', 'error_code': 'FILE_VIEW_SOURCE_INVALID',
+                            'detail': str((invalid or {}).get('detail') or 'The References source is unavailable.')[:1000]}
+                await self._live_mounts.ensure(projection, project_id=_GUEST_CONSOLE_VIEW_ID)
+                return {**result, 'state': 'ready'}
+            finally:
+                release()
+        except LiveMountBusyError as error:
+            return {**result, 'state': 'pending', 'detail': str(error)[:500]}
+        except Exception as error:
+            from harnessy.diagnostics import log_event
+            log_event('runtime', 'file_view_reconciliation_failed', environment_id=self.config.id,
+                      project_id=_GUEST_CONSOLE_VIEW_ID, error_code='FILE_VIEW_TRANSPORT_FAILED', error=error)
+            return {**result, 'state': 'error', 'error_code': 'FILE_VIEW_TRANSPORT_FAILED', 'detail': str(error)[:1000]}
 
     async def _projection_writer_context(self, projection, *, owner_id=''):
         policy = projection['policy']
@@ -699,23 +759,30 @@ python3 -c 'import sys; print(sys.version)'
         if plan.get('files_mode') != current.files_mode:
             raise RuntimeError('The VM file mode changed while its plan was prepared; request its current plan.')
         errors = [dict(row) for row in plan.get('errors', ())]
+        if not (await self.status()).running:
+            return {'state': 'stopped', 'revision': plan['revision'], 'projects': [], 'pending_project_ids': [],
+                    'references': {'state': 'stopped'}}
+        references = await self._reconcile_references(plan)
+        reference_result = {'references': references} if references is not None else {}
         if current.files_mode == 'copy':
-            return {'state': 'error' if errors else 'ready', 'revision': plan['revision'], 'projects': [
+            return {'state': 'error' if errors or (references or {}).get('state') == 'error' else
+                    'pending' if (references or {}).get('state') == 'pending' else 'ready',
+                'revision': plan['revision'], 'projects': [
                 {'project_id': row['project_id'], 'folder': row['folder'], 'state': 'ready',
                  'policy_revision': row['policy']['policy_revision'],
                  'detail': 'Independent guest copy; explicit deployment limits apply.'} for row in plan['projects']] + errors,
-                'pending_project_ids': []}
+                'pending_project_ids': [], **reference_result}
         if self._basic_copy:
             return {'state': 'unsupported', 'revision': plan['revision'], 'projects': [], 'pending_project_ids': [],
-                    'detail': 'Verified live SSHFS integration is unavailable for this OpenWrt release.'}
-        if not (await self.status()).running:
-            return {'state': 'stopped', 'revision': plan['revision'], 'projects': [], 'pending_project_ids': []}
-        requested = {row['project_id']: row for row in plan['projects']}
-        known = {row['project_id']: row for row in plan.get('known_projects', ())}
+                    'detail': 'Verified live SSHFS integration is unavailable for this OpenWrt release.', **reference_result}
+        requested = {row['project_id']: row for row in plan['projects'] if row['project_id'] != _GUEST_CONSOLE_VIEW_ID}
+        known = {row['project_id']: row for row in plan.get('known_projects', ()) if row['project_id'] != _GUEST_CONSOLE_VIEW_ID}
         known.update(requested)
         # Permanently removed chats no longer occur in the database plan, but
         # their owned live transports must still be retired.
         for view in tuple(self._live_mounts.views.values()):
+            if view.project_id == _GUEST_CONSOLE_VIEW_ID:
+                continue
             known.setdefault(view.project_id, {'project_id': view.project_id,
                 'folder': view.projection['policy'].get('writable_folder', '')})
         rows, pending = list(errors), []
@@ -765,11 +832,11 @@ python3 -c 'import sys; print(sys.version)'
                 # only a known activity reservation is classified as pending.
                 rows.append({**result, 'state': 'error', 'error_code': 'FILE_VIEW_TRANSPORT_FAILED',
                              'detail': str(error)[:1000]})
-        failed = any(row['state'] == 'error' for row in rows)
-        return {'state': 'error' if failed else 'pending' if pending else 'ready',
+        failed = any(row['state'] == 'error' for row in rows) or (references or {}).get('state') == 'error'
+        return {'state': 'error' if failed else 'pending' if pending or (references or {}).get('state') == 'pending' else 'ready',
                 'revision': plan['revision'], 'projects': rows,
                 'pending_project_ids': pending,
-                **({'error_code': 'FILE_VIEW_TRANSPORT_FAILED'} if failed else {})}
+                **({'error_code': 'FILE_VIEW_TRANSPORT_FAILED'} if failed else {}), **reference_result}
 
     async def _live_projection(self, active_root, policy, *, human=False):
         self._refresh_file_config()
@@ -1055,16 +1122,64 @@ python3 -c {shlex.quote(_REPLACE_GUEST_TREE)} {shlex.quote(stage)} {shlex.quote(
             policy['_mutation_conflict_keys'] = ('workspace-terminal:' + workspace.id,)
         return policy
 
-    async def open_guest_terminal(self):
-        """Open a human guest console; never synchronize canonical source."""
-        from .activity import activity
-        with activity(self.workspace_root, 'Opening OpenWrt guest console', environment_id=self.config.id):
+    def _guest_console_command(self, projection=None):
+        command = ('set -eu\ncd /root\n' + self._guest_work_path_exports()
+                   + '\nexec /bin/ash -i')
+        if projection is None:
+            return command
+        target = '/workspace/Files/References'
+        source = projection['remote'] + '/0'
+        # A fresh namespace exposes References alongside the VM's own files,
+        # without binding any Project. Guest-root administration is retained;
+        # the host-side SFTP capability independently rejects every write.
+        lines = ['set -eu', 'mount --make-rprivate /',
+                 'mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /workspace',
+                 'mkdir -p ' + shlex.quote(target),
+                 'mount --bind ' + shlex.quote(source) + ' ' + shlex.quote(target),
+                 'mount -o remount,bind,ro ' + shlex.quote(target),
+                 'mount -t tmpfs -o mode=0700,nosuid,nodev tmpfs /opt/harnessy-private', command]
+        return 'exec unshare --mount --pid --fork --mount-proc /bin/bash -c ' + shlex.quote('\n'.join(lines))
+
+    async def open_guest_terminal(self, *, workspace=None, owner_id=''):
+        """Open a root console with verified read-only References when supported."""
+        from .file_views import FILE_VIEWS, FileViewUnavailableError
+        self._refresh_file_config()
+        if workspace is not None and Path(workspace.root).resolve() != self.workspace_root.resolve():
+            raise ValueError('The guest console workspace identity does not match this VM.')
+        if not self._basic_copy and FILE_VIEWS.cached_workspace(self.workspace_root) is None:
+            raise FileViewUnavailableError('Open the workspace again before opening its References console.', 'FILE_VIEW_FAILED')
+        owner_id = str(owner_id or uuid.uuid4().hex)
+        if self._basic_copy:
+            release = acquire_activity(self.workspace_root, 'Opening OpenWrt guest console',
+                environment_id=self.config.id, project_id=_GUEST_CONSOLE_VIEW_ID, owner_id=owner_id)
+        else:
+            release = await FILE_VIEWS.acquire_terminal_activity(self.workspace_root,
+                environment_id=self.config.id, project_id=_GUEST_CONSOLE_VIEW_ID,
+                owner_id=owner_id, label='Opening OpenWrt guest console')
+        try:
             await self.start()
-            command = ('set -eu\ncd /root\n' + self._guest_work_path_exports()
-                       + '\nexec /bin/ash -i')
-            argv, env = self.controller.command(command)
+            projection = None
+            if not self._basic_copy:
+                policy = await FILE_VIEWS.ensure_references(self.workspace_root, environment_id=self.config.id,
+                                                            owner_id=owner_id)
+                admitted = FILE_VIEWS.cached_workspace(self.workspace_root)
+                if admitted is None:
+                    raise FileViewUnavailableError('Open the workspace again before opening its References console.', 'FILE_VIEW_FAILED')
+                from harnessy.core.project_mounts import build_references_policy
+                try:
+                    fresh = await finish_thread(build_references_policy, admitted)
+                except (OSError, ValueError) as error:
+                    raise FileViewUnavailableError('References changed before this console could open.', 'FILE_VIEW_POLICY_CHANGED') from error
+                if (FILE_VIEWS.cached_workspace(self.workspace_root) is not admitted or
+                        fresh['policy_revision'] != policy['policy_revision']):
+                    raise FileViewUnavailableError('References changed before this console could open.', 'FILE_VIEW_POLICY_CHANGED')
+                projection = self._references_projection(policy)
+                self._live_mounts.verified(projection)
+            argv, env = self.controller.command(self._guest_console_command(projection))
             argv[argv.index('-T')] = '-tt'
             return argv, env, self.workspace_root
+        finally:
+            release()
 
     async def open_terminal(self, *, active_root=None, output_policy=None, workspace=None):
         return await self.open_project_terminal(active_root=active_root, output_policy=output_policy, workspace=workspace)
