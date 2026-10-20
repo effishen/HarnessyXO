@@ -531,13 +531,22 @@ class EnvironmentOperationRegistry:
         key = self._key(workspace_root, environment_id)
         initial = self.state(workspace_root, environment_id=environment_id)
         operation_id = initial.operation_id
+        progress_open = True
 
         def set_phase(
             stage: str, message: str, *, detail: str = '',
             stage_progress_percent: float | None = None, progress_source: str = '',
             stage_timeout_seconds: float | None = None,
         ) -> None:
-            previous = self.state(workspace_root, environment_id=environment_id)
+            # A provider can hand this callback to a background task. Only the
+            # operation which created it may receive progress, and a terminal
+            # result must never become busy again. Use the existing record so
+            # a late callback cannot recreate removed runtime state either.
+            previous = self._states.get(key)
+            if (not progress_open or previous is None
+                    or previous.operation_id != operation_id
+                    or not previous.busy or previous.status not in {'queued', 'running'}):
+                return
             now = time.time()
             stage_changed = previous.stage != stage
             workflow_percent, step_index, step_total = self._workflow_progress(
@@ -822,6 +831,7 @@ class EnvironmentOperationRegistry:
             )
             log_event('harnessy', 'environment_action_failed', workspace=str(workspace_root), environment_id=environment_id, action=action, error=error)
         finally:
+            progress_open = False
             try:
                 from .status import ENVIRONMENT_STATUS
                 ENVIRONMENT_STATUS.invalidate(workspace_root, environment_id=environment_id)

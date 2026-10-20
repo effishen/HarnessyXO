@@ -93,6 +93,12 @@ removing a source invalidates the affected plans. Reconciliation runs after the
 metadata transaction, independently of the UI request, and uses fresh saved
 configuration. It must not start a stopped VM just because a checkbox changed.
 
+Background reconciliation owns its task context. It must not inherit a model
+request, browser request, or lifecycle progress callback. Lifecycle progress
+belongs to one operation ID and expires when that operation finishes; a late
+file-sharing update must never put a completed Start back into progress or
+overwrite a newer operation.
+
 | Change | Views to refresh |
 | --- | --- |
 | VM project selection or model enable/disable | Affected project views in that VM |

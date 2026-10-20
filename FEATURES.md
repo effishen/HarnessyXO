@@ -1,4 +1,4 @@
-# HarnessyXO v0.7.4 Features
+# HarnessyXO v0.7.5 Features
 
 ## Named VM environments
 

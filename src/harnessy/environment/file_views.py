@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import uuid
+from contextvars import Context
 from pathlib import Path
 from typing import Any
 
@@ -250,8 +251,13 @@ class FileViewRegistry:
             task_key = (*key, id(loop))
             task = self._tasks.get(task_key)
             if task is None or task.done():
-                self._tasks[task_key] = loop.create_task(self._worker(key), name='harnessy-file-views-' + key[1])
-        loop.call_soon_threadsafe(launch)
+                # This service owns its workspace/environment identity and
+                # obtains writer authority explicitly. A request's lifecycle
+                # progress callback, model selection or UI context must not
+                # survive in its independent background worker.
+                self._tasks[task_key] = loop.create_task(self._worker(key),
+                    name='harnessy-file-views-' + key[1], context=Context())
+        loop.call_soon_threadsafe(launch, context=Context())
 
     def activity_released(self, root, *, environment_id=None):
         workspace_root = str(Path(root).resolve())

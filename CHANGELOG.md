@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.7.5
+
+- Keep a completed VM operation completed. Late progress from background file-sharing setup can no longer leave Start spinning on “Installing verified local OpenWrt packages” after the VM and its project files are ready.
+- Keep background file-view workers separate from the command or browser request which scheduled them. Package setup for live sharing now stays in the project-file status instead of overwriting an earlier lifecycle operation.
+- Reject stale progress after success, failure, cancellation or timeout, and prevent an older operation from changing the progress of a newer one. Existing guest files and installed packages are preserved.
+
 ## v0.7.4
 
 - Record the VM mounting contract in `src/harnessy/environment/VM_FILES.md` and use one shared policy builder for model commands and project terminals. Keep owned files writable, ancestors and direct Project Access sources read-only, and References read-only. Preserve exact VM membership and non-transitive grants.
