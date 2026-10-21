@@ -14,6 +14,13 @@ from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 import httpx
 import segno
 
+from .notification_commands import (
+    CommandConfigurationError,
+    default_notification_commands,
+    normalize_notification_commands,
+    validate_notification_commands,
+)
+
 
 DEFAULT_NTFY_SETTINGS: dict[str, Any] = {
     'enabled': False,
@@ -26,6 +33,8 @@ DEFAULT_NTFY_SETTINGS: dict[str, Any] = {
     'include_names': True,
     'receive_replies': False,
     'reply_window_minutes': 1_440,
+    'commands': default_notification_commands(),
+    'plain_text_replies': True,
 }
 
 _TOPIC_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
@@ -104,6 +113,12 @@ def normalize_ntfy_settings(value: Any) -> dict[str, Any]:
     except (TypeError, ValueError):
         reply_minutes = 1_440
     result['reply_window_minutes'] = max(1, min(reply_minutes, 10_080))
+    result['commands'] = normalize_notification_commands(raw.get('commands'))
+    result['plain_text_replies'] = raw.get('plain_text_replies', True) is True
+    try:
+        validate_notification_commands(raw.get('commands'))
+    except CommandConfigurationError:
+        result['plain_text_replies'] = False
     return result
 
 
@@ -143,6 +158,11 @@ def resolve_ntfy_target(settings: Any) -> NtfyTarget:
 
 
 def validate_ntfy_settings(settings: Any, *, require_target: bool | None = None) -> dict[str, Any]:
+    raw = settings if isinstance(settings, dict) else {}
+    try:
+        validate_notification_commands(raw.get('commands'))
+    except CommandConfigurationError as exc:
+        raise NotificationConfigurationError(str(exc)) from exc
     config = normalize_ntfy_settings(settings)
     required = config['enabled'] if require_target is None else bool(require_target)
     if required:

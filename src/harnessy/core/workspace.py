@@ -12,6 +12,7 @@ import sqlite3
 import stat
 import sys
 import threading
+import time
 import uuid
 import zlib
 from dataclasses import dataclass, field
@@ -6653,6 +6654,241 @@ class WorkspaceStore:
             finally:
                 rows.close()
         return ''
+
+    def _notification_connect(self) -> sqlite3.Connection:
+        # Each caller gets its own read-only connection. Interrupted scans and
+        # busy databases fail quickly instead of blocking notification intake.
+        con = self._connect(readonly=True, timeout=0.25)
+        deadline = time.monotonic() + 2.0
+        con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+        try:
+            con.execute('BEGIN')
+        except BaseException:
+            con.close()
+            raise
+        return con
+
+    @staticmethod
+    def _notification_visible_sql() -> str:
+        meta = "CASE WHEN json_valid(m.metadata_json) THEN m.metadata_json ELSE '{}' END"
+        return ("typeof(m.content)='text' AND length(trim(m.content, char(9)||char(10)||char(11)||char(12)||char(13)||' '))>0 "
+                f"AND COALESCE(json_type(({meta}),'$.error'),'')<>'true' "
+                f"AND COALESCE(json_type(({meta}),'$.cancelled'),'')<>'true' "
+                f"AND COALESCE(json_extract(({meta}),'$.terminal_stop_reason'),'')<>'max_steps'")
+
+    @staticmethod
+    def _notification_run_sql(alias: str = 'm') -> str:
+        # The alias and JSON path are internal constants, never command input.
+        meta = f"CASE WHEN json_valid({alias}.metadata_json) THEN {alias}.metadata_json ELSE '{{}}' END"
+        value = f"json_extract(({meta}),'$.run_id')"
+        return (f"CASE WHEN json_type(({meta}),'$.run_id')='text' "
+                f"AND length({value})<=160 THEN {value} ELSE '' END")
+
+    def _notification_scope_in(
+        self, con: sqlite3.Connection, chat_id: str, *, run_id: str = '', prompt_id: str = '', scope: str = 'prompt',
+    ) -> dict[str, Any] | None:
+        """Resolve a notification's immutable user anchor without reading text."""
+        if scope == 'chat':
+            if con.execute('SELECT 1 FROM chats WHERE id=?', (str(chat_id),)).fetchone() is None:
+                return None
+            return {'chat_id': str(chat_id), 'run_id': str(run_id), 'prompt_id': str(prompt_id),
+                    'prompt_created_at': '', 'scope': 'chat'}
+        run_sql = self._notification_run_sql()
+        predicates = ["m.chat_id=?", "m.role='user'"]
+        parameters: list[Any] = [str(chat_id)]
+        if prompt_id:
+            predicates.append('m.id=?')
+            parameters.append(str(prompt_id))
+        if run_id:
+            predicates.append(f'({run_sql})=?')
+            parameters.append(str(run_id))
+        if not prompt_id and not run_id:
+            return None
+        prompt = con.execute(
+            f'SELECT m.id,m.created_at,m.rowid AS ordinal,{run_sql} AS run_id '
+            f"FROM messages AS m WHERE {' AND '.join(predicates)} "
+            'ORDER BY m.created_at DESC,m.rowid DESC LIMIT 1', parameters,
+        ).fetchone()
+        if prompt is None:
+            return None
+        following = con.execute(
+            "SELECT created_at,rowid AS ordinal FROM messages WHERE chat_id=? AND role='user' "
+            'AND (created_at>? OR (created_at=? AND rowid>?)) '
+            'ORDER BY created_at ASC,rowid ASC LIMIT 1',
+            (str(chat_id), prompt['created_at'], prompt['created_at'], prompt['ordinal']),
+        ).fetchone()
+        return {
+            'chat_id': str(chat_id), 'run_id': str(prompt['run_id'] or ''), 'scope': 'prompt',
+            'prompt_id': str(prompt['id']), 'prompt_created_at': str(prompt['created_at']),
+            '_prompt_ordinal': int(prompt['ordinal']),
+            '_next_created_at': str(following['created_at']) if following else None,
+            '_next_ordinal': int(following['ordinal']) if following else None,
+        }
+
+    def notification_prompt_context(
+        self, chat_id: str, *, run_id: str = '', prompt_id: str = '',
+    ) -> dict[str, Any] | None:
+        """Latest same-run user anchor, or an explicitly validated user anchor.
+
+        Follow-ups are user prompts too. The captured ID keeps later reads tied
+        to this prompt even when another run starts in the same chat.
+        """
+        with self._notification_connect() as con:
+            context = self._notification_scope_in(con, chat_id, run_id=run_id, prompt_id=prompt_id)
+        return {key: value for key, value in context.items() if not key.startswith('_')} if context else None
+
+    def _notification_predicate(
+        self, context: dict[str, Any], *, visible: bool = False,
+    ) -> tuple[str, list[Any]]:
+        if context.get('scope') == 'chat':
+            clauses = ["m.chat_id=?", "m.role='assistant'"]
+            if visible:
+                clauses.append(self._notification_visible_sql())
+            return ' AND '.join(clauses), [context['chat_id']]
+        clauses = ["m.chat_id=?", "m.role='assistant'",
+                   '(m.created_at>? OR (m.created_at=? AND m.rowid>?))']
+        parameters: list[Any] = [context['chat_id'], context['prompt_created_at'],
+                                 context['prompt_created_at'], context['_prompt_ordinal']]
+        if context['_next_ordinal'] is not None:
+            clauses.append('(m.created_at<? OR (m.created_at=? AND m.rowid<?))')
+            parameters.extend([context['_next_created_at'], context['_next_created_at'],
+                               context['_next_ordinal']])
+        if context['run_id']:
+            clauses.append(f'({self._notification_run_sql()})=?')
+            parameters.append(context['run_id'])
+        if visible:
+            clauses.append(self._notification_visible_sql())
+        return ' AND '.join(clauses), parameters
+
+    def notification_answer_rows(
+        self, chat_id: str, *, run_id: str = '', prompt_id: str = '',
+        start: int = 0, limit: int = 6, preview_chars: int = 220, scope: str = 'prompt',
+    ) -> dict[str, Any] | None:
+        """Bounded answer index; no reasoning, tool data or full bodies leave SQL."""
+        start, limit = max(0, int(start)), max(1, min(10, int(limit)))
+        preview_chars = max(1, min(220, int(preview_chars)))
+        with self._notification_connect() as con:
+            context = self._notification_scope_in(con, chat_id, run_id=run_id, prompt_id=prompt_id, scope=scope)
+            if context is None:
+                return None
+            predicate, parameters = self._notification_predicate(context, visible=True)
+            count = int(con.execute(f'SELECT COUNT(*) FROM messages AS m WHERE {predicate}', parameters).fetchone()[0])
+            rows = con.execute(
+                "SELECT m.id,m.created_at,substr(m.content,1,?) AS preview,"
+                'length(CAST(m.content AS BLOB)) AS content_bytes '
+                f'FROM messages AS m WHERE {predicate} '
+                'ORDER BY m.created_at ASC,m.rowid ASC LIMIT ? OFFSET ?',
+                (preview_chars, *parameters, limit, start),
+            ).fetchall()
+        return {'context': context, 'answer_count': count, 'answers': [dict(row) for row in rows]}
+
+    def notification_answer_page(
+        self, chat_id: str, *, run_id: str = '', prompt_id: str = '',
+        number: int | None = None, answer_id: str = '', page: int = 1, page_bytes: int = 2400, scope: str = 'prompt',
+    ) -> dict[str, Any] | None:
+        """One answer page, with at most 4096 bytes crossing SQLite's boundary.
+
+        The extra three bytes complete a UTF-8 character whose leading byte is
+        owned by this page. The next page skips its continuation bytes.
+        """
+        page_bytes = max(128, min(4089, int(page_bytes)))
+        page = max(1, int(page))
+        with self._notification_connect() as con:
+            context = self._notification_scope_in(con, chat_id, run_id=run_id, prompt_id=prompt_id, scope=scope)
+            if context is None:
+                return None
+            predicate, parameters = self._notification_predicate(context, visible=True)
+            count = int(con.execute(f'SELECT COUNT(*) FROM messages AS m WHERE {predicate}', parameters).fetchone()[0])
+            selected_number = count if number is None else max(1, int(number))
+            if answer_id:
+                target = con.execute(
+                    f'SELECT m.created_at,m.rowid AS ordinal FROM messages AS m WHERE {predicate} AND m.id=?',
+                    (*parameters, str(answer_id)),
+                ).fetchone()
+                if target is None:
+                    return {'context': context, 'answer_count': count, 'answer': None}
+                selected_number = int(con.execute(
+                    f'SELECT COUNT(*) FROM messages AS m WHERE {predicate} '
+                    'AND (m.created_at<? OR (m.created_at=? AND m.rowid<=?))',
+                    (*parameters, target['created_at'], target['created_at'], target['ordinal']),
+                ).fetchone()[0])
+            if selected_number > count or count == 0:
+                return {'context': context, 'answer_count': count, 'answer': None}
+            row = con.execute(
+                'SELECT m.id,m.created_at,length(CAST(m.content AS BLOB)) AS content_bytes,'
+                'substr(CAST(m.content AS BLOB),?,?) AS content_chunk,'
+                'substr(CAST(m.content AS BLOB),-4,4) AS content_tail '
+                f'FROM messages AS m WHERE {predicate} '
+                'ORDER BY m.created_at ASC,m.rowid ASC LIMIT 1 OFFSET ?',
+                (((page - 1) * page_bytes) + 1, page_bytes + 3, *parameters, selected_number - 1),
+            ).fetchone()
+        return {'context': context, 'answer_count': count, 'number': selected_number,
+                'page': page, 'page_bytes': page_bytes, 'answer': dict(row) if row else None}
+
+    def notification_metric_summary(
+        self, chat_id: str, *, run_id: str = '', prompt_id: str = '',
+    ) -> dict[str, Any] | None:
+        """Aggregate known main-call counters without exporting raw metric JSON."""
+        with self._notification_connect() as con:
+            context = self._notification_scope_in(con, chat_id, run_id=run_id, prompt_id=prompt_id)
+            if context is None:
+                return None
+            predicate, parameters = self._notification_predicate(context)
+            visible_predicate, visible_parameters = self._notification_predicate(context, visible=True)
+            answer_count = int(con.execute(
+                f'SELECT COUNT(*) FROM messages AS m WHERE {visible_predicate}', visible_parameters,
+            ).fetchone()[0])
+            meta = "CASE WHEN json_valid(m.metadata_json) THEN m.metadata_json ELSE '{}' END"
+            metric_id = "json_extract(meta,'$.generation_metric.metric_id')"
+            cte = (
+                f'WITH scoped AS (SELECT {meta} AS meta FROM messages AS m WHERE {predicate}), '
+                f"ids AS (SELECT DISTINCT {metric_id} AS metric_id FROM scoped "
+                "WHERE json_type(meta,'$.generation_metric.metric_id')='text' "
+                f'AND length({metric_id}) BETWEEN 1 AND 160), '
+                'known AS (SELECT g.rowid AS metric_ordinal,g.created_at,g.prompt_tokens,g.completion_tokens,g.total_tokens,g.cached_tokens,'
+                'g.duration_seconds,g.tps,g.prefill_tps,'
+                "CASE json_type(CASE WHEN json_valid(g.raw_json) THEN g.raw_json ELSE '{}' END,'$.harnessy.usage_estimated') WHEN 'true' THEN 1 WHEN 'false' THEN 0 END AS estimated,"
+                "CASE WHEN json_valid(g.raw_json) AND json_type(CASE WHEN json_valid(g.raw_json) THEN g.raw_json ELSE '{}' END,'$.harnessy.throughput_source')='text' "
+                "THEN substr(json_extract(g.raw_json,'$.harnessy.throughput_source'),1,80) ELSE '' END AS throughput_source,"
+                "CASE WHEN json_valid(g.raw_json) AND json_type(CASE WHEN json_valid(g.raw_json) THEN g.raw_json ELSE '{}' END,'$.harnessy.prefill_throughput_source')='text' "
+                "THEN substr(json_extract(g.raw_json,'$.harnessy.prefill_throughput_source'),1,80) ELSE '' END AS prefill_throughput_source "
+                'FROM generation_metrics AS g JOIN ids ON ids.metric_id=g.id WHERE g.chat_id=?) '
+            )
+            counters = ['prompt_tokens', 'completion_tokens', 'total_tokens', 'cached_tokens']
+            projections = ['(SELECT COUNT(*) FROM ids) AS model_calls', 'COUNT(*) AS recorded_metric_count']
+            for key in counters:
+                valid = f"typeof({key})='integer' AND {key} BETWEEN 0 AND 9007199254740991"
+                projections.extend([f'SUM(CASE WHEN {valid} THEN {key} END) AS {key}',
+                                    f'SUM(CASE WHEN {valid} THEN 1 ELSE 0 END) AS {key}_known_calls'])
+            valid_duration = "typeof(duration_seconds) IN ('integer','real') AND duration_seconds BETWEEN 0 AND 1000000000"
+            projections.extend([
+                f'SUM(CASE WHEN {valid_duration} THEN duration_seconds END) AS model_seconds',
+                f'SUM(CASE WHEN {valid_duration} THEN 1 ELSE 0 END) AS model_seconds_known_calls',
+                "MAX(estimated) AS usage_estimated",
+                "SUM(CASE WHEN estimated IS NOT NULL THEN 1 ELSE 0 END) AS usage_estimated_known_calls",
+            ])
+            summary = dict(con.execute(cte + f"SELECT {','.join(projections)} FROM known", (*parameters, str(chat_id))).fetchone())
+            latest = con.execute(
+                cte + 'SELECT tps,prefill_tps,throughput_source,prefill_throughput_source '
+                'FROM known ORDER BY created_at DESC,metric_ordinal DESC LIMIT 1', (*parameters, str(chat_id)),
+            ).fetchone()
+            # turn_elapsed_seconds belongs to the entire AgentRunner run, even
+            # when a queued user follow-up defines the selected prompt scope.
+            elapsed_predicate, elapsed_parameters = predicate, parameters
+            if context['run_id']:
+                elapsed_predicate = f"m.chat_id=? AND m.role='assistant' AND ({self._notification_run_sql()})=?"
+                elapsed_parameters = [str(chat_id), context['run_id']]
+            elapsed = con.execute(
+                f'WITH elapsed_source AS (SELECT m.created_at,m.rowid AS ordinal,{meta} AS meta '
+                f'FROM messages AS m WHERE {elapsed_predicate}) '
+                "SELECT json_extract(meta,'$.turn_elapsed_seconds') AS seconds FROM elapsed_source "
+                "WHERE json_type(meta,'$.turn_elapsed_seconds') IN ('integer','real') "
+                "AND json_extract(meta,'$.turn_elapsed_seconds') BETWEEN 0 AND 1000000000 "
+                'ORDER BY created_at DESC,ordinal DESC LIMIT 1', elapsed_parameters,
+            ).fetchone()
+        return {'context': context, 'answer_count': answer_count, **summary,
+                'latest_metric': dict(latest) if latest else None,
+                'saved_run_elapsed_seconds': elapsed['seconds'] if elapsed else None}
 
     def has_queued_prompt_checkpoint(self, chat_id: str, job_id: str) -> bool:
         """Check if the runner durably saved this queued job's User prompt."""

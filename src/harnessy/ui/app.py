@@ -18,7 +18,7 @@ import time
 import uuid
 from contextlib import nullcontext
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -89,6 +89,15 @@ from harnessy.core.notifications import (  # noqa: E402
     should_send_run_notification,
     validate_ntfy_settings,
 )
+from harnessy.core.notification_commands import (  # noqa: E402
+    notification_command_trigger, notification_help, parse_notification_command,
+    plain_text_reply_allowed,
+)
+from harnessy.core.notification_sessions import NotificationRoute, NotificationSessions  # noqa: E402
+from harnessy.core.notification_views import (  # noqa: E402
+    NotificationViewUnavailable, notification_answer, notification_answers, notification_stats,
+)
+from harnessy.ui.notification_commands import NotificationCommandEditor  # noqa: E402
 from harnessy.core.terminal import TerminalSession  # noqa: E402
 from harnessy.core.transcript import (  # noqa: E402
     assistant_stream_groups, locate_transcript_window, reconcile_transcript_window, shift_transcript_window,
@@ -341,6 +350,8 @@ class NtfyReplyTarget:
 
 _NTFY_REPLY_TARGET: NtfyReplyTarget | None = None
 _NTFY_REPLY_ROUTE_LOCK = asyncio.Lock()
+_NTFY_COMMAND_LOCK = asyncio.Lock()
+_NTFY_SESSIONS = NotificationSessions()
 
 
 @dataclass(slots=True)
@@ -355,6 +366,7 @@ class NtfyRecoveryNotice:
     progress_marker: str = ''
     tail: asyncio.Task[Any] | None = None
     notification_event: str = 'error'
+    route_code: str = ''
 
 
 @dataclass(slots=True)
@@ -20291,26 +20303,25 @@ window.harnessyTerminalFocus = function(terminalId) {
                             ).classes('text-xs hy-muted')
 
                             ui.separator()
-                            ui.label('Phone replies').classes('font-semibold')
+                            ui.label('Phone commands and replies').classes('font-semibold')
                             receive_replies = ui.switch(
-                                'Accept ntfy messages as replies',
+                                'Accept commands and replies from ntfy',
                                 value=bool(ntfy.get('receive_replies', False)),
                             )
                             reply_window = ui.number(
-                                'Reply window after the latest run alert (minutes)',
+                                'Command and reply window for each alert (minutes)',
                                 value=int(ntfy.get('reply_window_minutes') or 1_440),
                                 min=1, max=10_080, step=1,
                             ).classes('w-full')
                             ui.label(
-                                'Publish a message to this same topic from the ntfy app. Its message body becomes the next '
-                                'User prompt in the Project / Chat named by the newest successfully delivered run alert. '
-                                'If that chat is already running, the reply joins its safe follow-up queue.'
+                                'Publish commands to this same topic from the ntfy app to read answers, check statistics, '
+                                'select a chat or send a reply. Each delivered alert has a code. Selecting or reading an '
+                                'alert keeps that chat selected until you choose another, even when other chats notify you.'
                             ).classes('text-xs hy-muted')
                             ui.label(
-                                'Use RETRY followed by the code in an alert to continue that specific stopped run, '
-                                'or STATUS followed by its code to check progress. Recovery reports preparation, queueing, '
-                                'and confirmed resumption, then stays quiet until another error. Codes expire with the reply '
-                                'window or when HarnessyXO restarts. Retrying sends “continue” with the existing conversation and preserves saved work.'
+                                'Answers are sent only when requested. A reply joins a running chat at its next safe boundary '
+                                'or starts a new run with the current conversation. Retry continues the specific failed run '
+                                'and preserves saved work. Codes expire with the window above or when HarnessyXO restarts.'
                             ).classes('text-xs hy-muted')
                             ui.label(
                                 'HarnessyXO must be running. Old cached messages are ignored at startup. Locked chats reject '
@@ -20318,9 +20329,10 @@ window.harnessyTerminalFocus = function(terminalId) {
                                 'and choose Allow once or Deny in the project or Run queue.'
                             ).classes('text-xs hy-muted')
                             ui.label(
-                                'Enabling replies makes possession of this topic remote prompt authority. A phone-started run '
+                                'Enabled commands can read answers or send prompts. Keep the topic secret. A phone-started run '
                                 'may use every Tool permission currently set to On, so keep the topic secret.'
                             ).classes('text-xs text-negative font-semibold')
+                            command_editor = NotificationCommandEditor(ntfy, on_change=mark_dirty)
 
                             test_status = ui.label('').classes('text-xs hy-muted')
                             test_button = None
@@ -20337,6 +20349,8 @@ window.harnessyTerminalFocus = function(terminalId) {
                                     'include_names': bool(include_names.value),
                                     'receive_replies': bool(receive_replies.value),
                                     'reply_window_minutes': int(reply_window.value or 1_440),
+                                    'commands': command_editor.value(),
+                                    'plain_text_replies': command_editor.plain_text_replies,
                                 }
 
                             def refresh_ntfy_subscription_link(_event=None, *, dirty_change: bool = True) -> None:
@@ -21024,6 +21038,145 @@ def _set_ntfy_reply_target(
     )
 
 
+def _ntfy_route_candidate(config: dict[str, Any], ws: WorkspaceStore, chat_id: str, *,
+                          run_id: str, outcome: str, elapsed_seconds: float,
+                          code: str = '', retry_code: str = '') -> NotificationRoute:
+    """Capture the actual prompt now; delayed HTTP delivery must not retarget it."""
+    prompt_id = ''
+    try:
+        context = ws.notification_prompt_context(chat_id, run_id=run_id)
+        prompt_id = str(context.get('prompt_id') or '')
+    except Exception:
+        # A route may still accept a safe new reply if its historical view was
+        # unavailable. Reading it will fail closed rather than choose a prompt.
+        pass
+    try:
+        chat = ws.get_chat(chat_id)
+    except Exception:
+        chat = None
+    fingerprint = _ntfy_config_fingerprint(config)
+    if not code:
+        used = {route.code for route in _NTFY_SESSIONS.recent(fingerprint)} | set(_NTFY_RETRY_TICKETS)
+        code = secrets.token_hex(6).upper()
+        while code in used:
+            code = secrets.token_hex(6).upper()
+    return NotificationRoute(
+        code=code, workspace_id=ws.id, chat_id=chat_id,
+        run_id=run_id, prompt_id=prompt_id, config_fingerprint=fingerprint,
+        expires_at_monotonic=time.monotonic() + max(1, min(int(config['reply_window_minutes']), 10_080)) * 60,
+        notification_sequence=_next_ntfy_notification_sequence(),
+        workspace_name=_ntfy_utf8_clip(re.sub(r'[\x00-\x1f\x7f]+', ' ', ws.name), 160),
+        chat_title=_ntfy_utf8_clip(re.sub(r'[\x00-\x1f\x7f]+', ' ', chat.title if chat else 'Project / Chat'), 220), outcome=outcome,
+        elapsed_seconds=max(0.0, float(elapsed_seconds)),
+        workspace_generation=tuple(getattr(ws, '_workspace_generation', ())), retry_code=retry_code,
+    )
+
+
+def _arm_ntfy_route(machine: MachineStore, config: dict[str, Any], route: NotificationRoute) -> None:
+    latest = _machine_ntfy_settings(machine)
+    if (not latest.get('enabled') or not latest.get('receive_replies')
+            or _ntfy_config_fingerprint(latest) != route.config_fingerprint):
+        return
+    route = replace(route, expires_at_monotonic=time.monotonic() +
+                    max(1, min(int(latest['reply_window_minutes']), 10_080)) * 60)
+    _NTFY_SESSIONS.arm(route)
+    _set_ntfy_reply_target(config, route.workspace_id, route.chat_id,
+                          notification_sequence=route.notification_sequence)
+
+
+def _ntfy_menu_hint(config: dict[str, Any], route: NotificationRoute) -> str:
+    if not config.get('receive_replies'):
+        return ''
+    commands = []
+    for command_id, argument in (('use', route.code), ('read', ''), ('stats', ''), ('help', '')):
+        trigger = notification_command_trigger(config, command_id)
+        if trigger:
+            commands.append(trigger + (' ' + argument if argument else ''))
+    if route.retry_code:
+        trigger = notification_command_trigger(config, 'retry')
+        if trigger:
+            commands.append(trigger + ' ' + route.retry_code)
+    return '\nAlert code: ' + route.code + ('\nCommands: ' + ' · '.join(commands) if commands else '')
+
+
+def _ntfy_utf8_clip(value: str, limit: int) -> str:
+    data = value.encode('utf-8', errors='replace')
+    return data[:limit].decode('utf-8', errors='ignore') if len(data) > limit else value
+
+
+def _ntfy_bounded_body(message: str) -> str:
+    marker = message.rfind('\nAlert code: ')
+    if marker >= 0:
+        prefix, suffix = message[:marker], message[marker:]
+        suffix = _ntfy_utf8_clip(suffix, 1600)
+        return _ntfy_utf8_clip(prefix, 4096 - len(suffix.encode('utf-8'))) + suffix
+    return _ntfy_utf8_clip(message, 4096)
+
+
+def _ntfy_route_label(config: dict[str, Any], route: NotificationRoute | None) -> str:
+    if route is None:
+        return 'HarnessyXO commands'
+    label = 'Alert ' + route.code
+    if config.get('include_names'):
+        clean = lambda value: re.sub(r'[\x00-\x1f\x7f]+', ' ', value)
+        label += '\n' + _ntfy_utf8_clip(clean(route.workspace_name), 160)
+        label += ' / ' + _ntfy_utf8_clip(clean(route.chat_title), 220)
+    return label
+
+
+def _ntfy_command_current(machine: MachineStore, config: dict[str, Any], command_id: str,
+                           *, plain: bool = False) -> dict[str, Any] | None:
+    """Recheck settings after every suspension before publishing or mutating."""
+    current = _machine_ntfy_settings(machine)
+    try:
+        if (not current.get('enabled') or not current.get('receive_replies')
+                or _ntfy_config_fingerprint(current) != _ntfy_config_fingerprint(config)
+                or (command_id and not notification_command_trigger(current, command_id))
+                or (command_id and notification_command_trigger(current, command_id).casefold()
+                    != notification_command_trigger(config, command_id).casefold())
+                or (plain and not plain_text_reply_allowed(current))):
+            return None
+    except NotificationConfigurationError:
+        return None
+    return current
+
+
+async def _ntfy_command_response(machine: MachineStore, config: dict[str, Any], *,
+                                 command_id: str = '', route: NotificationRoute | None = None,
+                                 message: str, title: str = 'HarnessyXO', warning: bool = False) -> bool:
+    current = _ntfy_command_current(machine, config, command_id)
+    if current is None:
+        return False
+    body = _ntfy_route_label(current, route) + '\n\n' + message
+    # ntfy treats >4 KiB bodies as attachments. The view reader supplies small
+    # Unicode-safe pages; this final bound also covers long labels and menus.
+    body = _ntfy_utf8_clip(body, 4096)
+    return await _send_ntfy_reply_status(current, title=title, message=body,
+                                         tags='warning' if warning else 'information_source')
+
+
+def _ntfy_prepared_route_workspace(machine: MachineStore, route: NotificationRoute) -> WorkspaceStore:
+    """Read an already admitted generation; never initialize storage remotely."""
+    reg = machine.get_workspace(route.workspace_id)
+    if reg is None:
+        raise NotificationViewUnavailable('The workspace is no longer registered.')
+    with _RUNTIME_WORKSPACE_STORE_LOCK:
+        ws = next((item for item in _RUNTIME_WORKSPACE_STORES.values() if item.id == route.workspace_id), None)
+    if ws is None or str(ws.root) != str(reg.path):
+        raise NotificationViewUnavailable('Open this workspace in HarnessyXO before reading its notifications.')
+    if route.workspace_generation and tuple(ws._workspace_generation) != route.workspace_generation:
+        raise NotificationViewUnavailable('This workspace was replaced or repaired. Use a new alert.')
+    with workspace_shared_access(ws.root, expected_generation=ws._workspace_generation):
+        require_workspace_not_quarantined(ws.root)
+        chat = ws.get_chat(route.chat_id)
+        if chat is None or chat.archived_at is not None:
+            raise NotificationViewUnavailable('The Project / Chat is missing or archived.')
+        if route.prompt_id and not ws.notification_prompt_context(route.chat_id,
+                run_id=route.run_id, prompt_id=route.prompt_id):
+            raise NotificationViewUnavailable('The selected prompt was removed or its timeline changed. Use a new alert.')
+    return ws
+
+
 def _ntfy_recovery_notice(machine: MachineStore, ws: WorkspaceStore, chat_id: str,
                           run_id: str, *, outcome: str = 'error') -> NtfyRecoveryNotice | None:
     key = (ws.id, chat_id, run_id)
@@ -21072,7 +21225,10 @@ def _queue_ntfy_notice(machine: MachineStore, notice: NtfyRecoveryNotice, *, tit
             if (not latest['enabled'] or not latest.get(f'notify_on_{notice.notification_event}')
                     or _ntfy_config_fingerprint(latest) != _ntfy_config_fingerprint(notice.config)):
                 return
-            result = await send_ntfy_message(notice.config, title=title, message=message,
+            body = message
+            if notice.route_code and '\nAlert code: ' not in body:
+                body += '\nAlert code: ' + notice.route_code
+            result = await send_ntfy_message(notice.config, title=title, message=_ntfy_bounded_body(body),
                                              tags=tags, priority=priority)
             if accepted is not None:
                 accepted(result)
@@ -21240,8 +21396,12 @@ def _schedule_ntfy_run_notification(
                 # Recovery reported actual resumption already; no completion
                 # ping or token-by-token progress follows it.
                 if was_recovering:
+                    route = _ntfy_route_candidate(config, ws, chat_id, run_id=run_id,
+                        outcome=outcome, elapsed_seconds=elapsed_seconds)
+                    notice.route_code = route.code
                     _queue_ntfy_notice(machine, notice, title='HarnessyXO recovery finished',
-                        message='Recovery finished.' + notice.label, tags='white_check_mark')
+                        message='Recovery finished.' + notice.label + _ntfy_menu_hint(config, route),
+                        tags='white_check_mark', accepted=lambda _result: _arm_ntfy_route(machine, config, route))
                 return
         if not should_send_run_notification(config, outcome, elapsed_seconds):
             return
@@ -21269,31 +21429,35 @@ def _schedule_ntfy_run_notification(
                         if retry_allowed else (None, 'The backend still reported this request active. Stop or finish it before retrying in HarnessyXO.'))
                 except Exception:
                     ticket, unavailable = None, 'Saved retry details could not be read. Check this project in HarnessyXO.'
-                if ticket is not None and config['receive_replies']:
+                route = _ntfy_route_candidate(config, ws, chat_id, run_id=run_id,
+                    outcome=outcome, elapsed_seconds=elapsed_seconds,
+                    code=ticket.code if ticket else '', retry_code=ticket.code if ticket else '')
+                notice.route_code = route.code
+                if ticket is not None and config['receive_replies'] and notification_command_trigger(config, 'retry'):
                     action = ('send continue with the existing conversation, keeping work already done'
                               if ticket.continuation else 'start the saved queued request, which has not started yet')
-                    body += (f'\nReply RETRY {ticket.code} to {action}.'
-                             f'\nReply STATUS {ticket.code} to check progress.'
+                    body += (f'\nUse {notification_command_trigger(config, "retry")} {ticket.code} to {action}.'
                              '\nRetry also clears this run’s failed backend hold; other holds remain.'
                              '\nCodes expire with the reply window or when HarnessyXO restarts.')
                 elif ticket is not None:
-                    body += '\nRetry is available in HarnessyXO. Enable phone replies to retry from ntfy.'
+                    body += ('\nRetry is available in HarnessyXO. Enable Retry in Notifications settings to retry from ntfy.'
+                             if config['receive_replies'] else
+                             '\nRetry is available in HarnessyXO. Enable phone commands and replies to retry from ntfy.')
                 else:
                     body += '\nRetry is unavailable: ' + unavailable
-                sequence = _next_ntfy_notification_sequence()
+                body += _ntfy_menu_hint(config, route)
                 def accepted(result: Any) -> None:
-                    if ticket is not None:
+                    latest = _ntfy_command_current(machine, config, '')
+                    if ticket is not None and latest is not None:
                         ticket.armed = True
-                    _set_ntfy_reply_target(config, ws.id, chat_id, notification_sequence=sequence)
+                        ticket.expires_at = time.monotonic() + max(1, min(int(latest['reply_window_minutes']), 10_080)) * 60
+                    _arm_ntfy_route(machine, config, route)
                 _queue_ntfy_notice(machine, notice, title=title, message=body, tags=tags,
                                    priority=priority, accepted=accepted)
                 return
-        if bool(config.get('receive_replies')):
-            body += (
-                '\nReply in ntfy to continue this chat. '
-                'The newest HarnessyXO run alert is always the active reply target.'
-            )
-        notification_sequence = _next_ntfy_notification_sequence()
+        route = _ntfy_route_candidate(config, ws, chat_id, run_id=run_id,
+            outcome=outcome, elapsed_seconds=elapsed_seconds)
+        body += _ntfy_menu_hint(config, route)
     except NotificationConfigurationError:
         log_event(
             'harnessy', 'notification_delivery_failed', provider='ntfy',
@@ -21311,7 +21475,7 @@ def _schedule_ntfy_run_notification(
     async def deliver() -> None:
         try:
             result = await send_ntfy_message(
-                config, title=title, message=body, tags=tags, priority=priority,
+                config, title=title, message=_ntfy_bounded_body(body), tags=tags, priority=priority,
             )
         except NotificationDeliveryError as exc:
             log_event(
@@ -21326,9 +21490,7 @@ def _schedule_ntfy_run_notification(
                 workspace_id=ws.id, chat_id=chat_id,
             )
         else:
-            _set_ntfy_reply_target(
-                config, ws.id, chat_id, notification_sequence=notification_sequence,
-            )
+            _arm_ntfy_route(machine, config, route)
             log_event(
                 'harnessy', 'notification_delivered', provider='ntfy',
                 outcome=outcome, status_code=result.status_code,
@@ -21343,15 +21505,17 @@ def _schedule_ntfy_run_notification(
 
 async def _send_ntfy_reply_status(
     config: dict[str, Any], *, title: str, message: str, tags: str, priority: str = 'default',
-) -> None:
+) -> bool:
     try:
         await send_ntfy_message(
-            config, title=title, message=message, tags=tags, priority=priority,
+            config, title=title, message=_ntfy_bounded_body(message), tags=tags, priority=priority,
         )
+        return True
     except NotificationDeliveryError as exc:
         log_event('harnessy', 'ntfy_reply_status_failed', reason=exc.reason)
     except Exception as exc:
         log_event('harnessy', 'ntfy_reply_status_failed', reason='unexpected', error_type=type(exc).__name__)
+    return False
 
 
 def _remote_chat_runtime(
@@ -22636,12 +22800,15 @@ async def _handle_ntfy_recovery_command(machine: MachineStore, config: dict[str,
     if parsed is None:
         return False
     action, code = parsed
+    if _ntfy_command_current(machine, config, action.lower()) is None:
+        return True
     rejection = ''
     ticket: NtfyRetryTicket | None = None
     async with _NTFY_REPLY_ROUTE_LOCK:
         ticket = _NTFY_RETRY_TICKETS.get(code)
         if not code:
-            rejection = 'Use the exact command in the error alert, for example RETRY 12AB34CD or STATUS 12AB34CD.'
+            trigger = notification_command_trigger(config, action.lower())
+            rejection = f'Use the alert code after {trigger}, for example {trigger} 12AB34CD.'
         elif (ticket is None or not ticket.armed or ticket.expires_at < time.monotonic()
               or ticket.fingerprint != _ntfy_config_fingerprint(config)):
             rejection = 'This error-alert code is expired or unavailable. Use the newest error alert or retry in HarnessyXO.'
@@ -22650,13 +22817,17 @@ async def _handle_ntfy_recovery_command(machine: MachineStore, config: dict[str,
             phase = str((job or {}).get('status') or ticket.notice.phase)
             if phase == 'running':
                 phase = ticket.notice.phase
-            _queue_ntfy_notice(machine, ticket.notice, title='HarnessyXO recovery status',
-                               message=f'Recovery {code}: {phase}.' + ticket.notice.label, tags='information_source')
+            route = _NTFY_SESSIONS.resolve(_ntfy_config_fingerprint(config), code)
+            await _ntfy_command_response(machine, config, command_id='status', route=route,
+                message=f'Recovery {code}: {phase}.' + (ticket.notice.label if route is None else ''))
             return True
         elif ticket.claimed:
-            _queue_ntfy_notice(machine, ticket.notice, title='HarnessyXO retry already accepted',
-                message=f'This error alert has already been retried. Reply STATUS {code} to check progress.' + ticket.notice.label,
-                tags='information_source')
+            trigger = notification_command_trigger(config, 'status')
+            message = f'Alert {code} has already been retried.'
+            if trigger:
+                message += f' Use {trigger} {code} to check progress.'
+            route = _NTFY_SESSIONS.resolve(_ntfy_config_fingerprint(config), code)
+            await _ntfy_command_response(machine, config, command_id='retry', route=route, message=message)
             return True
         else:
             notice = ticket.notice
@@ -22666,7 +22837,9 @@ async def _handle_ntfy_recovery_command(machine: MachineStore, config: dict[str,
                       if reg and reg.path.is_dir() else None)
             except WorkspaceDatabaseError:
                 ws = None
-            chat = ws.get_chat(notice.chat_id) if ws else None
+            chat = await asyncio.to_thread(ws.get_chat, notice.chat_id) if ws else None
+            if _ntfy_command_current(machine, config, 'retry') is None:
+                return True
             key = (notice.workspace_id, notice.chat_id)
             active = _AGENT_TASKS.get(key)
             state = _AGENT_LIVE_STATES.get(key) or {}
@@ -22700,6 +22873,10 @@ async def _handle_ntfy_recovery_command(machine: MachineStore, config: dict[str,
 
                     async def prepare() -> None:
                         try:
+                            if _ntfy_command_current(machine, config, 'retry') is None:
+                                ticket.claimed = False
+                                notice.recovering = False
+                                return
                             if ticket.source_job_id:
                                 retry, _created = await asyncio.to_thread(
                                     retry_queued_run, machine, ticket.source_job_id)
@@ -22723,8 +22900,10 @@ async def _handle_ntfy_recovery_command(machine: MachineStore, config: dict[str,
                             ticket.claimed = False
                             notice.phase = 'failed'
                             reason = notification_error_summary(str(exc), secret=config['topic_secret'])
+                            retry = notification_command_trigger(_machine_ntfy_settings(machine), 'retry')
+                            hint = f'\nAfter fixing it, use {retry} {code} again.' if retry else ''
                             _queue_ntfy_notice(machine, notice, title='HarnessyXO retry could not start',
-                                message=f'Retry could not start: {reason}\nAfter fixing it, reply RETRY {code} again.' + notice.label,
+                                message=f'Alert {code}: retry could not start: {reason}' + hint + notice.label,
                                 tags='warning', priority='high')
                             log_event('harnessy', 'ntfy_retry_preparation_failed', error_type=type(exc).__name__)
                         finally:
@@ -22736,35 +22915,286 @@ async def _handle_ntfy_recovery_command(machine: MachineStore, config: dict[str,
                     _RUN_QUEUE_RETRY_TASKS[preparation_id] = task
                     return True
     if rejection:
-        await _send_ntfy_reply_status(config, title='HarnessyXO recovery command not accepted',
-                                     message=rejection, tags='warning', priority='high')
+        route = _NTFY_SESSIONS.resolve(_ntfy_config_fingerprint(config), code)
+        await _ntfy_command_response(machine, config, command_id=action.lower(), route=route,
+                                     message=rejection, warning=True)
     return True
 
 
-async def _handle_ntfy_incoming(machine: MachineStore, event: NtfyIncomingMessage) -> None:
-    """Route one live, non-Harnessy topic message to the current reply target."""
+def _ntfy_page_argument(value: str, *, default: int = 1) -> int:
+    value = value.strip()
+    if not value:
+        return default
+    if not value.isascii() or not value.isdigit() or not 1 <= int(value) <= 1_000_000:
+        raise NotificationViewUnavailable('Use a positive whole number for the page or answer number.')
+    return int(value)
+
+
+def _ntfy_seconds(value: Any) -> str:
+    if value is None:
+        return 'unavailable'
+    seconds = max(0, int(float(value)))
+    return f'{seconds // 3600}h {(seconds % 3600) // 60}m {seconds % 60}s' if seconds >= 3600 else f'{seconds // 60}m {seconds % 60}s'
+
+
+def _ntfy_stats_text(result: dict[str, Any], route: NotificationRoute) -> str:
+    elapsed = result.get('run_elapsed_seconds')
+    elapsed_source = result.get('elapsed_source')
+    if elapsed is None and route.elapsed_seconds:
+        elapsed, elapsed_source = route.elapsed_seconds, 'delivered alert'
+    lines = ['Since this prompt:',
+             f'Model answers: {result["answer_count"]}',
+             f'Recorded main model calls: {result["model_calls"]}',
+             f'Full run time: {_ntfy_seconds(elapsed)} ({elapsed_source})']
+    for field, label in (('prompt_tokens', 'Input tokens'), ('completion_tokens', 'Generated tokens'),
+                         ('cached_tokens', 'Cached input tokens')):
+        value = result.get(field)
+        suffix = '' if result.get(field + '_complete') else ' (partial recorded total)'
+        lines.append(label + ': ' + (f'{int(value):,}' + suffix if value is not None else 'unavailable'))
+    for field, label in (('latest_tps', 'Latest generation'), ('latest_prefill_tps', 'Latest prefill')):
+        value = result.get(field)
+        lines.append(label + ': ' + (f'{value:.1f} tok/s' if value is not None else 'unavailable'))
+    if result.get('usage_estimated'):
+        lines.append('Some token usage is estimated by the backend.')
+    lines.append('Token counters include backend-counted thinking and tools; completion checks and subagents are excluded.')
+    return '\n'.join(lines)
+
+
+async def _ntfy_read_command(machine: MachineStore, config: dict[str, Any], command_id: str,
+                              arguments: str, route: NotificationRoute) -> None:
+    cursor = _NTFY_SESSIONS.cursor(route)
+    next_cursor: tuple[str, int | None, str, int] | None = None
+    scope = 'chat' if command_id == 'history' else ('prompt' if command_id == 'replies' else cursor.browse_scope)
+    if (route.workspace_id, route.chat_id) in _TIMELINE_REPLACEMENTS:
+        raise NotificationViewUnavailable('This Project / Chat is changing its timeline. Wait until it finishes.')
+    if scope == 'prompt' and not route.prompt_id:
+        raise NotificationViewUnavailable('This alert has no saved prompt reference. Use a new run alert.')
+    kwargs: dict[str, Any] = dict(run_id=route.run_id, prompt_id=route.prompt_id)
+    if command_id in {'replies', 'history'}:
+        page = _ntfy_page_argument(arguments)
+        def read_list() -> dict[str, Any]:
+            ws = _ntfy_prepared_route_workspace(machine, route)
+            return notification_answers(ws, route.chat_id, page=page, scope=scope, **kwargs)
+        result = await asyncio.to_thread(read_list)
+        if _ntfy_command_current(machine, config, command_id) is None:
+            return
+        next_cursor = scope, None, '', 1
+        lines = [('Chat history' if scope == 'chat' else 'Since this prompt') +
+                 f' · {result["answer_count"]} answers · page {result["page"]}/{result["pages"]}']
+        for row in result['answers']:
+            preview = re.sub(r'\s+', ' ', row['preview'])
+            lines.append(f'{row["number"]}. ' + _ntfy_utf8_clip(preview, 340))
+        if not result['answers']:
+            lines.append('No saved model answers in this selection.')
+        read = notification_command_trigger(config, 'read')
+        if read:
+            lines.append(f'Use {read} NUMBER to read an answer.')
+        if result.get('has_more'):
+            trigger = notification_command_trigger(config, command_id)
+            lines.append(f'{trigger} {page + 1} for the next page.')
+        message = '\n'.join(lines)
+    elif command_id == 'stats':
+        if not route.prompt_id:
+            raise NotificationViewUnavailable('This alert has no saved prompt reference. Use a new run alert.')
+        live = dict(_AGENT_LIVE_STATES.get((route.workspace_id, route.chat_id)) or {})
+        def read_stats() -> dict[str, Any]:
+            ws = _ntfy_prepared_route_workspace(machine, route)
+            return notification_stats(ws, route.chat_id, live_state=live, **kwargs)
+        result = await asyncio.to_thread(read_stats)
+        message = _ntfy_stats_text(result, route)
+    else:
+        number: int | None = None
+        page, answer_id = 1, ''
+        if command_id == 'read':
+            if arguments.strip().casefold() == 'latest':
+                scope = 'prompt'
+            elif arguments.strip():
+                number = _ntfy_page_argument(arguments)
+        elif command_id in {'prev', 'next'}:
+            if cursor.answer_number is None:
+                raise NotificationViewUnavailable('Read an answer first, then move to its previous or next answer.')
+            number = cursor.answer_number + (-1 if command_id == 'prev' else 1)
+            if number < 1:
+                raise NotificationViewUnavailable('This is the first answer in this selection.')
+        elif command_id == 'more':
+            if not cursor.answer_id:
+                raise NotificationViewUnavailable('Read an answer first, then request its next page.')
+            page, answer_id = cursor.page + 1, cursor.answer_id
+        if scope == 'prompt' and not route.prompt_id:
+            raise NotificationViewUnavailable('This alert has no saved prompt reference. Use a new run alert.')
+        def read_answer() -> dict[str, Any]:
+            ws = _ntfy_prepared_route_workspace(machine, route)
+            return notification_answer(ws, route.chat_id, number=number, page=page,
+                                       answer_id=answer_id, scope=scope, **kwargs)
+        result = await asyncio.to_thread(read_answer)
+        if _ntfy_command_current(machine, config, command_id) is None:
+            return
+        next_cursor = scope, result['number'], result['id'], result['page']
+        message = (('Chat history' if scope == 'chat' else 'Since this prompt') +
+                   f' · answer {result["number"]}/{result["answer_count"]}' +
+                   f' · page {result["page"]}/{result["pages"]}\n{result["created_at"]}\n\n' + result['text'])
+        more = notification_command_trigger(config, 'more')
+        if result.get('has_more') and more:
+            message += f'\n\n{more} for the next page.'
+    await asyncio.to_thread(_ntfy_prepared_route_workspace, machine, route)
+    if (_NTFY_SESSIONS.resolve(route.config_fingerprint, route.code) != route
+            or time.monotonic() >= route.expires_at_monotonic):
+        raise NotificationViewUnavailable('The selected alert has expired. Use a new run alert.')
+    if (route.workspace_id, route.chat_id) in _TIMELINE_REPLACEMENTS:
+        raise NotificationViewUnavailable('The timeline changed while reading. Retry after it finishes.')
+    delivered = await _ntfy_command_response(machine, config, command_id=command_id, route=route, message=message)
+    if delivered and next_cursor is not None:
+        cursor.browse_scope, cursor.answer_number, cursor.answer_id, cursor.page = next_cursor
+
+
+async def _handle_ntfy_incoming(machine: MachineStore, event: NtfyIncomingMessage, *,
+                                 source_fingerprint: str = '') -> None:
+    """Consume the command menu before considering any message as a prompt."""
+    global _NTFY_REPLY_TARGET
+    if NTFY_OUTBOUND_TAG in event.tags:
+        return
+    async with _NTFY_COMMAND_LOCK:
+        config = _machine_ntfy_settings(machine)
+        if not config.get('enabled') or not config.get('receive_replies'):
+            _NTFY_REPLY_TARGET = None
+            _NTFY_SESSIONS.reset()
+            return
+        try:
+            fingerprint = _ntfy_config_fingerprint(config)
+        except NotificationConfigurationError:
+            return
+        if source_fingerprint and source_fingerprint != fingerprint:
+            return
+        if _NTFY_REPLY_TARGET is not None and _NTFY_REPLY_TARGET.config_fingerprint != fingerprint:
+            _NTFY_REPLY_TARGET = None
+        raw = str(event.message or '')
+        if '\x00' in raw:
+            await _ntfy_command_response(machine, config, message='Messages containing NUL characters are not accepted.', warning=True)
+            return
+        parsed = parse_notification_command(raw, config)
+        route = _NTFY_SESSIONS.resolve(fingerprint)
+        if parsed is None:
+            if not plain_text_reply_allowed(config):
+                await _ntfy_command_response(machine, config, route=route,
+                    message='Plain-message replies are disabled. Use an enabled command from Notifications settings.', warning=True)
+                return
+            target = route or (_NTFY_REPLY_TARGET if not _NTFY_SESSIONS.selected_code() else None)
+            await _route_ntfy_prompt(machine, event, text=raw, config=config, target=target, plain=True)
+            return
+        if parsed.state != 'enabled':
+            help_trigger = notification_command_trigger(config, 'help')
+            await _ntfy_command_response(machine, config, route=route,
+                message=('That command is disabled or unrecognized.' + (f' Use {help_trigger} for the enabled commands.' if help_trigger else
+                         ' Review command names and switches in Notifications settings.')), warning=True)
+            return
+        command_id, arguments = parsed.command_id, parsed.arguments
+        try:
+            if command_id == 'help':
+                help_text = notification_help(config) + '\nSelecting or reading an alert pins its chat.'
+                select_trigger = notification_command_trigger(config, 'use')
+                read_trigger = notification_command_trigger(config, 'read')
+                if select_trigger:
+                    help_text += f' Use {select_trigger} latest to select the newest alert.'
+                if read_trigger:
+                    help_text += f'\n{read_trigger} latest resets to answers since the selected alert’s prompt.'
+                await _ntfy_command_response(machine, config, command_id=command_id, route=route,
+                    message=help_text)
+                return
+            if command_id == 'chats':
+                page = _ntfy_page_argument(arguments)
+                routes = _NTFY_SESSIONS.recent(fingerprint)
+                pages = max(1, (len(routes) + 5) // 6)
+                if page > pages:
+                    raise NotificationViewUnavailable('There is no such recent-alert page.')
+                lines = [f'Recent notified chats · page {page}/{pages}']
+                for item in routes[(page - 1) * 6:page * 6]:
+                    label = _ntfy_route_label(config, item).replace('\n', ' · ')
+                    lines.append(('Selected · ' if route and route.code == item.code else '') + label + ' · ' + item.outcome)
+                if not routes:
+                    lines.append('No delivered run alerts are available in this session.')
+                use = notification_command_trigger(config, 'use')
+                if use:
+                    lines.append(f'{use} CODE selects a chat; {use} latest selects the newest alert.')
+                if page < pages:
+                    lines.append(f'{notification_command_trigger(config, "chats")} {page + 1} for more alerts.')
+                await _ntfy_command_response(machine, config, command_id=command_id, route=route, message='\n'.join(lines))
+                return
+            if command_id == 'use':
+                if not arguments.strip():
+                    raise NotificationViewUnavailable('Specify the alert code to select, or latest.')
+                route = _NTFY_SESSIONS.resolve(fingerprint, arguments, select=True)
+                if route is None:
+                    raise NotificationViewUnavailable('That alert code has expired or is unavailable.')
+                await _ntfy_command_response(machine, config, command_id=command_id, route=route,
+                    message='This chat is selected for later commands and replies. New alerts will not change the selection.')
+                return
+            if command_id in {'retry', 'status'} and parsed.legacy:
+                await _handle_ntfy_recovery_command(machine, config, command_id.upper() + ' ' + arguments.strip())
+                return
+            if command_id in {'retry', 'status'} and arguments.strip():
+                route = _NTFY_SESSIONS.resolve(fingerprint, arguments, select=True)
+                if route is None and command_id == 'retry':
+                    await _handle_ntfy_recovery_command(machine, config, 'RETRY ' + arguments.strip())
+                    return
+            if route is None:
+                raise NotificationViewUnavailable('No selected run alert is available. Wait for a new alert, or select an unexpired alert code.')
+            _NTFY_SESSIONS.resolve(fingerprint, route.code, select=True)
+            if command_id == 'reply':
+                await _route_ntfy_prompt(machine, event, text=arguments, config=config, target=route)
+            elif command_id == 'retry':
+                if not route.retry_code:
+                    raise NotificationViewUnavailable('The selected alert has no saved retry. Reply to start a new turn instead.')
+                await _handle_ntfy_recovery_command(machine, config, 'RETRY ' + route.retry_code)
+            elif command_id == 'status':
+                key = (route.workspace_id, route.chat_id)
+                live = _AGENT_LIVE_STATES.get(key) or {}
+                active = _AGENT_TASKS.get(key)
+                current = (live.get('run_id') == route.run_id and active is not None and not active.done())
+                phase = str(live.get('phase') or 'running') if current else route.outcome
+                message = ('Selected run: ' + (phase or 'status unavailable') +
+                           (' (currently running).' if current else ' (delivered alert; historical status).') +
+                           '\nDelivered run time: ' + _ntfy_seconds(route.elapsed_seconds))
+                if route.retry_code:
+                    ticket = _NTFY_RETRY_TICKETS.get(route.retry_code)
+                    if ticket is not None:
+                        message += '\nRecovery: ' + ticket.notice.phase
+                await _ntfy_command_response(machine, config, command_id=command_id, route=route, message=message)
+            else:
+                await _ntfy_read_command(machine, config, command_id, arguments, route)
+        except NotificationViewUnavailable as exc:
+            await _ntfy_command_response(machine, config, command_id=command_id, route=route,
+                message=str(exc), warning=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log_event('harnessy', 'ntfy_command_unavailable', command_id=command_id, error_type=type(exc).__name__)
+            await _ntfy_command_response(machine, config, command_id=command_id, route=route,
+                message='The selected workspace is busy or unavailable. Open HarnessyXO to check it, then retry the command.', warning=True)
+
+
+async def _route_ntfy_prompt(machine: MachineStore, event: NtfyIncomingMessage, *,
+                             text: str, config: dict[str, Any], target: NtfyReplyTarget | NotificationRoute | None,
+                             plain: bool = False) -> None:
+    """Dispatch an explicit reply through the normal chat admission pipeline."""
     global _NTFY_REPLY_TARGET
     if NTFY_OUTBOUND_TAG in event.tags:
         return
 
-    config = _machine_ntfy_settings(machine)
-    if not bool(config.get('enabled')) or not bool(config.get('receive_replies')):
+    if _ntfy_command_current(machine, config, 'reply', plain=plain) is None:
         return
     try:
         config_fingerprint = _ntfy_config_fingerprint(config)
     except NotificationConfigurationError:
         return
 
-    text = str(event.message or '').replace('\x00', '').strip()
-    if await _handle_ntfy_recovery_command(machine, config, text):
-        return
     rejection: tuple[str, str] | None = None
     ack: tuple[str, str, str] | None = None
     finishing_task: asyncio.Task[Any] | None = None
 
     while True:
         async with _NTFY_REPLY_ROUTE_LOCK:
-            target = _NTFY_REPLY_TARGET
+            if _ntfy_command_current(machine, config, 'reply', plain=plain) is None:
+                return
             if target is None or target.config_fingerprint != config_fingerprint:
                 rejection = (
                     'HarnessyXO reply not accepted',
@@ -22778,7 +23208,7 @@ async def _handle_ntfy_incoming(machine: MachineStore, event: NtfyIncomingMessag
                     'The latest run alert is outside the configured reply window. Start a run in HarnessyXO and reply to its new alert.',
                 )
                 break
-            if not text:
+            if not text.strip():
                 rejection = ('HarnessyXO reply was empty', 'Send a non-empty message to the ntfy topic.')
                 break
             if len(text) > MAX_NTFY_REPLY_CHARS:
@@ -22798,7 +23228,7 @@ async def _handle_ntfy_incoming(machine: MachineStore, event: NtfyIncomingMessag
                 break
             try:
                 ws = await asyncio.to_thread(_prepare_runtime_workspace, reg.path, reg.name)
-                chat = ws.get_chat(target.chat_id)
+                chat = await asyncio.to_thread(ws.get_chat, target.chat_id)
             except Exception:
                 ws = None
                 chat = None
@@ -22808,6 +23238,23 @@ async def _handle_ntfy_incoming(machine: MachineStore, event: NtfyIncomingMessag
                     'HarnessyXO reply target is unavailable',
                     'The Project / Chat for the latest run alert no longer exists.',
                 )
+                break
+            if _ntfy_command_current(machine, config, 'reply', plain=plain) is None:
+                return
+            current_registration = machine.get_workspace(target.workspace_id)
+            if (time.monotonic() >= target.expires_at_monotonic
+                    or (isinstance(target, NotificationRoute)
+                        and _NTFY_SESSIONS.resolve(config_fingerprint, target.code) != target)):
+                rejection = ('HarnessyXO reply expired', 'The selected alert expired while the workspace was being checked. Use a new alert.')
+                break
+            if current_registration is None or str(current_registration.path) != str(reg.path):
+                rejection = ('HarnessyXO reply target changed', 'The workspace registration changed. Use a new alert.')
+                break
+            if isinstance(target, NotificationRoute) and target.workspace_generation and ws is not None and tuple(ws._workspace_generation) != target.workspace_generation:
+                rejection = ('HarnessyXO reply target changed', 'This workspace was replaced or repaired. Use a new alert.')
+                break
+            if chat.archived_at is not None:
+                rejection = ('HarnessyXO reply target unavailable', 'The selected Project / Chat is archived.')
                 break
             if chat.locked:
                 rejection = (
@@ -22887,13 +23334,11 @@ async def _handle_ntfy_incoming(machine: MachineStore, event: NtfyIncomingMessag
             'harnessy', 'ntfy_reply_rejected', reason=rejection[0],
             chars=len(text),
         )
-        await _send_ntfy_reply_status(
-            config, title=rejection[0], message=rejection[1], tags='warning', priority='high',
-        )
+        await _ntfy_command_response(machine, config, command_id='reply', title=rejection[0],
+            route=target if isinstance(target, NotificationRoute) else None, message=rejection[1], warning=True)
     elif ack is not None:
-        await _send_ntfy_reply_status(
-            config, title=ack[0], message=ack[1], tags=ack[2],
-        )
+        await _ntfy_command_response(machine, config, command_id='reply', title=ack[0],
+            route=target if isinstance(target, NotificationRoute) else None, message=ack[1])
 
 
 async def _ntfy_reply_supervisor(machine: MachineStore) -> None:
@@ -22916,8 +23361,12 @@ async def _ntfy_reply_supervisor(machine: MachineStore) -> None:
 
             if not wanted_fingerprint and _NTFY_REPLY_TARGET is not None:
                 _NTFY_REPLY_TARGET = None
+            if not wanted_fingerprint:
+                _NTFY_SESSIONS.reset()
 
             if wanted_fingerprint != active_fingerprint:
+                if active_fingerprint:
+                    _NTFY_SESSIONS.reset()
                 previous = _NTFY_REPLY_LISTENER_TASK
                 _NTFY_REPLY_LISTENER_TASK = None
                 if previous is not None and not previous.done():
@@ -22930,9 +23379,9 @@ async def _ntfy_reply_supervisor(machine: MachineStore) -> None:
                 ):
                     _NTFY_REPLY_TARGET = None
                 if wanted_fingerprint:
-                    async def receive(event: NtfyIncomingMessage) -> None:
+                    async def receive(event: NtfyIncomingMessage, *, expected_fingerprint: str = wanted_fingerprint) -> None:
                         try:
-                            await _handle_ntfy_incoming(machine, event)
+                            await _handle_ntfy_incoming(machine, event, source_fingerprint=expected_fingerprint)
                         except asyncio.CancelledError:
                             raise
                         except Exception as exc:

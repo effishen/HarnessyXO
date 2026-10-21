@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.7.10
+
+- Add an interactive ntfy menu for reading the model's latest answer, browsing earlier answers and sending a reply to the selected chat. Enable it in **Settings → Notifications**. Default commands include `.help`, `.chats`, `.use CODE`, `.read`, `.replies`, `.history`, `.prev`, `.next`, `.more`, `.stats`, `.status`, `.reply` and `.retry`.
+- Rename each command and turn individual actions On or Off in Notifications settings. Help shows only the enabled commands and their current names. Keep optional plain-message replies separately selectable; turning Reply off blocks those prompts too. Reserve command-shaped text so renamed, disabled or unknown commands cannot accidentally reach the model.
+- Give delivered alerts a code and retain the exact chat, run and prompt they describe. Explicitly selecting a chat pins it when newer alerts arrive. Keep existing expiry, locked-chat checks, retry validation, follow-up queues and tool permissions in effect.
+- Read visible answer text without thinking or raw tool activity. Browse replies since the selected prompt or across the chat, with numbered entries and one small UTF-8 page per command. Exclude explicitly marked app error/status messages; mixed partial answers saved as error/cancelled messages are excluded as a whole.
+- Show visible-answer counts, recorded main model-call counts, available token/cache/speed measurements and full run elapsed time. Label their scope and leave missing measurements unavailable. Main-call totals exclude separate completion-check control requests and subagent calls.
+- Keep command reads bounded and read-only. Do not create a replacement workspace when a database is missing. Stop remote actions when their route or configuration is no longer valid, and prevent outgoing responses from being treated as new prompts. Reading commands send answer content through the configured ntfy server; keep its topic secret.
+- Preserve VM resource monitoring, file views, workspace access rules and existing alert delivery behavior. Leave README unchanged.
+
 ## v0.7.9
 
 - See guest CPU usage, RAM used/available, system load, swap and uptime in **VM → Manage → Details**, alongside the existing storage readings. Keep the display readable on narrow screens.
