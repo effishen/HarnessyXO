@@ -1,4 +1,4 @@
-# HarnessyXO v0.7.13 Features
+# HarnessyXO v0.7.14 Features
 
 ## Context budgeting and retention
 
@@ -703,11 +703,11 @@ Workspace and machine databases use WAL so background reads can coexist with mes
 - ntfy success/failure/stopped alerts with no required account or inbound port.
 - Locally rendered subscription QR, generated secret topic, and test notification.
 - Optional interactive commands for reading model answers, browsing earlier replies, checking run statistics and replying to the selected chat.
-- Editable command names and individual On/Off switches in **Settings → Notifications**, with a help preview and an optional plain-message reply switch. Command names start with `.`, `/` or `!`; help uses the current names and enabled actions.
+- Editable command names and individual On/Off switches in **Settings → Notifications**, with a help preview. Command names start with `.`, `/` or `!`; help uses the current names and enabled actions. Ordinary messages are ignored.
 - Delivered alerts carry a selection code. Start with the newest alert, select another with `.use CODE`, and keep that selection when later alerts arrive. Routes expire after the configured reply window or an app restart.
 - `.read [number]`, `.prev`, `.next` and `.more` read saved answer text in small pages. `.replies [page]` lists answers since the selected alert's prompt; `.history [page]` lists earlier answers across that chat. Exclude thinking, raw tool calls and explicitly marked app error/status messages.
 - `.stats` reports visible-answer counts, recorded main model calls, available token/cache/speed measurements and run elapsed time. Keep missing counters unavailable and distinguish main-call totals from full run time.
-- `.reply text` sends the text to the selected chat through the normal follow-up queue and tool permissions. Disabling Reply also blocks plain-message prompts. Renamed, disabled and unknown command-shaped messages never become model prompts.
+- `.reply text` sends the text to the selected chat through the normal follow-up queue and tool permissions. Only the configured, enabled reply command can send a prompt; old plain-message settings have no effect. Retired command names, disabled commands and unknown commands never become model prompts.
 - Error reasons with exact-run RETRY/STATUS codes, source/model/attachment validation and duplicate protection.
 - Preparation/queue/retry updates, one confirmed Running again alert and quiet recovered completion.
 - Brief automatic GPU/memory recovery notifications; active backend requests are not offered for remote replay.

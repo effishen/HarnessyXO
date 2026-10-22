@@ -91,7 +91,6 @@ from harnessy.core.notifications import (  # noqa: E402
 )
 from harnessy.core.notification_commands import (  # noqa: E402
     notification_command_trigger, notification_help, parse_notification_command,
-    plain_text_reply_allowed,
 )
 from harnessy.core.notification_sessions import NotificationRoute, NotificationSessions  # noqa: E402
 from harnessy.core.notification_views import (  # noqa: E402
@@ -1974,7 +1973,7 @@ class HarnessyPage:
         ui.separator().classes('hy-action-menu-separator')
         self._action_menu_button(menu, 'External Targets', 'lan', lambda r=reg: self.open_external_targets(r), disabled=not available)
         self._action_menu_button(menu, 'Open Terminal', 'terminal', lambda r=reg: self.open_tool_tab('terminal', r), disabled=not available)
-        self._action_menu_button(menu, 'Environment', 'shield', lambda r=reg: self.open_tool_tab('environment', r), disabled=not available)
+        self._action_menu_button(menu, 'VM Environments', 'shield', lambda r=reg: self.open_tool_tab('environment', r), disabled=not available)
         ui.separator().classes('hy-action-menu-separator')
         self._action_menu_button(menu, 'Workspace Memory', 'memory', lambda r=reg: self.open_tool_tab('memory', r), disabled=not available)
         self._action_menu_button(menu, 'Workspace Instructions', 'edit_note', lambda r=reg: self.open_workspace_instructions(r), disabled=not available)
@@ -20629,7 +20628,6 @@ window.harnessyTerminalFocus = function(terminalId) {
                                     'receive_replies': bool(receive_replies.value),
                                     'reply_window_minutes': int(reply_window.value or 1_440),
                                     'commands': command_editor.value(),
-                                    'plain_text_replies': command_editor.plain_text_replies,
                                 }
 
                             def refresh_ntfy_subscription_link(_event=None, *, dirty_change: bool = True) -> None:
@@ -21403,8 +21401,7 @@ def _ntfy_route_label(config: dict[str, Any], route: NotificationRoute | None) -
     return label
 
 
-def _ntfy_command_current(machine: MachineStore, config: dict[str, Any], command_id: str,
-                           *, plain: bool = False) -> dict[str, Any] | None:
+def _ntfy_command_current(machine: MachineStore, config: dict[str, Any], command_id: str) -> dict[str, Any] | None:
     """Recheck settings after every suspension before publishing or mutating."""
     current = _machine_ntfy_settings(machine)
     try:
@@ -21412,8 +21409,7 @@ def _ntfy_command_current(machine: MachineStore, config: dict[str, Any], command
                 or _ntfy_config_fingerprint(current) != _ntfy_config_fingerprint(config)
                 or (command_id and not notification_command_trigger(current, command_id))
                 or (command_id and notification_command_trigger(current, command_id).casefold()
-                    != notification_command_trigger(config, command_id).casefold())
-                or (plain and not plain_text_reply_allowed(current))):
+                    != notification_command_trigger(config, command_id).casefold())):
             return None
     except NotificationConfigurationError:
         return None
@@ -23328,7 +23324,7 @@ async def _ntfy_read_command(machine: MachineStore, config: dict[str, Any], comm
 
 async def _handle_ntfy_incoming(machine: MachineStore, event: NtfyIncomingMessage, *,
                                  source_fingerprint: str = '') -> None:
-    """Consume the command menu before considering any message as a prompt."""
+    """Accept notification commands; ordinary messages never become prompts."""
     global _NTFY_REPLY_TARGET
     if NTFY_OUTBOUND_TAG in event.tags:
         return
@@ -23353,12 +23349,6 @@ async def _handle_ntfy_incoming(machine: MachineStore, event: NtfyIncomingMessag
         parsed = parse_notification_command(raw, config)
         route = _NTFY_SESSIONS.resolve(fingerprint)
         if parsed is None:
-            if not plain_text_reply_allowed(config):
-                await _ntfy_command_response(machine, config, route=route,
-                    message='Plain-message replies are disabled. Use an enabled command from Notifications settings.', warning=True)
-                return
-            target = route or (_NTFY_REPLY_TARGET if not _NTFY_SESSIONS.selected_code() else None)
-            await _route_ntfy_prompt(machine, event, text=raw, config=config, target=target, plain=True)
             return
         if parsed.state != 'enabled':
             help_trigger = notification_command_trigger(config, 'help')
@@ -23452,14 +23442,13 @@ async def _handle_ntfy_incoming(machine: MachineStore, event: NtfyIncomingMessag
 
 
 async def _route_ntfy_prompt(machine: MachineStore, event: NtfyIncomingMessage, *,
-                             text: str, config: dict[str, Any], target: NtfyReplyTarget | NotificationRoute | None,
-                             plain: bool = False) -> None:
+                             text: str, config: dict[str, Any], target: NtfyReplyTarget | NotificationRoute | None) -> None:
     """Dispatch an explicit reply through the normal chat admission pipeline."""
     global _NTFY_REPLY_TARGET
     if NTFY_OUTBOUND_TAG in event.tags:
         return
 
-    if _ntfy_command_current(machine, config, 'reply', plain=plain) is None:
+    if _ntfy_command_current(machine, config, 'reply') is None:
         return
     try:
         config_fingerprint = _ntfy_config_fingerprint(config)
@@ -23472,7 +23461,7 @@ async def _route_ntfy_prompt(machine: MachineStore, event: NtfyIncomingMessage, 
 
     while True:
         async with _NTFY_REPLY_ROUTE_LOCK:
-            if _ntfy_command_current(machine, config, 'reply', plain=plain) is None:
+            if _ntfy_command_current(machine, config, 'reply') is None:
                 return
             if target is None or target.config_fingerprint != config_fingerprint:
                 rejection = (
@@ -23488,7 +23477,8 @@ async def _route_ntfy_prompt(machine: MachineStore, event: NtfyIncomingMessage, 
                 )
                 break
             if not text.strip():
-                rejection = ('HarnessyXO reply was empty', 'Send a non-empty message to the ntfy topic.')
+                rejection = ('HarnessyXO reply was empty',
+                             f'Use {notification_command_trigger(config, "reply")} followed by a non-empty message.')
                 break
             if len(text) > MAX_NTFY_REPLY_CHARS:
                 rejection = (
@@ -23518,7 +23508,7 @@ async def _route_ntfy_prompt(machine: MachineStore, event: NtfyIncomingMessage, 
                     'The Project / Chat for the latest run alert no longer exists.',
                 )
                 break
-            if _ntfy_command_current(machine, config, 'reply', plain=plain) is None:
+            if _ntfy_command_current(machine, config, 'reply') is None:
                 return
             current_registration = machine.get_workspace(target.workspace_id)
             if (time.monotonic() >= target.expires_at_monotonic

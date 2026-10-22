@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.7.14
+
+- Rename **Environment** to **VM Environments** in the Workspace menu. It opens the same VM environment controls; **External Targets** keeps its existing label and action.
+- Notification replies now require an enabled reply command, such as `.reply your message`. Ordinary messages are ignored, including with older saved settings. Remove the plain-message reply switch; command names and individual action switches remain editable in **Settings → Notifications**.
+
 ## v0.7.13
 
 - Keep one bounded context-retention note when older work leaves the active prompt. Replace accumulated legacy archive markers, preserve retrieval pointers and keep controller bookkeeping separate from model-authored replies. Actual trimming adds a compact **Context trimmed** timeline event with counts; unchanged requests do not add another event. Saved chat messages and attachments stay unchanged.

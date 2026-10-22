@@ -62,14 +62,6 @@ class NotificationCommandEditor:
                         self.enabled_switches[definition.id] = switch
                         trigger.on_value_change(self._changed)
                         switch.on_value_change(self._changed)
-            self.plain_switch = ui.switch(
-                'Allow plain messages as model replies',
-                value=raw.get('plain_text_replies', True) is True,
-            ).classes('w-full min-w-0 text-sm').style('overflow-wrap:anywhere').props(
-                'data-hy-notification-plain-replies=1',
-            )
-            self.plain_note = ui.label('').classes('text-xs hy-muted').style('overflow-wrap:anywhere')
-            self.plain_switch.on_value_change(self._changed)
             self.error = ui.label('').classes('w-full text-xs text-negative').style(
                 'white-space:pre-wrap;overflow-wrap:anywhere',
             ).props('role=status data-hy-notification-command-error=1')
@@ -82,11 +74,6 @@ class NotificationCommandEditor:
             ).classes('max-w-full').style('white-space:normal')
         self._ready = True
         self.refresh()
-
-    @property
-    def plain_text_replies(self) -> bool:
-        """Return the stored preference; Reply's switch also gates it at runtime."""
-        return self.plain_switch.value is True
 
     def value(self) -> dict[str, dict[str, Any]]:
         return {
@@ -101,14 +88,6 @@ class NotificationCommandEditor:
         return validate_notification_commands(self.value())
 
     def refresh(self) -> None:
-        reply_enabled = self.enabled_switches['reply'].value is True
-        self.plain_switch.set_enabled(reply_enabled)
-        self.plain_note.set_text(
-            'Messages without a command are sent to the selected chat. Command-shaped '
-            'messages are handled by the menu.' if reply_enabled else
-            'Plain message replies are unavailable while Reply to model is off. '
-            'Your preference is retained.'
-        )
         try:
             commands = self.validate()
         except CommandConfigurationError as exc:
@@ -116,9 +95,7 @@ class NotificationCommandEditor:
             self.preview.set_text('Fix the command settings above to preview help.')
             return
         self.error.set_text('')
-        self.preview.set_text(notification_help({
-            'commands': commands, 'plain_text_replies': self.plain_text_replies,
-        }))
+        self.preview.set_text(notification_help({'commands': commands}))
 
     async def _changed(self, _event: Any = None) -> None:
         if not self._ready:

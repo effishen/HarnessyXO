@@ -34,7 +34,6 @@ DEFAULT_NTFY_SETTINGS: dict[str, Any] = {
     'receive_replies': False,
     'reply_window_minutes': 1_440,
     'commands': default_notification_commands(),
-    'plain_text_replies': True,
 }
 
 _TOPIC_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
@@ -114,11 +113,6 @@ def normalize_ntfy_settings(value: Any) -> dict[str, Any]:
         reply_minutes = 1_440
     result['reply_window_minutes'] = max(1, min(reply_minutes, 10_080))
     result['commands'] = normalize_notification_commands(raw.get('commands'))
-    result['plain_text_replies'] = raw.get('plain_text_replies', True) is True
-    try:
-        validate_notification_commands(raw.get('commands'))
-    except CommandConfigurationError:
-        result['plain_text_replies'] = False
     return result
 
 

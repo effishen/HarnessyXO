@@ -1,8 +1,8 @@
 """Configurable names for a fixed set of interactive notification actions.
 
 Command names are data, never Python, shell syntax or model instructions.
-Disabled, retired and unknown command-shaped messages are always consumed by
-the command layer instead of becoming prompts.
+Only an enabled reply command can submit a prompt. Ordinary messages and
+disabled, retired or unknown commands never become model prompts.
 """
 from __future__ import annotations
 
@@ -127,12 +127,6 @@ def notification_command_trigger(config: Any, command_id: str, *, enabled_only: 
     return row['trigger']
 
 
-def plain_text_reply_allowed(config: Any) -> bool:
-    raw = config if isinstance(config, dict) else {}
-    return bool(raw.get('plain_text_replies', True) is True
-                and normalize_notification_commands(raw.get('commands'))['reply']['enabled'])
-
-
 def parse_notification_command(text: Any, config: Any) -> ParsedNotificationCommand | None:
     """Parse once without lowercasing, stripping or rewriting the reply body."""
     if not isinstance(text, str):
@@ -179,6 +173,5 @@ def notification_help(config: Any) -> str:
             lines.append(usage + ' — ' + item.description)
     if len(lines) == 1:
         lines.append('No commands are enabled. Change them in Notifications settings.')
-    if plain_text_reply_allowed(raw):
-        lines.append('Plain messages also reply to the selected chat.')
+    lines.append('Only enabled commands are accepted. Ordinary messages are ignored.')
     return '\n'.join(lines)
