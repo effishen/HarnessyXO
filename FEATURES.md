@@ -178,6 +178,7 @@ Workspace and machine databases use WAL so background reads can coexist with mes
 - Keep queued Latest intent through the task between a refresh acknowledgement and the pending jump. Tab/page/periodic saves preserve it, and a newer upward gesture cancels the deferred jump.
 
 - Keep follow-latest intent through chat-tab switches, background browser tabs, redraws and reloads. Save Latest immediately while history is loading; preserve paused reading when you scroll up.
+- Hold the paragraph or line you are reading steady while older/newer history loads and content finishes laying out. Capture any continued scrolling before replacing the page; ignore temporary browser clamping, preserve deliberate gestures, and recenter around your current message if you reverse direction during loading.
 - Use clickable grey rectangles for earlier/later hidden marker pages instead of a visible scrollbar. At an end the rectangle disappears. Wheel, touch and keyboard still scroll the marker list independently.
 - Use the top arrow to jump directly to the beginning of the chat and marker list; the bottom arrow jumps to latest and follows while revealing the list end.
 - Keep a 10 px grey rounded square for every user prompt, including bookmarked prompts. Long marker lists scroll independently of the transcript.

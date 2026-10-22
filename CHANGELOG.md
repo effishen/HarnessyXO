@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.7.11
+
+- Keep the paragraph or line you are reading in place when older or newer chat history loads. Preserve it through delayed image, Markdown and layout changes after loading finishes.
+- Capture your latest reading position immediately before a history update. Ignore temporary scroll positions caused by the page swap, keep deliberate scrolling responsive, and recenter when a direction change would otherwise remove the message you are reading.
+- Preserve paused reading, live follow, prompt navigation, Top and Jump to latest as separate choices. Retire observers when a chat is replaced, and reject stale history updates before they change the displayed rows.
+
 ## v0.7.10
 
 - Add an interactive ntfy menu for reading the model's latest answer, browsing earlier answers and sending a reply to the selected chat. Enable it in **Settings → Notifications**. Default commands include `.help`, `.chats`, `.use CODE`, `.read`, `.replies`, `.history`, `.prev`, `.next`, `.more`, `.stats`, `.status`, `.reply` and `.retry`.

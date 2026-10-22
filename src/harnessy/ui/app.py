@@ -13206,9 +13206,12 @@ function hyRestoreDensityAnchor(anchor) {
         || Number(state.navigationSerial || 0) !== anchor.navigation) return;
     if (anchor.following && state.element === anchor.root && typeof state.pin === 'function') {
       state.pin(false);
+    } else if (typeof state.stabilizeReadingAnchor === 'function') {
+      state.stabilizeReadingAnchor();
     } else if (anchor.node && anchor.node.isConnected) {
       anchor.root.scrollTop += anchor.node.getBoundingClientRect().top - anchor.top;
     }
+    state.rememberReadingAnchor?.();
     if (typeof state.observeGeometry === 'function') state.observeGeometry();
     if (typeof state.updatePromptNavigator === 'function') state.updatePromptNavigator();
   });
@@ -14999,6 +15002,7 @@ function hyReleaseDelayedNavigation(state) {
   if (!state.navigationDelayed) return;
   clearTimeout(state.virtualTimer); state.virtualTimer=null;
   state.virtualizing=false; state.restoring=false; state.activeRequest=null;
+  state.windowMutating=false;
   state.navigationDelayed=false; state.virtualDirection='';
 }
 function hyRetryPromptNavigation() {
@@ -15072,6 +15076,7 @@ window.harnessyJumpToPrompt = function(messageId, afterRender) {
     if (!card || !card.getBoundingClientRect().height) { hyPromptJumpFailed(state); return; }
     state.pendingPromptTarget='';
     card.scrollIntoView({block:'nearest',behavior:'instant'});
+    state.rememberReadingAnchor?.();
     document.querySelectorAll('.hy-prompt-reference-target').forEach(node=>node.classList.remove('hy-prompt-reference-target'));
     card.classList.add('hy-prompt-reference-target'); setTimeout(()=>card.classList.remove('hy-prompt-reference-target'),2200);
     const serial=state.navigationSerial,controller=state.scrollControllerSerial;
@@ -15096,6 +15101,7 @@ window.harnessyJumpToPrompt = function(messageId, afterRender) {
     state.programmaticTarget = Math.max(0, el.scrollTop + targetTop - 18);
     state.programmaticUntil = performance.now() + 140;
     el.scrollTop = state.programmaticTarget;
+    state.rememberReadingAnchor?.();
     const navigation = state.navigationSerial, controller = state.scrollControllerSerial;
     requestAnimationFrame(() => hyCompletePromptNavigation(state,navigatorRow || {id},target,el,navigation,controller));
     if (typeof state.observeGeometry === 'function') state.observeGeometry();
@@ -15151,6 +15157,7 @@ window.harnessySetupChatScroll = function(workspaceId, chatId, saved, username) 
   if (state.pageHideListener) window.removeEventListener('pagehide', state.pageHideListener);
   if (state.saveTimer) { clearTimeout(state.saveTimer); state.saveTimer = null; }
   if (state.resizeObserver) { try { state.resizeObserver.disconnect(); } catch (_) {} state.resizeObserver = null; }
+  if (state.layoutObserver) { try { state.layoutObserver.disconnect(); } catch (_) {} state.layoutObserver = null; }
   if (state.pinFrame) { try { cancelAnimationFrame(state.pinFrame); } catch (_) {} state.pinFrame = null; }
   if (state.virtualFrame) { try { cancelAnimationFrame(state.virtualFrame); } catch (_) {} state.virtualFrame = null; }
   if (state.intentFrame) { try { cancelAnimationFrame(state.intentFrame); } catch (_) {} state.intentFrame = null; }
@@ -15183,6 +15190,10 @@ window.harnessySetupChatScroll = function(workspaceId, chatId, saved, username) 
   // acknowledgement cannot impersonate its first new navigation request.
   state.activeRequest = null;
   state.virtualAnchor = null;
+  state.readingAnchor = null;
+  state.windowMutating = false;
+  state.preserveWindowAnchor = false;
+  state.anchorCorrectionTarget = null;
   state.requestSerial = Number(state.requestSerial || 0);
   state.lastInputAt = 0;
   state.lastDirection = 0;
@@ -15242,9 +15253,10 @@ window.harnessySetupChatScroll = function(workspaceId, chatId, saved, username) 
       emitEvent('harnessy_transcript_follow', {workspace_id:workspaceId, chat_id:chatId,
         render_token:state.renderToken, following:mode === 'following'});
     }
-    // Native scroll anchoring is helpful while the user is reading older
-    // content, but it fights deliberate bottom pinning during live output.
-    el.style.overflowAnchor = mode === 'paused' ? 'auto' : 'none';
+    // One controller owns anchoring in both modes. Native anchoring can choose
+    // a different row while Vue swaps history, then apply a second correction.
+    el.style.overflowAnchor = 'none';
+    if (mode === 'following') state.readingAnchor = null;
     updateJump();
     // Save the choice in this task, before a tab replacement can cancel the
     // pending pin or throttled position save. An outstanding Latest still owns
@@ -15321,6 +15333,134 @@ window.harnessySetupChatScroll = function(workspaceId, chatId, saved, username) 
   };
   state.currentAnchor = currentAnchor;
 
+  // Retain the actual paragraph/line being read, not just the top of a possibly
+  // very tall message. Overlapping history rows normally keep these DOM nodes;
+  // the message/offset fallback also survives a canonical row replacement.
+  const captureReadingAnchor = () => {
+    const anchor = currentAnchor();
+    const message = anchor.id && document.getElementById('hy-msg-' + anchor.id);
+    if (!message || !el.contains(message)) return null;
+    const bounds = el.getBoundingClientRect();
+    const blocks = message.querySelectorAll('p, pre, li, blockquote, tr, h1, h2, h3, h4, h5, h6, img, .hy-user-bubble');
+    let node = message;
+    for (const block of blocks) {
+      const rect = block.getBoundingClientRect();
+      if (rect.height > 0 && rect.bottom > bounds.top + 1 && rect.top < bounds.bottom) { node = block; break; }
+    }
+    const path = [];
+    for (let item = node; item !== message && item.parentElement; item = item.parentElement)
+      path.unshift(Array.prototype.indexOf.call(item.parentElement.children, item));
+    const reading = {message:anchor, node, path, top:node.getBoundingClientRect().top - bounds.top, scrollTop:el.scrollTop};
+    // A text caret anchors a line even inside one long paragraph/code block.
+    // If the point lands on padding or another control, keep the block anchor.
+    const rect = node.getBoundingClientRect();
+    const x = Math.max(bounds.left + 2, rect.left + Math.min(24, rect.width / 2));
+    const y = Math.max(bounds.top + 2, rect.top + 2);
+    if (x < bounds.right && y < bounds.bottom) {
+      let text, offset;
+      if (typeof document.caretPositionFromPoint === 'function') {
+        const caret = document.caretPositionFromPoint(x, y); text = caret?.offsetNode; offset = caret?.offset;
+      } else if (typeof document.caretRangeFromPoint === 'function') {
+        const caret = document.caretRangeFromPoint(x, y); text = caret?.startContainer; offset = caret?.startOffset;
+      }
+      if (text?.nodeType === Node.TEXT_NODE && node.contains(text)) {
+        const range = document.createRange(); range.setStart(text, offset); range.collapse(true);
+        const line = range.getClientRects()[0];
+        if (line && line.height > 0) reading.line = {text, offset, top:line.top - bounds.top};
+      }
+    }
+    return reading;
+  };
+  const rememberReadingAnchor = () => {
+    if (state.element !== el || state.scrollControllerSerial !== controllerSerial || state.mode !== 'paused'
+        || state.windowMutating) return;
+    state.readingAnchor = captureReadingAnchor();
+    if (state.virtualizing && (['older','newer','refresh'].includes(state.virtualDirection) || state.preserveWindowAnchor))
+      state.virtualAnchor = currentAnchor();
+  };
+  state.rememberReadingAnchor = rememberReadingAnchor;
+  const stabilizeReadingAnchor = () => {
+    if (state.element !== el || state.scrollControllerSerial !== controllerSerial || !el.isConnected
+        || state.mode !== 'paused' || state.restoring
+        || (state.virtualizing && !['older','newer','refresh'].includes(state.virtualDirection) && !state.preserveWindowAnchor)) return;
+    const reading = state.readingAnchor;
+    if (!reading) { rememberReadingAnchor(); return; }
+    // Outside a row swap, retain the anchor's content coordinate so a genuine
+    // wheel/touch movement survives even if layout changes before its scroll
+    // event. During a swap, subtract browser clamping from that displacement:
+    // shrinking the temporary page is not a request to move the reader.
+    let movement = el.scrollTop - reading.scrollTop;
+    const maxTop = Math.max(0, el.scrollHeight - el.clientHeight);
+    if (state.windowMutating && Number(state.navigationSerial || 0) === state.windowInputSerial)
+      movement = 0;
+    else if (state.windowMutating && reading.scrollTop > maxTop && Math.abs(el.scrollTop - maxTop) <= 1)
+      movement -= maxTop - reading.scrollTop;
+    reading.top -= movement;
+    if (reading.line) reading.line.top -= movement;
+    reading.message.offset += movement;
+    reading.scrollTop = el.scrollTop;
+    const bounds = el.getBoundingClientRect();
+    const message = document.getElementById('hy-msg-' + reading.message.id);
+    if (!message || !el.contains(message) || message.getBoundingClientRect().height <= 0) return;
+    let delta;
+    const line = reading.line;
+    if (line?.text.isConnected && message.contains(line.text) && line.offset <= line.text.length) {
+      const range = document.createRange(); range.setStart(line.text, line.offset); range.collapse(true);
+      const rect = range.getClientRects()[0];
+      if (rect?.height > 0) delta = rect.top - bounds.top - line.top;
+    }
+    if (delta === undefined) {
+      let node = reading.node;
+      if (!node?.isConnected || !message.contains(node)) {
+        node = message;
+        for (const index of reading.path) { node = node?.children[index]; if (!node) break; }
+      }
+      if (node?.getBoundingClientRect().height > 0) delta = node.getBoundingClientRect().top - bounds.top - reading.top;
+      else delta = message.getBoundingClientRect().top - bounds.top + reading.message.offset;
+    }
+    if (Math.abs(delta) > 0.5) {
+      el.scrollTop += delta;
+      reading.scrollTop = el.scrollTop;
+      state.anchorCorrectionTarget = el.scrollTop;
+      state.programmaticTarget = el.scrollTop;
+      state.programmaticUntil = performance.now() + 140;
+    }
+  };
+  state.stabilizeReadingAnchor = stabilizeReadingAnchor;
+  state.prepareWindowRender = (messageIds, aliases, keepLive) => {
+    // Called immediately before the server sends a DOM mutation. Continued
+    // scrolling during its background DB read belongs to the newer viewport.
+    if (state.element !== el || state.scrollControllerSerial !== controllerSerial || !state.virtualizing) return false;
+    stabilizeReadingAnchor();
+    rememberReadingAnchor();
+    if (state.mode === 'paused' && (['older','newer','refresh'].includes(state.virtualDirection) || state.preserveWindowAnchor)) {
+      const anchor = state.virtualAnchor;
+      const resolved = String(aliases?.[anchor?.id] || anchor?.id || '');
+      const baseId = resolved.split('--segment-')[0];
+      if (Array.isArray(messageIds) && resolved
+          && !messageIds.includes(baseId) && !(keepLive && resolved.startsWith('live-'))) {
+        // A reversal during the DB read can leave the prepared page on the
+        // other side of the reader. Keep this DOM intact and recenter instead
+        // of evicting the paragraph being read. The new request supersedes the
+        // old acknowledgement through its normal monotonic request ID.
+        clearTimeout(state.virtualTimer); state.virtualTimer = null;
+        state.virtualizing = false; state.windowMutating = false; state.activeRequest = null;
+        if (resolved.startsWith('live-')) requestTranscriptWindow('latest', undefined, true);
+        else {
+          requestTranscriptWindow('locate', {id:baseId, offset:anchor.offset}, true);
+        }
+        return false;
+      }
+      if (anchor && resolved !== anchor.id) {
+        anchor.id = resolved;
+        if (state.readingAnchor) state.readingAnchor.message.id = resolved;
+      }
+    }
+    state.windowMutating = true;
+    state.windowInputSerial = Number(state.navigationSerial || 0);
+    return true;
+  };
+
   const snapshot = (followIntent) => {
     const explicitIntent = typeof followIntent === 'boolean';
     if (state.element !== el || !el.isConnected || (!explicitIntent && (state.restoring || state.virtualizing))) return;
@@ -15372,15 +15512,18 @@ window.harnessySetupChatScroll = function(workspaceId, chatId, saved, username) 
   state.canOlder = canOlder;
   state.canNewer = canNewer;
 
-  const requestTranscriptWindow = (direction, anchorOverride) => {
+  const requestTranscriptWindow = (direction, anchorOverride, preserveReading = false) => {
     if (state.element !== el || state.virtualizing || (state.restoring && direction !== 'locate')) return false;
     if (direction === 'older' && !canOlder()) return false;
     if (direction === 'newer' && !canNewer()) return false;
     const anchor = anchorOverride && anchorOverride.id ? anchorOverride : currentAnchor();
     state.virtualizing = true;
     state.virtualDirection = direction;
+    state.preserveWindowAnchor = preserveReading;
     state.cancelTransactionFollow = false;
     state.virtualAnchor = anchor;
+    if (['older','newer'].includes(direction)) rememberReadingAnchor();
+    state.windowMutating = false;
     state.pendingInput = false;
     state.activeRequest = ++state.requestSerial;
     el.style.overflowAnchor = 'none';
@@ -15432,14 +15575,23 @@ window.harnessySetupChatScroll = function(workspaceId, chatId, saved, username) 
   state.checkTranscriptWindow = scheduleTranscriptWindowCheck;
 
   state.listener = () => {
+    const corrected = state.anchorCorrectionTarget !== null && Math.abs(el.scrollTop - state.anchorCorrectionTarget) <= 1;
+    state.anchorCorrectionTarget = null;
+    const geometryChanged = el.clientHeight !== state.lastViewportHeight
+      || el.clientWidth !== state.lastViewportWidth || el.scrollHeight !== state.lastContentHeight;
+    if (geometryChanged && state.mode === 'paused') stabilizeReadingAnchor();
     if (state.virtualizing) {
       const top = el.scrollTop;
       // Scrollbar dragging has no wheel event. A bare pointer-down on a
       // disclosure, however, is not a request to stop following.
-      if (scrollbarInputActive() && Math.abs(top - state.lastScrollTop) > 1) {
+      if (!state.windowMutating && scrollbarInputActive() && Math.abs(top - state.lastScrollTop) > 1) {
         noteInput(top < state.lastScrollTop ? -1 : 1);
       }
-      if (state.pendingInput) state.virtualAnchor = currentAnchor();
+      // A DOM swap/clamp also dispatches scroll. Sticky pendingInput alone is
+      // not evidence that the reader moved; never save that transient layout.
+      const recentInput = state.lastInputAt > 0 && performance.now() - state.lastInputAt < 1600;
+      if (!corrected && !geometryChanged && (scrollbarInputActive() || recentInput)
+          && Math.abs(top - state.lastScrollTop) > 1) rememberReadingAnchor();
       observeGeometry();
       updateJump();
       return;
@@ -15463,8 +15615,6 @@ window.harnessySetupChatScroll = function(workspaceId, chatId, saved, username) 
     state.programmaticTarget = null;
     const movedUp = top < previousTop - 1;
     const movedDown = top > previousTop + 1;
-    const geometryChanged = el.clientHeight !== state.lastViewportHeight
-      || el.clientWidth !== state.lastViewportWidth || el.scrollHeight !== state.lastContentHeight;
     const recentInput = scrollbarInputActive() || (state.lastInputAt > 0 && performance.now() - state.lastInputAt < 1600);
     state.lastViewportHeight = el.clientHeight;
     state.lastViewportWidth = el.clientWidth;
@@ -15475,6 +15625,7 @@ window.harnessySetupChatScroll = function(workspaceId, chatId, saved, username) 
     else if (state.mode === 'following' && (geometryChanged || !atBottomNow())) schedulePin();
     else if (movedDown && userDownActive()) state.lastDirection = 1;
     observeGeometry();
+    if (!corrected && !geometryChanged && state.mode === 'paused') rememberReadingAnchor();
     if (state.mode === 'paused' && (movedDown || userDownActive())) resumeAtLatest();
     updateJump();
     if (typeof state.updatePromptNavigator === 'function') state.updatePromptNavigator();
@@ -15485,6 +15636,10 @@ window.harnessySetupChatScroll = function(workspaceId, chatId, saved, username) 
   el.addEventListener('scroll', state.listener, {passive:true});
 
   const noteInput = (direction) => {
+    // Settle any pending layout correction before the browser applies this
+    // gesture, so later compensation cannot pull the reader back to old text.
+    stabilizeReadingAnchor();
+    state.anchorCorrectionTarget = null;
     state.navigationSerial = Number(state.navigationSerial || 0) + 1;
     state.promptExplicitTarget = '';
     state.pendingPromptTarget = '';
@@ -15590,6 +15745,7 @@ window.harnessySetupChatScroll = function(workspaceId, chatId, saved, username) 
   // schedules one rAF pin only while follow mode is active.
   state.resizeObserver = new ResizeObserver(() => {
     if (state.element !== el) return;
+    stabilizeReadingAnchor();
     if (!scrollbarInputActive()) observeGeometry();
     if (!state.restoring && state.mode === 'following') schedulePin();
     updateJump();
@@ -15597,6 +15753,20 @@ window.harnessySetupChatScroll = function(workspaceId, chatId, saved, username) 
   });
   state.resizeObserver.observe(el);
   Array.from(el.children).forEach(child => state.resizeObserver.observe(child));
+  // Content wrappers can be added/replaced and their total height can stay the
+  // same while rows above the viewport move. Observe mutations as well, and
+  // attach size observation to new wrappers without retaining detached rows.
+  let observedChildren = new Set(Array.from(el.children));
+  state.layoutObserver = new MutationObserver(() => {
+    if (state.element !== el || state.scrollControllerSerial !== controllerSerial) return;
+    const children = new Set(Array.from(el.children));
+    for (const child of observedChildren) if (!children.has(child)) state.resizeObserver.unobserve(child);
+    for (const child of children) if (!observedChildren.has(child)) state.resizeObserver.observe(child);
+    observedChildren = children;
+    stabilizeReadingAnchor();
+    if (!state.restoring && !state.virtualizing && state.mode === 'following') schedulePin();
+  });
+  state.layoutObserver.observe(el, {childList:true, subtree:true, characterData:true});
 
   const restore = () => {
     if (state.element !== el || state.scrollControllerSerial !== controllerSerial || !el.isConnected) return;
@@ -15635,6 +15805,7 @@ window.harnessySetupChatScroll = function(workspaceId, chatId, saved, username) 
         setMode(following ? 'following' : 'paused');
       }
       else if (state.mode === 'restoring') setMode('paused');
+      rememberReadingAnchor();
       if (state.mode === 'following') schedulePin();
       snapshot();
       scheduleTranscriptWindowCheck();
@@ -15668,6 +15839,8 @@ window.harnessyBeforeTranscriptUpdate = function(workspaceId, chatId, renderToke
   state.virtualDirection = 'refresh';
   state.cancelTransactionFollow = false;
   state.virtualAnchor = state.currentAnchor();
+  state.rememberReadingAnchor?.();
+  state.windowMutating = false;
   state.pendingInput = false;
   state.activeRequest = ++state.requestSerial;
   el.style.overflowAnchor = 'none';
@@ -15681,6 +15854,13 @@ window.harnessyBeforeTranscriptUpdate = function(workspaceId, chatId, renderToke
   },4500);
   return {anchor_id:state.virtualAnchor.id, anchor_offset:state.virtualAnchor.offset,
           following:state.mode === 'following', request_id:state.activeRequest};
+};
+window.harnessyBeforeTranscriptWindowRender = function(workspaceId, chatId, renderToken, requestId, messageIds, aliases, keepLive) {
+  const state = window.harnessyChatScroll || {};
+  const el = document.getElementById('hy-message-scroll');
+  if (!el || state.element !== el || !el.isConnected || state.workspaceId !== workspaceId || state.chatId !== chatId
+      || String(state.renderToken) !== String(renderToken) || state.activeRequest !== Number(requestId)) return false;
+  return state.prepareWindowRender?.(messageIds, aliases, keepLive) === true;
 };
 window.harnessyTranscriptWindowRendered = function(anchorId, anchorOffset, direction, changed, renderToken, requestId, following, succeeded = true) {
   const state = window.harnessyChatScroll || {};
@@ -15696,8 +15876,10 @@ window.harnessyTranscriptWindowRendered = function(anchorId, anchorOffset, direc
     const finish = () => {
       if (!current()) { resolve(false); return; }
       clearTimeout(state.virtualTimer); state.virtualTimer = null; state.navigationDelayed=false;
-      const anchor = state.pendingInput && state.virtualAnchor ? state.virtualAnchor : {id:anchorId, offset:anchorOffset};
-      const shouldFollow = !state.cancelTransactionFollow &&
+      const anchor = state.virtualAnchor || {id:anchorId, offset:anchorOffset};
+      const retainReading = (['older','newer','refresh'].includes(direction) || state.preserveWindowAnchor)
+        && state.readingAnchor?.message.id === anchor.id;
+      const shouldFollow = !state.cancelTransactionFollow && !state.preserveWindowAnchor &&
         ((direction === 'latest' && succeeded !== false && (changed || !state.canNewer?.())) ||
          (direction === 'refresh' && following && state.mode === 'following'));
       const downToTail = state.lastDirection > 0 && (direction === 'newer' || state.pendingInput);
@@ -15706,7 +15888,12 @@ window.harnessyTranscriptWindowRendered = function(anchorId, anchorOffset, direc
       const queuedPrompt = state.pendingPromptTarget;
       const queuedNavigationSerial = state.navigationSerial;
       state.restoring = false;
+      // Settle while the frozen mutation/input boundary still distinguishes
+      // browser clamping from a real gesture, even if an observer has not run.
+      if (retainReading) state.stabilizeReadingAnchor?.();
       state.virtualizing = false;
+      state.windowMutating = false;
+      state.preserveWindowAnchor = false;
       state.virtualDirection = '';
       state.activeRequest = null;
       // The queued task still owns Latest. Tab/page saves in this handoff must
@@ -15723,7 +15910,7 @@ window.harnessyTranscriptWindowRendered = function(anchorId, anchorOffset, direc
       } else if (shouldFollow) {
         state.setMode('following'); state.pin(true);
       } else {
-        if ((changed || direction === 'locate') && anchor.id) state.restoreAnchor(anchor.id, anchor.offset);
+        if (!retainReading && (changed || direction === 'locate') && anchor.id) state.restoreAnchor(anchor.id, anchor.offset);
         state.setMode('paused');
         state.programmaticTarget = el.scrollTop;
         state.programmaticUntil = performance.now() + 100;
@@ -15732,6 +15919,7 @@ window.harnessyTranscriptWindowRendered = function(anchorId, anchorOffset, direc
         // is rearmed just as it is after a non-virtualized scroll.
         if (downToTail && state.nearLatest()) state.pin(true);
       }
+      state.rememberReadingAnchor?.();
       if (succeeded === false && direction === 'latest') hyPromptNavigationNotice('Latest messages could not be loaded. Select Jump to latest to retry.');
       else if (succeeded === false && !queuedPrompt && !queuedTop && !queuedJump) hyPromptNavigationNotice('Messages could not be loaded. Your current view has been kept; choose a navigator entry or Jump to latest to retry.');
       else if (succeeded !== false && !queuedPrompt && !queuedTop && !queuedJump) hyClearPromptNavigationNotice();
@@ -15855,6 +16043,7 @@ window.harnessyGoToTop = function() {
   state.programmaticTarget = 0;
   state.programmaticUntil = performance.now() + 120;
   el.scrollTop = 0;
+  state.rememberReadingAnchor?.();
   if (typeof state.observeGeometry === 'function') state.observeGeometry();
   if (typeof state.updateJump === 'function') state.updateJump();
   if (typeof state.snapshot === 'function') state.snapshot();
@@ -16307,6 +16496,25 @@ window.harnessyTerminalFocus = function(terminalId) {
             if (self._transcript_windows.get(key) != previous
                     or self._transcript_following.get(key, True) != previous_following):
                 raise RuntimeError('Transcript view changed during background read')
+            ready = await self._transcript_javascript(client,
+                'window.harnessyBeforeTranscriptWindowRender && '
+                f'window.harnessyBeforeTranscriptWindowRender({json.dumps(ws.id)}, '
+                f'{json.dumps(chat_id)}, {generation}, {int(capture.get("request_id") or 0)}, '
+                f'{json.dumps([msg.id for msg in prepared["messages"]])}, '
+                f'{json.dumps(live_state.get("anchor_aliases") or {})}, '
+                f'{str(bool(prepared["state"].get("tail"))).lower()});',
+                timeout=2.0,
+            )
+            if ready is not True:
+                raise RuntimeError('Transcript view is no longer ready for rendering')
+            if (generation != self._chat_render_generation or self.message_area is not area
+                    or not self._ui_elements_alive(area)
+                    or self.active_tab_key != self._chat_tab_key(*key)
+                    or key in self._pending_transcript_navigation):
+                return False
+            if (self._transcript_windows.get(key) != previous
+                    or self._transcript_following.get(key, True) != previous_following):
+                raise RuntimeError('Transcript view changed before rendering')
             self._transcript_following[key] = following
             self._draw_messages(ws, chat_id, reset_window=following, prepared=prepared)
             # The server mutation is committed. The browser remains locked until
@@ -16432,9 +16640,33 @@ window.harnessyTerminalFocus = function(terminalId) {
             if self._transcript_windows.get(key) != previous:
                 raise RuntimeError('Transcript view changed during background read')
             after = prepared['state']
-            self._transcript_following[key] = direction == 'latest'
             changed = any(before.get(k) != after.get(k) for k in ('start', 'end', 'total'))
             if changed:
+                # The reader can keep scrolling during the background read.
+                # Freeze its latest DOM anchor before Vue adds/removes rows;
+                # scroll events from that mutation must not replace it.
+                ready = await self._transcript_javascript(area.client,
+                    'window.harnessyBeforeTranscriptWindowRender && '
+                    f'window.harnessyBeforeTranscriptWindowRender({json.dumps(workspace_id)}, '
+                    f'{json.dumps(chat_id)}, {generation}, {request_id}, '
+                    f'{json.dumps([msg.id for msg in prepared["messages"]])}, '
+                    f'{json.dumps((_AGENT_LIVE_STATES.get(key) or {}).get("anchor_aliases") or {})}, '
+                    f'{str(bool(after.get("tail"))).lower()});', timeout=2.0)
+                if ready is not True:
+                    raise RuntimeError('Transcript view is no longer ready for rendering')
+                current = (generation == self._chat_render_generation and self.message_area is area
+                           and self._ui_elements_alive(area)
+                           and self.active_tab_key == self._chat_tab_key(*key)
+                           and self._transcript_navigation_latest.get(key) == (generation, request_id)
+                           and key not in self._pending_transcript_navigation)
+                if not current:
+                    self._transcript_window_busy.discard(key)
+                    owns_busy = False
+                    await self._drain_transcript_navigation(key)
+                    return
+                if self._transcript_windows.get(key) != previous:
+                    raise RuntimeError('Transcript view changed before rendering')
+                self._transcript_following[key] = direction == 'latest'
                 # One-way handoff from direct live callbacks to the process-owned
                 # reattach observer. Never let two renderers write the same rows.
                 live_state = _AGENT_LIVE_STATES.get(key)
@@ -16444,6 +16676,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                 self._live_sync_view = self._live_sync_tool_view = None
                 self._draw_messages(ws, chat_id, prepared=prepared)
             else:
+                self._transcript_following[key] = direction == 'latest'
                 self._transcript_windows[key] = dict(after)
             succeeded = True
         except asyncio.CancelledError:
