@@ -1,4 +1,11 @@
-# HarnessyXO v0.7.12 Features
+# HarnessyXO v0.7.13 Features
+
+## Context budgeting and retention
+
+- Open **Performance / Context** to see how the last recorded request divided its total context between output, safety space, instructions/tools, controller notes and conversation. Token counts identify their source; estimates are marked with `~` and kept separate from completed backend usage.
+- A context setting is a total-window ceiling. Output and safety reservations still apply. Initial requests use a conservative UTF-8 estimate until trustworthy measurements are available. An unchanged measured prefix can use its backend count plus conservatively estimated additions; rebuilt prompts need compatible observations before receiving a calibrated estimate.
+- Supported llama.cpp servers can count the actual chat payload through their request token-count endpoint. Count requests use the same configured service and credentials, have bounded time and size limits, and fall back when unavailable. Other backends can learn from completed prompt usage; no tokenizer or model download is required. Changed request identities, tool schemas and unsupported media reset the learned view.
+- Older saved work can leave the active prompt while remaining retrievable with chat-history tools. Keep at most one bounded controller note, including when migrating accumulated legacy markers. Actual trimming appears as a compact **Context trimmed** timeline event with its counts. The event stays out of model input; routine retention housekeeping does not become a fabricated assistant reply or an instruction to announce an archive event.
 
 ## Printable chat PDFs
 

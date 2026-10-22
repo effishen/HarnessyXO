@@ -62,6 +62,103 @@ def bounded_memory(text: str, max_tokens: int) -> str:
 
 
 _PASTE = re.compile(r'(<pasted_text>\n)(.*?)(\n</pasted_text>)', re.S)
+_LEGACY_ARCHIVE_PREFIX = (
+    '[HarnessyXO generated archive marker — not assistant reasoning and not evidence of current environment state. '
+    'Completed transcript steps archived from this prompt only; saved originals are unchanged. '
+)
+_CONTEXT_NOTICE_PREFIX = '[HarnessyXO context notice — controller metadata]'
+_SOURCE_ID = re.compile(r'[A-Za-z0-9_.:-]{1,128}\Z')
+
+
+def _notice_source_ids(values: Any) -> list[str]:
+    if not isinstance(values, (list, tuple)):
+        return []
+    result: list[str] = []
+    bounded = values if len(values) <= 24 else [*values[:12], *values[-12:]]
+    for value in bounded:
+        if isinstance(value, str) and _SOURCE_ID.fullmatch(value) and value not in result:
+            result.append(value)
+    return result
+
+
+def _context_notice_ids(message: dict[str, Any]) -> list[str]:
+    """Read bounded retrieval pointers, never historical message bodies."""
+    if message.get('_harnessy_context_notice') is True:
+        return _notice_source_ids(message.get('_harnessy_notice_source_ids'))
+    text = str(message.get('content') or '')[:4096]
+    match = re.search(r'First message IDs: (.*?)\. Most recent message IDs: (.*?)\. Use search_chat_history', text)
+    if match:
+        return _notice_source_ids([part.strip() for group in match.groups() for part in group.split(',')])
+    return []
+
+
+def _is_context_notice(message: dict[str, Any], source_for: Callable[[dict[str, Any]], Any]) -> bool:
+    # Literal user/model text stored in the transcript is always preserved,
+    # even when it quotes a former controller marker verbatim.
+    if source_for(message) is not None or message.get('role') not in {'user', 'assistant', 'system'}:
+        return False
+    if message.get('tool_calls') or message.get('tool_call_id'):
+        return False
+    if message.get('_harnessy_context_notice') is True:
+        return True
+    content = message.get('content')
+    return isinstance(content, str) and content.startswith(_LEGACY_ARCHIVE_PREFIX)
+
+
+def _set_context_notice(message: dict[str, Any], source_ids: list[str]) -> None:
+    ids = _notice_source_ids(source_ids)
+    ids = list(dict.fromkeys([*ids[:3], *ids[-3:]]))
+    message.update({
+        'role': 'user',
+        '_harnessy_context_notice': True,
+        '_harnessy_region': 'context_notice',
+        '_harnessy_notice_source_ids': ids,
+        'content': (
+            _CONTEXT_NOTICE_PREFIX + '\n'
+            'Some earlier saved messages are outside this request. Their originals remain in chat history. '
+            'Use search_chat_history or read_chat_message only when an exact earlier detail is needed. '
+            + ('Original message IDs (earliest/recent): ' + ', '.join(ids) + '. ' if ids else '')
+            + 'Continue the task without announcing routine context housekeeping. '
+            'This controller note is not an assistant reply or evidence of current environment state.'
+        ),
+    })
+
+
+def _notice_insertion_index(messages: list[dict[str, Any]], index: int) -> int:
+    """Keep a controller row outside an assistant/tool-result protocol block."""
+    index = min(max(0, index), len(messages))
+    if index < len(messages) and messages[index].get('role') == 'tool':
+        while index > 0 and messages[index - 1].get('role') == 'tool':
+            index -= 1
+        if index > 0 and messages[index - 1].get('role') == 'assistant' and messages[index - 1].get('tool_calls'):
+            index -= 1
+    return index
+
+
+def _normalize_context_notices(
+    messages: list[dict[str, Any]], source_for: Callable[[dict[str, Any]], Any],
+) -> tuple[dict[str, Any] | None, int]:
+    """Collapse old request-only controller artifacts before any budgeting."""
+    prior: list[dict[str, Any]] = []
+    source_ids: list[str] = []
+    first_index = 0
+    for index, message in enumerate(messages):
+        if not _is_context_notice(message, source_for):
+            continue
+        if not prior:
+            first_index = index
+        prior.append(message)
+        source_ids.extend(_context_notice_ids(message))
+        # Retain first/recent pointers without growing a second history buffer.
+        source_ids = list(dict.fromkeys([*source_ids[:3], *source_ids[-3:]]))
+    if not prior:
+        return None, 0
+    removed = {id(message) for message in prior}
+    messages[:] = [message for message in messages if id(message) not in removed]
+    note: dict[str, Any] = {}
+    _set_context_notice(note, source_ids)
+    messages.insert(_notice_insertion_index(messages, first_index), note)
+    return note, len(prior)
 
 
 def _completed_tool_blocks(messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
@@ -92,6 +189,7 @@ def budget_request(
     compact_tool: Callable[[Any], str],
     protected_source_ids: set[str] | None = None,
     protected_eviction_order: list[str] | None = None,
+    token_counter: Any = None,
 ) -> dict[str, Any]:
     """Mutate the assembled request view in place; preserve complete tool pairs.
 
@@ -100,6 +198,9 @@ def budget_request(
     turn. The latest user instruction is never silently truncated. Archive
     notices retain original message IDs for explicit bounded retrieval.
     """
+    archive_marker, prior_notice_count = _normalize_context_notices(messages, source_for)
+    count_text = token_counter.estimate_text if token_counter is not None else estimate_text
+    count_message = token_counter.estimate_message if token_counter is not None else estimate_message
     context, context_source = effective_context(profile, runtime)
     # Unknown is not misrepresented as a backend capacity. A local planning
     # ceiling still bounds growth until an actual context can be observed.
@@ -108,15 +209,33 @@ def budget_request(
     reserve = reserve if reserve > 0 else min(8192, max(1024, planning_ceiling // 4))
     safety = max(512, math.ceil(planning_ceiling * 0.10))
     input_limit = planning_ceiling - reserve - safety
-    schema_tokens = estimate_text(json.dumps(tools or [], ensure_ascii=False, separators=(',', ':'))) + (8 if tools else 0)
-    system_tokens = sum(estimate_message(m) for m in messages if m.get('role') == 'system')
-    fixed = schema_tokens + system_tokens
-    # Estimates guide trimming of retrievable history. They cannot prove that
-    # mandatory input exceeds the server's tokenizer/runtime capacity; send
-    # the preserved request and let actual backend feedback decide admission.
-    request_limit = min(input_limit, fixed + max(0, hot_target))
-    before = schema_tokens + sum(estimate_message(m) for m in messages)
+    schema_tokens = system_tokens = fixed = request_limit = 0
+
+    def recount() -> int:
+        nonlocal schema_tokens, system_tokens, fixed, request_limit
+        total = token_counter.estimate_request(messages, tools) if token_counter is not None else None
+        # Whole-request evaluation can invalidate a native/prefix anchor and
+        # change the allocation ratio. Refresh fixed costs afterward, before
+        # deciding how much history fits or reporting component allocations.
+        schema_tokens = (token_counter.estimate_tools(tools) if token_counter is not None else
+                         count_text(json.dumps(tools or [], ensure_ascii=False, separators=(',', ':'))) + (8 if tools else 0))
+        system_tokens = sum(count_message(message) for message in messages if message.get('role') == 'system')
+        fixed = schema_tokens + system_tokens
+        # Estimates guide trimming of retrievable history. Mandatory input
+        # remains preserved for actual backend admission feedback.
+        request_limit = min(input_limit, fixed + max(0, hot_target))
+        if token_counter is not None:
+            return total
+        return schema_tokens + sum(count_message(message) for message in messages)
+
+    before = recount()
     count = before
+
+    def changed_request(delta: int) -> None:
+        nonlocal count
+        # A native count/prefix anchor describes one exact request. Mutating
+        # its covered rows can invalidate it, so a row delta is not sufficient.
+        count = recount() if token_counter is not None else count + delta
     compacted = 0
     compacted_ids: list[str] = []
     steps_archived = 0
@@ -138,11 +257,11 @@ def budget_request(
         if source is None:
             return False
         replacement = compact_tool(source)
-        old = estimate_message(message)
-        if estimate_text(replacement) >= estimate_text(message.get('content')):
+        old = count_message(message)
+        if count_text(replacement) >= count_text(message.get('content')):
             return False
         message['content'] = replacement
-        count += estimate_message(message) - old
+        changed_request(count_message(message) - old)
         compacted += 1
         sid = str(getattr(source, 'id', '') or '')
         if sid and sid not in compacted_ids:
@@ -181,7 +300,7 @@ def budget_request(
             text = str(holder.get(key) or '')
             if '<pasted_text>' not in text:
                 continue
-            old = estimate_message(m)
+            old = count_message(m)
             text, n = _PASTE.subn(
                 '[Pasted-text payload deferred to fit the request. The private attachment is unchanged. '
                 'Use a narrow search_attachment query and one bounded read_attachment range with the '
@@ -190,7 +309,7 @@ def budget_request(
             )
             holder[key] = text
             attachments_deferred += n
-            count += estimate_message(m) - old
+            changed_request(count_message(m) - old)
 
     latest_user = next((m for m in reversed(messages) if m.get('role') == 'user' and source_for(m) is not None), None)
     # Atomic blocks: assistant/tool-call record plus every paired result. A
@@ -207,8 +326,24 @@ def budget_request(
         elif id(m) not in claimed and m is not latest_user and m.get('role') in {'user', 'assistant'}:
             if not m.get('tool_calls'):
                 candidates.append([m])
-    archive_marker = None
-    first_ids: list[str] = []
+    def archive_block(block: list[dict[str, Any]]) -> list[str]:
+        nonlocal archive_marker, count, steps_archived
+        ids = [str(source_for(message).id) for message in block]
+        old = sum(count_message(message) for message in block)
+        prior_marker_tokens = count_message(archive_marker) if archive_marker is not None else 0
+        pointer_ids = _context_notice_ids(archive_marker) if archive_marker is not None else []
+        if archive_marker is None:
+            index = next(i for i, message in enumerate(messages) if message is block[0])
+            archive_marker = {}
+            messages.insert(_notice_insertion_index(messages, index), archive_marker)
+        remove = {id(message) for message in block}
+        messages[:] = [message for message in messages if id(message) not in remove]
+        archived_ids.extend(ids)
+        steps_archived += 1
+        _set_context_notice(archive_marker, [*pointer_ids, *ids])
+        changed_request(count_message(archive_marker) - prior_marker_tokens - old)
+        return ids
+
     for block in candidates:
         if count <= request_limit:
             break
@@ -216,33 +351,7 @@ def budget_request(
             continue
         if any(source_id_for(m) in protected_ids for m in block):
             continue
-        ids = [str(source_for(m).id) for m in block]
-        archived_tool_names = [str(m.get('name') or 'tool') for m in block if m.get('role') == 'tool']
-        if archive_marker is None:
-            first_ids = ids[:3]
-            archive_marker = {'role': 'assistant', 'content': ''}
-            index = next(i for i, m in enumerate(messages) if m is block[0])
-            messages.insert(index, archive_marker)
-            prior_marker_tokens = 0
-        else:
-            prior_marker_tokens = estimate_message(archive_marker)
-        old = sum(estimate_message(m) for m in block)
-        remove = {id(m) for m in block}
-        messages[:] = [m for m in messages if id(m) not in remove]
-        archived_ids.extend(ids)
-        steps_archived += 1
-        archive_marker['content'] = (
-            '[HarnessyXO generated archive marker — not assistant reasoning and not evidence of current environment state. '
-            'Completed transcript steps archived from this prompt only; saved originals are unchanged. '
-            f'{steps_archived} completed blocks. First message IDs: ' + ', '.join(first_ids) +
-            '. Most recent message IDs: ' + ', '.join(ids[-3:]) +
-            '. Use search_chat_history/read_chat_message for exact originals. '
-            'Archived tool results are historical snapshots; re-query tools for current filesystem/VM state.]' +
-            ('\nRecently archived tool names: ' + ', '.join(archived_tool_names[-6:]) if archived_tool_names else '') +
-            ('\nAttachment retrieval results were compacted, not the attachment. Re-run a narrower '
-             'search_attachment or one bounded read_attachment range; do not reconstruct the whole file.'
-             if any(name in {'search_attachment', 'read_attachment'} for name in archived_tool_names) else ''))
-        count += estimate_message(archive_marker) - prior_marker_tokens - old
+        archive_block(block)
 
     # Request-only adaptive-retention capsules are deliberately late and
     # disposable under hard budget pressure. They preserve evidence without
@@ -255,10 +364,10 @@ def budget_request(
                 break
             if not bool(message.get('_harnessy_adaptive_retention')):
                 continue
-            old = estimate_message(message)
+            old = count_message(message)
             source_id = str(message.get('_harnessy_source_id') or '')
             messages.remove(message)
-            count -= old
+            changed_request(-old)
             if source_id and source_id not in adaptive_capsules_evicted:
                 adaptive_capsules_evicted.append(source_id)
                 if source_id not in protected_evicted:
@@ -305,42 +414,16 @@ def budget_request(
                 break
             if not all(message in messages for message in block):
                 continue
-            ids = [source_id_for(m) for m in block]
-            archived_tool_names = [str(m.get('name') or 'tool') for m in block if m.get('role') == 'tool']
-            if archive_marker is None:
-                first_ids = ids[:3]
-                archive_marker = {'role': 'assistant', 'content': ''}
-                index = next(i for i, m in enumerate(messages) if m is block[0])
-                messages.insert(index, archive_marker)
-                prior_marker_tokens = 0
-            else:
-                prior_marker_tokens = estimate_message(archive_marker)
-            old = sum(estimate_message(m) for m in block)
-            remove = {id(m) for m in block}
-            messages[:] = [m for m in messages if id(m) not in remove]
-            archived_ids.extend(ids)
-            steps_archived += 1
+            ids = archive_block(block)
             for sid in ids:
                 if sid in protected_ids and sid not in protected_evicted:
                     protected_evicted.append(sid)
-            archive_marker['content'] = (
-                '[HarnessyXO generated archive marker — not assistant reasoning and not evidence of current environment state. '
-                'Completed transcript steps archived from this prompt only; saved originals are unchanged. '
-                f'{steps_archived} completed blocks. First message IDs: ' + ', '.join(first_ids) +
-                '. Most recent message IDs: ' + ', '.join(ids[-3:]) +
-                '. Use search_chat_history/read_chat_message for exact originals. '
-                'Archived tool results are historical snapshots; re-query tools for current filesystem/VM state.]' +
-                ('\nRecently archived tool names: ' + ', '.join(archived_tool_names[-6:]) if archived_tool_names else '') +
-                ('\nAttachment retrieval results were compacted, not the attachment. Re-run a narrower '
-                 'search_attachment or one bounded read_attachment range; do not reconstruct the whole file.'
-                 if any(name in {'search_attachment', 'read_attachment'} for name in archived_tool_names) else ''))
-            count += estimate_message(archive_marker) - prior_marker_tokens - old
 
-    count = schema_tokens + sum(estimate_message(m) for m in messages)
+    count = recount()
 
     components: dict[str, int] = defaultdict(int)
     for key, value in system_components.items():
-        components[key] += estimate_text(value)
+        components[key] += count_text(value)
     # Include wrappers/separators/chat-template estimate rather than pretend the
     # component sums exactly match a tokenizer measurement.
     known_system = sum(components.values())
@@ -349,7 +432,10 @@ def budget_request(
     for m in messages:
         if m.get('role') == 'system':
             continue
-        tokens = estimate_message(m)
+        tokens = count_message(m)
+        if m.get('_harnessy_context_notice') is True and source_for(m) is None:
+            components['controller_metadata'] += tokens
+            continue
         source = source_for(m)
         content = m.get('content')
         plain = content if isinstance(content, str) else '\n'.join(str(p.get('text') or '') for p in content or [] if isinstance(p, dict))
@@ -359,15 +445,15 @@ def budget_request(
         if source is None and ('warm-context excerpts' in plain or bool(m.get('_harnessy_adaptive_retention'))):
             key = 'retrieved_material'
         if source is not None and m.get('role') == 'user':
-            base = min(tokens, estimate_text(source.content))
+            base = min(tokens, count_text(source.content))
             components['conversation'] += base
             components['expanded_attachments'] += tokens - base
         else:
             components[key] += tokens
     for key in ('core', 'global_instructions', 'workspace_instructions', 'project_chat_instructions', 'task_state', 'skill', 'memory', 'archive_policy',
-                'conversation', 'expanded_attachments', 'retrieved_material', 'tool_schemas'):
+                'conversation', 'expanded_attachments', 'retrieved_material', 'tool_schemas', 'controller_metadata'):
         components.setdefault(key, 0)
-    return {
+    report = {
         'budget_method': 'estimated UTF-8 bytes / 3 + message overhead; images assumed 4096 tokens each',
         'usage_kind': 'estimate_not_tokenizer_measurement', 'component_tokens_estimated': dict(components),
         'effective_context_window': context or None, 'context_source': context_source,
@@ -379,9 +465,15 @@ def budget_request(
         'estimate_over_budget': count > input_limit,
         'estimated_excess_tokens': max(0, count - input_limit),
         'active_tool_results_compacted': compacted, 'completed_steps_archived': steps_archived,
+        'controller_metadata_tokens_estimated': components['controller_metadata'],
+        'controller_notice_count': int(archive_marker is not None),
+        'context_notices_collapsed': max(0, prior_notice_count - 1),
         'compacted_tool_message_ids': compacted_ids[-24:],
         'attachment_payloads_deferred': attachments_deferred, 'budget_archived_message_ids': archived_ids[-24:],
         'adaptive_retention_evicted_message_ids': protected_evicted,
         'adaptive_retention_capsules_evicted': len(adaptive_capsules_evicted),
         'memory_excerpted': '[Workspace memory prompt excerpt;' in system_components.get('memory', ''),
     }
+    if token_counter is not None:
+        report.update(token_counter.metadata(messages, tools))
+    return report

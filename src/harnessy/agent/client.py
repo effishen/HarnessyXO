@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import inspect
 import json
 import re
 import time
@@ -283,6 +284,132 @@ class OpenAICompatibleClient:
         if self.api_key:
             headers['Authorization'] = f'Bearer {self.api_key}'
         return headers
+
+    def token_accounting_configuration(self) -> dict[str, Any]:
+        """Identity of the actual prompt transport, without credentials."""
+        backend = str(self._detected_backend or self.profile.get('backend') or self.api_mode)
+        return {
+            'endpoint': self.endpoint, 'model': self.model,
+            'backend': backend, 'api_mode': self.api_mode,
+            'thinking': self.thinking,
+            'thinking_wire': thinking_payload(self.profile, self.thinking,
+                                              'ollama' if backend == 'ollama' else 'openai'),
+            'chat_template': self.profile.get('chat_template'),
+            'chat_template_kwargs': self.profile.get('chat_template_kwargs'),
+        }
+
+    @staticmethod
+    def _budget_accepts_measurement(callback: Any) -> bool:
+        try:
+            parameters = inspect.signature(callback).parameters
+            return 'token_count' in parameters or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+        except (TypeError, ValueError):
+            return False
+
+    async def _invoke_request_budget(self, runtime: int = 0, source: str | None = None,
+                                     *, token_count: dict[str, Any] | None = None) -> None:
+        callback = getattr(self, 'request_budget_callback', None)
+        if not callable(callback):
+            return
+        kwargs = {'token_count': token_count} if token_count is not None and self._budget_accepts_measurement(callback) else {}
+        result = callback(runtime, source, **kwargs) if source is not None else callback(runtime, **kwargs)
+        if inspect.isawaitable(result):
+            await result
+
+    async def _native_prompt_count(self, payload: dict[str, Any], *, backend: str) -> dict[str, Any] | None:
+        """Count only through llama.cpp's request-count API on this endpoint.
+
+        This does not generate a reply. Unsupported/failed bounded probes fall
+        back to usage-calibrated accounting, without changing model settings.
+        No speculative tokenizer downloads or unrelated service requests occur.
+        """
+        if backend != 'llamacpp':
+            return None
+        messages = payload.get('messages') or []
+        if self._has_image_input(messages) or any(
+            isinstance(row.get('content'), list) and any(
+                isinstance(part, dict) and part.get('type') not in {'text', 'input_text'}
+                for part in row['content']
+            ) for row in messages if isinstance(row, dict)
+        ):
+            return None
+        configuration = self.token_accounting_configuration()
+        identity = hashlib.sha256(json.dumps(configuration, sort_keys=True, default=str).encode()).hexdigest()
+        unavailable = getattr(self, '_native_token_count_unavailable', {})
+        if unavailable.get(identity, 0.) > time.monotonic():
+            return None
+        body = {**payload, 'stream': False}
+        encoded = json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+        if len(encoded) > 2 * 1024 * 1024:
+            return None
+        reason = 'unavailable'
+        cooldown = 30.
+        try:
+            async with asyncio.timeout(3.):
+                async with httpx.AsyncClient(timeout=httpx.Timeout(2.5), follow_redirects=False) as client:
+                    async with client.stream('POST', self.endpoint + '/input_tokens',
+                                             headers=self._headers(), content=encoded) as response:
+                        if response.status_code != 200:
+                            reason = 'http_status_' + str(response.status_code)
+                            cooldown = 300. if response.status_code in {400, 401, 403, 404, 405, 501} else 30.
+                        else:
+                            chunks: list[bytes] = []
+                            size = 0
+                            async for chunk in response.aiter_bytes():
+                                size += len(chunk)
+                                if size > 64 * 1024:
+                                    raise ValueError('Token-count response exceeds its bound')
+                                chunks.append(chunk)
+                            result = json.loads(b''.join(chunks))
+                            tokens = result.get('input_tokens') if isinstance(result, dict) else None
+                            if isinstance(tokens, int) and not isinstance(tokens, bool) and 0 < tokens <= 2 ** 31 - 1:
+                                # Bind the measurement to the complete actual
+                                # wire body; mutation requires another count.
+                                fingerprint = hashlib.sha256(json.dumps(payload, ensure_ascii=False,
+                                    sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
+                                return {'tokens': tokens, 'source': 'native_tokenizer',
+                                        'request_fingerprint': fingerprint,
+                                        'configuration': configuration}
+                            reason = 'invalid_token_count'
+        except asyncio.CancelledError:
+            raise
+        except (TimeoutError, httpx.HTTPError, ValueError, TypeError, UnicodeError):
+            reason = 'count_probe_failed'
+        if len(unavailable) >= 8:
+            unavailable.clear()
+        unavailable[identity] = time.monotonic() + cooldown
+        self._native_token_count_unavailable = unavailable
+        log_event('backend', 'prompt_token_count_unavailable', backend='llama.cpp',
+                  model=self.model, reason=reason)
+        return None
+
+    async def _prepare_openai_payload(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
+                                      *, backend: str, max_output_tokens: int | None) -> dict[str, Any]:
+        callback = getattr(self, 'request_budget_callback', None)
+        payload = self._payload(messages, tools, backend=backend, max_output_tokens=max_output_tokens)
+        if not callable(callback):
+            return payload
+        if backend == 'llamacpp' and self._budget_accepts_measurement(callback):
+            for _attempt in range(3):
+                count = await self._native_prompt_count(payload, backend=backend)
+                if count is None:
+                    break
+                await self._invoke_request_budget(token_count={**count, 'final': False})
+                revised = self._payload(messages, tools, backend=backend, max_output_tokens=max_output_tokens)
+                if revised == payload:
+                    # Finalization records delivery/provenance only; the
+                    # preliminary callback has already budgeted this body.
+                    await self._invoke_request_budget(token_count={**count, 'final': True})
+                    final_payload = self._payload(messages, tools, backend=backend, max_output_tokens=max_output_tokens)
+                    if final_payload != revised:
+                        raise RuntimeError('The measured prompt changed during final budget recording.')
+                    return final_payload
+                payload = revised
+        await self._invoke_request_budget()
+        return self._payload(messages, tools, backend=backend, max_output_tokens=max_output_tokens)
 
     @staticmethod
     def _has_image_input(messages: list[dict[str, Any]]) -> bool:
@@ -1391,10 +1518,8 @@ class OpenAICompatibleClient:
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
         *, backend: str = 'openai', max_output_tokens: int | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        budget = getattr(self, 'request_budget_callback', None)
-        if callable(budget):
-            budget(0)
-        payload = self._payload(messages, tools, backend=backend, max_output_tokens=max_output_tokens)
+        payload = await self._prepare_openai_payload(messages, tools, backend=backend,
+                                                     max_output_tokens=max_output_tokens)
         backend_label = 'llama.cpp' if backend == 'llamacpp' else ('oMLX' if backend == 'omlx' else 'openai')
         observation = _StreamObservation()
         request_summary = self._request_summary(payload, backend_label, self.endpoint)
@@ -1475,6 +1600,7 @@ class OpenAICompatibleClient:
                             if line.startswith('data:'):
                                 line = line[5:].strip()
                             if line == '[DONE]':
+                                await queue.put(('terminal', None))
                                 return
                             try:
                                 data = json.loads(line)
@@ -1510,6 +1636,9 @@ class OpenAICompatibleClient:
                 if kind == 'runtime_status':
                     yield {'type': 'runtime_status', 'status': value}
                     continue
+                if kind == 'terminal':
+                    yield {'type': 'stream_completed', 'source': 'sse_done'}
+                    continue
                 if kind == 'error':
                     if isinstance(value, asyncio.CancelledError):
                         raise value
@@ -1543,6 +1672,8 @@ class OpenAICompatibleClient:
                         'type': 'message', 'message': message,
                         'finish_reason': choice.get('finish_reason') if isinstance(choice, dict) else None,
                     }
+                    if isinstance(choice, dict) and isinstance(choice.get('message'), dict):
+                        yield {'type': 'stream_completed', 'source': 'nonstream_response'}
                     break
                 if kind != 'data' or not isinstance(value, dict):
                     continue
@@ -1563,6 +1694,8 @@ class OpenAICompatibleClient:
                     observation.event({'provider': 'openai', 'kind': 'tool_call_delta', 'tool_calls': raw_calls})
                     log_event('tools', 'tool_stream_raw', provider='openai', semantics='delta', tool_calls=raw_calls)
                 yield {'type': 'delta', 'delta': delta, 'finish_reason': choice.get('finish_reason')}
+                if isinstance(choice.get('finish_reason'), str) and choice['finish_reason'].strip():
+                    yield {'type': 'stream_completed', 'source': 'finish_reason'}
         finally:
             observation.log(provider='openai', observation='transport_closed')
             if not response_task.done():
@@ -1704,6 +1837,7 @@ class OpenAICompatibleClient:
                             if line.startswith('data:'):
                                 line = line[5:].strip()
                             if line == '[DONE]':
+                                await queue.put(('terminal', None))
                                 return
                             try:
                                 data = json.loads(line)
@@ -1836,6 +1970,9 @@ class OpenAICompatibleClient:
                         last_activity_phase = str(value.get('phase') or last_activity_phase)
                         yield {'type': 'runtime_status', 'status': value}
                     continue
+                if kind == 'terminal':
+                    yield {'type': 'stream_completed', 'source': 'sse_done'}
+                    continue
                 if kind == 'error':
                     if isinstance(value, asyncio.CancelledError):
                         raise value
@@ -1862,6 +1999,8 @@ class OpenAICompatibleClient:
                         log_event('tools', 'tool_stream_raw', provider='openai', semantics='message', tool_calls=raw_calls)
                     yield {'type': 'message', 'message': message,
                            'finish_reason': choice.get('finish_reason') if isinstance(choice, dict) else None}
+                    if isinstance(choice, dict) and isinstance(choice.get('message'), dict):
+                        yield {'type': 'stream_completed', 'source': 'nonstream_response'}
                     continue
                 if kind != 'data' or not isinstance(value, dict):
                     continue
@@ -1885,6 +2024,8 @@ class OpenAICompatibleClient:
                     observation.event({'provider': 'openai', 'kind': 'tool_call_delta', 'tool_calls': raw_calls})
                     log_event('tools', 'tool_stream_raw', provider='openai', semantics='delta', tool_calls=raw_calls)
                 yield {'type': 'delta', 'delta': delta, 'finish_reason': choice.get('finish_reason')}
+                if isinstance(choice.get('finish_reason'), str) and choice['finish_reason'].strip():
+                    yield {'type': 'stream_completed', 'source': 'finish_reason'}
         finally:
             observation.log(provider='openai', observation='transport_closed')
             stop.set()
@@ -1963,9 +2104,7 @@ class OpenAICompatibleClient:
         except Exception:
             preflight_runtime = None
         preflight_context = int((preflight_runtime or {}).get('context_window') or 0)
-        budget = getattr(self, 'request_budget_callback', None)
-        if callable(budget):
-            budget(self._effective_ollama_context(preflight_context),
+        await self._invoke_request_budget(self._effective_ollama_context(preflight_context),
                    'observed_runtime' if preflight_context else 'native_startup_ceiling_runtime_unobserved')
         payload = self._ollama_payload(
             messages, tools, runtime_context_window=preflight_context,
@@ -2260,6 +2399,8 @@ class OpenAICompatibleClient:
                         client_request_id=observation.client_request_id, **observation.counts,
                     )
                     yield {'type': 'usage', 'usage': usage, 'raw': data}
+                    if data.get('done') is True:
+                        yield {'type': 'stream_completed', 'source': 'ollama_done'}
         finally:
             observation.log(provider='ollama', observation='transport_closed')
             telemetry_stop.set()

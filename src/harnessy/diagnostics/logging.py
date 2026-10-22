@@ -127,12 +127,19 @@ _CONTEXT_TUNING_NUMBERS = frozenset({
     'output_reserve_tokens', 'request_limit_tokens', 'epoch_runway_tokens',
     'epoch_transition_count', 'schema_version',
     'selected_history_ceiling', 'requested_history_target', 'failed_upward_probes',
+    'controller_metadata_tokens_estimated', 'controller_notice_count',
+    'token_accounting_actual_tokens', 'token_accounting_raw_tokens',
+    'token_accounting_samples', 'token_accounting_ratio',
+    'token_accounting_uncertainty_tokens',
 })
 _CONTEXT_TUNING_BOOLEANS = frozenset({
     'usage_estimated', 'actual_prompt_tokens_estimated', 'probe_active',
     'budget_changed', 'partial_output_seen', 'minimum_preserved',
+    'token_accounting_exact',
 })
 _CONTEXT_TUNING_ENUMS = {
+    'token_accounting_method': frozenset({'rough', 'calibrated', 'prefix_anchor', 'native_tokenizer'}),
+    'token_accounting_source': frozenset({'utf8_estimate', 'backend_usage', 'backend_timings', 'native_tokenizer'}),
     'actual_prompt_tokens_source': frozenset({
         'backend_usage', 'backend_timings', 'backend_error', 'estimated', 'unavailable',
     }),
@@ -172,6 +179,11 @@ _CONTEXT_TUNING_ENUMS = {
 }
 _CONTEXT_TUNING_ENUMS['method'] = _CONTEXT_TUNING_ENUMS['tuning_method']
 _CONTEXT_TUNING_IDS = frozenset({'job_id', 'chat_id', 'workspace_id', 'run_id', 'record_id', 'session_id'})
+_CONTEXT_TOKEN_ACCOUNTING_KEYS = frozenset({
+    'token_accounting_method', 'token_accounting_source', 'token_accounting_exact',
+    'token_accounting_actual_tokens', 'token_accounting_raw_tokens',
+    'token_accounting_samples', 'token_accounting_ratio', 'token_accounting_uncertainty_tokens',
+})
 
 
 def _context_tuning_payload(event: Any, fields: dict[str, Any]) -> dict[str, Any] | None:
@@ -223,6 +235,9 @@ def _context_tuning_payload(event: Any, fields: dict[str, Any]) -> dict[str, Any
 def _is_sensitive_log_key(key: str) -> bool:
     """Credentials are excluded even when content-rich diagnostics are chosen."""
     lowered = str(key).lower()
+    if lowered in _CONTEXT_TOKEN_ACCOUNTING_KEYS:
+        # These reviewed scalar counts/enums are not authentication tokens.
+        return False
     return (
         any(part in lowered for part in (
             'api_key', 'apikey', 'password', 'authorization', 'cookie', 'secret',
@@ -285,6 +300,7 @@ _PRIVACY_SAFE_STRING_KEYS = {
     'budget_method', 'context_epoch_reason', 'prompt_cacheability_health',
     'prompt_cacheability_transport_reason', 'prompt_cache_first_changed_region',
     'prompt_cache_estimate_kind', 'tuning_method',
+    'token_accounting_method', 'token_accounting_source',
     'watchdog_request_state', 'watchdog_evidence', 'recovery_skip_reason',
     'decision',  # Completion-check enum; raw check conversation is never logged here.
 }
@@ -454,6 +470,8 @@ _VM_COMMAND_ID_KEYS = frozenset({'command_id', 'parent_start_command_id', 'start
 
 def _safe_event_field(key: str, value: Any) -> Any:
     """Keep reviewed structured evidence intact, without widening raw limits."""
+    if key.lower() in _CONTEXT_TOKEN_ACCOUNTING_KEYS:
+        return _privacy_safe_value(value, key=key)
     if _is_sensitive_log_key(key):
         return '<redacted>'
     if key == 'environment_id':
@@ -1027,7 +1045,9 @@ class DiagnosticsManager:
         if isinstance(value, dict):
             out = {}
             for key, item in list(value.items())[:80]:
-                if _is_sensitive_log_key(str(key)):
+                if str(key).lower() in _CONTEXT_TOKEN_ACCOUNTING_KEYS:
+                    out[str(key)] = _privacy_safe_value(item, key=str(key))
+                elif _is_sensitive_log_key(str(key)):
                     out[str(key)] = '<redacted>'
                 else:
                     out[str(key)] = DiagnosticsManager._safe(item, depth=depth + 1)
@@ -1563,6 +1583,9 @@ def _safe_error_summary(value: Any) -> Any:
 
 def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
     lowered = key.lower()
+    if lowered in _CONTEXT_TOKEN_ACCOUNTING_KEYS:
+        validated = _context_tuning_payload('request_prepared', {lowered: value}) or {}
+        return validated.get(lowered)
     if _is_sensitive_log_key(lowered):
         return '<redacted>'
     if not key and isinstance(value, dict):

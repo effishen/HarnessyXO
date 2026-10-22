@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.13
+
+- Keep one bounded context-retention note when older work leaves the active prompt. Replace accumulated legacy archive markers, preserve retrieval pointers and keep controller bookkeeping separate from model-authored replies. Actual trimming adds a compact **Context trimmed** timeline event with counts; unchanged requests do not add another event. Saved chat messages and attachments stay unchanged.
+- Use completed backend prompt usage to estimate an unchanged prefix and charge new messages conservatively. Rebuilt prompts use calibration only after enough compatible measurements; changed models, endpoints, tool schemas, settings or unsupported media fall back to the rough estimate. Measurements remain local to the current run.
+- Use llama.cpp's request token-count endpoint when that server supports it. Count the actual chat payload on the configured endpoint, recount after budgeting changes it, and fall back when the bounded count request is unsupported or unavailable. Other backends use measured-usage fallback without downloading tokenizers or models.
+- Show a context-budget breakdown in **Performance / Context**: total window, output reservation, safety space, instructions/tools, controller overhead and conversation allowance. Distinguish rough or calibrated estimates, measured-prefix estimates, exact tokenizer counts and completed backend usage.
+- Keep the existing output allowance, safety margin and capacity-recovery behavior. Initial requests can still use the conservative estimate while measurements become available; a total context setting is not an input-only allowance. Ignore incomplete, estimated or cache-only usage when learning prompt size, and record counting provenance in diagnostics.
+
 ## v0.7.12
 
 - Export a **Printable PDF** from a Project / Chat's menu or the existing export dialog. Choose the entire saved chat, selected prompts with their replies, or an inclusive message range. Search message previews to choose the range's first and last messages.

@@ -8415,6 +8415,8 @@ class HarnessyPage:
         if event_type == 'context_compaction':
             return {'running': 'Tuning', 'success': 'Recovered', 'failed': 'Recovery failed',
                     'waiting': 'Waiting for memory', 'blocked': 'Backend blocked'}.get(status, status.title())
+        if event_type == 'context_retention':
+            return {'complete': 'Recorded', 'success': 'Recorded'}.get(status, status.title())
         if event_type == 'live_context_update':
             return {'success': 'Applied', 'failed': 'Not applied'}.get(status, status.title())
         if event_type == 'model_slot_wait':
@@ -8430,7 +8432,28 @@ class HarnessyPage:
     @staticmethod
     def _activity_detail_lines(event_type: str, details: dict[str, Any], *, status: str = '') -> list[str]:
         lines: list[str] = []
-        if event_type == 'context_compaction':
+        if event_type == 'context_retention':
+            assembled = number(details.get('input_tokens_estimated'))
+            budget = number(details.get('input_budget_tokens'))
+            if assembled is not None and budget is not None:
+                lines.append(f'Recorded input (estimate): {int(assembled):,} / {int(budget):,} tokens available for input')
+            elif assembled is not None:
+                lines.append(f'Recorded input (estimate): {int(assembled):,} tokens')
+            method = {
+                'rough': 'UTF-8 estimate',
+                'calibrated': 'Calibrated from backend usage',
+                'prefix_anchor': 'Measured prefix with estimated additions',
+                'native_tokenizer': 'Backend request tokenizer',
+            }.get(str(details.get('token_accounting_method') or ''))
+            if method:
+                lines.append(f'Count method: {method}')
+            epoch = number(details.get('context_epoch'))
+            if epoch is not None:
+                lines.append(f'Context epoch: {int(epoch):,}')
+            notices = number(details.get('controller_notice_count'))
+            if notices is not None:
+                lines.append(f'Controller archive notes in this prompt: {int(notices):,}')
+        elif event_type == 'context_compaction':
             phase = str(details.get('context_tuning_phase') or '')
             current_phase = phase in {'downward_retry', 'upward_probe', 'accepted'}
             downward_details = not current_phase or phase == 'downward_retry'
@@ -8825,6 +8848,7 @@ class HarnessyPage:
         compact_text = title + (f' · {status_text}' if status_text else '')
         icon = {
             'context_compaction': 'compress',
+            'context_retention': 'compress',
             'live_context_update': 'tune',
             'automatic_continuation': 'replay',
             'model_slot_wait': 'hourglass_top',
@@ -12808,6 +12832,12 @@ class HarnessyPage:
         default_metric = request_metric.get('thinking_model_default')
         default_metric = default_metric if isinstance(default_metric, dict) else {}
         context_strategy = request_metric.get('context_strategy') if isinstance(request_metric.get('context_strategy'), dict) else {}
+        from harnessy.ui.context_budget_view import context_budget_view
+        budget_view = context_budget_view(
+            context_strategy,
+            backend_prompt_tokens=(latest.get('prompt_tokens')
+                                   if harnessy_metric.get('prompt_usage_estimated') is False else None),
+        )
         backend_timings = raw_metric.get('timings') if isinstance(raw_metric.get('timings'), dict) else {}
         backend_decode_seconds = number(harnessy_metric.get('backend_decode_seconds'))
         backend_prefill_seconds = number(harnessy_metric.get('backend_prefill_seconds'))
@@ -12927,7 +12957,7 @@ class HarnessyPage:
             ('Safety margin', context_strategy.get('safety_margin_tokens', '—')),
             ('Input budget', context_strategy.get('input_budget_tokens', '—')),
             ('Budget context source', context_strategy.get('context_source', '—')),
-            ('Estimation method', context_strategy.get('budget_method', '—')),
+            ('Budget counting details', context_strategy.get('budget_method', '—')),
             *[(f'{key.replace("_", " ").title()} (estimated tokens)', value) for key, value in
               (context_strategy.get('component_tokens_estimated') or {}).items()],
             ('Attachment strategy', attachment_strategy),
@@ -12946,8 +12976,15 @@ class HarnessyPage:
                 ui.label('Project / Chat Performance / Context').classes('text-xl font-semibold')
                 ui.space()
                 ui.button(icon='close', on_click=dialog.close).props('flat round dense aria-label="Close dialog"')
-            with ui.column().classes('w-full gap-2 p-4').style('flex:1;min-height:0;overflow:auto'):
+            with ui.column().classes('w-full gap-2 p-4').style('flex:1;min-height:0;overflow-y:auto;overflow-x:hidden'):
                 ui.label('Last recorded model-call totals and chat aggregates, not a live view of the next request. Transcript bubble durations describe only their own Thinking, answer, or Tool phase. Unsupported metrics are shown as —. Prompt cacheability is a privacy-safe row-level estimate over consecutive requests; backend cached-token accounting is shown separately when reported. Prefill speed is estimated from prompt tokens / time-to-first-token when native timings are unavailable.').classes('text-xs hy-muted')
+                with ui.column().classes('w-full gap-2 rounded border p-3').style('flex:none;min-width:0;overflow-x:hidden'):
+                    ui.label('Context budget · last recorded request').classes('text-sm font-semibold')
+                    ui.label(budget_view.explanation).classes('text-xs hy-muted').style('white-space:normal;overflow-wrap:anywhere')
+                    for name, value in budget_view.rows:
+                        with ui.row().classes('w-full items-start gap-2').style('min-width:0'):
+                            ui.label(name).classes('hy-muted text-xs').style('flex:1 1 190px;min-width:0;overflow-wrap:anywhere')
+                            ui.label(value).classes('font-mono text-xs').style('flex:1 1 150px;min-width:0;overflow-wrap:anywhere')
                 for name, value in fields:
                     with ui.row().classes('w-full items-start gap-2'):
                         ui.label(name).classes('hy-muted').style('flex:0 1 220px')
