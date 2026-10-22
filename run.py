@@ -742,6 +742,9 @@ def main() -> None:
         and (vendor_dir / "httpx").is_dir()
         and (vendor_dir / "playwright").is_dir()
         and (vendor_dir / "segno").is_dir()
+        and (vendor_dir / "reportlab").is_dir()
+        and (vendor_dir / "pypdfium2").is_dir()
+        and (vendor_dir / "pypdfium2_raw").is_dir()
     )
 
     if vendor_ready:

@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.7.12
+
+- Export a **Printable PDF** from a Project / Chat's menu or the existing export dialog. Choose the entire saved chat, selected prompts with their replies, or an inclusive message range. Search message previews to choose the range's first and last messages.
+- Choose **Full**, **One line** or **Nothing** independently for your prompts, model replies, Thinking, tool calls, tool results, prompt processing, events/completion checks and attachment references. Select timestamps, model information, tokens, speeds, elapsed time, cache statistics, titles and IDs separately. Compact entries contain recorded labels and selected statistics; no model is asked to summarize them.
+- Preview actual PDF pages inside the app, move between pages or jump to a page, then download the same PDF or open it for printing. Changing options invalidates the old preview. Completed PDFs remain in the chat's Downloads, and closing the dialog leaves a running export available when reopened.
+- Read a coherent snapshot of saved history, including activity and messages outside the visible chat window. Keep nonadjacent selections in order, preserve alternating Thinking/reply segments and prevent omitted fields from returning through raw metadata or completion-check details. Unsaved streaming text is excluded without stopping the model.
+- Wrap and paginate long text, code and tables. Compact rows wrap when needed to fit the page. Use available embedded host fonts; characters unsupported by those fonts appear as explicit Unicode codes with a warning. Attachment references list names/types/sizes; attachment contents and remote images are not embedded. Very large selections fail clearly instead of silently truncating.
+- Install the PDF dependencies automatically through `run.py`. Keep preview/download access bound to the signed-in account and registered workspace, support cancellation without publishing a partial PDF, and retain the existing Markdown/handover exports and chat scrolling behavior. Leave README unchanged.
+
 ## v0.7.11
 
 - Keep the paragraph or line you are reading in place when older or newer chat history loads. Preserve it through delayed image, Markdown and layout changes after loading finishes.

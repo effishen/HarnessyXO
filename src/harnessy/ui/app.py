@@ -2038,6 +2038,7 @@ class HarnessyPage:
         self._action_menu_button(menu, 'Go to top', 'vertical_align_top', lambda c=chat: self._go_to_chat_top(ws, c.id))
         self._action_menu_button(menu, 'Show/hide prompt navigator', 'more_vert', lambda: self._toggle_prompt_navigator())
         self._action_menu_button(menu, 'Export Project / Chat…', 'file_download', lambda c=chat: self.open_chat_export(ws, c.id))
+        self._action_menu_button(menu, 'Printable PDF…', 'picture_as_pdf', lambda c=chat: self.open_chat_print(ws, c.id))
         ui.separator().classes('hy-action-menu-separator')
         if not archived:
             busy_action('Archive', 'archive', lambda c=chat: self._archive_chat(ws, c.id), disabled=chat.locked or chat.pinned)
@@ -2684,6 +2685,10 @@ class HarnessyPage:
                 if not _is_stale_ui_error(exc):
                     raise
 
+    def open_chat_print(self, ws: WorkspaceStore, chat_id: str) -> None:
+        from harnessy.ui.chat_print import open_chat_print
+        open_chat_print(self, ws, chat_id)
+
     def open_chat_export(self, ws: WorkspaceStore, chat_id: str) -> None:
         """Read-only export, independent of the mounted transcript and live agent."""
         chat = ws.get_chat(chat_id)
@@ -2697,6 +2702,10 @@ class HarnessyPage:
             with ui.row().classes('hy-editor-header w-full items-center no-wrap'):
                 ui.label(f'Export Project / Chat — {chat.title}').classes('font-semibold min-w-0').style('overflow-wrap:anywhere')
                 ui.space()
+                def printable_pdf() -> None:
+                    dialog.close()
+                    self.open_chat_print(ws, chat_id)
+                ui.button('Printable PDF', icon='picture_as_pdf', on_click=printable_pdf).props('flat dense no-caps')
                 ui.button(icon='close', on_click=dialog.close).props('flat round dense aria-label="Close; an export already started continues"').tooltip('Close; an export already started continues')
             with ui.column().classes('w-full gap-3 p-4').style('flex:1;min-height:0;overflow-y:auto'):
                 ui.label('Exports snapshot saved history directly, not the visible browser window. A running agent continues. Unsaved streaming text is excluded and the snapshot time is recorded.').classes('text-sm hy-muted')
@@ -23939,6 +23948,8 @@ def run_app() -> None:
     _register_attachment_api(machine)
     from harnessy.ui.target_views import register_target_view_routes
     register_target_view_routes(app, machine, user_store)
+    from harnessy.ui.print_preview import register_print_preview_routes
+    register_print_preview_routes(app, machine)
 
     workspace_load_tasks: set[asyncio.Task[Any]] = set()
 
@@ -24079,6 +24090,10 @@ def run_app() -> None:
 
     async def close_runtime_resources() -> None:
         global _NTFY_REPLY_SUPERVISOR_TASK, _NTFY_REPLY_TARGET, _RUN_QUEUE_SUPERVISOR_TASK, _EVENT_LOOP_WATCHDOG_TASK
+        from harnessy.agent.print_exports import close_print_exports
+        from harnessy.ui.print_preview import close_print_previews
+        close_print_previews()
+        await close_print_exports()
         # Recovery workers own private copies. Let an atomic database switch
         # finish or roll back before closing the general worker gate.
         await RECOVERY_OPERATIONS.close()

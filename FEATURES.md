@@ -1,4 +1,14 @@
-# HarnessyXO v0.7.9 Features
+# HarnessyXO v0.7.12 Features
+
+## Printable chat PDFs
+
+- Open **Printable PDF** from a Project / Chat's menu, or use the **Printable PDF** button in the existing export dialog. Export the entire saved chat, selected prompts with their replies, or an inclusive saved-message range. Search message numbers or previews to select each end; activity rows count as saved messages too.
+- Set each content section to **Full**, **One line** or **Nothing**: prompts, replies, Thinking, tool calls, tool results, prompt processing, events/completion checks and attachment references. Select timestamps, model/backend, token counts, speeds, elapsed time, cache statistics, titles and IDs independently. Compact entries retain their timeline position and wrap to fit the page. They contain deterministic labels/statistics, never AI summaries or hidden copies of the omitted body.
+- See actual PDF pages in a paginated in-app preview, jump to any page, download those same bytes, or open the PDF for printing. Changing choices clears the old preview. A completed PDF is also saved in that chat's Downloads; closing the dialog does not cancel work, and Cancel export leaves the chat and model running.
+- Snapshot saved history directly, independently of the current browser window. Preserve chronological Thinking/reply segments and selected prompt spans, include activity, and exclude unsaved streaming output. Selected prompts must still exist in the captured snapshot; stale selections never expand into a whole-chat export.
+- Keep full tool results separate from call-argument metadata. Completion-check exchanges respect the reply and Thinking choices. Attachment Full lists saved reference metadata only; binary contents, arbitrary local paths and remote Markdown images are not fetched or embedded.
+- Print long code, links and tables within page margins, splitting across pages when needed. Embed available supported host-font glyphs. Unsupported characters appear as visible Unicode codes with a warning instead of missing-glyph squares. Printable exports support up to 64 MiB of selected full text, 200,000 indexed messages/sections and 250,000 formatted blocks; exceeding a limit gives a clear error without a partial download.
+- PDF setup uses the launcher's normal dependency installation. Preview pages and downloads require the signed-in account, current workspace registration and an unchanged completed PDF. PDF work has its own bounded queue and does not consume model generation slots. Existing Markdown and generated handover exports remain available.
 
 ## Named VM environments
 
