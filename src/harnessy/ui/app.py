@@ -7990,7 +7990,7 @@ class HarnessyPage:
                 values = [bool(getattr(e, 'value', False)) for e in cls._transcript_descendants(root)
                           if any(kind in e._classes for kind in (
                               'hy-thinking', 'hy-tool-raw', 'hy-completion-check-disclosure',
-                              'hy-completion-check-reasoning',
+                              'hy-completion-check-reasoning', 'hy-context-retention-disclosure',
                           ))]
                 if any(values):
                     state[str(mid)] = values
@@ -8005,7 +8005,7 @@ class HarnessyPage:
             disclosures = [e for e in cls._transcript_descendants(root)
                            if any(kind in e._classes for kind in (
                                'hy-thinking', 'hy-tool-raw', 'hy-completion-check-disclosure',
-                               'hy-completion-check-reasoning',
+                               'hy-completion-check-reasoning', 'hy-context-retention-disclosure',
                            ))]
             for element, opened in zip(disclosures, values):
                 if opened:
@@ -8909,8 +8909,11 @@ class HarnessyPage:
                         ui.label(short_time).classes('hy-message-time').tooltip(full_time)
                     if summary:
                         ui.label(summary).classes('hy-activity-summary')
-                    for line in detail_lines:
-                        ui.label(line).classes('hy-activity-detail')
+                    with (ui.expansion('View context details', icon='info_outline', value=False).classes(
+                        'hy-context-retention-disclosure w-full min-w-0'
+                    ) if event_type == 'context_retention' and detail_lines else nullcontext()):
+                        for line in detail_lines:
+                            ui.label(line).classes('hy-activity-detail')
                     if event_type == 'completion_check':
                         self._render_completion_check_conversation(details, running=status == 'running')
 

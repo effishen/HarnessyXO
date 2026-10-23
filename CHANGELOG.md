@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.7.15
+
+- Collapse the token counts and counting details on **Context trimmed** cards under **View context details**. The title, timestamp and short summary stay visible, and opening or closing the details works like the other info cards. Keep the open state when the transcript redraws and retain the existing compact Events view.
+
 ## v0.7.14
 
 - Rename **Environment** to **VM Environments** in the Workspace menu. It opens the same VM environment controls; **External Targets** keeps its existing label and action.
