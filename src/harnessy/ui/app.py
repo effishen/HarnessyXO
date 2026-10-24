@@ -1778,12 +1778,25 @@ class HarnessyPage:
                   elapsed_seconds=round(time.monotonic() - started, 3))
 
     async def _download_diagnostics(self, *, include_content: bool = False) -> None:
+        notice = ui.notification('Collecting VM logs and diagnostics…', spinner=True, timeout=None,
+                                 close_button=False)
         try:
             # Record the request *before* snapshotting so the exported ZIP itself
             # contains the event which caused it to be collected. The default
             # export is privacy-safe; raw content requires explicit opt-in.
             log_event('harnessy', 'diagnostics_download_requested', include_content=bool(include_content))
             _observe_run_queue_snapshot(self.machine, source='diagnostics_download', force=True)
+            from harnessy.diagnostics.guest_logs import refresh_guest_logs
+            try:
+                refreshed = await refresh_guest_logs()
+                log_event('harnessy', 'guest_log_refresh_completed',
+                          registered_guests=int(refreshed.get('registered', 0)),
+                          completed_guests=int(refreshed.get('completed', 0)),
+                          limited=bool(refreshed.get('limited', False)))
+            except Exception as exc:
+                from harnessy.diagnostics.technical import technical_error_evidence
+                log_event('harnessy', 'guest_log_refresh_failed', technical_error=technical_error_evidence(exc))
+            notice.message = 'Packaging diagnostics…'
             path = await asyncio.to_thread(refresh_diagnostics_bundle, include_content=bool(include_content))
             if path is None or not Path(path).is_file():
                 ui.notify('Could not create the diagnostics bundle.', type='negative')
@@ -1798,19 +1811,28 @@ class HarnessyPage:
             except RuntimeError as notify_exc:
                 if not _is_stale_ui_error(notify_exc):
                     raise
+        finally:
+            try:
+                notice.dismiss()
+            except RuntimeError:
+                pass
 
     def _open_diagnostics_download_dialog(self) -> None:
         with ui.dialog() as dialog, ui.card().classes('w-[620px] max-w-[94vw] gap-3'):
             ui.label('Download Diagnostics').classes('text-lg font-semibold')
             ui.label(
                 'Includes scrubbed technical logs and errors, model timing/token metrics, VM startup/reset '
-                'history, host software versions and resource state. Coverage reports show missing or '
+                'history, sanitized guest system/kernel logs, host software versions and resource state. Coverage reports show missing or '
                 'truncated sources.'
             ).classes('text-sm hy-muted')
             ui.label(
                 'Chat messages, model reasoning/answers, file contents, tool commands/results and '
-                'credentials are excluded. Guest console logs contribute boot/error signals only. '
-                'Collection does not start VMs or run guest commands.'
+                'credentials are excluded. Guest logs retain reviewed technical events only. '
+                'Fixed read-only checks refresh available running VMs; stopped VMs are not started.'
+            ).classes('text-sm hy-muted')
+            ui.label(
+                'External-device evidence comes from existing Harnessy activity only. '
+                'Diagnostics never connect to external devices or run commands on them.'
             ).classes('text-sm hy-muted')
             include_content = ui.checkbox(
                 'Include conversation/model/tool content', value=False,

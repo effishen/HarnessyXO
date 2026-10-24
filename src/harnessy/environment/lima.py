@@ -302,6 +302,35 @@ class LimaVMEnvironment(WorkspaceEnvironment):
         except Exception:
             pass
 
+        try:
+            from harnessy.diagnostics.guest_logs import register_guest_probe
+            register_guest_probe(self.workspace_root, environment_id=self.config.id,
+                runtime_root=self.environment_root, kind='linux', probe=self._guest_diagnostic_probe)
+        except Exception:
+            pass
+
+    async def _guest_diagnostic_probe(self, script: str, timeout: float) -> tuple[int, bytes, bytes]:
+        from harnessy.diagnostics.guest_logs import GuestProbeUnavailable
+        _validate_registry_path(self.environment_root, self.workspace_root)
+        if self._read_readiness().get('phase') in {'stopped', 'destroyed', 'deleted', 'creating'}:
+            raise GuestProbeUnavailable(state='stopped', code='guest_stopped')
+        # limactl shell only inspects an already-running guest. In particular,
+        # do not call _ensure_running or prepare a project execution view.
+        rc, out, err = await self._run('shell', '--workdir', '/', self.INSTANCE,
+            'sudo', '-n', '--', '/bin/sh', '-c', script, timeout=timeout, check=False,
+            diagnostic_probe=True)
+        return rc, out.encode('utf-8', errors='replace'), err.encode('utf-8', errors='replace')
+
+    def _guest_transport_failure(self, *, stderr: str = '', returncode: int | None = None,
+                                 timed_out: bool = False) -> None:
+        try:
+            from harnessy.diagnostics.guest_logs import record_guest_transport
+            record_guest_transport(self.workspace_root, environment_id=self.config.id,
+                runtime_root=self.environment_root, kind='linux', operation='ssh_command',
+                stderr=stderr.encode('utf-8', errors='replace'), returncode=returncode, timed_out=timed_out)
+        except Exception:
+            pass
+
     def _workspace_cache_key(self) -> str:
         return str(self.environment_root.expanduser().resolve())
 
@@ -2591,7 +2620,7 @@ exit $rc
 
     async def _run(
         self, *args: str, timeout: float | None = 120.0, check: bool = False,
-        input_text: str | None = None,
+        input_text: str | None = None, diagnostic_probe: bool = False,
     ) -> tuple[int, str, str]:
         from harnessy.diagnostics.technical import technical_error_evidence
 
@@ -2609,7 +2638,7 @@ exit $rc
         startup = {'last_boot_milestone': 'unknown', 'controller_failure_kind': 'unknown'}
         stdout_buffer = bytearray()
         stderr_buffer = bytearray()
-        buffer_limit = 512 * 1024
+        buffer_limit = 128 * 1024 + 1 if diagnostic_probe else 512 * 1024
         capture_files: dict[str, Any] = {}
         capture_sizes = {'stdout': 0, 'stderr': 0}
         final_capture_sizes: dict[str, int] | None = None
@@ -2790,8 +2819,8 @@ exit $rc
 
         try:
             payload = input_text.encode('utf-8') if input_text is not None else None
-            observer = self._controller_output_callback
-            if observer is None and not trusted_control_plane:
+            observer = None if diagnostic_probe else self._controller_output_callback
+            if observer is None and not trusted_control_plane and not diagnostic_probe:
                 communicate = process.communicate(payload)
                 stdout_b, stderr_b = await asyncio.wait_for(communicate, timeout=timeout) if timeout else await communicate
             else:
@@ -3010,6 +3039,7 @@ exit $rc
         self, *, ready: bool, phase: str, error: str = '', boot_id: str = '', guard_hash: str = '',
     ) -> None:
         _validate_registry_path(self.readiness_path, self.workspace_root)
+        previous = self._read_readiness()
         self.state_root.mkdir(parents=True, exist_ok=True)
         payload = {
             'ready': bool(ready),
@@ -3030,6 +3060,12 @@ exit $rc
             _RUNTIME_READY_BOOT[cache_key] = self._runtime_boot_id
         else:
             _RUNTIME_READY_BOOT.pop(cache_key, None)
+        if ready and phase == 'ready' and (not previous.get('ready') or previous.get('boot_id') != boot_id):
+            try:
+                from harnessy.diagnostics.guest_logs import request_guest_capture
+                request_guest_capture(self.workspace_root, self.config.id, 'vm_ready')
+            except Exception:
+                pass
 
     def _clear_readiness(self, phase: str = 'stopped') -> None:
         self._write_readiness(ready=False, phase=phase, error='', boot_id='')
@@ -3833,10 +3869,16 @@ print(json.dumps(facts))
             )
             self._authorize_model_project(output_policy)
             started = time.perf_counter()
-            rc, stdout, stderr = await self._run(
-                'shell', '--workdir', '/', self.INSTANCE, '/bin/bash', '-lc', self._guest_wrapper(view_command),
-                timeout=timeout, check=False,
-            )
+            try:
+                rc, stdout, stderr = await self._run(
+                    'shell', '--workdir', '/', self.INSTANCE, '/bin/bash', '-lc', self._guest_wrapper(view_command),
+                    timeout=timeout, check=False,
+                )
+            except asyncio.TimeoutError:
+                self._guest_transport_failure(timed_out=True)
+                raise
+            if rc == 255:
+                self._guest_transport_failure(stderr=stderr, returncode=rc)
             duration = max(0.0, time.perf_counter() - started)
             projection_error_code = workspace_projection_failure(rc, stderr)
             projection_probe_code = workspace_projection_probe_failure(stderr)

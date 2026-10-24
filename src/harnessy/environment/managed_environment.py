@@ -156,6 +156,12 @@ class ManagedEnvironment(WorkspaceEnvironment):
         self.vm_root = self.controller.home
         self.snapshots_root = self.controller.root / 'snapshots'
         self._process_tasks: set[asyncio.Task] = set()
+        try:
+            from harnessy.diagnostics.guest_logs import register_guest_probe
+            register_guest_probe(self.workspace_root, environment_id=self.config.id,
+                runtime_root=self.environment_root, kind='unsupported', probe=None)
+        except Exception:
+            pass
 
     def _lock(self) -> asyncio.Lock:
         key = str(self.environment_root), id(asyncio.get_running_loop())

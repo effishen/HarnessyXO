@@ -10,7 +10,7 @@ from typing import Any
 from nicegui import ui
 
 from harnessy.environment import EnvironmentConfig, EnvironmentManager, ENVIRONMENT_OPERATIONS, ENVIRONMENT_STATUS
-from harnessy.environment.activity import active_work
+from harnessy.environment.activity import active_work, reserve_environment_change
 from harnessy.environment.presets import IMAGES, PRESETS, TOOL_BUNDLES, canonical_arch, execution_mode, get_preset
 from harnessy.environment.resources import resource_values
 from harnessy.ui.project_access import ProjectAccessEditor
@@ -77,6 +77,66 @@ def tool_label(preset, tool_id: str) -> str:
         if tool is not None:
             return tool.label
     return TOOL_LABELS.get(tool_id, tool_id)
+
+
+def emulated_radio_lines(config, snapshot: Any = None, *, running: bool = False,
+                         known: bool = True, busy: bool = False) -> tuple[str, str]:
+    """Keep the saved selection separate from the last observed guest state."""
+    if config.provider != 'openwrt':
+        return ('Emulated radios are not managed for this VM image.', '')
+    from harnessy.environment.test_radios import public_radio_snapshot
+    observed = public_radio_snapshot(snapshot)
+    requested = config.emulation or {}
+    lines = []
+    for kind, label, noun in (('wifi', 'Wi-Fi', 'radio'), ('bluetooth', 'Bluetooth', 'controller')):
+        selected = bool(requested.get(kind))
+        prefix = f'{label}: setup {"on" if selected else "off"}'
+        item = observed[kind]
+        if not known:
+            detail = 'VM status unavailable'
+        elif not running:
+            detail = 'applies on next Start' if selected else 'VM stopped'
+        elif busy:
+            detail = 'VM operation in progress'
+        elif item['verified']:
+            count = item['radio_count']
+            detail = f'{count} emulated {noun}{"s" if count != 1 else ""} verified at last probe'
+        elif item['status'] in {'error', 'unavailable'}:
+            detail = 'not ready · ' + item['reason'].replace('_', ' ')
+        else:
+            detail = 'not yet verified' if selected else 'none verified'
+        lines.append(prefix + ' · ' + detail)
+    return tuple(lines)
+
+
+async def save_emulated_radio_selection(workspace_root, environment_id: str, *,
+                                        wifi: bool, bluetooth: bool, expected: dict | None = None):
+    """Save only a stopped VM's desired radios, preserving concurrent settings."""
+    from harnessy.environment.base import environment_config_lock
+    manager = EnvironmentManager(workspace_root, environment_id=environment_id)
+    current = manager.config
+    if current is None or current.provider != 'openwrt':
+        raise ValueError('Radio emulation controls are available for OpenWrt VMs only.')
+    release = reserve_environment_change(workspace_root, 'emulated radios', environment_id=environment_id)
+    try:
+        if ENVIRONMENT_OPERATIONS.state(workspace_root, environment_id=environment_id).busy:
+            raise RuntimeError('Wait for this VM operation to finish before changing emulated radios.')
+        provider = manager.provider()
+        if (await provider.status()).running:
+            raise RuntimeError('Stop this VM before changing emulated radios. The selection applies on its next Start.')
+        with environment_config_lock(workspace_root, environment_id):
+            latest = manager.get(environment_id)
+            if latest is None or latest.provider != 'openwrt':
+                raise ValueError('This OpenWrt VM no longer exists.')
+            wanted = {'wifi': bool(wifi), 'bluetooth': bool(bluetooth)}
+            if expected is not None and latest.emulation != expected and latest.emulation != wanted:
+                raise ValueError('The radio selection changed while this dialog was open. Reopen Emulated radios to review it.')
+            saved = manager.save(replace(latest, emulation=wanted))
+        provider.controller.forget_radios()
+        ENVIRONMENT_STATUS.invalidate(workspace_root, environment_id=environment_id)
+        return saved
+    finally:
+        release()
 
 
 def open_vm_creator(workbench, workspace, on_saved) -> None:
@@ -350,6 +410,62 @@ def render_vm_environments(workbench, tab, workspace) -> None:
         with local_panel:
             return ui.dialog()
 
+    radio_editors: dict[str, dict[str, Any]] = {}
+
+    def edit_radios(environment_id: str) -> None:
+        config = manager.get(environment_id)
+        if config is None or config.provider != 'openwrt':
+            ui.notify('Radio emulation controls are available for OpenWrt VMs only.', type='warning')
+            return
+        expected = dict(config.emulation or {})
+        with vm_dialog() as dialog, ui.card().classes('w-[620px] max-w-[94vw] gap-3').style('max-height:90vh;overflow-y:auto'):
+            ui.label('Emulated radios · ' + config.name).classes('text-lg font-semibold').style('overflow-wrap:anywhere')
+            ui.label('Software emulation only: no physical RF, USB dongle identity or nearby devices.').classes('text-xs hy-muted')
+            state = ui.label('').classes('text-sm').style('white-space:pre-wrap;overflow-wrap:anywhere')
+            wifi = ui.checkbox('Emulated Wi-Fi radios (mac80211_hwsim)', value=bool(expected.get('wifi'))).props('data-hy-vm-radio-wifi=true')
+            bluetooth = ui.checkbox('Emulated Bluetooth controllers', value=bool(expected.get('bluetooth'))).props('data-hy-vm-radio-bluetooth=true')
+            ui.label('Stop the VM to change this selection, then Start it to apply. Matching packages and controller setup are handled automatically.').classes('text-xs hy-muted')
+            ui.label('Turning Bluetooth setup off stops HarnessyXO’s managed controllers on the next Start. Turning Wi-Fi setup off skips future setup; already installed interfaces and your network configuration stay in the guest.').classes('text-xs hy-muted')
+            error = ui.label('').classes('text-sm text-negative').style('white-space:pre-wrap;overflow-wrap:anywhere').props('role=alert')
+            with ui.row().classes('w-full justify-end gap-2 flex-wrap'):
+                ui.button('Close', on_click=dialog.close).props('flat no-caps')
+
+                def retry_setup() -> None:
+                    try:
+                        if ENVIRONMENT_OPERATIONS.start(workspace.root, 'start', environment_id=environment_id):
+                            dialog.close(); sync_cards()
+                        else:
+                            error.set_text('Wait for this VM’s current operation to finish.')
+                    except Exception as exc:
+                        error.set_text(str(exc))
+
+                repair = ui.button('Set up / repair radios', icon='build', on_click=retry_setup).props('outline no-caps')
+                repair.tooltip('Check and repair the saved selection through Start / Retry Setup. VM storage is preserved.')
+
+                async def apply() -> None:
+                    if form['saving']:
+                        return
+                    form['saving'] = True
+                    sync_cards()
+                    try:
+                        await save_emulated_radio_selection(workspace.root, environment_id,
+                            wifi=bool(wifi.value), bluetooth=bool(bluetooth.value), expected=expected)
+                        dialog.close(); render_cards(); sync_cards()
+                        ui.notify('Radio selection saved for the next Start.', type='positive')
+                    except Exception as exc:
+                        if not error.is_deleted:
+                            error.set_text(str(exc))
+                    finally:
+                        form['saving'] = False
+                        sync_cards()
+
+                save = ui.button('Apply for next Start', icon='save', on_click=apply).props('unelevated no-caps')
+            form = dict(dialog=dialog, state=state, wifi=wifi, bluetooth=bluetooth, save=save, repair=repair, saving=False)
+            radio_editors[environment_id] = form
+            dialog.on_value_change(lambda event: radio_editors.pop(environment_id, None) if not event.value else None)
+        sync_cards()
+        dialog.open()
+
     def edit(config) -> None:
         with vm_dialog() as editor, ui.card().classes('w-[620px] max-w-[94vw] gap-3').style('max-height:92vh;overflow-y:auto'):
             ui.label('VM Settings').classes('text-lg font-semibold')
@@ -520,6 +636,18 @@ def render_vm_environments(workbench, tab, workspace) -> None:
                     ui.label(f'{config.cpu} vCPU · {config.memory_mb / 1024:g} GiB RAM · {config.disk_gb} GiB disk').classes('text-xs hy-muted')
                     ui.label(f'Tool preset: {TOOL_BUNDLES.get(preset.tools_id, preset.tools_id)}').classes('text-xs hy-muted')
                     ui.label(FILE_MODES.get(config.files_mode, config.files_mode)).classes('text-xs hy-muted')
+                    with ui.column().classes('w-full gap-1').props(f'data-hy-vm-radio-summary={config.id}'):
+                        if config.provider == 'openwrt':
+                            with ui.row().classes('w-full items-start no-wrap gap-2'):
+                                ui.icon('wifi', size='16px').classes('shrink-0')
+                                radio_wifi = ui.label('').classes('text-xs hy-muted').style('overflow-wrap:anywhere')
+                            with ui.row().classes('w-full items-start no-wrap gap-2'):
+                                ui.icon('bluetooth', size='16px').classes('shrink-0')
+                                radio_bluetooth = ui.label('').classes('text-xs hy-muted').style('overflow-wrap:anywhere')
+                            ui.label('Software emulation only · no physical RF or USB dongles').classes('text-xs hy-muted')
+                        else:
+                            radio_wifi = radio_bluetooth = None
+                            ui.label('Emulated radios are not managed for this VM image.').classes('text-xs hy-muted')
                     if config.project_access == 'all':
                         ui.label('Project access: All projects / chats, including future ones').classes('text-xs hy-muted')
                     else:
@@ -562,12 +690,14 @@ def render_vm_environments(workbench, tab, workspace) -> None:
                         if getattr(config, 'desktop', False):
                             graphical = ui.button('Web UI' if config.provider == 'openwrt' else 'Desktop', icon='desktop_windows',
                                       on_click=lambda _=None, eid=config.id: workbench.open_vm_tab(workspace, eid, 'desktop')).props('flat no-caps')
+                        if config.provider == 'openwrt':
+                            ui.button('Emulated radios', icon='wifi', on_click=lambda _=None, eid=config.id: edit_radios(eid)).props('outline no-caps')
                         manage = ui.button('Manage', icon='tune', on_click=lambda _=None, eid=config.id: toggle_manage(eid)).props('outline no-caps')
                         ui.button('Settings', icon='settings', on_click=lambda _=None, item=config: edit(item)).props('flat dense no-caps aria-label="VM settings"')
                         delete = ui.button(icon='delete_outline', on_click=lambda _=None, item=config: remove(item)).props('flat round dense color=negative aria-label="Remove VM environment"')
                     details = ui.column().classes('w-full gap-0 mt-2 pt-2').style('min-width:0;border-top:1px solid var(--hy-border)').props(f'data-hy-vm-details={config.id}')
                     details.set_visibility(False)
-                    card_states[config.id] = dict(config=config, card=vm_card, spinner=spinner, status=status, operation=operation, detail=detail, timing=timing, progress=progress, progress_panel=progress_panel, progress_icon=progress_icon, start=start_button, stop=stop_button, terminal=terminal, terminal_options=terminal_options, graphical=graphical, manage=manage, details=details, delete=delete, availability=availability, running=False)
+                    card_states[config.id] = dict(config=config, card=vm_card, spinner=spinner, status=status, operation=operation, detail=detail, timing=timing, progress=progress, progress_panel=progress_panel, progress_icon=progress_icon, start=start_button, stop=stop_button, terminal=terminal, terminal_options=terminal_options, graphical=graphical, manage=manage, details=details, delete=delete, availability=availability, radio_wifi=radio_wifi, radio_bluetooth=radio_bluetooth, running=False)
         tab_syncing['value'] = False
         sync_details()
 
@@ -617,6 +747,23 @@ def render_vm_environments(workbench, tab, workspace) -> None:
             counts[summary_state] = counts.get(summary_state, 0) + 1
             active = bool(active_work(workspace.root, environment_id=environment_id))
             known = bool(controls.get('known'))
+            if controls['radio_wifi'] is not None:
+                lines = emulated_radio_lines(controls['config'], controls.get('radio_snapshot'),
+                    running=bool(controls.get('running')), known=known, busy=busy)
+                controls['radio_wifi'].set_text(lines[0])
+                controls['radio_bluetooth'].set_text(lines[1])
+            form = radio_editors.get(environment_id)
+            if form is not None and not form['dialog'].is_deleted:
+                can_edit = known and not busy and not active and not controls.get('running') and not form['saving']
+                for key in ('wifi', 'bluetooth', 'save'):
+                    form[key].set_enabled(can_edit)
+                form['repair'].set_enabled(known and not busy and not active and bool(controls.get('running')) and not form['saving'])
+                form['state'].set_text('Saving radio selection…' if form['saving'] else
+                    'Checking VM status…' if not known else
+                    'Wait for this VM’s current operation to finish.' if busy else
+                    'Finish this VM’s commands and close its terminals first.' if active else
+                    'VM is running. Stop it before changing the selection; saved setup can be repaired now.' if controls.get('running') else
+                    'VM is stopped. Change the selection and apply it for the next Start.')
             for key in ('start', 'stop', 'delete'):
                 controls[key].set_enabled(known and not busy and not active)
             controls['start'].set_enabled(known and not busy and not active and not (controls.get('running') and controls.get('ready')))
@@ -651,7 +798,8 @@ def render_vm_environments(workbench, tab, workspace) -> None:
                     controls.update(status_attempted=True, known=not bool(poll_error), poll_error=poll_error,
                                     running=bool(status.get('running')), ready=bool(status.get('ready')),
                                     status_detail=str(status.get('error') or status.get('detail') or '') if not status.get('ready') else '',
-                                    state='Unavailable' if poll_error else str(status.get('state') or 'stopped'))
+                                    state='Unavailable' if poll_error else str(status.get('state') or 'stopped'),
+                                    radio_snapshot=info.get('hardware_emulation'))
             except Exception as exc:
                 controls.update(status_attempted=True, known=False, ready=False, state='Unavailable', poll_error=str(exc))
         sync_cards()

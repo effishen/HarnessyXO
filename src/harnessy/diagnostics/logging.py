@@ -470,6 +470,12 @@ _VM_COMMAND_ID_KEYS = frozenset({'command_id', 'parent_start_command_id', 'start
 
 def _safe_event_field(key: str, value: Any) -> Any:
     """Keep reviewed structured evidence intact, without widening raw limits."""
+    if key.lower() == 'external_device':
+        from .external_devices import validate_external_device_observation
+        return validate_external_device_observation(value)
+    if key.lower() == 'guest_transport':
+        from .guest_logs import validate_transport_evidence
+        return validate_transport_evidence(value)
     if key.lower() in _CONTEXT_TOKEN_ACCOUNTING_KEYS:
         return _privacy_safe_value(value, key=key)
     if _is_sensitive_log_key(key):
@@ -1583,6 +1589,12 @@ def _safe_error_summary(value: Any) -> Any:
 
 def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
     lowered = key.lower()
+    if lowered == 'external_device':
+        from .external_devices import validate_external_device_observation
+        return validate_external_device_observation(value)
+    if lowered == 'guest_transport':
+        from .guest_logs import validate_transport_evidence
+        return validate_transport_evidence(value)
     if lowered in _CONTEXT_TOKEN_ACCOUNTING_KEYS:
         validated = _context_tuning_payload('request_prepared', {lowered: value}) or {}
         return validated.get(lowered)
@@ -2332,6 +2344,18 @@ def _privacy_manifest(*, include_content: bool = False) -> str:
         'arbitrary guest lines, paths, names and message bodies are omitted. These tails can contain observations '
         'from earlier boots and do not establish an underlying cause by themselves. VM collection reads existing '
         'files only: it opens no database and runs no VM/controller commands.\n\n'
+        'GUEST_LOGS.json and guest-logs/ contain bounded, sanitized guest system/kernel and SSH '
+        'observations. The browser refreshes available running-VM connections with fixed read-only '
+        'checks before packaging; stopped VMs are not started. Failure captures are coalesced and '
+        'bounded. Only reviewed technical event codes, timestamps and numeric facts are retained; '
+        'arbitrary guest messages, commands, paths and credentials are omitted in both export modes. '
+        'Coverage distinguishes missing, unsupported and unreachable sources, and retained evidence '
+        'is not proof of current guest health. Command-line/offline packaging reads saved observations only.\n\n'
+        'EXTERNAL_DEVICES.json contains host-side observations of already requested external SSH '
+        'operations: opaque device identities, reviewed outcomes, permission decisions, timing, byte '
+        'counts and transport error codes. Diagnostics do not connect to external devices, run '
+        'commands on them or collect their logs. Commands, output text, addresses, names and '
+        'credentials are excluded from these observations in both export modes.\n\n'
         'FILE_VIEWS.json records bounded persisted VM file-view observations: requested and applied policy '
         'revisions, per-project states, fixed stages and failure codes, pending project IDs and transport '
         'capabilities. It excludes names, paths and file content. These receipts describe retained observations; '
@@ -2472,6 +2496,51 @@ def _collect_test_target_export(latest: Path, *, include_content: bool) -> tuple
                 'technical_error': technical_error_evidence(exc)}, {}
 
 
+def _collect_guest_export(latest: Path) -> tuple[dict[str, Any], dict[str, bytes]]:
+    """Guest output is always projected, including in a content-rich bundle."""
+    try:
+        from .guest_logs import (MAX_ENVIRONMENTS, MAX_EXPORT_BYTES,
+                                 collect_guest_log_diagnostics, validate_guest_log_report)
+        collected = collect_guest_log_diagnostics(latest)
+        report = validate_guest_log_report(collected['report'])
+        members = collected['members']
+        if not isinstance(report, dict) or not isinstance(members, dict) or len(members) > MAX_ENVIRONMENTS:
+            raise ValueError('Invalid guest log collection')
+        declared = {row['archive_member'] for row in report.get('environments', [])
+                    if isinstance(row, dict) and 'archive_member' in row}
+        if set(members) != declared:
+            raise ValueError('Guest log coverage does not match archive members')
+        total = 0
+        for name, payload in members.items():
+            if (not isinstance(name, str) or not re.fullmatch(
+                    r'guest-logs/[0-9a-f]{64}/(?:[0-9a-f]{32}|legacy)/guest-events\.technical\.jsonl', name)
+                    or not isinstance(payload, bytes)):
+                raise ValueError('Invalid guest log archive member')
+            total += len(payload)
+            if total > MAX_EXPORT_BYTES:
+                raise ValueError('Guest log export exceeds its bound')
+        json.dumps(report, ensure_ascii=False, allow_nan=False)
+        return report, members
+    except Exception as exc:
+        from .technical import technical_error_evidence
+        return {'schema_version': 1, 'status': 'unavailable', 'scope': 'sanitized_guest_observations',
+                'environments': [], 'technical_error': technical_error_evidence(exc)}, {}
+
+
+def _collect_external_device_export(latest: Path) -> dict[str, Any]:
+    try:
+        from .external_devices import (collect_external_device_diagnostics,
+                                       validate_external_device_report)
+        report = validate_external_device_report(collect_external_device_diagnostics(latest))
+        if not isinstance(report, dict) or len(json.dumps(report, allow_nan=False).encode('utf-8')) > 2 * 1024 * 1024:
+            raise ValueError('Invalid external device observation report')
+        return report
+    except Exception as exc:
+        from .technical import technical_error_evidence
+        return {'schema_version': 1, 'status': 'unavailable', 'scope': 'host_observations_only',
+                'devices_contacted_for_collection': False, 'technical_error': technical_error_evidence(exc)}
+
+
 def collect_existing_diagnostics(app_root: Path, *, include_content: bool = False) -> Path | None:
     """Build a fresh diagnostics ZIP from current logs.
 
@@ -2499,6 +2568,8 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
 
             vm_report, vm_members = _collect_vm_export(latest, include_content=include_content)
             target_report, target_members = _collect_test_target_export(latest, include_content=include_content)
+            guest_report, guest_members = _collect_guest_export(latest)
+            external_device_report = _collect_external_device_export(latest)
             try:
                 from .file_views import collect_file_view_diagnostics
                 file_view_report = collect_file_view_diagnostics(latest)
@@ -2546,6 +2617,16 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
             summary += file_view_summary_lines(file_view_report)
             summary += storage_summary_lines(storage_report)
             summary += resource_summary_lines(resource_report)
+            try:
+                from .guest_logs import summary_lines as guest_summary_lines
+                summary += guest_summary_lines(guest_report)
+            except Exception:
+                summary += '\nGuest system logs: summary unavailable; see GUEST_LOGS.json.\n'
+            try:
+                from .external_devices import summary_lines as external_device_summary_lines
+                summary += external_device_summary_lines(external_device_report)
+            except Exception:
+                summary += '\nExternal device observations: summary unavailable; see EXTERNAL_DEVICES.json.\n'
             zf.writestr('SUMMARY.txt', summary)
             zf.writestr('FILE_VIEWS.json', json.dumps(file_view_report, ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('VM_STORAGE.json', json.dumps(storage_report, ensure_ascii=False, indent=2, allow_nan=False))
@@ -2577,12 +2658,17 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
             zf.writestr('COLLECTOR_ERRORS.json', json.dumps({
                 'schema_version': 1, 'collectors': {name: value for name, value in
                     (('summary', incidents), ('workspace_vm', vm_report), ('test_targets', target_report), ('host', host_report),
-                     ('file_views', file_view_report), ('vm_storage', storage_report), ('vm_resources', resource_report))
+                     ('file_views', file_view_report), ('vm_storage', storage_report), ('vm_resources', resource_report),
+                     ('guest_logs', guest_report), ('external_devices', external_device_report))
                     if value.get('technical_error')},
             }, ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('VM_LOGS.json', json.dumps(vm_report, ensure_ascii=False, indent=2, allow_nan=False))
             for name, payload in vm_members.items():
                 zf.writestr(name, payload)
+            zf.writestr('GUEST_LOGS.json', json.dumps(guest_report, ensure_ascii=False, indent=2, allow_nan=False))
+            for name, payload in guest_members.items():
+                zf.writestr(name, payload)
+            zf.writestr('EXTERNAL_DEVICES.json', json.dumps(external_device_report, ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('TARGET_LOGS.json', json.dumps(target_report, ensure_ascii=False, indent=2, allow_nan=False))
             for name, payload in target_members.items():
                 zf.writestr(name, payload)

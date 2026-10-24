@@ -250,6 +250,31 @@ class OpenWrtEnvironment(WorkspaceEnvironment):
         self._terminal_projections = {}
         from harnessy.diagnostics.vm_logs import register_workspace_runtime
         register_workspace_runtime(self.workspace_root, environment_id=self.config.id, runtime_root=self.environment_root)
+        try:
+            from harnessy.diagnostics.guest_logs import register_guest_probe
+            register_guest_probe(self.workspace_root, environment_id=self.config.id,
+                runtime_root=self.environment_root, kind='openwrt', probe=self._guest_diagnostic_probe)
+        except Exception:
+            pass  # Optional diagnostics must never prevent opening the VM.
+
+    async def _guest_diagnostic_probe(self, script: str, timeout: float) -> tuple[int, bytes, bytes]:
+        from harnessy.diagnostics.guest_logs import GuestProbeUnavailable
+        self._validate_private_runtime()
+        if not self.controller.instance_dir.is_dir() or self._state().get('running') is False:
+            raise GuestProbeUnavailable(state='stopped', code='guest_stopped')
+        # A fixed read-only administrative probe never starts a VM, mounts a
+        # project, runs a login profile or changes the active project policy.
+        return await self._raw(script, timeout=timeout, output_limit=128 * 1024, login_shell=False)
+
+    def _guest_transport_failure(self, *, stderr: bytes = b'', returncode: int | None = None,
+                                 timed_out: bool = False) -> None:
+        try:
+            from harnessy.diagnostics.guest_logs import record_guest_transport
+            record_guest_transport(self.workspace_root, environment_id=self.config.id,
+                runtime_root=self.environment_root, kind='openwrt', operation='ssh_command',
+                stderr=stderr, returncode=returncode, timed_out=timed_out)
+        except Exception:
+            pass  # Recording evidence cannot change a command's outcome.
 
     @property
     def _live_mounts(self):
@@ -271,12 +296,20 @@ class OpenWrtEnvironment(WorkspaceEnvironment):
             # Metadata probes must not execute a guest login profile. Keep the
             # existing model, lifecycle, and interactive transports unchanged.
             argv[-1] = '/bin/ash -c ' + shlex.quote(command)
-        process = await asyncio.create_subprocess_exec(*argv, env=env, cwd=self.environment_root,
-            stdin=asyncio.subprocess.PIPE if data is not None else asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            process = await asyncio.create_subprocess_exec(*argv, env=env, cwd=self.environment_root,
+                stdin=asyncio.subprocess.PIPE if data is not None else asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        except OSError as exc:
+            self._guest_transport_failure(stderr=str(exc).encode('utf-8', errors='replace'))
+            raise
+        diagnostic_stderr = bytearray()
         async def read(stream, limit, name):
             chunks, count = [], 0
             while chunk := await stream.read(65536):
+                if name == 'stderr':
+                    diagnostic_stderr.extend(chunk)
+                    del diagnostic_stderr[:-8192]
                 if failure_capture is not None:
                     # Preserve a bounded tail even when wait_for cancels the
                     # transfer. Only fixed radio setup callers export it.
@@ -301,7 +334,12 @@ class OpenWrtEnvironment(WorkspaceEnvironment):
                  asyncio.create_task(read(process.stderr, 4 * 1024 * 1024, 'stderr')), asyncio.create_task(process.wait())]
         try:
             _, out, err, code = await asyncio.wait_for(asyncio.gather(*tasks), timeout)
+            if code == 255:
+                self._guest_transport_failure(stderr=bytes(diagnostic_stderr), returncode=code)
             return code, out, err
+        except asyncio.TimeoutError:
+            self._guest_transport_failure(stderr=bytes(diagnostic_stderr), timed_out=True)
+            raise
         finally:
             if process.returncode is None:
                 process.kill()
@@ -343,6 +381,12 @@ class OpenWrtEnvironment(WorkspaceEnvironment):
             'boot_id': boot_id if running else '',
         })
         self._ready = ready
+        if ready and event == 'ready' and (not previous.get('ready') or previous.get('boot_id') != boot_id):
+            try:
+                from harnessy.diagnostics.guest_logs import request_guest_capture
+                request_guest_capture(self.workspace_root, self.config.id, 'vm_ready')
+            except Exception:
+                pass
 
     async def status(self) -> EnvironmentStatus:
         try:

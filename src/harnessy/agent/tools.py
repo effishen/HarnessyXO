@@ -2422,6 +2422,23 @@ class WorkspaceToolbox:
             'mapping_probe_recovered': bool(mapping.get('recovered_from_transient_probe')),
         }
 
+    def _mapping_guest_evidence(self, stderr: str = '', *, returncode: int | None = None,
+                                timed_out: bool = False) -> dict[str, Any]:
+        """Keep reviewed SSH failure facts without exposing guest output."""
+        try:
+            from harnessy.diagnostics.guest_logs import record_guest_transport, transport_evidence
+            evidence = transport_evidence(stderr, returncode=returncode, timed_out=timed_out)
+        except Exception:
+            return {}
+        try:
+            record_guest_transport(self.workspace.root, environment_id=self.environment_id,
+                runtime_root=self.environment.environment_root,
+                kind='openwrt' if self.environment.config.provider == 'openwrt' else 'linux',
+                operation='mapping_probe', stderr=stderr, returncode=returncode, timed_out=timed_out)
+        except Exception:
+            pass
+        return evidence
+
     async def _verify_workspace_mapping(self, *, force: bool = False) -> dict[str, Any]:
         """Prove that the selected host root and isolated /workspace are identical.
 
@@ -2551,11 +2568,14 @@ class WorkspaceToolbox:
             self._mapping_cache_key = None
             self._mapping_cache_verified_at = 0.0
             code, message = probe_error
+            guest_transport = self._mapping_guest_evidence(message,
+                timed_out=code == 'WORKSPACE_MAPPING_PROBE_TIMEOUT')
             runtime = self._runtime_identity()
             log_event(
                 'tools', 'workspace_mapping_probe_failed', workspace=str(self.workspace.root), environment_id=self.environment_id,
                 error_code=code, vm_generation=runtime.get('vm_generation'),
                 vm_boot_id=runtime.get('vm_boot_id'),
+                guest_transport=guest_transport,
             )
             return self._halt_mapping({
                 'ok': False,
@@ -2566,6 +2586,7 @@ class WorkspaceToolbox:
                 'error': message,
                 'probe_attempts': probe_attempts,
                 'transient_probe_failures': transient_probe_failures,
+                'guest_transport': guest_transport,
                 'recovered_from_transient_probe': False,
                 'workspace_state': self._workspace_state(
                     view='selected-root+isolated-workspace', mapping_verified=False,
@@ -2609,6 +2630,8 @@ class WorkspaceToolbox:
         projection_error = workspace_projection_failure(returncode, str(getattr(result, 'stderr', '') or ''))
         projection_probe = workspace_projection_probe_failure(str(getattr(result, 'stderr', '') or ''))
         code = ('WORKSPACE_PROJECTION_UNAVAILABLE' if projection_error else 'WORKSPACE_MAPPING_PROBE_FAILED') if returncode else 'WORKSPACE_MAPPING_MISMATCH'
+        guest_transport = self._mapping_guest_evidence(str(getattr(result, 'stderr', '') or ''),
+            returncode=returncode) if returncode else {}
         log_event(
             'tools', 'workspace_mapping_probe_failed' if returncode else 'workspace_mapping_mismatch', workspace=str(self.workspace.root), environment_id=self.environment_id,
             error_code=code, projection_error_code=projection_error,
@@ -2617,6 +2640,7 @@ class WorkspaceToolbox:
             probe_attempts=probe_attempts,
             transient_probe_failures=transient_probe_failures,
             vm_generation=runtime.get('vm_generation'), vm_boot_id=runtime.get('vm_boot_id'),
+            guest_transport=guest_transport,
         )
         return self._halt_mapping({
             'ok': False,
@@ -2637,6 +2661,7 @@ class WorkspaceToolbox:
             'probe_returncode': getattr(result, 'returncode', None),
             'probe_attempts': probe_attempts,
             'transient_probe_failures': transient_probe_failures,
+            'guest_transport': guest_transport,
             'recovered_from_transient_probe': False,
             'workspace_state': self._workspace_state(
                 view='selected-root+isolated-workspace', mapping_verified=False,

@@ -1,6 +1,14 @@
-# HarnessyXO v0.7.16 Features
+# HarnessyXO v0.7.17 Features
 
 - OpenWrt VM commands and probes reuse an authenticated SSH connection with separate sessions for each task. Long-running tasks retain their existing runtime allowance; the connection closes after all sessions finish and 60 idle seconds pass. SSHFS file streams use dedicated connections, and each VM launch or identity change gets its own private control socket.
+
+## VM and external-device diagnostics
+
+- **Download Diagnostics** includes **GUEST_LOGS.json** and sanitized guest-log records alongside VM boot/controller evidence. Available OpenWrt and Linux connections receive fixed read-only system, kernel and SSH checks; stopped VMs are not started. Windows guest-log capture is reported as unsupported. Offline packaging uses saved observations.
+- Keep collection bounded and rate-limited. Failure captures retain reviewed SSH/SSHFS error codes and the last successful guest observation, with timestamps and an observed boot ID. Unknown messages, commands, paths, addresses and credentials are omitted; saved records are validated again when exported, including in content-rich diagnostics.
+- **EXTERNAL_DEVICES.json** uses host-side observations of existing external SSH activity only: operation outcomes, transport errors, timing and byte counts. Diagnostics never connect to those devices, send additional commands or retrieve their logs.
+- Open an OpenWrt VM's **Emulated radios** control from its main card. The card separates saved Wi-Fi/Bluetooth selections from the last verified software-radio counts. Stop the VM to change the selections, then Start to apply them. Emulated radios have no physical RF access or USB dongle identity.
+- Turning Wi-Fi setup off skips automatic setup and preserves installed interfaces. Bluetooth setup off stops the managed controllers when applied. The status lines keep actual observations separate from those setup selections.
 
 ## Context budgeting and retention
 

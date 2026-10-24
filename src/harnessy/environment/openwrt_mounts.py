@@ -188,6 +188,26 @@ class OpenWrtLiveMounts:
             from harnessy.diagnostics import log_event
             log_event('runtime', 'file_view_transport_failed', environment_id=self.owner.config.id,
                       project_id=view.project_id, error_code='FILE_VIEW_TRANSPORT_FAILED')
+            async def preserve_transport_failure():
+                try:
+                    # stdout EOF can precede the final SSH stderr bytes. Wait
+                    # briefly for the existing drain, without blocking file-view
+                    # invalidation or starting another guest connection here.
+                    if not item.draining.done():
+                        await asyncio.wait((item.draining,), timeout=.25)
+                    error = None if task.cancelled() else task.exception()
+                    tail = bytes(item.errors)
+                    if error is not None:
+                        tail = (tail + b'\n' + str(error).encode('utf-8', errors='replace'))[-8192:]
+                    from harnessy.diagnostics.guest_logs import record_guest_transport
+                    record_guest_transport(self.owner.workspace_root, environment_id=self.owner.config.id,
+                        runtime_root=self.owner.environment_root, kind='openwrt', operation='sshfs',
+                        stderr=tail, returncode=item.process.returncode)
+                except Exception:
+                    pass
+            recording = asyncio.create_task(preserve_transport_failure())
+            self.owner._tasks.add(recording)
+            recording.add_done_callback(self.owner._tasks.discard)
             FILE_VIEWS.request(self.owner.workspace_root, reason='file_view_transport_failed',
                                environment_id=self.owner.config.id)
         serving.add_done_callback(channel_finished)

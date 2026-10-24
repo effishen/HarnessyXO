@@ -13,6 +13,7 @@ import shutil
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Awaitable, Callable
@@ -119,6 +120,11 @@ class TargetCommandResult:
     stdout: str
     stderr: str
     duration_seconds: float
+    stdout_bytes: int | None = None
+    stderr_bytes: int | None = None
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
+    host_spawn_seconds: float | None = None
 
 
 class ExternalTargetBroker:
@@ -127,6 +133,47 @@ class ExternalTargetBroker:
         self.chat_id = str(chat_id or '')
         self.ssh_binary = shutil.which('ssh') or 'ssh'
         self.known_hosts = workspace.meta / 'external_targets_known_hosts'
+
+    def _observe_device(self, target: ExternalTarget, *, operation: str, phase: str,
+                        outcome: str, request_id: str = '', **facts: Any) -> None:
+        # Managed VMs have their own guest diagnostics. This observer never
+        # resolves a target or performs any additional device operation.
+        try:
+            if target.managed_vm:
+                return
+            from harnessy.diagnostics.external_devices import record_external_device_observation
+            record_external_device_observation(self.workspace.id, target.id, chat_id=self.chat_id,
+                operation=operation, phase=phase, outcome=outcome, request_id=request_id, **facts)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _observation_operation(policy_guard: tuple[str, dict[str, Any]] | None) -> str:
+        return {'target_status': 'status', 'target_exec': 'exec', 'target_list_files': 'list_files',
+                'target_copy_to': 'copy_to', 'target_copy_from': 'copy_from'}.get(
+                    policy_guard[0] if policy_guard else '', 'ssh_command')
+
+    def _observe_exception(self, target: ExternalTarget, *, operation: str, request_id: str,
+                           started: float, error: BaseException) -> None:
+        if isinstance(error, asyncio.CancelledError):
+            outcome, codes = 'cancelled', ['operation_cancelled']
+        elif isinstance(error, asyncio.TimeoutError):
+            outcome, codes = 'timeout', ['operation_timeout']
+        elif isinstance(error, ExternalTargetProjectAccessError):
+            outcome, codes = 'access_blocked', ['project_access_denied']
+        elif isinstance(error, FileNotFoundError) or isinstance(error.__cause__, FileNotFoundError):
+            outcome, codes = 'client_missing', ['client_missing']
+        elif isinstance(error, OSError):
+            outcome, codes = 'spawn_failed', ['local_failure']
+            if error.errno in {12, 23, 24}:
+                codes.append('local_resource_limit')
+            elif error.errno in {1, 13}:
+                codes.append('permission_denied')
+        else:
+            outcome, codes = 'local_failure', ['local_failure']
+        self._observe_device(target, operation=operation, phase='finished', outcome=outcome,
+            request_id=request_id, duration_seconds=max(0.0, time.perf_counter() - started),
+            error_codes=codes, output_partial=True)
 
     def resolve(self, target_id_or_name: str, *, require_enabled: bool = True,
                 model_permissions: bool = False) -> ExternalTarget:
@@ -149,18 +196,32 @@ class ExternalTargetBroker:
 
     def _require_target(self, target: ExternalTarget, tool_name: str, arguments: dict[str, Any],
                         *, unchanged: bool = False) -> ExternalTarget:
-        current = self.resolve(target.id, model_permissions=True)
+        operation = self._observation_operation((tool_name, arguments))
+        try:
+            current = self.resolve(target.id, model_permissions=True)
+        except ExternalTargetError as exc:
+            access = isinstance(exc, ExternalTargetProjectAccessError)
+            self._observe_device(target, operation=operation, phase='blocked',
+                outcome='access_blocked' if access else 'target_unavailable',
+                error_codes=['project_access_denied' if access else 'target_unavailable'])
+            raise
         if unchanged and any(getattr(current, field) != getattr(target, field) for field in
                 ('host', 'port', 'username', 'identity_file', 'auth_method', 'remote_root', 'managed_vm')):
+            self._observe_device(current, operation=operation, phase='blocked', outcome='policy_changed',
+                error_codes=['connection_settings_changed'])
             raise ExternalTargetError('Target connection settings changed. Resolve the target again before retrying.')
         permissions = target_tool_permissions(current, tool_name, arguments)
         previous = target_tool_permissions(target, tool_name, arguments)
         if any(permission == 'ask' and previous.get(action) == 'on'
                for action, permission in permissions.items()):
+            self._observe_device(current, operation=operation, phase='blocked', outcome='policy_changed',
+                error_codes=['approval_required'])
             raise ExternalTargetError('Target permissions changed to Ask. Retry the action to request approval.')
         blocked = [TARGET_ACTION_LABELS.get(action, 'Unsupported target action')
                    for action, permission in permissions.items() if permission == 'off']
         if blocked:
+            self._observe_device(current, operation=operation, phase='blocked', outcome='permission_blocked',
+                error_codes=['action_disabled'])
             raise ExternalTargetError('Target action is Off: ' + ', '.join(blocked) + '.')
         return current
 
@@ -373,6 +434,31 @@ class ExternalTargetBroker:
         self, target: ExternalTarget, remote_command: str, *, timeout: float = 120.0,
         input_bytes: bytes | None = None, max_output_chars: int = 80_000,
         policy_guard: tuple[str, dict[str, Any]] | None = None,
+        observation_operation: str = '',
+    ) -> TargetCommandResult:
+        operation = observation_operation or self._observation_operation(policy_guard)
+        request_id, started = uuid.uuid4().hex, time.perf_counter()
+        self._observe_device(target, operation=operation, phase='requested', outcome='requested',
+                             request_id=request_id, stdin_bytes=len(input_bytes) if input_bytes is not None else 0)
+        try:
+            result = await self._run_ssh_impl(target, remote_command, timeout=timeout,
+                input_bytes=input_bytes, max_output_chars=max_output_chars, policy_guard=policy_guard)
+        except BaseException as exc:
+            self._observe_exception(target, operation=operation, request_id=request_id, started=started, error=exc)
+            raise
+        self._observe_device(target, operation=operation, phase='finished',
+            outcome='success' if result.ok else 'transport_failure' if result.returncode == 255 else 'remote_failure',
+            request_id=request_id, duration_seconds=result.duration_seconds, host_spawn_seconds=getattr(result, 'host_spawn_seconds', None),
+            returncode=result.returncode, stdout_bytes=getattr(result, 'stdout_bytes', None), stderr_bytes=getattr(result, 'stderr_bytes', None),
+            stdout_truncated=getattr(result, 'stdout_truncated', False), stderr_truncated=getattr(result, 'stderr_truncated', False),
+            stderr=result.stderr, error_codes=[] if result.ok else [
+                'ssh_transport_failure' if result.returncode == 255 else 'remote_exit_nonzero'])
+        return result
+
+    async def _run_ssh_impl(
+        self, target: ExternalTarget, remote_command: str, *, timeout: float = 120.0,
+        input_bytes: bytes | None = None, max_output_chars: int = 80_000,
+        policy_guard: tuple[str, dict[str, Any]] | None = None,
     ) -> TargetCommandResult:
         started = time.perf_counter()
         try:
@@ -382,6 +468,7 @@ class ExternalTargetBroker:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+            host_spawn_seconds = max(0.0, time.perf_counter() - started)
             try:
                 if policy_guard is not None:
                     self._require_target(target, *policy_guard, unchanged=True)
@@ -398,11 +485,15 @@ class ExternalTargetBroker:
         duration = max(0.0, time.perf_counter() - started)
         stdout = stdout_b.decode('utf-8', errors='replace')
         stderr = stderr_b.decode('utf-8', errors='replace')
-        if len(stdout) > max_output_chars:
+        stdout_truncated, stderr_truncated = len(stdout) > max_output_chars, len(stderr) > max_output_chars
+        if stdout_truncated:
             stdout = stdout[:max_output_chars] + '\n...[stdout truncated by HarnessyXO]'
-        if len(stderr) > max_output_chars:
+        if stderr_truncated:
             stderr = stderr[:max_output_chars] + '\n...[stderr truncated by HarnessyXO]'
-        return TargetCommandResult(proc.returncode == 0, proc.returncode, stdout, stderr, duration)
+        return TargetCommandResult(proc.returncode == 0, proc.returncode, stdout, stderr, duration,
+            stdout_bytes=len(stdout_b), stderr_bytes=len(stderr_b),
+            stdout_truncated=stdout_truncated, stderr_truncated=stderr_truncated,
+            host_spawn_seconds=host_spawn_seconds)
 
     async def _start_ssh(
         self, target: ExternalTarget, command: str, *, policy_guard: tuple[str, dict[str, Any]] | None = None, **kwargs: Any,
@@ -539,7 +630,8 @@ class ExternalTargetBroker:
                 f"if (!(Test-Path -LiteralPath {root} -PathType Container)) {{ throw 'Test root does not exist' }}; "
                 "Write-Output 'HX_OK'; Write-Output ('USER=' + $env:USERNAME); Write-Output ('HOST=' + $env:COMPUTERNAME)"
             )
-        result = await self._run_ssh(target, command, timeout=timeout, policy_guard=guard)
+        result = await self._run_ssh(target, command, timeout=timeout, policy_guard=guard,
+                                     observation_operation='connection_test')
         if audit:
             self.workspace.record_external_target_event(
                 target.id, chat_id=self.chat_id, action='connection_test',
@@ -702,6 +794,24 @@ class ExternalTargetBroker:
         }
 
     async def copy_from(self, target: ExternalTarget, *, local_root: Path, remote_path: str, local_path: str, timeout: float = 300.0) -> dict[str, Any]:
+        request_id, started = uuid.uuid4().hex, time.perf_counter()
+        self._observe_device(target, operation='copy_from', phase='requested', outcome='requested', request_id=request_id)
+        try:
+            result = await self._copy_from_impl(target, local_root=local_root, remote_path=remote_path,
+                                                local_path=local_path, timeout=timeout)
+        except BaseException as exc:
+            self._observe_exception(target, operation='copy_from', request_id=request_id, started=started, error=exc)
+            raise
+        counts = result.pop('_diagnostic_byte_counts', {})
+        self._observe_device(target, operation='copy_from', phase='finished',
+            outcome='success' if result['ok'] else 'transport_failure' if result['returncode'] == 255 else 'remote_failure',
+            request_id=request_id, duration_seconds=result['duration_seconds'], returncode=result['returncode'],
+            stderr=result['stderr'], stdout_bytes=counts.get('stdout_bytes'), stderr_bytes=counts.get('stderr_bytes'),
+            error_codes=[] if result['ok'] else [
+                'ssh_transport_failure' if result['returncode'] == 255 else 'remote_exit_nonzero'])
+        return result
+
+    async def _copy_from_impl(self, target: ExternalTarget, *, local_root: Path, remote_path: str, local_path: str, timeout: float = 300.0) -> dict[str, Any]:
         guard = ('target_copy_from', {'remote_path': remote_path})
         target = self._require_target(target, *guard, unchanged=True)
         rel, source = self._remote_path(target, remote_path, allow_dot=False)
@@ -778,4 +888,5 @@ class ExternalTargetBroker:
             'ok': ok, 'target': self.public_target(target), 'remote_path': rel,
             'local_path': str(local_path), 'bytes': received if ok else 0,
             'stderr': stderr, 'returncode': returncode, 'duration_seconds': duration,
+            '_diagnostic_byte_counts': {'stdout_bytes': received, 'stderr_bytes': len(stderr_b)},
         }

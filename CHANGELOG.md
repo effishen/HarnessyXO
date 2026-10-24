@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.17
+
+- Add sanitized guest system, kernel and SSH observations to **Download Diagnostics**, alongside the existing VM boot and controller logs. OpenWrt and Linux VM connections use fixed, read-only checks with bounded output, concurrency and collection time. Retain failed attempts and the last successful observation, including the observed guest boot ID. Stopped VMs stay stopped; Windows guest-log capture is explicitly reported as unsupported.
+- Preserve reviewed SSH and SSHFS failure codes, exit status and timing evidence when commands or workspace verification fail. Captures are coalesced and rate-limited, and never replay a model command. Guest messages, file paths, addresses and credentials are omitted from the new guest-log records in both diagnostics modes.
+- Add **EXTERNAL_DEVICES.json** with host-side observations from already requested external SSH operations. Diagnostics do not connect to external devices, send them extra commands or collect their logs.
+- Restore **Emulated radios** in each OpenWrt VM's main card. Show Wi-Fi/Bluetooth setup selections separately from the last verified emulated-radio counts. Stop the VM to change its selections, then Start to apply them; running VMs can use the existing setup/repair action.
+- Turning Wi-Fi setup off skips future automatic setup and preserves installed interfaces; the card continues to show any verified radios. Bluetooth setup off stops managed controllers when applied.
+
 ## v0.7.16
 
 - Reuse authenticated SSH connections for OpenWrt VM commands and health/workspace probes instead of reconnecting for every call. Keep separate command sessions and dedicated SSHFS file streams. Long-running tasks keep their sessions; the shared connection expires only after all sessions finish and it stays idle for 60 seconds. VM restarts and identity changes select a new private control socket. Existing VMs need no rebuild.
