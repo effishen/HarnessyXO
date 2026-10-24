@@ -98,8 +98,8 @@ class _Controller(OpenWrtTargetManager):
             argv[index] = 'user,id=wan,restrict=on'
         return argv
 
-    def command(self, command):
-        argv, env = super().command(command)
+    def command(self, command, *, reuse_connection=True):
+        argv, env = super().command(command, reuse_connection=reuse_connection)
         # OpenWrt's login profile prints a banner even for noninteractive SSH.
         # Binary project/artifact transfers must receive only their payload.
         argv[-1] = '/bin/ash -c ' + shlex.quote(command)

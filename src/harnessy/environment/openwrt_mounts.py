@@ -162,7 +162,8 @@ class OpenWrtLiveMounts:
         if not row['writable']:
             options.append('ro')
         command = 'exec sshfs :/ ' + shlex.quote(path) + ' -f -o ' + shlex.quote(','.join(options))
-        argv, env = self.owner.controller.command(command)
+        # The persistent file stream must not share a command control socket.
+        argv, env = self.owner.controller.command(command, reuse_connection=False)
         process = await asyncio.create_subprocess_exec(*argv, env=env, cwd=self.owner.environment_root,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         revoked = asyncio.Event()

@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.7.16
+
+- Reuse authenticated SSH connections for OpenWrt VM commands and health/workspace probes instead of reconnecting for every call. Keep separate command sessions and dedicated SSHFS file streams. Long-running tasks keep their sessions; the shared connection expires only after all sessions finish and it stays idle for 60 seconds. VM restarts and identity changes select a new private control socket. Existing VMs need no rebuild.
+- Keep workspace mapping verification and tool permissions in place. This reduces SSH connection churn; it does not establish the cause of earlier VM outages. Sanitized guest-log collection will follow separately.
+
 ## v0.7.15
 
 - Collapse the token counts and counting details on **Context trimmed** cards under **View context details**. The title, timestamp and short summary stay visible, and opening or closing the details works like the other info cards. Keep the open state when the transcript redraws and retain the existing compact Events view.

@@ -1,4 +1,6 @@
-# HarnessyXO v0.7.15 Features
+# HarnessyXO v0.7.16 Features
+
+- OpenWrt VM commands and probes reuse an authenticated SSH connection with separate sessions for each task. Long-running tasks retain their existing runtime allowance; the connection closes after all sessions finish and 60 idle seconds pass. SSHFS file streams use dedicated connections, and each VM launch or identity change gets its own private control socket.
 
 ## Context budgeting and retention
 

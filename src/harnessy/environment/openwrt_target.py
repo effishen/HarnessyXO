@@ -522,14 +522,31 @@ class OpenWrtTargetManager(TestTargetManager):
             await asyncio.sleep(0.5)
         raise RuntimeError('Could not confirm OpenWrt has stopped; its data was preserved.')
 
-    def command(self, command):
+    def command(self, command, *, reuse_connection=True):
         ports = json.loads((self.instance_dir / 'ports.json').read_text())
+        if reuse_connection:
+            # Reuse authentication for command/probe channels. A new VM launch
+            # or replaced identity gets a different socket in the existing
+            # private, short runtime directory (also safe on macOS).
+            key = (self.instance_dir / 'id_ed25519').stat()
+            identity = hashlib.sha256(json.dumps([
+                int(ports['ssh']), (self.instance_dir / 'ports.json').stat().st_mtime_ns,
+                key.st_dev, key.st_ino, key.st_size, key.st_mtime_ns,
+            ]).encode()).hexdigest()[:16]
+            control = self.runtime_dir() / ('ssh-' + identity + '.sock')
+            connection_options = [
+                '-o', 'ControlMaster=auto', '-o', 'ControlPersist=60',
+                '-o', 'ControlPath=' + str(control),
+                '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=3',
+            ]
+        else:
+            connection_options = ['-o', 'ControlMaster=no', '-o', 'ControlPath=none']
         argv = [discover_binary('ssh') or 'ssh', '-F', os.devnull, '-T', '-p', str(int(ports['ssh'])),
             '-i', str(self.instance_dir / 'id_ed25519'), '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes',
             '-o', 'ConnectTimeout=5', '-o', 'ForwardAgent=no', '-o', 'StrictHostKeyChecking=accept-new',
             '-o', 'HostKeyAlias=harnessy-test-' + self.target.id,
             '-o', 'UserKnownHostsFile=' + str(self.instance_dir / 'known_hosts'),
-            '-o', 'GlobalKnownHostsFile=' + os.devnull, 'root@127.0.0.1',
+            '-o', 'GlobalKnownHostsFile=' + os.devnull, *connection_options, 'root@127.0.0.1',
             '/bin/ash -lc ' + shlex.quote(command)]
         return argv, self._env()
 
