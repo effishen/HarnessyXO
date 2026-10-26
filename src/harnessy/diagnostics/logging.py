@@ -2361,6 +2361,12 @@ def _privacy_manifest(*, include_content: bool = False) -> str:
         'arbitrary guest messages, commands, paths and credentials are omitted in both export modes. '
         'Coverage distinguishes missing, unsupported and unreachable sources, and retained evidence '
         'is not proof of current guest health. Command-line/offline packaging reads saved observations only.\n\n'
+        'VM_STALLS.json and vm-stalls/ retain failure-time host observations independently of guest SSH: '
+        'owned QEMU monitor status, numeric process/progress counters, host resource pressure and fixed '
+        'serial signals. Capture is bounded, coalesced and read-only; it does not start, stop or reset a VM. '
+        'Export reads saved receipts and validates them again in both content modes. Process command lines, '
+        'addresses, raw monitor replies and serial text are excluded. Missing or unsupported observations '
+        'remain explicit; these snapshots are evidence, not an automatic cause diagnosis.\n\n'
         'EXTERNAL_DEVICES.json contains host-side observations of already requested external SSH '
         'operations: opaque device identities, reviewed outcomes, permission decisions, timing, byte '
         'counts and transport error codes. Diagnostics do not connect to external devices, run '
@@ -2551,6 +2557,37 @@ def _collect_external_device_export(latest: Path) -> dict[str, Any]:
                 'devices_contacted_for_collection': False, 'technical_error': technical_error_evidence(exc)}
 
 
+def _collect_vm_stall_export(latest: Path) -> tuple[dict[str, Any], dict[str, bytes]]:
+    """Failure-time host observations never contain raw guest or process text."""
+    try:
+        from .vm_logs import collect_vm_stall_diagnostics, validate_vm_stall_report
+        collected = collect_vm_stall_diagnostics(latest)
+        report = validate_vm_stall_report(collected['report'])
+        members = collected['members']
+        if not isinstance(report, dict) or not isinstance(members, dict) or len(members) > 32:
+            raise ValueError('Invalid VM failure-time collection')
+        declared = {row['archive_member'] for row in report.get('environments', [])
+                    if isinstance(row, dict) and 'archive_member' in row}
+        if set(members) != declared:
+            raise ValueError('VM failure-time coverage does not match archive members')
+        total = 0
+        for name, payload in members.items():
+            if (not isinstance(name, str) or not re.fullmatch(
+                    r'vm-stalls/[0-9a-f]{64}/[0-9a-f]{32}/vm-stalls\.technical\.jsonl', name)
+                    or not isinstance(payload, bytes) or len(payload) > 128 * 1024):
+                raise ValueError('Invalid VM failure-time archive member')
+            total += len(payload)
+            if total > 2 * 1024 * 1024:
+                raise ValueError('VM failure-time collection exceeds its bound')
+        if len(json.dumps(report, allow_nan=False).encode('utf-8')) > 2 * 1024 * 1024:
+            raise ValueError('VM failure-time report exceeds its bound')
+        return report, members
+    except Exception as exc:
+        from .technical import technical_error_evidence
+        return {'schema_version': 1, 'status': 'unavailable', 'scope': 'host_observations_at_vm_failure',
+                'environments': [], 'technical_error': technical_error_evidence(exc)}, {}
+
+
 def collect_existing_diagnostics(app_root: Path, *, include_content: bool = False) -> Path | None:
     """Build a fresh diagnostics ZIP from current logs.
 
@@ -2579,6 +2616,7 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
             vm_report, vm_members = _collect_vm_export(latest, include_content=include_content)
             target_report, target_members = _collect_test_target_export(latest, include_content=include_content)
             guest_report, guest_members = _collect_guest_export(latest)
+            vm_stall_report, vm_stall_members = _collect_vm_stall_export(latest)
             external_device_report = _collect_external_device_export(latest)
             try:
                 from .file_views import collect_file_view_diagnostics
@@ -2633,6 +2671,11 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
             except Exception:
                 summary += '\nGuest system logs: summary unavailable; see GUEST_LOGS.json.\n'
             try:
+                from .vm_logs import stall_summary_lines
+                summary += stall_summary_lines(vm_stall_report)
+            except Exception:
+                summary += '\nVM failure-time state: summary unavailable; see VM_STALLS.json.\n'
+            try:
                 from .external_devices import summary_lines as external_device_summary_lines
                 summary += external_device_summary_lines(external_device_report)
             except Exception:
@@ -2669,7 +2712,7 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
                 'schema_version': 1, 'collectors': {name: value for name, value in
                     (('summary', incidents), ('workspace_vm', vm_report), ('test_targets', target_report), ('host', host_report),
                      ('file_views', file_view_report), ('vm_storage', storage_report), ('vm_resources', resource_report),
-                     ('guest_logs', guest_report), ('external_devices', external_device_report))
+                     ('guest_logs', guest_report), ('vm_stalls', vm_stall_report), ('external_devices', external_device_report))
                     if value.get('technical_error')},
             }, ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('VM_LOGS.json', json.dumps(vm_report, ensure_ascii=False, indent=2, allow_nan=False))
@@ -2677,6 +2720,9 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
                 zf.writestr(name, payload)
             zf.writestr('GUEST_LOGS.json', json.dumps(guest_report, ensure_ascii=False, indent=2, allow_nan=False))
             for name, payload in guest_members.items():
+                zf.writestr(name, payload)
+            zf.writestr('VM_STALLS.json', json.dumps(vm_stall_report, ensure_ascii=False, indent=2, allow_nan=False))
+            for name, payload in vm_stall_members.items():
                 zf.writestr(name, payload)
             zf.writestr('EXTERNAL_DEVICES.json', json.dumps(external_device_report, ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('TARGET_LOGS.json', json.dumps(target_report, ensure_ascii=False, indent=2, allow_nan=False))

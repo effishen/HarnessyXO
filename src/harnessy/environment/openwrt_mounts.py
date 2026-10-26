@@ -199,6 +199,12 @@ class OpenWrtLiveMounts:
                     tail = bytes(item.errors)
                     if error is not None:
                         tail = (tail + b'\n' + str(error).encode('utf-8', errors='replace'))[-8192:]
+                    try:
+                        from harnessy.diagnostics.vm_logs import request_vm_stall_capture
+                        request_vm_stall_capture(self.owner, connection_mode='independent',
+                            stderr=tail, returncode=item.process.returncode)
+                    except Exception:
+                        pass
                     from harnessy.diagnostics.guest_logs import record_guest_transport
                     record_guest_transport(self.owner.workspace_root, environment_id=self.owner.config.id,
                         runtime_root=self.owner.environment_root, kind='openwrt', operation='sshfs',

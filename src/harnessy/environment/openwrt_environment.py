@@ -270,6 +270,14 @@ class OpenWrtEnvironment(WorkspaceEnvironment):
     def _guest_transport_failure(self, *, stderr: bytes = b'', returncode: int | None = None,
                                  timed_out: bool = False, connection_mode: str = 'reused',
                                  duration_seconds: float = 0.0) -> None:
+        # The guest SSH path may be the failing component. Capture the owned
+        # QEMU monitor/process and host state independently of guest logging.
+        try:
+            from harnessy.diagnostics.vm_logs import request_vm_stall_capture
+            request_vm_stall_capture(self, connection_mode=connection_mode, stderr=stderr,
+                returncode=returncode, timed_out=timed_out, duration_seconds=duration_seconds)
+        except Exception:
+            pass
         try:
             from harnessy.diagnostics import log_event
             from harnessy.diagnostics.guest_logs import record_guest_transport, transport_evidence

@@ -48,6 +48,7 @@ _GUEST_CODES = frozenset({
     'out_of_memory', 'oom_kill', 'kernel_panic', 'kernel_oops', 'soft_lockup', 'hung_task',
     'filesystem_error', 'io_error', 'storage_full', 'read_only_filesystem', 'fuse_disconnected',
     'ssh_authentication_failed', 'ssh_session_opened', 'ssh_session_closed', 'ssh_server_started',
+    'ssh_session_closed_before_auth', 'ssh_session_closed_after_auth',
     'ssh_connection_limit', 'connection_timeout', 'connection_refused', 'connection_reset',
     'connection_closed', 'broken_pipe', 'too_many_open_files', 'process_limit',
     'service_crash', 'network_link_down', 'network_link_up', 'permission_denied',
@@ -59,8 +60,17 @@ _TRANSPORT_CODES = frozenset({
     'channel_limit', 'channel_open_failed', 'local_resource_limit', 'broken_pipe',
     'multiplex_unavailable', 'ssh_exit_255', 'command_timeout',
 })
+_TRANSPORT_STAGES = frozenset({'unknown', 'tcp_connect', 'ssh_identification', 'key_exchange',
+    'host_key_verification', 'authentication', 'session_open', 'multiplex'})
+_SSH_CLOSE_REASONS = frozenset({'authentication_timeout', 'idle_timeout', 'keepalive_timeout',
+                              'connection_reset', 'connection_closed', 'unknown'})
+MAX_PROCESS_SCAN = 128
+_PROCESS_METRICS = frozenset(
+    name + '_' + state for name in ('dropbear', 'sshd', 'sshfs')
+    for state in ('processes', 'running', 'sleeping', 'blocked', 'stopped', 'zombie', 'other'))
 _METRICS = frozenset({'mem_total_kib', 'mem_available_kib', 'swap_total_kib', 'swap_free_kib',
-                      'uptime_seconds', 'dropbear_processes', 'sshd_processes', 'sshfs_processes'})
+                      'uptime_seconds', 'process_scan_examined', 'process_scan_limited',
+                      'process_scan_errors'}) | _PROCESS_METRICS
 _ID = re.compile(r'^[0-9a-f]{32}$')
 _HASH = re.compile(r'^[0-9a-f]{64}$')
 _TIMESTAMP = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$')
@@ -108,10 +118,61 @@ if test -r /proc/meminfo; then
 fi
 if test -r /proc/uptime; then awk '{print "__HXGL_METRIC__ uptime_seconds "$1}' /proc/uptime; fi
 if test -r /proc/sys/kernel/random/boot_id; then printf '__HXGL_BOOT__ '; cat /proc/sys/kernel/random/boot_id; fi
-if command -v pidof >/dev/null 2>&1; then
-  for p in dropbear sshd sshfs; do
-    n=$(pidof "$p" 2>/dev/null | awk '{print NF}')
-    printf '__HXGL_METRIC__ %s_processes %s\n' "$p" "${n:-0}"
+if test -d /proc; then
+  dropbear_processes=0 dropbear_running=0 dropbear_sleeping=0 dropbear_blocked=0 dropbear_stopped=0 dropbear_zombie=0 dropbear_other=0
+  sshd_processes=0 sshd_running=0 sshd_sleeping=0 sshd_blocked=0 sshd_stopped=0 sshd_zombie=0 sshd_other=0
+  sshfs_processes=0 sshfs_running=0 sshfs_sleeping=0 sshfs_blocked=0 sshfs_stopped=0 sshfs_zombie=0 sshfs_other=0
+  scanned=0 limited=0 scan_errors=0
+  for process in /proc/[0-9]*; do
+    test -d "$process" || continue
+    if test "$scanned" -ge 128; then limited=1; break; fi
+    scanned=$((scanned + 1))
+    if ! IFS= read -r name < "$process/comm" 2>/dev/null; then scan_errors=$((scan_errors + 1)); continue; fi
+    case "$name" in dropbear|sshd|sshfs) ;; *) continue ;; esac
+    state=unknown
+    if IFS= read -r value < "$process/stat" 2>/dev/null; then
+      value=${value##*) }; state=${value%% *}
+    fi
+    # Names are fixed cases; no guest command line or path is emitted.
+    case "$name" in
+      dropbear)
+        dropbear_processes=$((dropbear_processes + 1))
+        case "$state" in
+          R) dropbear_running=$((dropbear_running + 1));;
+          S|I) dropbear_sleeping=$((dropbear_sleeping + 1));;
+          D) dropbear_blocked=$((dropbear_blocked + 1));;
+          T|t) dropbear_stopped=$((dropbear_stopped + 1));;
+          Z) dropbear_zombie=$((dropbear_zombie + 1));;
+          *) dropbear_other=$((dropbear_other + 1));;
+        esac;;
+      sshd)
+        sshd_processes=$((sshd_processes + 1))
+        case "$state" in
+          R) sshd_running=$((sshd_running + 1));;
+          S|I) sshd_sleeping=$((sshd_sleeping + 1));;
+          D) sshd_blocked=$((sshd_blocked + 1));;
+          T|t) sshd_stopped=$((sshd_stopped + 1));;
+          Z) sshd_zombie=$((sshd_zombie + 1));;
+          *) sshd_other=$((sshd_other + 1));;
+        esac;;
+      sshfs)
+        sshfs_processes=$((sshfs_processes + 1))
+        case "$state" in
+          R) sshfs_running=$((sshfs_running + 1));;
+          S|I) sshfs_sleeping=$((sshfs_sleeping + 1));;
+          D) sshfs_blocked=$((sshfs_blocked + 1));;
+          T|t) sshfs_stopped=$((sshfs_stopped + 1));;
+          Z) sshfs_zombie=$((sshfs_zombie + 1));;
+          *) sshfs_other=$((sshfs_other + 1));;
+        esac;;
+    esac
+  done
+  printf '__HXGL_METRIC__ process_scan_examined %s\n__HXGL_METRIC__ process_scan_limited %s\n__HXGL_METRIC__ process_scan_errors %s\n' "$scanned" "$limited" "$scan_errors"
+  for entry in \
+    "dropbear_processes=$dropbear_processes" "dropbear_running=$dropbear_running" "dropbear_sleeping=$dropbear_sleeping" "dropbear_blocked=$dropbear_blocked" "dropbear_stopped=$dropbear_stopped" "dropbear_zombie=$dropbear_zombie" "dropbear_other=$dropbear_other" \
+    "sshd_processes=$sshd_processes" "sshd_running=$sshd_running" "sshd_sleeping=$sshd_sleeping" "sshd_blocked=$sshd_blocked" "sshd_stopped=$sshd_stopped" "sshd_zombie=$sshd_zombie" "sshd_other=$sshd_other" \
+    "sshfs_processes=$sshfs_processes" "sshfs_running=$sshfs_running" "sshfs_sleeping=$sshfs_sleeping" "sshfs_blocked=$sshfs_blocked" "sshfs_stopped=$sshfs_stopped" "sshfs_zombie=$sshfs_zombie" "sshfs_other=$sshfs_other"; do
+    printf '__HXGL_METRIC__ %s %s\n' "${entry%%=*}" "${entry#*=}"
   done
 fi
 printf '__HXGL_COMPLETE__\n'
@@ -146,6 +207,14 @@ def _number(value: Any, maximum: float = 1e15) -> int | float | None:
 
 def _integer(value: Any, maximum: int = 2**31 - 1) -> int:
     return value if type(value) is int and 0 <= value <= maximum else 0
+
+
+def _metric_number(name: str, value: Any) -> int | float | None:
+    if name == 'uptime_seconds':
+        return _number(value)
+    limit = (1 if name == 'process_scan_limited' else MAX_PROCESS_SCAN
+             if name in _PROCESS_METRICS or name.startswith('process_scan_') else 1e15)
+    return value if type(value) is int and 0 <= value <= limit else None
 
 
 def _enum(value: Any, choices: Any, default: str = '') -> str:
@@ -193,6 +262,7 @@ def validate_transport_evidence(value: Any) -> dict[str, Any]:
            'timed_out': value.get('timed_out') is True,
            'bytes_seen': _integer(value.get('bytes_seen')),
            'omitted_lines': _integer(value.get('omitted_lines'))}
+    out['failure_stage'] = _enum(value.get('failure_stage'), _TRANSPORT_STAGES, 'unknown')
     code = value.get('returncode')
     if type(code) is int and -255 <= code <= 255:
         out['returncode'] = code
@@ -219,11 +289,28 @@ def transport_evidence(stderr: Any = b'', returncode: int | None = None, timed_o
         ('multiplex_unavailable', ('control socket connect', 'mux_client', 'muxclient', 'multiplex')),
     )
     codes = [code for code, signatures in rules if any(word in text for word in signatures)]
+    # These labels describe explicit stderr signatures only. A command deadline
+    # with no SSH output does not establish whether TCP or SSH was reached.
+    stage = 'unknown'
+    if any(phrase in text for phrase in ('during banner exchange', 'kex_exchange_identification', 'ssh_exchange_identification')):
+        stage = 'ssh_identification'
+    elif re.search(r'(?m)^ssh: connect to host .+ port [0-9]+:', text):
+        stage = 'tcp_connect'
+    elif any(phrase in text for phrase in ('no matching key exchange method found', 'no matching cipher found', 'no matching host key type found')):
+        stage = 'key_exchange'
+    elif any(phrase in text for phrase in ('host key verification failed', 'remote host identification has changed')):
+        stage = 'host_key_verification'
+    elif any(phrase in text for phrase in ('permission denied (', 'authentication failed', 'no supported authentication methods')):
+        stage = 'authentication'
+    elif any(phrase in text for phrase in ('channel open failed', 'open failed:', 'administratively prohibited', 'too many sessions', 'no more sessions', 'maxsessions')):
+        stage = 'session_open'
+    elif any(phrase in text for phrase in ('control socket connect', 'mux_client', 'muxclient', 'multiplex')):
+        stage = 'multiplex'
     if timed_out:
         codes.append('command_timeout')
     if returncode == 255:
         codes.append('ssh_exit_255')
-    return validate_transport_evidence({'codes': codes, 'returncode': returncode, 'timed_out': timed_out,
+    return validate_transport_evidence({'codes': codes, 'returncode': returncode, 'timed_out': timed_out, 'failure_stage': stage,
         'bytes_seen': min(len(data), 2**31 - 1), 'omitted_lines': len(text.splitlines())})
 
 
@@ -244,7 +331,8 @@ def _guest_record(line: str) -> dict[str, Any] | None:
         ('ssh_connection_limit', ('maxstartups', 'maxsessions', 'too many sessions', 'no more sessions')),
         ('ssh_authentication_failed', ('bad password attempt', 'pubkey auth failed', 'failed password', 'authentication failure')),
         ('ssh_session_opened', ('pubkey auth succeeded', 'accepted publickey', 'session opened for user')),
-        ('ssh_session_closed', ('exit (', 'session closed for user', 'exit before auth')),
+        ('ssh_session_closed_before_auth', ('exit before auth', 'connection closed by authenticating user', 'connection closed by invalid user')),
+        ('ssh_session_closed_after_auth', ('exit (', 'session closed for user')),
         ('ssh_server_started', ('running in background', 'server listening on')),
         ('connection_timeout', ('connection timed out', 'timeout before auth')),
         ('connection_refused', ('connection refused',)),
@@ -268,6 +356,14 @@ def _guest_record(line: str) -> dict[str, Any] | None:
     if code.startswith('ssh_') and not re.search(r'\b(?:dropbear|sshd)(?:\[|\s|:)', lower):
         return None
     row: dict[str, Any] = {'code': code}
+    if code in {'ssh_session_closed_before_auth', 'ssh_session_closed_after_auth'}:
+        row['close_reason'] = next((label for label, phrases in (
+            ('authentication_timeout', ('timeout before auth', 'authentication timeout')),
+            ('idle_timeout', ('idle timeout',)),
+            ('keepalive_timeout', ('keepalive timeout', 'keepalive failure')),
+            ('connection_reset', ('connection reset',)),
+            ('connection_closed', ('connection closed', 'remote host closed')),
+        ) if any(phrase in lower for phrase in phrases)), 'unknown')
     match = _GUEST_TIME.search(line)
     if match and _timestamp(match.group(1)):
         row['timestamp'] = match.group(1)
@@ -297,6 +393,8 @@ def _validate_source(value: Any) -> dict[str, Any]:
         if not isinstance(row, dict) or not _enum(row.get('code'), _GUEST_CODES):
             continue
         item = {'code': row['code']}
+        if row['code'] in {'ssh_session_closed_before_auth', 'ssh_session_closed_after_auth'}:
+            item['close_reason'] = _enum(row.get('close_reason'), _SSH_CLOSE_REASONS, 'unknown')
         stamp = _timestamp(row.get('timestamp'))
         if stamp:
             item['timestamp'] = stamp
@@ -344,7 +442,10 @@ def _project_guest_output(output: Any) -> dict[str, Any]:
                     value = float(parts[2])
                     value = _number(value)
                     if value is not None:
-                        metrics[parts[1]] = int(value) if value.is_integer() else value
+                        parsed = int(value) if value.is_integer() else value
+                        validated = _metric_number(parts[1], parsed)
+                        if validated is not None:
+                            metrics[parts[1]] = validated
                 except (ValueError, OverflowError):
                     pass
             continue
@@ -369,6 +470,7 @@ def _project_guest_output(output: Any) -> dict[str, Any]:
         record = _guest_record(line[:384])
         if source == 'ssh' and record is not None and record['code'] not in {
                 'ssh_connection_limit', 'ssh_authentication_failed', 'ssh_session_opened', 'ssh_session_closed',
+                'ssh_session_closed_before_auth', 'ssh_session_closed_after_auth',
                 'ssh_server_started', 'fuse_disconnected', 'connection_timeout', 'connection_refused',
                 'connection_reset', 'connection_closed', 'broken_pipe', 'too_many_open_files', 'process_limit'}:
             record = None
@@ -408,7 +510,7 @@ def validate_guest_receipt(value: Any) -> dict[str, Any] | None:
         sources = value.get('sources') if isinstance(value.get('sources'), dict) else {}
         row['sources'] = {name: _validate_source(sources.get(name)) for name in _SOURCE_NAMES}
         metrics = value.get('metrics') if isinstance(value.get('metrics'), dict) else {}
-        row['metrics'] = {name: number for name in _METRICS if (number := _number(metrics.get(name))) is not None}
+        row['metrics'] = {name: number for name in _METRICS if (number := _metric_number(name, metrics.get(name))) is not None}
         row['complete'] = value.get('complete') is True
         row['bytes_seen'] = _integer(value.get('bytes_seen'))
         row['truncated'] = value.get('truncated') is True

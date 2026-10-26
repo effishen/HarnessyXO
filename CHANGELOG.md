@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.7.19
+
+- Save a failure-time VM snapshot when OpenWrt SSH times out, fails, or an owned SSHFS stream disconnects. Capture the owned QEMU monitor, host resource pressure, QEMU process/progress counters and local forwarding socket states without contacting guest SSH. Keep a bounded receipt for the normal **Download Diagnostics** bundle instead of relying only on a healthy snapshot taken later.
+- Add **VM_STALLS.json** and sanitized saved records under **vm-stalls/**. Record unavailable, unsupported and timed-out sources explicitly. Collection is read-only and does not restart a VM, stop active work, replay commands or contact external devices. Detailed host/process counters currently cover Linux; QEMU monitor and serial observations also work on supported macOS hosts.
+- Preserve the observed SSH failure stage, including TCP connection versus SSH banner exchange. Distinguish guest session closes before authentication from authenticated closes and retain fixed timeout reasons. Guest diagnostics add bounded numeric process-state counts without command lines or names.
+- Keep raw monitor replies, process arguments, socket addresses and serial text out of these new records in both diagnostics modes. These changes collect evidence during the recurring outage; they do not establish or claim to repair its underlying cause.
+
 ## v0.7.18
 
 - Recover from a temporary VM connection timeout before stopping an agent run. Workspace checks now use their bounded four-attempt window for timeouts as well as inconclusive exits. OpenWrt retries read the same fresh mapping nonce over an independent SSH connection, with the same project access and isolation checks.

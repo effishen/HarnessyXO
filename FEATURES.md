@@ -1,7 +1,9 @@
-# HarnessyXO v0.7.18 Features
+# HarnessyXO v0.7.19 Features
 
 - OpenWrt VM commands and probes reuse an authenticated SSH connection with separate sessions for each task. Long-running tasks retain their existing runtime allowance; the connection closes after all sessions finish and 60 idle seconds pass. SSHFS file streams use dedicated connections, and each VM launch or identity change gets its own private control socket.
 - Workspace proof timeouts receive bounded recovery before a run stops. OpenWrt retries only the controller-created nonce read over independent SSH, then changes the connection used by future commands after exact verification. Existing jobs, terminals and file streams remain attached to their original connections; model commands are never replayed and recovery never starts or restarts a VM. Guest diagnostic captures also use independent SSH.
+- OpenWrt SSH/SSHFS failures trigger a bounded host-side snapshot independent of guest SSH. **Download Diagnostics** includes **VM_STALLS.json** with saved QEMU monitor observations, serial signals, Linux host pressure, verified QEMU process progress and local forwarding socket states. A later healthy VM does not overwrite these failure-time facts. Unsupported or unavailable sources remain explicit; raw process arguments, monitor replies and addresses are excluded.
+- SSH evidence distinguishes an observed TCP connection failure from banner exchange, key exchange, authentication and session opening. A silent command deadline stays unknown. Guest session exits before authentication keep their fixed timeout reason, and bounded process-state counts can identify blocked SSH/FUSE processes without revealing command lines.
 
 ## VM and external-device diagnostics
 
