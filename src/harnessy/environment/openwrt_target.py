@@ -16,6 +16,7 @@ import shlex
 import shutil
 import socket
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -31,6 +32,9 @@ OPENWRT_READINESS_SECONDS = 240.0
 OPENWRT_POLL_SECONDS = 2.0
 OPENWRT_LAUNCH_SECONDS = 30.0
 _LAUNCH_REAPERS: set[asyncio.Task] = set()
+_COMMAND_TRANSPORT_SESSION = secrets.token_hex(8)
+_COMMAND_TRANSPORTS: dict[str, tuple[str, int]] = {}
+_COMMAND_TRANSPORT_LOCK = threading.Lock()
 
 
 def qemu_binary(architecture: str) -> str:
@@ -522,18 +526,50 @@ class OpenWrtTargetManager(TestTargetManager):
             await asyncio.sleep(0.5)
         raise RuntimeError('Could not confirm OpenWrt has stopped; its data was preserved.')
 
+    def _command_transport(self) -> tuple[str, str, int]:
+        """Return the current command socket identity across provider instances.
+
+        Rotation only selects the socket for future clients. Existing masters
+        and their active channels are owned by OpenSSH and remain untouched.
+        """
+        ports_file = self.instance_dir / 'ports.json'
+        ports = json.loads(ports_file.read_text())
+        key = (self.instance_dir / 'id_ed25519').stat()
+        identity = hashlib.sha256(json.dumps([
+            _COMMAND_TRANSPORT_SESSION,
+            int(ports['ssh']), ports_file.stat().st_mtime_ns,
+            key.st_dev, key.st_ino, key.st_size, key.st_mtime_ns,
+        ]).encode()).hexdigest()[:16]
+        runtime = str(self.runtime_dir())
+        with _COMMAND_TRANSPORT_LOCK:
+            previous_identity, generation = _COMMAND_TRANSPORTS.get(runtime, (identity, 0))
+            if previous_identity != identity:
+                generation = 0
+            _COMMAND_TRANSPORTS[runtime] = (identity, generation)
+        return runtime, identity, generation
+
+    def command_transport_token(self) -> str:
+        _, identity, generation = self._command_transport()
+        return f'{identity}:{generation}'
+
+    def rotate_command_transport(self, *, expected_token: str) -> bool:
+        runtime, identity, generation = self._command_transport()
+        with _COMMAND_TRANSPORT_LOCK:
+            current = _COMMAND_TRANSPORTS.get(runtime)
+            if current != (identity, generation) or expected_token != f'{identity}:{generation}':
+                return False
+            _COMMAND_TRANSPORTS[runtime] = (identity, generation + 1)
+        return True
+
     def command(self, command, *, reuse_connection=True):
         ports = json.loads((self.instance_dir / 'ports.json').read_text())
         if reuse_connection:
             # Reuse authentication for command/probe channels. A new VM launch
             # or replaced identity gets a different socket in the existing
             # private, short runtime directory (also safe on macOS).
-            key = (self.instance_dir / 'id_ed25519').stat()
-            identity = hashlib.sha256(json.dumps([
-                int(ports['ssh']), (self.instance_dir / 'ports.json').stat().st_mtime_ns,
-                key.st_dev, key.st_ino, key.st_size, key.st_mtime_ns,
-            ]).encode()).hexdigest()[:16]
-            control = self.runtime_dir() / ('ssh-' + identity + '.sock')
+            runtime, identity, generation = self._command_transport()
+            suffix = '' if generation == 0 else '-' + str(generation)
+            control = Path(runtime) / ('ssh-' + identity + suffix + '.sock')
             connection_options = [
                 '-o', 'ControlMaster=auto', '-o', 'ControlPersist=60',
                 '-o', 'ControlPath=' + str(control),

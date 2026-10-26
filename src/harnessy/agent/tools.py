@@ -443,6 +443,7 @@ class WorkspaceToolbox:
         *,
         cwd: str,
         timeout: float | None,
+        independent_mapping_probe: bool = False,
     ):
         """Run in the selected workspace view with its required source policy."""
         if self.environment is None:
@@ -454,6 +455,10 @@ class WorkspaceToolbox:
             'active_root': self.root,
             'output_policy': self._environment_output_policy(),
         }
+        if independent_mapping_probe:
+            probe = getattr(self.environment, 'exec_mapping_probe', None)
+            if callable(probe):
+                return await probe(command, **kwargs)
         return await self.environment.exec(command, **kwargs)
 
     def _environment_output_policy(self) -> dict[str, Any]:
@@ -2156,7 +2161,7 @@ class WorkspaceToolbox:
 
     def _halt_mapping(self, payload: dict[str, Any]) -> dict[str, Any]:
         payload.update(retryable=False, stop_agent_run=True,
-                       next_model_action='Stop this run. Do not retry verification or claim VM tests passed. Host edits, if marked write_applied, remain applied. The user can inspect the canonical Project Files and restart the VM before a new run.')
+                       next_model_action='Stop this run. Do not retry verification or claim VM tests passed. Host edits, if marked write_applied, remain applied. The user can inspect the canonical Project Files and the VM connection state before starting a new run.')
         self._mapping_failure = dict(payload)
         self._mapping_failure_key = self._mapping_cache_identity()
         self._mapping_cache_key = None
@@ -2499,6 +2504,41 @@ class WorkspaceToolbox:
         probe_error: tuple[str, str] | None = None
         probe_attempts = 0
         transient_probe_failures = 0
+        independent_probe = False
+        transport_rotated = False
+        transport_token = None
+        token_reader = getattr(self.environment, 'command_transport_token', None)
+        if callable(token_reader):
+            try:
+                transport_token = token_reader()
+            except (OSError, ValueError):
+                # First use can create the VM and its SSH identity below.
+                pass
+
+        def record_retry(attempt: int, failure_kind: str) -> bool:
+            nonlocal independent_probe, transport_token
+            if attempt >= len(WORKSPACE_MAPPING_PROBE_RETRY_DELAYS):
+                return False
+            # Only this controller-created nonce is retried. A different SSH
+            # connection must not replay the command which preceded the proof.
+            independent_probe = callable(getattr(self.environment, 'exec_mapping_probe', None))
+            if independent_probe and transport_token is None and callable(token_reader):
+                try:
+                    transport_token = token_reader()
+                except (OSError, ValueError):
+                    pass
+            runtime = self._runtime_identity()
+            log_event(
+                'tools', 'workspace_mapping_probe_retry', workspace=str(self.workspace.root), environment_id=self.environment_id,
+                attempt=attempt, next_attempt=attempt + 1,
+                retry_delay_seconds=WORKSPACE_MAPPING_PROBE_RETRY_DELAYS[attempt],
+                probe_returncode=getattr(result, 'returncode', None),
+                probe_failure_kind=failure_kind,
+                probe_connection_mode='independent' if independent_probe else 'provider_default',
+                vm_generation=runtime.get('vm_generation'), vm_boot_id=runtime.get('vm_boot_id'),
+            )
+            return True
+
         try:
             probe_dir.mkdir(parents=True, exist_ok=True)
             with probe_path.open('w', encoding='utf-8') as handle:
@@ -2512,12 +2552,17 @@ class WorkspaceToolbox:
                 try:
                     result = await self._environment_exec(
                         f'cat -- {shlex.quote(guest_probe)}', cwd=self.guest_root, timeout=15.0,
+                        independent_mapping_probe=independent_probe,
                     )
+                    probe_error = None
                 except asyncio.TimeoutError:
+                    transient_probe_failures += 1
                     probe_error = (
                         'WORKSPACE_MAPPING_PROBE_TIMEOUT',
                         'HarnessyXO could not verify the VM /workspace mapping before the probe timed out.',
                     )
+                    if record_retry(attempt, 'timeout'):
+                        continue
                     break
                 except Exception as exc:
                     if getattr(exc, 'error_code', '') in _FILE_VIEW_ERRORS | {'VM_PROJECT_ACCESS_DENIED', 'VM_ENVIRONMENT_DISABLED'}:
@@ -2541,16 +2586,8 @@ class WorkspaceToolbox:
                     # environment failure, not a visibility lag.
                     break
                 transient_probe_failures += 1
-                if attempt >= len(WORKSPACE_MAPPING_PROBE_RETRY_DELAYS):
+                if not record_retry(attempt, 'ssh_exit' if returncode == 255 else 'probe_exit'):
                     break
-                runtime = self._runtime_identity()
-                log_event(
-                    'tools', 'workspace_mapping_probe_retry', workspace=str(self.workspace.root), environment_id=self.environment_id,
-                    attempt=attempt, next_attempt=attempt + 1,
-                    retry_delay_seconds=WORKSPACE_MAPPING_PROBE_RETRY_DELAYS[attempt],
-                    probe_returncode=returncode,
-                    vm_generation=runtime.get('vm_generation'), vm_boot_id=runtime.get('vm_boot_id'),
-                )
         finally:
             try:
                 probe_path.unlink(missing_ok=True)
@@ -2568,7 +2605,9 @@ class WorkspaceToolbox:
             self._mapping_cache_key = None
             self._mapping_cache_verified_at = 0.0
             code, message = probe_error
-            guest_transport = self._mapping_guest_evidence(message,
+            # This message is Harnessy's own timeout description, not SSH
+            # stderr. Do not misclassify it as an observed TCP timeout.
+            guest_transport = self._mapping_guest_evidence('' if code == 'WORKSPACE_MAPPING_PROBE_TIMEOUT' else message,
                 timed_out=code == 'WORKSPACE_MAPPING_PROBE_TIMEOUT')
             runtime = self._runtime_identity()
             log_event(
@@ -2576,6 +2615,8 @@ class WorkspaceToolbox:
                 error_code=code, vm_generation=runtime.get('vm_generation'),
                 vm_boot_id=runtime.get('vm_boot_id'),
                 guest_transport=guest_transport,
+                probe_attempts=probe_attempts, transient_probe_failures=transient_probe_failures,
+                probe_connection_mode='independent' if independent_probe else 'provider_default',
             )
             return self._halt_mapping({
                 'ok': False,
@@ -2593,9 +2634,13 @@ class WorkspaceToolbox:
                 ),
             })
 
-        observed = str(getattr(result, 'stdout', '') or '').strip()
-        verified = bool(getattr(result, 'returncode', 1) == 0 and observed == nonce)
+        observed = str(getattr(result, 'stdout', '') or '')
+        verified = bool(getattr(result, 'returncode', 1) == 0 and observed == nonce + '\n')
         if verified:
+            if independent_probe:
+                recover = getattr(self.environment, 'recover_command_transport', None)
+                if callable(recover) and transport_token is not None:
+                    transport_rotated = bool(recover(expected_token=transport_token))
             self._mapping_failure = None
             self._mapping_failure_key = None
             self._mapping_cache_key = current_key
@@ -2606,6 +2651,8 @@ class WorkspaceToolbox:
                 probe_attempts=probe_attempts,
                 transient_probe_failures=transient_probe_failures,
                 recovered_from_transient_probe=bool(transient_probe_failures),
+                probe_connection_mode='independent' if independent_probe else 'provider_default',
+                command_transport_rotated=transport_rotated,
                 vm_generation=runtime.get('vm_generation'), vm_boot_id=runtime.get('vm_boot_id'),
             )
             return {
@@ -2618,6 +2665,8 @@ class WorkspaceToolbox:
                 'probe_attempts': probe_attempts,
                 'transient_probe_failures': transient_probe_failures,
                 'recovered_from_transient_probe': bool(transient_probe_failures),
+                'probe_connection_mode': 'independent' if independent_probe else 'provider_default',
+                'command_transport_rotated': transport_rotated,
                 'workspace_state': self._workspace_state(
                     view='selected-root+isolated-workspace', mapping_verified=True,
                 ),

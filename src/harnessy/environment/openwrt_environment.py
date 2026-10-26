@@ -264,12 +264,19 @@ class OpenWrtEnvironment(WorkspaceEnvironment):
             raise GuestProbeUnavailable(state='stopped', code='guest_stopped')
         # A fixed read-only administrative probe never starts a VM, mounts a
         # project, runs a login profile or changes the active project policy.
-        return await self._raw(script, timeout=timeout, output_limit=128 * 1024, login_shell=False)
+        return await self._raw(script, timeout=timeout, output_limit=128 * 1024,
+                               login_shell=False, reuse_connection=False)
 
     def _guest_transport_failure(self, *, stderr: bytes = b'', returncode: int | None = None,
-                                 timed_out: bool = False) -> None:
+                                 timed_out: bool = False, connection_mode: str = 'reused',
+                                 duration_seconds: float = 0.0) -> None:
         try:
-            from harnessy.diagnostics.guest_logs import record_guest_transport
+            from harnessy.diagnostics import log_event
+            from harnessy.diagnostics.guest_logs import record_guest_transport, transport_evidence
+            log_event('tools', 'vm_ssh_command_failed', environment_id=self.config.id,
+                      probe_connection_mode=connection_mode,
+                      duration_seconds=duration_seconds, returncode=returncode, timed_out=timed_out,
+                      guest_transport=transport_evidence(stderr, returncode=returncode, timed_out=timed_out))
             record_guest_transport(self.workspace_root, environment_id=self.config.id,
                 runtime_root=self.environment_root, kind='openwrt', operation='ssh_command',
                 stderr=stderr, returncode=returncode, timed_out=timed_out)
@@ -290,8 +297,11 @@ class OpenWrtEnvironment(WorkspaceEnvironment):
                 await result
 
     async def _raw(self, command: str, *, data: bytes | None = None, timeout: float = 120, output_limit: int = 16 * 1024 * 1024,
-                   failure_capture: dict[str, bytes] | None = None, login_shell: bool = True) -> tuple[int, bytes, bytes]:
-        argv, env = self.controller.command(command)
+                   failure_capture: dict[str, bytes] | None = None, login_shell: bool = True,
+                   reuse_connection: bool = True) -> tuple[int, bytes, bytes]:
+        started = time.monotonic()
+        connection_mode = 'reused' if reuse_connection else 'independent'
+        argv, env = self.controller.command(command, reuse_connection=reuse_connection)
         if not login_shell:
             # Metadata probes must not execute a guest login profile. Keep the
             # existing model, lifecycle, and interactive transports unchanged.
@@ -301,7 +311,8 @@ class OpenWrtEnvironment(WorkspaceEnvironment):
                 stdin=asyncio.subprocess.PIPE if data is not None else asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         except OSError as exc:
-            self._guest_transport_failure(stderr=str(exc).encode('utf-8', errors='replace'))
+            self._guest_transport_failure(stderr=str(exc).encode('utf-8', errors='replace'),
+                connection_mode=connection_mode, duration_seconds=time.monotonic() - started)
             raise
         diagnostic_stderr = bytearray()
         async def read(stream, limit, name):
@@ -335,10 +346,12 @@ class OpenWrtEnvironment(WorkspaceEnvironment):
         try:
             _, out, err, code = await asyncio.wait_for(asyncio.gather(*tasks), timeout)
             if code == 255:
-                self._guest_transport_failure(stderr=bytes(diagnostic_stderr), returncode=code)
+                self._guest_transport_failure(stderr=bytes(diagnostic_stderr), returncode=code,
+                    connection_mode=connection_mode, duration_seconds=time.monotonic() - started)
             return code, out, err
         except asyncio.TimeoutError:
-            self._guest_transport_failure(stderr=bytes(diagnostic_stderr), timed_out=True)
+            self._guest_transport_failure(stderr=bytes(diagnostic_stderr), timed_out=True,
+                connection_mode=connection_mode, duration_seconds=time.monotonic() - started)
             raise
         finally:
             if process.returncode is None:
@@ -1086,11 +1099,67 @@ python3 -c {shlex.quote(_REPLACE_GUEST_TREE)} {shlex.quote(stage)} {shlex.quote(
         return 'exec unshare --mount --pid --fork --mount-proc /bin/bash -c ' + shlex.quote('\n'.join(lines))
 
     async def exec(self, command: str, *, cwd='/workspace', timeout=None, active_root=None, output_policy=None) -> ExecResult:
+        return await self._exec(command, cwd=cwd, timeout=timeout, active_root=active_root,
+                                output_policy=output_policy)
+
+    def command_transport_token(self) -> str:
+        return self.controller.command_transport_token()
+
+    def recover_command_transport(self, *, expected_token: str) -> bool:
+        """Select a fresh socket only after a separately verified file proof.
+
+        The caller supplies the token from before the failed proof. Several
+        concurrent recoveries of that same token cause at most one rotation.
+        No process, command, terminal or passive SSHFS connection is stopped.
+        """
+        changed = self.controller.rotate_command_transport(expected_token=expected_token)
+        if changed:
+            try:
+                from harnessy.diagnostics import log_event
+                log_event('runtime', 'vm_command_transport_rotated', environment_id=self.config.id,
+                          reason='independent_mapping_verified', probe_connection_mode='independent',
+                          command_transport_rotated=True, active_channels_preserved=True)
+            except Exception:
+                pass  # Optional evidence must not undo a verified rotation.
+        return changed
+
+    async def exec_mapping_probe(self, command: str, *, cwd='/workspace', timeout=15,
+                                 active_root=None, output_policy=None) -> ExecResult:
+        """Read one controller-created nonce through a separate SSH connection.
+
+        The isolated project view and normal access checks still apply. This
+        narrow recovery entry point never starts a VM or replays model code.
+        """
+        try:
+            words = shlex.split(command)
+        except ValueError as exc:
+            raise ValueError('Invalid workspace nonce probe.') from exc
+        path = PurePosixPath(words[2]) if len(words) == 3 else None
+        if (len(words) != 3 or words[:2] != ['cat', '--'] or path is None
+                or not path.is_absolute() or '..' in path.parts
+                or not str(path).startswith('/workspace/')
+                or path.parent.name != '.harnessyxo-probes'
+                or re.fullmatch(r'probe-[0-9a-f]{32}\.txt', path.name) is None):
+            raise ValueError('Recovery accepts only a workspace nonce read.')
+        seconds = float(15 if timeout is None else timeout)
+        if not 0 < seconds <= 15:
+            raise ValueError('Workspace nonce recovery must finish within 15 seconds.')
+        # Reconstruct from parsed arguments; shell operators in a caller's
+        # spelling cannot turn a nonce read into another command.
+        fixed = 'cat -- ' + shlex.quote(str(path))
+        return await asyncio.wait_for(self._exec(fixed, cwd=cwd, timeout=seconds,
+            active_root=active_root, output_policy=output_policy,
+            reuse_connection=False, allow_start=False), seconds)
+
+    async def _exec(self, command: str, *, cwd='/workspace', timeout=None, active_root=None,
+                    output_policy=None, reuse_connection=True, allow_start=True) -> ExecResult:
         self._refresh_file_config()
         if not str(command).strip():
             raise ValueError('Command must not be empty.')
         self._authorize_model(output_policy)
         if not self._ready:
+            if not allow_start:
+                raise RuntimeError('The VM is not ready for an independent workspace probe.')
             await self.start()
         projection = (self._projection(active_root, output_policy) if self.config.files_mode == 'copy'
                       else await self._live_projection(active_root, output_policy))
@@ -1102,7 +1171,8 @@ python3 -c {shlex.quote(_REPLACE_GUEST_TREE)} {shlex.quote(stage)} {shlex.quote(
             await self._sync(projection)
             self._authorize_model(projection['policy'])
             try:
-                rc, out, err = await self._raw(self._command(projection, command, cwd), timeout=timeout or 3600)
+                rc, out, err = await self._raw(self._command(projection, command, cwd), timeout=timeout or 3600,
+                    reuse_connection=reuse_connection, login_shell=reuse_connection)
             except BaseException:
                 collection = asyncio.create_task(self._collect(projection))
                 try:

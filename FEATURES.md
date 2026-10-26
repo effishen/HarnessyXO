@@ -1,6 +1,7 @@
-# HarnessyXO v0.7.17 Features
+# HarnessyXO v0.7.18 Features
 
 - OpenWrt VM commands and probes reuse an authenticated SSH connection with separate sessions for each task. Long-running tasks retain their existing runtime allowance; the connection closes after all sessions finish and 60 idle seconds pass. SSHFS file streams use dedicated connections, and each VM launch or identity change gets its own private control socket.
+- Workspace proof timeouts receive bounded recovery before a run stops. OpenWrt retries only the controller-created nonce read over independent SSH, then changes the connection used by future commands after exact verification. Existing jobs, terminals and file streams remain attached to their original connections; model commands are never replayed and recovery never starts or restarts a VM. Guest diagnostic captures also use independent SSH.
 
 ## VM and external-device diagnostics
 
@@ -517,8 +518,8 @@ Workspace and machine databases use WAL so background reads can coexist with mes
 ## Transient workspace-verification recovery
 
 - A fresh host mapping nonce is durably written once and kept alive through a bounded four-attempt verification window spanning 1.1 seconds of backoff.
-- Only inconclusive nonzero probe executions without a structured projection error are retried. This handles brief shared-filesystem directory-entry visibility lag without weakening the safety boundary.
-- A zero-exit probe containing different bytes is an immediate `WORKSPACE_MAPPING_MISMATCH`; an exact host/VM file digest mismatch remains an immediate `FILE_VIEW_MISMATCH`; structured projection failures and timeouts remain terminal.
+- Inconclusive nonzero probe executions without a structured projection error, and probe timeouts, are retried. Each attempt has a 15-second deadline; the four-attempt window includes 1.1 seconds of backoff. OpenWrt retries bypass the shared command connection while preserving the authorized isolated project view.
+- A zero-exit probe containing different bytes is an immediate `WORKSPACE_MAPPING_MISMATCH`; an exact host/VM file digest mismatch remains an immediate `FILE_VIEW_MISMATCH`; structured projection failures and access denials remain terminal. Exhausted timeout recovery still stops the run.
 - The final Tool receipt records attempt count, transient failures, and whether the probe recovered. Probe files are still removed before any model-requested command executes.
 - A saved workspace-safety terminal answer now says **Blocked after …** in red instead of incorrectly saying **Completed in …**.
 - `copy_attachment_to_project` remains byte-exact, non-overwriting, and private-source-preserving. A successfully recovered probe proceeds to the existing independent whole-file SHA-256 and byte-count comparison.

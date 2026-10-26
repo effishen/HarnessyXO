@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.7.18
+
+- Recover from a temporary VM connection timeout before stopping an agent run. Workspace checks now use their bounded four-attempt window for timeouts as well as inconclusive exits. OpenWrt retries read the same fresh mapping nonce over an independent SSH connection, with the same project access and isolation checks.
+- After an independent OpenWrt check verifies the exact nonce, select a new shared SSH connection for future commands. Leave existing command sessions, terminals and SSHFS file streams untouched. Timed-out model commands are never replayed, and recovery never restarts a VM. Existing VMs need no rebuild.
+- Collect OpenWrt guest diagnostics over an independent connection so a stalled command connection cannot block the capture. Record the connection mode, retry reason and transport rotation in diagnostics; distinguish a command deadline from an observed SSH connection timeout.
+- Keep different-byte results, structured projection failures and access denials blocked. If bounded recovery fails, the run still stops for inspection. This repairs the connection-recovery path; it does not establish the cause of every guest or host stall.
+
 ## v0.7.17
 
 - Add sanitized guest system, kernel and SSH observations to **Download Diagnostics**, alongside the existing VM boot and controller logs. OpenWrt and Linux VM connections use fixed, read-only checks with bounded output, concurrency and collection time. Retain failed attempts and the last successful observation, including the observed guest boot ID. Stopped VMs stay stopped; Windows guest-log capture is explicitly reported as unsupported.

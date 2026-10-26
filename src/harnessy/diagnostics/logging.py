@@ -466,10 +466,16 @@ def validate_workspace_recovery_event(event: Any, value: Any) -> dict[str, Any] 
 
 
 _VM_COMMAND_ID_KEYS = frozenset({'command_id', 'parent_start_command_id', 'startup_attempt_id'})
+_MAPPING_RECOVERY_ENUMS = {
+    'probe_connection_mode': frozenset({'provider_default', 'independent', 'reused'}),
+    'probe_failure_kind': frozenset({'timeout', 'ssh_exit', 'probe_exit'}),
+}
 
 
 def _safe_event_field(key: str, value: Any) -> Any:
     """Keep reviewed structured evidence intact, without widening raw limits."""
+    if key.lower() in _MAPPING_RECOVERY_ENUMS or key.lower() == 'command_transport_rotated':
+        return _privacy_safe_value(value, key=key)
     if key.lower() == 'external_device':
         from .external_devices import validate_external_device_observation
         return validate_external_device_observation(value)
@@ -1589,6 +1595,10 @@ def _safe_error_summary(value: Any) -> Any:
 
 def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
     lowered = key.lower()
+    if lowered in _MAPPING_RECOVERY_ENUMS:
+        return value if isinstance(value, str) and value in _MAPPING_RECOVERY_ENUMS[lowered] else None
+    if lowered == 'command_transport_rotated':
+        return value if type(value) is bool else None
     if lowered == 'external_device':
         from .external_devices import validate_external_device_observation
         return validate_external_device_observation(value)
