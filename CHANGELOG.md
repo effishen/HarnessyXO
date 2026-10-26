@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.7.20
+
+- Wait for a temporary OpenWrt SSH outage to clear before ending the agent run. After a workspace proof first loses its connection, allow up to three minutes of cancellable recovery with spaced independent checks. Show **Waiting for VM connection** while the pending tool waits.
+- Verify the same fresh workspace nonce before admitting the pending command. Once the proof succeeds, use a fresh shared connection for future commands. Existing jobs, terminals and SSHFS streams keep their sessions; recovery never replays a model command.
+- Keep changed workspace identities, access denials, authentication failures, different-byte proofs and structured projection errors blocked. Stop if the recovery window expires, and remove the temporary proof on success, failure or cancellation. Preserve normal first-use VM startup.
+- Retain recovery timing and outcomes in diagnostics alongside the failure-time VM snapshots from v0.7.19. This improves recovery from a temporary outage; the cause of the original guest/host connectivity stall remains unverified.
+
 ## v0.7.19
 
 - Save a failure-time VM snapshot when OpenWrt SSH times out, fails, or an owned SSHFS stream disconnects. Capture the owned QEMU monitor, host resource pressure, QEMU process/progress counters and local forwarding socket states without contacting guest SSH. Keep a bounded receipt for the normal **Download Diagnostics** bundle instead of relying only on a healthy snapshot taken later.
