@@ -69,6 +69,29 @@ class SSHFSSetupError(RuntimeError):
         super().__init__(messages[self.error_code] + detail + ' The VM disk and project files were preserved.')
 
 
+class DesktopSetupError(RuntimeError):
+    def __init__(self, code: str) -> None:
+        messages = {
+            'DESKTOP_KERNEL_UNSUPPORTED': 'The guest kernel does not provide the graphics support this desktop needs. Use Repair Desktop to prepare a desktop-capable kernel.',
+            'DESKTOP_BOOT_POLICY_CUSTOM': 'A desktop kernel is staged, but the guest has custom boot settings. Choose the desktop-capable kernel in the guest boot settings, then restart the VM.',
+            'DESKTOP_BOOT_VERIFY_FAILED': 'The VM did not boot the verified desktop kernel. Check its guest boot settings before trying Repair Desktop again.',
+            'DESKTOP_KERNEL_VERIFY_FAILED': 'The desktop kernel could not be verified. No automatic restart was performed.',
+            'DESKTOP_OFFLINE': 'Desktop packages are missing and public outbound is disabled. Enable public outbound, then use Repair Desktop.',
+            'DESKTOP_APT_UPDATE_FAILED': 'The guest could not refresh the desktop package list. Check its network and package repositories, then retry Repair Desktop.',
+            'DESKTOP_APT_INSTALL_FAILED': 'The guest could not install the desktop packages. Check its package manager, then retry Repair Desktop.',
+            'DESKTOP_SESSION_NOT_READY': 'The guest desktop session is not active. Use Repair Desktop to check its display manager and graphics support.',
+            'DESKTOP_REPAIR_TIMEOUT': 'Desktop setup exceeded its time limit. Check the guest package manager and network before retrying.',
+            'DESKTOP_REPAIR_BUSY': 'Finish this VM’s active work before repairing its desktop.',
+            'DESKTOP_ARCH_MISMATCH': 'The desktop repair does not match this guest architecture.',
+            'DESKTOP_PREREQUISITE_MISSING': 'A required guest desktop setup tool is missing.',
+            'DESKTOP_PROBE_FAILED': 'The guest desktop could not be checked. Retry Desktop after confirming that the VM is running.',
+            'DESKTOP_REPAIR_FAILED': 'Desktop setup failed. Check the guest display manager and package manager, then retry Repair Desktop.',
+            'DESKTOP_REPAIR_CANCELLED': 'Desktop repair was cancelled.',
+        }
+        self.error_code = code if isinstance(code, str) and code in messages else 'DESKTOP_REPAIR_FAILED'
+        super().__init__(messages[self.error_code] + ' CLI readiness is checked separately; the VM disk and project files were preserved.')
+
+
 class _LimaDesktopView:
     """Read-only GUI adapter; lifecycle stays in the named VM registry."""
 
@@ -3469,6 +3492,7 @@ exit $rc
         error = str(readiness.get('error') or '')
         state = 'ready' if ready else ('running_not_ready' if running else raw.lower())
         detail = error or ('Ready for workspace execution.' if ready else raw)
+        guest.update(self._desktop_status_fields(str(readiness.get('boot_id') or '') if ready else ''))
         return EnvironmentStatus(state, 'lima', True, True, running, detail, version, ready=ready, phase=phase, error=error, **guest)
 
     async def _ensure_host_prerequisites(self, *, progress=None, allow_install: bool = True) -> None:
@@ -3549,35 +3573,202 @@ exit $rc
             digest, images / 'kali.tar.xz', lambda _line: None)
         await finish_thread(extract_cloud_disk, archive, destination)
 
+    def _latest_desktop_snapshot(self) -> dict | None:
+        snapshot = None
+        try:
+            from harnessy.diagnostics.desktop import latest_desktop
+            snapshot = latest_desktop(self.workspace_root, self.config.id, self.environment_root)
+        except Exception:
+            pass
+        observed = getattr(self, '_desktop_snapshot', None)
+        if isinstance(observed, dict) and (snapshot is None or
+                float(observed.get('observed_at_epoch') or 0) >= float(snapshot.get('observed_at_epoch') or 0)):
+            return observed
+        return snapshot
+
+    def _desktop_status_fields(self, boot_id: str = '') -> dict:
+        if not self.config.desktop:
+            return {'desktop_ready': False, 'desktop_state': 'disabled', 'desktop_error': ''}
+        from .desktop_setup import DESKTOP_SETUP_REVISION
+        snapshot = self._latest_desktop_snapshot()
+        if (not snapshot or not boot_id or snapshot.get('boot_id') != boot_id
+                or str(snapshot.get('revision') or '') != DESKTOP_SETUP_REVISION):
+            return {'desktop_ready': False, 'desktop_state': 'unknown', 'desktop_error': ''}
+        ready = snapshot.get('state') == 'ready' and snapshot.get('error_code') == 'NONE'
+        code = str(snapshot.get('error_code') or 'DESKTOP_PROBE_FAILED')
+        if snapshot.get('state') == 'reboot_required':
+            message = 'Desktop support is staged. Use Repair Desktop to restart and verify it.'
+        else:
+            message = str(DesktopSetupError(code))
+        return {'desktop_ready': ready, 'desktop_state': str(snapshot.get('state') or 'unknown'),
+                'desktop_error': '' if ready else message}
+
+    async def _record_desktop_snapshot(self, snapshot: dict) -> dict:
+        from .desktop_setup import DESKTOP_SETUP_REVISION
+        snapshot = {**snapshot, 'revision': DESKTOP_SETUP_REVISION, 'observed_at_epoch': time.time()}
+        self._desktop_snapshot = snapshot
+        try:
+            from harnessy.diagnostics.desktop import record_desktop
+            await _bounded_diagnostic_io(record_desktop, self.workspace_root, self.config.id,
+                self.environment_root, snapshot, timeout=self.TIMEOUT_DIAGNOSTIC_RESOURCES)
+        except Exception:
+            pass
+        return snapshot
+
+    async def _probe_desktop(self) -> dict:
+        try:
+            from .desktop_setup import build_desktop_probe_script, parse_desktop_probe, DESKTOP_PROBE_TIMEOUT_SECONDS
+            rc, stdout, _ = await self._run('shell', '--workdir', '/', self.INSTANCE,
+                'sudo', '-n', '--', '/bin/sh', '-c', build_desktop_probe_script(),
+                timeout=DESKTOP_PROBE_TIMEOUT_SECONDS + 2, check=False, diagnostic_probe=True)
+            if rc != 0:
+                raise ValueError('probe_failed')
+            snapshot = parse_desktop_probe(stdout)
+        except Exception:
+            snapshot = {'schema_version': 1, 'state': 'failed', 'error_code': 'DESKTOP_PROBE_FAILED',
+                        'boot_id': str(self._read_readiness().get('boot_id') or '')}
+        return await self._record_desktop_snapshot(snapshot)
+
+    async def _run_desktop_repair(self, *, allow_kernel_repair: bool, progress=None) -> dict:
+        from .desktop_setup import (build_desktop_repair_script, parse_desktop_repair,
+                                    DESKTOP_REPAIR_TIMEOUT_SECONDS)
+        await self._emit_progress(progress, 'desktop_installing', 'Preparing guest desktop support…',
+            detail='Checking the display manager, desktop session and guest graphics support.',
+            stage_timeout_seconds=DESKTOP_REPAIR_TIMEOUT_SECONDS)
+        try:
+            rc, stdout, _ = await self._run('shell', '--workdir', '/', self.INSTANCE,
+                'sudo', '-n', '--', '/bin/sh', '-c',
+                build_desktop_repair_script(architecture='amd64' if self.config.architecture == 'x86_64' else self.config.architecture,
+                    public_network=bool(self.config.network), allow_kernel_repair=allow_kernel_repair),
+                timeout=DESKTOP_REPAIR_TIMEOUT_SECONDS + 5, check=False, diagnostic_probe=True)
+            snapshot = parse_desktop_repair(stdout)
+            if rc != 0 and snapshot.get('state') not in {'failed', 'manual_boot_required'}:
+                snapshot = {**snapshot, 'state': 'failed', 'error_code': 'DESKTOP_REPAIR_FAILED'}
+        except asyncio.TimeoutError:
+            snapshot = {'schema_version': 1, 'state': 'failed', 'error_code': 'DESKTOP_REPAIR_TIMEOUT',
+                        'boot_id': str(self._read_readiness().get('boot_id') or '')}
+        except Exception:
+            snapshot = {'schema_version': 1, 'state': 'failed', 'error_code': 'DESKTOP_REPAIR_FAILED',
+                        'boot_id': str(self._read_readiness().get('boot_id') or '')}
+        return await self._record_desktop_snapshot(snapshot)
+
     async def _ensure_desktop(self, progress=None) -> None:
+        """Optional GUI setup never revokes independently verified CLI readiness."""
         if not self.config.desktop:
             return
-        probe = 'test -f /var/lib/harnessy-desktop-ready && command -v startxfce4 >/dev/null && systemctl is-enabled lightdm >/dev/null'
-        rc, _, _ = await self._run('shell', self.INSTANCE, '/bin/bash', '-lc', probe, timeout=15, check=False)
-        if rc == 0:
+        try:
+            snapshot = await self._probe_desktop()
+            if snapshot.get('state') == 'ready':
+                return
+            snapshot = await self._run_desktop_repair(allow_kernel_repair=False, progress=progress)
+            if snapshot.get('state') == 'ready':
+                await self._probe_desktop()
+        except Exception:
+            await self._record_desktop_snapshot({'schema_version': 1, 'state': 'failed',
+                'error_code': 'DESKTOP_REPAIR_FAILED', 'boot_id': str(self._read_readiness().get('boot_id') or '')})
+
+    async def _check_desktop_once(self) -> None:
+        if not self.config.desktop:
             return
-        if not self.config.network:
-            raise RuntimeError('The selected graphical desktop is not installed and VM network access is off. Enable networking to install it first.')
-        await self._emit_progress(progress, 'provisioning_packages', 'Installing the optional graphical desktop…',
-                                  stage_timeout_seconds=self.TIMEOUT_PROVISION)
-        apt = get_preset(self.config.preset).image.package_manager == 'apt'
-        install = ("export DEBIAN_FRONTEND=noninteractive\napt-get update\n"
-                   "echo 'lightdm shared/default-x-display-manager select lightdm' | debconf-set-selections\n"
-                   "apt-get install -y --no-install-recommends xorg xfce4 xfce4-terminal lightdm dbus-x11"
-                   if apt else 'dnf install -y @xfce-desktop-environment lightdm xorg-x11-server-Xorg')
-        script = '''set -euo pipefail
-desktop_user=$1
-''' + install + '''
-mkdir -p /etc/lightdm/lightdm.conf.d /var/lib
-printf '[Seat:*]\\nautologin-user=%s\\nautologin-user-timeout=0\\nuser-session=xfce\\n' "$desktop_user" >/etc/lightdm/lightdm.conf.d/50-harnessy.conf
-systemctl set-default graphical.target
-systemctl enable lightdm
-systemctl restart lightdm
-touch /var/lib/harnessy-desktop-ready
-'''
-        command = 'desktop_user=$(id -un); exec sudo -n /bin/bash -c ' + shlex.quote(script) + ' harnessy-desktop "$desktop_user"'
-        await self._run('shell', self.INSTANCE, '/bin/bash', '-lc', command,
-                        timeout=self.TIMEOUT_PROVISION, check=True)
+        from .desktop_setup import DESKTOP_SETUP_REVISION
+        boot_id = str(self._read_readiness().get('boot_id') or '')
+        previous = self._latest_desktop_snapshot()
+        if previous and previous.get('boot_id') == boot_id and str(previous.get('revision') or '') == DESKTOP_SETUP_REVISION:
+            return
+        await self._probe_desktop()
+
+    async def verify_desktop_ready(self) -> dict:
+        """Fresh human-view evidence, without installation or a restart."""
+        if not self.config.desktop:
+            raise RuntimeError('This VM was created without a graphical desktop.')
+        readiness = self._read_readiness()
+        if not readiness.get('ready') or not readiness.get('boot_id'):
+            raise RuntimeError('Finish Start / Retry Setup before opening this desktop.')
+        snapshot = await self._probe_desktop()
+        if snapshot.get('boot_id') != readiness.get('boot_id'):
+            raise DesktopSetupError('DESKTOP_BOOT_VERIFY_FAILED')
+        if snapshot.get('state') != 'ready' or snapshot.get('error_code') != 'NONE':
+            raise DesktopSetupError(str(snapshot.get('error_code') or 'DESKTOP_SESSION_NOT_READY'))
+        return snapshot
+
+    async def _repair_desktop_locked(self, progress=None, *, cancel_event: asyncio.Event | None = None) -> EnvironmentStatus:
+        def check_cancelled() -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                raise asyncio.CancelledError
+
+        async with self._workspace_start_lock():
+            self._refresh_saved_network_policy()
+            if not self.config.desktop:
+                raise RuntimeError('Enable this VM’s desktop before repairing it.')
+            status = await self.status()
+            if not status.running or not await self._current_boot_is_verified():
+                raise RuntimeError('Finish Start / Retry Setup before repairing this desktop.')
+            original_boot = str(self._read_readiness().get('boot_id') or '')
+            await self._emit_progress(progress, 'desktop_checking', 'Checking the guest desktop…')
+            check_cancelled()
+            result = await self._run_desktop_repair(allow_kernel_repair=True, progress=progress)
+            check_cancelled()
+            if result.get('state') not in {'ready', 'reboot_required'}:
+                raise DesktopSetupError(str(result.get('error_code') or 'DESKTOP_REPAIR_FAILED'))
+            candidate = str(result.get('candidate_kernel_sha256') or '')
+            if result.get('state') == 'reboot_required':
+                if not re.fullmatch(r'[0-9a-f]{64}', candidate):
+                    raise DesktopSetupError('DESKTOP_KERNEL_VERIFY_FAILED')
+                await self._emit_progress(progress, 'desktop_restarting', 'Restarting the VM to verify desktop support…',
+                    detail='The existing VM disk and earlier kernels are preserved.',
+                    stage_timeout_seconds=self.TIMEOUT_STOP + self.TIMEOUT_START)
+                check_cancelled()
+                await self.stop()
+                stopped = await self.status()
+                if stopped.running or stopped.state != 'stopped':
+                    raise RuntimeError('The VM did not stop. Desktop repair did not restart it.')
+                check_cancelled()
+                await self._start_locked(progress=progress, ensure_desktop=False)
+                check_cancelled()
+            await self._emit_progress(progress, 'desktop_verifying', 'Verifying the active guest desktop…')
+            snapshot = await self._probe_desktop()
+            if (snapshot.get('boot_id') != self._read_readiness().get('boot_id') or
+                    (result.get('state') == 'reboot_required' and (
+                        snapshot.get('boot_id') == original_boot
+                        or not candidate or snapshot.get('running_kernel_sha256') != candidate))):
+                snapshot = await self._record_desktop_snapshot({**snapshot, 'state': 'failed',
+                    'error_code': 'DESKTOP_BOOT_VERIFY_FAILED'})
+            if snapshot.get('state') != 'ready' or snapshot.get('error_code') != 'NONE':
+                raise DesktopSetupError(str(snapshot.get('error_code') or 'DESKTOP_SESSION_NOT_READY'))
+            await self._emit_progress(progress, 'desktop_ready', 'Guest desktop is ready.', stage_progress_percent=100.0)
+            return await self.status()
+
+    @_lifecycle_diagnostics('desktop')
+    async def repair_desktop(self, progress=None, *, reservation_held: bool = False) -> EnvironmentStatus:
+        release = ((lambda: None) if reservation_held else
+                   reserve_environment_change(self.workspace_root, 'desktop repair', environment_id=self.config.id))
+        worker = None
+        cancel_event = asyncio.Event()
+        try:
+            worker = asyncio.create_task(self._repair_desktop_locked(progress=progress, cancel_event=cancel_event))
+            return await asyncio.shield(worker)
+        finally:
+            interrupted = False
+            if worker is not None:
+                if not worker.done():
+                    cancel_event.set()
+                while not worker.done():
+                    try:
+                        await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        if not worker.done():
+                            cancel_event.set()
+                            interrupted = True
+                    except Exception:
+                        break
+                if worker.done():
+                    try:
+                        worker.result()
+                    except BaseException:
+                        pass
+            release()
+            if interrupted:
+                raise asyncio.CancelledError
 
     def _read_verified_guest(self) -> dict[str, Any]:
         path = self.state_root / 'verified-guest.json'
@@ -3930,7 +4121,7 @@ print(json.dumps(facts))
         # update as well as live ACL/name/network changes made by another tab.
         self.config = saved
 
-    async def _start_locked(self, progress=None) -> EnvironmentStatus:
+    async def _start_locked(self, progress=None, *, ensure_desktop: bool = True) -> EnvironmentStatus:
         self._refresh_saved_network_policy()
         async def report(phase: str, message: str, **meta: Any) -> None:
             self._write_readiness(ready=False, phase=phase)
@@ -3947,6 +4138,8 @@ print(json.dumps(facts))
         if status.running and not binding_needs_reconcile and await self._current_boot_is_verified():
             if not self._read_verified_guest():
                 await self._record_verified_guest()
+            if ensure_desktop:
+                await self._check_desktop_once()
             await self._emit_progress(progress, 'ready', 'Environment Ready', stage_progress_percent=100.0, progress_source='lima')
             return await self.status()
         if status.running and self._mount_type() == 'reverse-sshfs':
@@ -4021,6 +4214,8 @@ print(json.dumps(facts))
         if await self._current_boot_is_verified():
             if not self._read_verified_guest():
                 await self._record_verified_guest()
+            if ensure_desktop:
+                await self._check_desktop_once()
             await self._emit_progress(progress, 'ready', 'Environment Ready', stage_progress_percent=100.0, progress_source='lima')
             return await self.status()
         # Package installation is explicit one-time disk setup, never a Lima
@@ -4029,8 +4224,9 @@ print(json.dumps(facts))
         await report('checking_workspace_files', 'Checking workspace file sharing…',
                      stage_timeout_seconds=self.TIMEOUT_WORKSPACE_MOUNTS)
         await self._verify_workspace_backing_mounts()
-        await self._ensure_desktop(progress=progress)
         await self._enforce_runtime_guard(progress=progress)
+        if ensure_desktop:
+            await self._ensure_desktop(progress=progress)
         await self._record_verified_guest()
         await self._emit_progress(progress, 'ready', 'Environment Ready', stage_progress_percent=100.0, progress_source='lima')
         return await self.status()

@@ -182,6 +182,9 @@ class EnvironmentStatus:
     error: str = ''
     environment_id: str = ''
     environment_name: str = ''
+    desktop_ready: bool = False
+    desktop_state: str = ''
+    desktop_error: str = ''
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -1,4 +1,7 @@
-# HarnessyXO v0.7.25 Features
+# HarnessyXO v0.7.26 Features
+
+- Terminal/model Ready and Desktop Ready are separate. Verify the running graphical session and active display before opening the browser desktop; a VNC connection alone does not prove that the guest has graphics output.
+- Desktop-enabled Lima Linux VMs have **Repair Desktop**. Finish their tasks and close their tabs first. Repair keeps the VM disk and older kernels, can add the generic Kali kernel when the cloud kernel lacks graphics support, and verifies supported boot settings before restarting. Custom boot policies remain explicit. **VM_DESKTOP.json** retains bounded, content-free observations.
 
 - Prepare SSHFS before Lima requires shared-folder mounts. Missing-helper setup and package failures have bounded waits and specific errors. An idle degraded VM can retry setup using its existing disk; model commands still require verified mounts and isolation.
 

@@ -38,6 +38,7 @@ class RegistryViewManager:
         self.windows = bool(getattr(controller, 'windows', False))
         self.backend = str(getattr(controller, 'backend', config.provider))
         self.key = str(controller.key)
+        self._desktop_checked = False
 
     @property
     def busy(self) -> bool:
@@ -52,6 +53,11 @@ class RegistryViewManager:
         if not self.registry_valid():
             raise RuntimeError('This VM environment is no longer available.')
         status = await self.provider.status()
+        check = getattr(self.provider, 'verify_desktop_ready', None)
+        if not self._desktop_checked and callable(check) and status.running:
+            await check()
+            self._desktop_checked = True
+            status = await self.provider.status()
         return status.to_dict() if hasattr(status, 'to_dict') else dict(status)
 
     def desktop_info(self) -> dict[str, Any]:

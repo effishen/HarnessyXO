@@ -678,6 +678,9 @@ def render_vm_environments(workbench, tab, workspace) -> None:
                     ui.label(f'{config.cpu} vCPU · {config.memory_mb / 1024:g} GiB RAM · {config.disk_gb} GiB disk').classes('text-xs hy-muted')
                     ui.label(f'Tool preset: {TOOL_BUNDLES.get(preset.tools_id, preset.tools_id)}').classes('text-xs hy-muted')
                     ui.label(FILE_MODES.get(config.files_mode, config.files_mode)).classes('text-xs hy-muted')
+                    desktop_status = None
+                    if config.provider == 'lima' and config.desktop:
+                        desktop_status = ui.label('Desktop: not checked').classes('text-xs hy-muted').style('overflow-wrap:anywhere').props(f'data-hy-vm-desktop-status={config.id}')
                     with ui.column().classes('w-full gap-1').props(f'data-hy-vm-radio-summary={config.id}'):
                         if config.provider == 'openwrt':
                             with ui.row().classes('w-full items-start no-wrap gap-2'):
@@ -719,17 +722,20 @@ def render_vm_environments(workbench, tab, workspace) -> None:
                         terminal = ui.button('Terminal', icon='terminal', on_click=lambda _=None, eid=config.id: workbench.open_tool_tab('terminal', workbench._find_reg(workspace.id), environment_id=eid)).props('flat no-caps')
                         terminal_options = ui.button(icon='arrow_drop_down', on_click=lambda _=None, eid=config.id: workbench._choose_vm_terminal(workbench._find_reg(workspace.id), eid)).props('flat dense aria-label="Choose terminal mode and project"')
                         terminal_options.tooltip('Choose Project files or Guest console')
-                        graphical = None
+                        graphical = desktop_repair = None
                         if getattr(config, 'desktop', False):
                             graphical = ui.button('Web UI' if config.provider == 'openwrt' else 'Desktop', icon='desktop_windows',
                                       on_click=lambda _=None, eid=config.id: workbench.open_vm_tab(workspace, eid, 'desktop')).props('flat no-caps')
+                            if config.provider == 'lima':
+                                desktop_repair = ui.button('Repair Desktop', icon='desktop_access_disabled', on_click=lambda _=None, callback=queue: callback('desktop')).props('flat no-caps')
+                                desktop_repair.tooltip('Repair the guest desktop. A missing graphics driver may need a guest kernel install and restart. Finish VM work and close its tabs first.')
                         if config.provider == 'openwrt':
                             ui.button('Emulated radios', icon='wifi', on_click=lambda _=None, eid=config.id: edit_radios(eid)).props('outline no-caps')
                         manage = ui.button('Manage', icon='tune', on_click=lambda _=None, eid=config.id: toggle_manage(eid)).props('outline no-caps')
                         delete = ui.button(icon='delete_outline', on_click=lambda _=None, item=config: remove(item)).props('flat round dense color=negative aria-label="Remove VM environment"')
                     details = ui.column().classes('w-full gap-0 mt-2 pt-2').style('min-width:0;border-top:1px solid var(--hy-border)').props(f'data-hy-vm-details={config.id}')
                     details.set_visibility(False)
-                    card_states[config.id] = dict(config=config, card=vm_card, spinner=spinner, status=status, operation=operation, detail=detail, timing=timing, progress=progress, progress_panel=progress_panel, progress_icon=progress_icon, start=start_button, stop=stop_button, terminal=terminal, terminal_options=terminal_options, graphical=graphical, manage=manage, details=details, delete=delete, radio_wifi=radio_wifi, radio_bluetooth=radio_bluetooth, running=False)
+                    card_states[config.id] = dict(config=config, card=vm_card, spinner=spinner, status=status, operation=operation, detail=detail, timing=timing, progress=progress, progress_panel=progress_panel, progress_icon=progress_icon, start=start_button, stop=stop_button, terminal=terminal, terminal_options=terminal_options, graphical=graphical, desktop_repair=desktop_repair, desktop_status=desktop_status, manage=manage, details=details, delete=delete, radio_wifi=radio_wifi, radio_bluetooth=radio_bluetooth, running=False)
         tab_syncing['value'] = False
         sync_details()
 
@@ -752,7 +758,7 @@ def render_vm_environments(workbench, tab, workspace) -> None:
                 state_label = {'start': 'Starting…', 'stop': 'Stopping…', 'snapshot': 'Creating snapshot…',
                                'restore': 'Restoring…', 'reset': 'Resetting…', 'rebuild': 'Rebuilding…',
                                'tools': 'Updating tools…', 'resources': 'Applying resources…',
-                               'network': 'Applying network…', 'remove': 'Removing…'}.get(op.action, 'Working…')
+                               'network': 'Applying network…', 'remove': 'Removing…', 'desktop': 'Repairing desktop…'}.get(op.action, 'Working…')
                 controls['status'].set_text(state_label)
                 controls['status'].props('color=primary')
                 controls['operation'].set_text(op.message or 'Working…')
@@ -766,6 +772,7 @@ def render_vm_environments(workbench, tab, workspace) -> None:
                 summary_state = 'starting' if op.action in {'start', 'restore', 'reset', 'rebuild'} else 'stopping' if op.action == 'stop' else 'updating'
             else:
                 controls['operation'].set_text(
+                    'Desktop setup incomplete' if op.error and op.action == 'desktop' else
                     'VM setup incomplete' if op.error and op.action == 'start' and controls.get('running') else
                     'VM operation failed' if op.error else 'VM status unavailable' if controls.get('poll_error') else
                     'Checking VM status…' if checking else 'VM status'
@@ -808,6 +815,20 @@ def render_vm_environments(workbench, tab, workspace) -> None:
             controls['terminal_options'].set_enabled(not busy and bool(controls.get('ready')))
             if controls['graphical'] is not None:
                 controls['graphical'].set_enabled(not busy and bool(controls.get('running')))
+            if controls.get('desktop_repair') is not None:
+                controls['desktop_repair'].set_enabled(can_retry and bool(controls.get('running')) and bool(controls.get('ready')))
+                line = ('Desktop: VM stopped' if not controls.get('running') else
+                        'Desktop: Ready' if controls.get('desktop_ready') else
+                        'Desktop: ' + (str(controls.get('desktop_error') or '') or
+                                       ('checking…' if controls.get('desktop_state') == 'checking' else
+                                        'not verified. Open Desktop to check, or use Repair Desktop.')))
+                controls['desktop_status'].set_text(line)
+                if controls.get('running') and not controls.get('desktop_ready'):
+                    controls['desktop_status'].classes(add='text-warning', remove='hy-muted text-positive')
+                elif controls.get('running'):
+                    controls['desktop_status'].classes(add='text-positive', remove='hy-muted text-warning')
+                else:
+                    controls['desktop_status'].classes(add='hy-muted', remove='text-positive text-warning')
             controls['delete'].set_enabled(can_retry and (not known or not controls.get('running')))
         configs = [value['config'] for value in card_states.values()]
         parts = [f'{len(configs)} VM' + ('' if len(configs) == 1 else 's')]
@@ -832,6 +853,8 @@ def render_vm_environments(workbench, tab, workspace) -> None:
                     poll_error = str(info.get('_status_poll_error') or '')
                     controls.update(status_attempted=True, known=not bool(poll_error), poll_error=poll_error,
                                     running=bool(status.get('running')), ready=bool(status.get('ready')),
+                                    desktop_ready=bool(status.get('desktop_ready')), desktop_state=str(status.get('desktop_state') or ''),
+                                    desktop_error=str(status.get('desktop_error') or ''),
                                     status_detail=str(status.get('error') or status.get('detail') or '') if not status.get('ready') else '',
                                     state='Unavailable' if poll_error else str(status.get('state') or 'stopped'),
                                     radio_snapshot=info.get('hardware_emulation'))

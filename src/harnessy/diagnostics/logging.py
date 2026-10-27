@@ -341,6 +341,8 @@ _VM_DIAGNOSTIC_ENUMS = {
         'restarting_reset_vm', 'rebuilding', 'network_stopping', 'network_applying', 'network_starting',
         'resources_checking', 'resources_applying', 'resources_saving', 'resources_complete',
         'removal_checking', 'removal_destroying', 'removal_complete',
+        'desktop_checking', 'desktop_installing', 'desktop_kernel',
+        'desktop_restarting', 'desktop_verifying', 'desktop_ready',
     }),
 }
 _WORKSPACE_DATABASE_ENUMS = {
@@ -1658,9 +1660,9 @@ def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
         return [item for item in value[:1000] if isinstance(item, str)
                 and re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', item)] if isinstance(value, (list, tuple)) else []
     if lowered == 'environment_action':
-        return value if isinstance(value, str) and value in {'create', 'start', 'stop', 'reset', 'rebuild', 'destroy', 'remove', 'restore', 'snapshot', 'tools', 'network', 'resources'} else None
+        return value if isinstance(value, str) and value in {'create', 'start', 'stop', 'reset', 'rebuild', 'destroy', 'remove', 'restore', 'snapshot', 'tools', 'network', 'resources', 'desktop'} else None
     if lowered == 'lifecycle_action':
-        return value if isinstance(value, str) and value in {'create', 'start', 'stop', 'reset', 'rebuild', 'destroy'} else None
+        return value if isinstance(value, str) and value in {'create', 'start', 'stop', 'reset', 'rebuild', 'destroy', 'desktop'} else None
     if lowered == 'preservation_reason':
         return value if isinstance(value, str) and value in {'before_start', 'before_reset', 'before_delete',
             'controller_error', 'controller_timeout', 'controller_cancelled', 'controller_spawn_error'} else None
@@ -2392,6 +2394,11 @@ def _privacy_manifest(*, include_content: bool = False) -> str:
         'filesystem kinds, kernel 9p support, boot identity and fixed failure codes. Missing and invalid '
         'receipts remain explicit. Paths, mount sources, commands and file content are excluded in both '
         'export modes. Export reads saved observations only and never runs SSH or verifies live mounts.\n\n'
+        'VM_DESKTOP.json records up to eight saved desktop readiness observations per VM: boot identity, '
+        'observation time, fixed states/failure codes, reviewed kernel/DRM capability flags, graphics device '
+        'counts and display/session presence. Kernel release strings, boot configuration, paths, usernames, '
+        'process arguments and raw guest output are excluded in both export modes. Missing and invalid '
+        'receipts remain explicit. Export reads saved observations only and never contacts a guest.\n\n'
         'VM_RESOURCES.json records bounded persisted guest CPU usage/iowait percentages, vCPU count and '
         'sample interval, memory/cache/swap byte counters, load averages and uptime. Resource timestamps '
         'and freshness are separate from disk observations; last-known readings remain explicitly stale. '
@@ -2687,6 +2694,14 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
                                 'scope': 'persisted_runtime_observations', 'environments': [],
                                 'technical_error': technical_error_evidence(exc)}
             try:
+                from .desktop import collect_desktop_diagnostics
+                desktop_report = collect_desktop_diagnostics(latest)
+            except Exception as exc:
+                from .technical import technical_error_evidence
+                desktop_report = {'schema_version': 1, 'status': 'collector_failed',
+                                  'scope': 'persisted_runtime_observations', 'environments': [],
+                                  'technical_error': technical_error_evidence(exc)}
+            try:
                 from .vm_resources import collect_resource_diagnostics
                 resource_report = collect_resource_diagnostics(latest)
             except Exception as exc:
@@ -2716,10 +2731,12 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
             from .file_views import summary_lines as file_view_summary_lines
             from .vm_storage import summary_lines as storage_summary_lines
             from .workspace_mounts import summary_lines as mount_summary_lines
+            from .desktop import summary_lines as desktop_summary_lines
             from .vm_resources import summary_lines as resource_summary_lines
             summary += file_view_summary_lines(file_view_report)
             summary += storage_summary_lines(storage_report)
             summary += mount_summary_lines(mount_report)
+            summary += desktop_summary_lines(desktop_report)
             summary += resource_summary_lines(resource_report)
             try:
                 from .guest_logs import summary_lines as guest_summary_lines
@@ -2742,6 +2759,7 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
             zf.writestr('FILE_VIEWS.json', json.dumps(file_view_report, ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('VM_STORAGE.json', json.dumps(storage_report, ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('VM_MOUNTS.json', json.dumps(mount_report, ensure_ascii=False, indent=2, allow_nan=False))
+            zf.writestr('VM_DESKTOP.json', json.dumps(desktop_report, ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('VM_RESOURCES.json', json.dumps(resource_report, ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('INCIDENTS.json', json.dumps(incidents, ensure_ascii=False, indent=2))
             zf.writestr('PERMISSIONS.json', json.dumps(incidents.get('permission_audit', {
@@ -2771,6 +2789,7 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
                 'schema_version': 1, 'collectors': {name: value for name, value in
                     (('summary', incidents), ('workspace_vm', vm_report), ('test_targets', target_report), ('host', host_report),
                      ('file_views', file_view_report), ('vm_storage', storage_report), ('vm_mounts', mount_report),
+                     ('vm_desktop', desktop_report),
                      ('vm_resources', resource_report),
                      ('guest_logs', guest_report), ('vm_stalls', vm_stall_report),
                      ('lima_startup', lima_startup_report), ('external_devices', external_device_report))
