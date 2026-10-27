@@ -774,6 +774,9 @@ def _evidence(row: dict[str, Any]) -> dict[str, Any]:
         'capture_scope', 'pending_progress', 'post_exit_output_not_collected',
     )
     evidence = {key: row[key] for key in keys if key in row}
+    if 'guest_transport' in row:
+        from .guest_logs import validate_transport_evidence
+        evidence['guest_transport'] = validate_transport_evidence(row['guest_transport'])
     if row.get('event') == 'host_prerequisite_setup':
         from .startup import validate_startup_event
         evidence.update(validate_startup_event('host_prerequisite_setup', row) or {})

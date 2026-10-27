@@ -1,4 +1,6 @@
-# HarnessyXO v0.7.28 Features
+# HarnessyXO v0.7.29 Features
+
+- Retry Setup waits for a previous shutdown to finish when the app restarts during Stop. While the native VM status still says Running but guest control is unavailable, startup performs bounded read-only checks before proceeding. An unavailable control channel is reported separately from missing file-sharing packages, and diagnostics retain reviewed SSH transport failure categories.
 
 - A desktop-enabled VM completes its kernel and graphical setup through normal **Start / Retry Setup**, Create, Rebuild and Factory Reset controls. These human actions verify the desktop before reporting success. Internal model/terminal startup retains independent CLI readiness. Desktop installation reports its current step, elapsed time and recent package-output activity; saved diagnostics retain fixed failure reasons.
 
