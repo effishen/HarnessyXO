@@ -351,6 +351,7 @@ Workspace and machine databases use WAL so background reads can coexist with mes
 
 - Choose the default model for new projects/chats separately from the profile being edited. Set default thinking per model; new chats and model switches inherit it, while existing saved chat choices remain intact.
 - Use **Environments → Create VM Environment** for named local development/test guests. Choose the OS, architecture, resources, project-file access and network setting for each VM; no primary VM is required.
+- After a VM status check fails, retry Start or Stop, or use Remove and type its name to confirm. Removal verifies a stopped VM before deleting its disk; a definition with no VM instance can be removed even when Lima is unavailable. Workspace project files and conversations are preserved.
 - Use brokered model commands, binary file transfer, and main-area Bash/PowerShell/ash, noVNC Desktop and LuCI Web UI tabs. Manage start/stop and full stopped-VM snapshots, including Windows firmware/TPM state.
 - Match ARM64 or x86-64 to the host for acceleration, or choose the other architecture for CPU emulation. Windows requires matching installation media, Lima 2.2+, QEMU and swtpm. OpenWrt requires QEMU and e2fsprogs; it uses private NAT, pinned official images and a dedicated guest SSH key.
 

@@ -580,7 +580,7 @@ def render_vm_environments(workbench, tab, workspace) -> None:
         with vm_dialog() as dialog, ui.card().classes('w-[560px] max-w-[94vw] gap-3'):
             ui.label('Remove VM Environment?').classes('text-lg font-semibold text-negative')
             ui.label(f'Remove “{config.name}” and its VM disk, snapshots, installed packages and private build files?').classes('text-sm')
-            ui.label('Workspace project source and conversations are preserved. Stop this VM first.').classes('text-sm')
+            ui.label('HarnessyXO checks that this VM is stopped or was never created before removing anything. A running VM will not be removed. Workspace project source and conversations are preserved.').classes('text-sm')
             confirmation = ui.input('Type the VM name to confirm', placeholder=config.name).classes('w-full')
             with ui.row().classes('w-full justify-end gap-2'):
                 ui.button('Cancel', on_click=dialog.close).props('flat no-caps')
@@ -709,7 +709,8 @@ def render_vm_environments(workbench, tab, workspace) -> None:
                     with ui.row().classes('w-full gap-1 flex-wrap').props(f'data-hy-vm-controls={config.id}'):
                         def queue(action: str, environment_id=config.id) -> None:
                             try:
-                                ENVIRONMENT_OPERATIONS.start(workspace.root, action, environment_id=environment_id)
+                                if not ENVIRONMENT_OPERATIONS.start(workspace.root, action, environment_id=environment_id):
+                                    ui.notify('Wait for this VM’s current operation to finish.', type='warning')
                                 sync_cards()
                             except Exception as exc:
                                 ui.notify(str(exc), type='negative')
@@ -795,16 +796,19 @@ def render_vm_environments(workbench, tab, workspace) -> None:
                     'Finish this VM’s commands and close its terminals first.' if active else
                     'VM is running. Stop it before changing the selection; saved setup can be repaired now.' if controls.get('running') else
                     'VM is stopped. Change the selection and apply it for the next Start.')
-            for key in ('start', 'stop', 'delete'):
-                controls[key].set_enabled(known and not busy and not active)
-            controls['start'].set_enabled(known and not busy and not active and not (controls.get('running') and controls.get('ready')))
+            # A failed observer is not proof that the VM is running, stopped,
+            # or unsafe to inspect. Lifecycle operations perform their own
+            # checks; keep those recovery entry points available after a poll
+            # failure instead of making a broken controller impossible to fix.
+            can_retry = (known or bool(controls.get('status_attempted'))) and not busy and not active
+            controls['start'].set_enabled(can_retry and (not known or not (controls.get('running') and controls.get('ready'))))
             controls['start'].set_text('Retry Setup' if controls.get('running') and not controls.get('ready') else 'Start')
-            controls['stop'].set_enabled(known and not busy and not active and bool(controls.get('running')))
+            controls['stop'].set_enabled(can_retry and (not known or bool(controls.get('running'))))
             controls['terminal'].set_enabled(not busy and bool(controls.get('ready')))
             controls['terminal_options'].set_enabled(not busy and bool(controls.get('ready')))
             if controls['graphical'] is not None:
                 controls['graphical'].set_enabled(not busy and bool(controls.get('running')))
-            controls['delete'].set_enabled(known and not busy and not active and not controls.get('running'))
+            controls['delete'].set_enabled(can_retry and (not known or not controls.get('running')))
         configs = [value['config'] for value in card_states.values()]
         parts = [f'{len(configs)} VM' + ('' if len(configs) == 1 else 's')]
         parts.extend(f'{counts[state]} {state}' for state in ('starting', 'stopping', 'updating', 'ready', 'needs setup', 'stopped', 'checking', 'unavailable') if counts.get(state))
