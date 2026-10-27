@@ -1,4 +1,6 @@
-# HarnessyXO v0.7.30 Features
+# HarnessyXO v0.7.31 Features
+
+- Close VM desktop tabs cleanly, including views revoked during a connection or cleanup. Expected view cancellation finishes socket cleanup without an application traceback; genuine display transport failures remain visible in diagnostics.
 
 - Allow DNS requests redirected by Lima's internal resolver without opening other private-network services. Existing VMs apply the revised policy through **Start / Retry Setup**. Desktop setup stops after a failed or incomplete package-index refresh and shows its recorded failure reason directly in VM status and setup errors.
 

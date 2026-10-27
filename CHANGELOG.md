@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.7.31
+
+- Close a VM desktop tab without printing an ASGI cancellation traceback. Treat the cancellation deliberately requested by closing or revoking that view as normal connection cleanup.
+- Finish draining the display bridge and closing its socket when a view closes during cleanup. Preserve unrelated request cancellation and continue reporting genuine display connection, read and write failures.
+- Restart HarnessyXO to apply the update. An existing VM does not need to be rebuilt or set up again for this fix.
+
 ## v0.7.30
 
 - Keep DNS working through Lima's internal resolver redirection. Match translated DNS requests by their original configured resolver and port, while continuing to block unrelated private-network traffic. Public outbound disabled still blocks external DNS.

@@ -562,27 +562,50 @@ async def _vnc_socket(websocket: WebSocket, token: str) -> None:
             while await handle.authorized():
                 await asyncio.sleep(2)
         tasks = [asyncio.create_task(f()) for f in (from_vm, to_vm, guard)]
-        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()
+    except asyncio.CancelledError:
+        # Closing/revoking this lease deliberately cancels its socket owner.
+        # An unrelated request/server cancellation still belongs to the caller.
+        if not handle.closed:
+            raise
     except (OSError, asyncio.TimeoutError, WebSocketDisconnect, RuntimeError):
         if not handle.closed:
             _view_failure(handle, 'vnc_transport_unavailable')
-        pass
     finally:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        if writer:
-            writer.close()
+        async def close_transport():
             try:
-                await asyncio.wait_for(writer.wait_closed(), 2)
-            except (OSError, asyncio.TimeoutError):
-                pass
-        if owner:
-            handle.tasks.discard(owner)
-        try:
-            await websocket.close()
-        except RuntimeError:
-            pass
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                if writer:
+                    writer.close()
+                    try:
+                        await asyncio.wait_for(writer.wait_closed(), 2)
+                    except (OSError, asyncio.TimeoutError):
+                        pass
+            finally:
+                if owner:
+                    handle.tasks.discard(owner)
+                try:
+                    await asyncio.wait_for(websocket.close(), 2)
+                except (OSError, asyncio.TimeoutError, WebSocketDisconnect, RuntimeError):
+                    pass
+
+        # Lease closure can also arrive after a browser disconnect has already
+        # started cleanup. Drain the accepted cleanup even if the owner is
+        # cancelled again, without hiding cancellation of an open lease.
+        cleanup = asyncio.create_task(close_transport())
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = cancelled or not handle.closed
+        cleanup.result()
+        if cancelled:
+            raise asyncio.CancelledError
 
 
 def register_target_view_routes(app: Any, machine: Any, user_store: Any = None) -> None:
