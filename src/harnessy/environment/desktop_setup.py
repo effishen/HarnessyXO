@@ -492,7 +492,9 @@ def apt(packages):
     options = ['-o', 'Acquire::Retries=1', '-o', 'Acquire::http::Timeout=15',
         '-o', 'Acquire::https::Timeout=15', '-o', 'DPkg::Lock::Timeout=30']
     action('INSTALL', 'Refreshing guest package indexes for the graphical desktop', 'package_index')
-    code, output = run(['apt-get', *options, 'update'], 90)
+    # APT otherwise permits a successful exit after transient index failures,
+    # then tries installing from stale indexes for the full install deadline.
+    code, output = run(['apt-get', *options, '-o', 'APT::Update::Error-Mode=any', 'update'], 90)
     if code:
         raise Failure('DESKTOP_APT_UPDATE_FAILED', classify(code, output))
     action('INSTALL', 'Installing selected graphical desktop dependencies',

@@ -1,4 +1,6 @@
-# HarnessyXO v0.7.29 Features
+# HarnessyXO v0.7.30 Features
+
+- Allow DNS requests redirected by Lima's internal resolver without opening other private-network services. Existing VMs apply the revised policy through **Start / Retry Setup**. Desktop setup stops after a failed or incomplete package-index refresh and shows its recorded failure reason directly in VM status and setup errors.
 
 - Retry Setup waits for a previous shutdown to finish when the app restarts during Stop. While the native VM status still says Running but guest control is unavailable, startup performs bounded read-only checks before proceeding. An unavailable control channel is reported separately from missing file-sharing packages, and diagnostics retain reviewed SSH transport failure categories.
 

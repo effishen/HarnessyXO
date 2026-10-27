@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.7.30
+
+- Keep DNS working through Lima's internal resolver redirection. Match translated DNS requests by their original configured resolver and port, while continuing to block unrelated private-network traffic. Public outbound disabled still blocks external DNS.
+- Stop desktop setup when refreshing package indexes fails, including partial updates that APT normally treats as warnings. Avoid continuing a long installation against incomplete package indexes.
+- Show the recorded DNS, repository, storage or package-manager failure reason in the VM status and setup error, instead of leaving it only in diagnostics.
+- Update and use **Start / Retry Setup** on the existing Kali VM to apply the revised policy and continue desktop setup. No rebuild is required. Native Spark package installation, reboot and graphical output still need confirmation after updating.
+
 ## v0.7.29
 
 - Preserve an accepted Stop transition before running the native stop command. After an app restart, Start / Retry Setup waits for shutdown settlement before attempting guest file-sharing or desktop setup.
