@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.7.23
+
+- Keep background database polling, composer saves, model-request storage/build work and file searches off the UI loop. Coalesce repeated status reads and skip queue maintenance writes when nothing needs changing. Keep accepted writes ordered when Stop is pressed.
+- Retain the loaded page for up to three minutes through a temporary socket interruption, so a short stall does not send you back through workspace loading. Connection indicators and sign-in checks still show the actual connection state.
+- Keep a bounded backup of unsent text in the browser tab, scoped to the signed-in user and project. Recover typing across a reconnect without submitting a prompt. Send and queue actions require a connection; accepted sends, timeline restores and sign-out discard stale drafts.
+- Preserve queue admission while completion checks or backend-recovery pauses are being saved. Waiting projects must not slip through a pending pause just because storage is busy.
+- Capture Lima startup observations automatically after a quiet startup and at failure, before controller cleanup. Include verified selected-instance process states, QEMU capability-check children, owned monitor status, and guest serial-log coverage in **LIMA_STARTUP.json** and **lima-startup/**. Retain early stall evidence alongside recent and final observations; exports report missing or unsupported observations explicitly.
+- Show how long startup has produced no new output and whether the controller is still running, separately from verified guest boot progress.
+- The cause of the reported Kali twenty-minute startup timeout remains unverified. The new process and monitor captures fill the evidence gap in older bundles.
+
 ## v0.7.22
 
 - Recover VM controls after a failed status check. Start, Stop and Remove can retry after the first check fails; active VM work and ongoing operations still block conflicting actions. Removal checks the VM again before deleting anything.

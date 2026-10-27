@@ -16,6 +16,8 @@ import threading
 import stat
 from contextvars import ContextVar
 from contextlib import nullcontext
+from collections import deque
+from copy import copy, deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timezone
@@ -48,6 +50,49 @@ ToolHandler = Callable[[dict[str, Any]], Awaitable[str]]
 _FILE_VIEW_OWNER: ContextVar[str] = ContextVar('tool_file_view_owner', default='')
 _FILE_VIEW_ERRORS = frozenset({'FILE_VIEW_PENDING', 'FILE_VIEW_UNSUPPORTED',
                               'FILE_VIEW_FAILED', 'FILE_VIEW_POLICY_CHANGED'})
+_FILE_SCAN_MAX_ENTRIES = 20_000
+_FILE_SCAN_MAX_BYTES = 64 * 1024 * 1024
+_FILE_SCAN_SECONDS = 15.0
+
+
+class _FileScanCancelled(Exception):
+    pass
+
+
+class _FileScanBudget:
+    """Bound read-only worker scans independently of their output limits."""
+
+    def __init__(self, stop: threading.Event) -> None:
+        self.stop = stop
+        self.deadline = time.monotonic() + _FILE_SCAN_SECONDS
+        self.entries = 0
+        self.bytes = 0
+        self.limit = ''
+
+    def available(self) -> bool:
+        if self.stop.is_set():
+            raise _FileScanCancelled()
+        if time.monotonic() >= self.deadline:
+            self.limit = 'time'
+        return not self.limit
+
+    def visit(self) -> bool:
+        if not self.available():
+            return False
+        if self.entries >= _FILE_SCAN_MAX_ENTRIES:
+            self.limit = 'entries'
+            return False
+        self.entries += 1
+        return True
+
+    def read(self, size: int) -> bool:
+        if not self.available():
+            return False
+        if self.bytes + size > _FILE_SCAN_MAX_BYTES:
+            self.limit = 'bytes'
+            return False
+        self.bytes += size
+        return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -1644,6 +1689,7 @@ class WorkspaceToolbox:
             if blocked is not None:
                 record['result'] = blocked
                 return blocked
+            scan_policy = deepcopy(self.output_policy) if name in {'list_files', 'search_text'} else None
             execution_started = time.perf_counter()
             file_view_owner = uuid.uuid4().hex
             file_view_token = _FILE_VIEW_OWNER.set(file_view_owner)
@@ -1658,6 +1704,23 @@ class WorkspaceToolbox:
                     tool=name, tool_call_id=self.tool_call_id,
                 ) as memory_scope:
                     result = await handler(arguments)
+                    if scan_policy is not None:
+                        def current_scan_scope():
+                            return (self.workspace.active_root_path(self.chat_id).resolve(),
+                                    self.workspace.output_policy(self.chat_id))
+                        current_root, current_policy = await asyncio.to_thread(current_scan_scope)
+                        blocked = await authorize('after_read', allow_prompt=False)
+                        if blocked is not None:
+                            payload = json.loads(blocked)
+                            payload['output_withheld'] = True
+                            result = json.dumps(payload)
+                        elif (current_root != self.root
+                              or current_policy.get('policy_revision') != scan_policy.get('policy_revision')):
+                            result = json.dumps({
+                                'ok': False, 'error_code': 'FILE_VIEW_POLICY_CHANGED',
+                                'output_withheld': True, 'retryable': False,
+                                'error': 'Project file access changed during this scan. Its output was withheld; retry using the current project scope.',
+                            })
             finally:
                 _TOOL_STATUS_CALLBACK.reset(status_token)
                 _FILE_VIEW_OWNER.reset(file_view_token)
@@ -2190,7 +2253,7 @@ class WorkspaceToolbox:
                     f'File is larger than {max_bytes // (1024 * 1024)} MiB; '
                     'use search_text or a narrower file operation'
                 )
-            raw = handle.read()
+            raw = handle.read() if max_bytes is None else handle.read(max_bytes + 1)
             after = os.fstat(handle.fileno())
         identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
         if identity(before) != identity(after) or identity(after) != identity(path.stat()) or len(raw) != after.st_size:
@@ -2973,7 +3036,78 @@ class WorkspaceToolbox:
                 )
         return json.dumps(result)
 
+    async def _run_file_scan(self, operation: str, a: dict[str, Any]) -> str:
+        # A toolbox can be refreshed by another caller while this worker is
+        # reading. Give the scan its own captured namespace and ContextVars;
+        # execute() revalidates the saved grant before releasing its result.
+        scanner = copy(self)
+        scanner.output_policy = deepcopy(self.output_policy)
+        scanner._refresh_project_namespace()
+        stop = threading.Event()
+        worker = asyncio.create_task(asyncio.to_thread(
+            getattr(scanner, operation), dict(a), _FileScanBudget(stop),
+        ))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            stop.set()
+            # A read already in the OS can finish after cancellation, but the
+            # worker must not start another file or publish a late result.
+            def consume(task: asyncio.Task) -> None:
+                if not task.cancelled():
+                    task.exception()
+            worker.add_done_callback(consume)
+            raise
+
+    def _scan_file_paths(
+        self, sources: list[tuple[Path, bool]], budget: _FileScanBudget, *, descend=None,
+    ):
+        """Walk real directories lazily, pruning hidden and synthetic roots."""
+        pending = deque()
+        for source, include_self in sources:
+            if not budget.available():
+                return
+            if not self._path_stays_in_root(source):
+                continue
+            if include_self:
+                if not budget.visit():
+                    return
+                yield source
+            if descend is None or descend(source):
+                pending.append(source)
+        while pending:
+            if not budget.available():
+                return
+            directory = pending.popleft()
+            # Recheck at descent, including after the directory was queued.
+            if not self._path_stays_in_root(directory):
+                continue
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        if not budget.visit():
+                            return
+                        if entry.name == FILES_PROBE_DIR_NAME or (
+                            self._block_meta and entry.name == META_DIR_NAME
+                        ) or (directory == self.root and entry.name in self._ancestor_by_folder):
+                            continue
+                        path = Path(entry.path)
+                        if not self._path_stays_in_root(path):
+                            continue
+                        yield path
+                        # pathlib.rglob did not recurse through directory
+                        # symlinks either. Authorized live roots are supplied
+                        # explicitly, so never follow them a second time.
+                        if (entry.is_dir(follow_symlinks=False)
+                                and (descend is None or descend(path))):
+                            pending.append(path)
+            except OSError:
+                continue
+
     async def list_files(self, a: dict[str, Any]) -> str:
+        return await self._run_file_scan('_list_files', a)
+
+    def _list_files(self, a: dict[str, Any], budget: _FileScanBudget) -> str:
         base = self._resolve(a.get('path', '.'), must_exist=True)
         if not base.is_dir():
             raise ValueError('path must be a directory')
@@ -2981,69 +3115,51 @@ class WorkspaceToolbox:
         max_entries = max(1, min(int(a.get('max_entries', 300)), 2000))
         lines: list[str] = []
         files_root = self.workspace.files_root.resolve()
-        candidates: list[Path]
+        sources: list[tuple[Path, bool]]
         if base == files_root:
             # Do not enumerate unrelated sibling projects. The parent chain is
             # exposed only as nested live links inside the owned project.
-            candidates = [self.workspace.references_dir, self.root]
-            candidates.extend(self.workspace.references_dir.rglob('*'))
-            candidates.extend(self.root.rglob('*'))
+            sources = [(self.workspace.references_dir, True), (self.root, True)]
             for row in self._ancestor_rows:
                 upstream = Path(str(row['host_path']))
-                candidates.append(upstream)
-                candidates.extend(upstream.rglob('*'))
+                sources.append((upstream, True))
             for row in self._direct_access_rows:
                 shared = Path(str(row['host_path']))
-                candidates.append(shared)
-                candidates.extend(shared.rglob('*'))
+                sources.append((shared, True))
         else:
-            candidates = list(base.rglob('*'))
+            sources = [(base, False)]
             if base == self.root:
-                reserved = set(self._ancestor_by_folder)
-                candidates = [
-                    path for path in candidates
-                    if not path.relative_to(self.root).parts
-                    or path.relative_to(self.root).parts[0] not in reserved
-                ]
                 for row in self._ancestor_rows:
                     upstream = Path(str(row['host_path']))
-                    candidates.append(upstream)
-                    candidates.extend(upstream.rglob('*'))
-        safe_candidates: list[tuple[Path, str]] = []
-        for path in candidates:
-            if not self._path_stays_in_root(path):
-                continue
-            try:
-                if base == files_root:
-                    target = path.resolve(strict=False)
-                    references = self.workspace.references_dir.resolve()
-                    if target == references or references in target.parents:
-                        relative = target.relative_to(references).as_posix()
-                        logical = f'{FILES_DIR_NAME}/{REFERENCES_DIR_NAME}' + (
-                            '' if relative == '.' else f'/{relative}'
-                        )
-                    elif target == self.root or self.root in target.parents:
-                        relative = target.relative_to(self.root).as_posix()
-                        logical = f'{FILES_DIR_NAME}/{self.writable_output_folder}' + (
-                            '' if relative == '.' else f'/{relative}'
-                        )
-                    elif any(
-                        target == Path(str(row['host_path'])).resolve()
-                        or Path(str(row['host_path'])).resolve() in target.parents
-                        for row in self._direct_access_rows
-                    ):
-                        logical = self._listed_logical_relative(path)
-                    else:
-                        logical = f'{FILES_DIR_NAME}/{self.writable_output_folder}/' + self._listed_logical_relative(path)
-                else:
+                    sources.append((upstream, True))
+
+        def logical_path(path: Path) -> str:
+            if base == files_root:
+                target = path.resolve(strict=False)
+                references = self.workspace.references_dir.resolve()
+                if target == references or references in target.parents:
+                    relative = target.relative_to(references).as_posix()
+                    logical = f'{FILES_DIR_NAME}/{REFERENCES_DIR_NAME}' + (
+                        '' if relative == '.' else f'/{relative}'
+                    )
+                elif target == self.root or self.root in target.parents:
+                    relative = target.relative_to(self.root).as_posix()
+                    logical = f'{FILES_DIR_NAME}/{self.writable_output_folder}' + (
+                        '' if relative == '.' else f'/{relative}'
+                    )
+                elif any(
+                    target == Path(str(row['host_path'])).resolve()
+                    or Path(str(row['host_path'])).resolve() in target.parents
+                    for row in self._direct_access_rows
+                ):
                     logical = self._listed_logical_relative(path)
-            except ValueError:
-                continue
-            safe_candidates.append((path, logical))
-        for path, logical in sorted(
-            safe_candidates,
-            key=lambda item: (len(Path(item[1]).parts), item[1].lower()),
-        ):
+                else:
+                    logical = f'{FILES_DIR_NAME}/{self.writable_output_folder}/' + self._listed_logical_relative(path)
+            else:
+                logical = self._listed_logical_relative(path)
+            return logical
+
+        def relative_depth(path: Path, logical: str) -> int:
             if base == files_root:
                 logical_parts = Path(logical).parts
                 rel_to_base = Path(*logical_parts[1:]) if logical_parts and logical_parts[0] == FILES_DIR_NAME else Path(logical)
@@ -3054,8 +3170,29 @@ class WorkspaceToolbox:
                     rel_to_base = path.resolve(strict=False).relative_to(base.resolve())
                 except ValueError:
                     rel_to_base = Path(logical)
-            if len(rel_to_base.parts) > max_depth + 1:
+            return len(rel_to_base.parts)
+
+        def descend(path: Path) -> bool:
+            try:
+                return relative_depth(path, logical_path(path)) < max_depth + 1
+            except ValueError:
+                return False
+
+        safe_candidates: list[tuple[Path, str]] = []
+        for path in self._scan_file_paths(sources, budget, descend=descend):
+            try:
+                logical = logical_path(path)
+            except ValueError:
                 continue
+            if relative_depth(path, logical) > max_depth + 1:
+                continue
+            safe_candidates.append((path, logical))
+        for path, logical in sorted(
+            safe_candidates,
+            key=lambda item: (len(Path(item[1]).parts), item[1].lower()),
+        ):
+            if not budget.available() and budget.limit == 'time':
+                break
             if self._block_meta and META_DIR_NAME in Path(logical).parts:
                 continue
             is_live_link = any(
@@ -3068,7 +3205,7 @@ class WorkspaceToolbox:
             if len(lines) >= max_entries:
                 lines.append('... truncated ...')
                 break
-        truncated = bool(lines and lines[-1] == '... truncated ...')
+        truncated = bool(budget.limit or (lines and lines[-1] == '... truncated ...'))
         payload = {
             'ok': True,
             'root': '.',
@@ -3096,6 +3233,8 @@ class WorkspaceToolbox:
             'truncated': truncated,
         }
         if truncated:
+            if budget.limit:
+                payload['scan_limit'] = budget.limit
             payload['truncation_guidance'] = (
                 'Output was truncated. Do not repeat or broaden the whole-workspace listing. '
                 'Narrow the next query to the specific directory/artifact required for the next action.'
@@ -3269,29 +3408,28 @@ class WorkspaceToolbox:
         return json.dumps(payload)
 
     async def search_text(self, a: dict[str, Any]) -> str:
+        return await self._run_file_scan('_search_text', a)
+
+    def _search_text(self, a: dict[str, Any], budget: _FileScanBudget) -> str:
         query = str(a['query'])
+        lowered_query = query.lower()
         base = self._resolve(a.get('path', '.'), must_exist=True)
         pattern = str(a.get('glob', '*'))
         max_results = max(1, min(int(a.get('max_results', 100)), 500))
         results: list[dict[str, Any]] = []
         provenance_by_path: dict[str, dict[str, Any]] = {}
-        iterator = list(base.rglob('*')) if base.is_dir() else [base]
+        sources = [(base, False)]
         if base == self.root:
-            reserved = set(self._ancestor_by_folder)
-            iterator = [
-                path for path in iterator
-                if not path.relative_to(self.root).parts
-                or path.relative_to(self.root).parts[0] not in reserved
-            ]
             for row in self._ancestor_rows:
                 upstream = Path(str(row['host_path']))
-                iterator.extend(upstream.rglob('*'))
+                sources.append((upstream, False))
         elif base == self.workspace.files_root.resolve():
-            iterator = [*self.root.rglob('*'), *self.workspace.references_dir.rglob('*')]
+            sources = [(self.root, False), (self.workspace.references_dir, False)]
             for row in self._ancestor_rows:
-                iterator.extend(Path(str(row['host_path'])).rglob('*'))
+                sources.append((Path(str(row['host_path'])), False))
+        iterator = self._scan_file_paths(sources, budget) if base.is_dir() else iter([base])
         for path in iterator:
-            if len(results) >= max_results:
+            if len(results) >= max_results or not budget.available():
                 break
             if not self._path_stays_in_root(path):
                 continue
@@ -3301,18 +3439,25 @@ class WorkspaceToolbox:
             if not fnmatch.fnmatch(path.name, pattern) and not fnmatch.fnmatch(logical, pattern):
                 continue
             try:
-                if path.stat().st_size > 3 * 1024 * 1024:
+                size = path.stat().st_size
+                if size > 3 * 1024 * 1024:
                     continue
+                if not budget.read(size):
+                    break
                 raw, file_state = self._read_file_snapshot(path, max_bytes=3 * 1024 * 1024)
                 if b'\x00' in raw[:4096]:
                     continue
                 text = raw.decode('utf-8', errors='replace')
-            except (OSError, UnicodeError):
+            except (OSError, UnicodeError, ValueError):
                 continue
             logged = False
             for lineno, line in enumerate(text.splitlines(), 1):
-                if query.lower() in line.lower():
+                if lineno % 256 == 1 and not budget.available():
+                    break
+                if lowered_query in line.lower():
                     if not logged:
+                        if not budget.available():
+                            break
                         file_state.update(file_path_identity(path, **self._file_identity_args(path)))
                         self._file_receipt('search_text', path, file_state=file_state, ok=True)
                         provenance_by_path[logical] = self._path_provenance(path)
@@ -3323,11 +3468,15 @@ class WorkspaceToolbox:
                     })
                     if len(results) >= max_results:
                         break
-        return json.dumps({
+        payload = {
             'ok': True, 'query': query, 'results': results,
             'provenance_by_path': provenance_by_path,
-            'truncated': len(results) >= max_results,
-        })
+            'truncated': bool(budget.limit or len(results) >= max_results),
+        }
+        if budget.limit:
+            payload.update(scan_limit=budget.limit,
+                           truncation_guidance='Search was partial. Narrow the path or glob before searching again.')
+        return json.dumps(payload)
 
     async def make_directory(self, a: dict[str, Any]) -> str:
         path = self._resolve(a['path'], for_write=True)

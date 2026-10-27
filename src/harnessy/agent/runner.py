@@ -4,6 +4,7 @@ import asyncio
 import base64
 import copy
 import hashlib
+import inspect
 import json
 import math
 import mimetypes
@@ -14,7 +15,7 @@ import httpx
 from datetime import datetime, timedelta
 from itertools import count
 from collections.abc import Awaitable, Callable
-from contextlib import aclosing
+from contextlib import aclosing, asynccontextmanager
 from typing import Any
 
 from harnessy.environment.activity import activity
@@ -57,6 +58,28 @@ ReasoningCallback = Callable[[str], Awaitable[None]]
 StatusCallback = Callable[[str], Awaitable[None]]
 TranscriptEventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 FollowupCallback = Callable[[bool], Awaitable[list[dict[str, Any]]]]
+
+
+async def _runner_storage_call(operation, /, *args, **kwargs):
+    """Keep ordered storage work off the loop and settle it before cleanup.
+
+    A thread cannot roll back a write merely because its awaiting run stopped.
+    Drain the one accepted operation before propagating cancellation so history
+    finalizers and writer-lease release cannot race a late transcript commit.
+    Callers retain callbacks and UI work on the event loop.
+    """
+    worker = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except (asyncio.CancelledError, Exception):
+                pass
+        if not worker.cancelled():
+            worker.exception()
+        raise
 
 
 
@@ -437,8 +460,8 @@ class AgentRunner:
         agent_slot_lease: Any | None = None,
         live_profile_loader: Callable[[], dict[str, Any] | None] | None = None,
         live_permission_loader: Callable[[], dict[str, Any]] | None = None,
-        backend_recovery_callback: Callable[[str, dict[str, Any]], None] | None = None,
-        completion_gate_callback: Callable[[str, dict[str, Any]], None] | None = None,
+        backend_recovery_callback: Callable[[str, dict[str, Any]], None | Awaitable[None]] | None = None,
+        completion_gate_callback: Callable[[str, dict[str, Any]], None | Awaitable[None]] | None = None,
     ) -> None:
         self.workspace = workspace
         self.chat_id = chat_id
@@ -1575,7 +1598,7 @@ Rules:
     ) -> None:
         target = int(change.get('new_target_tokens') or 0)
         mode = str(change.get('new_mode') or 'auto')
-        row = self.workspace.add_activity_event(
+        row = (await _runner_storage_call(self.workspace.add_activity_event,
             self.chat_id,
             'live_context_update',
             title='Live context setting applied',
@@ -1587,7 +1610,7 @@ Rules:
             tone='indigo',
             run_id=self.run_id,
             details={**change, 'step': step + 1},
-        )
+        ))
         await emit_event(
             'timeline_activity', message_id=row.id,
             activity_type='live_context_update', status='success',
@@ -1745,7 +1768,7 @@ Rules:
             actual_prompt_tokens=None, actual_prompt_tokens_source='unavailable',
         )
         if self._auto_tuning_activity_id:
-            self.workspace.update_activity_event(self._auto_tuning_activity_id, {
+            (await _runner_storage_call(self.workspace.update_activity_event, self._auto_tuning_activity_id, {
                 'title': 'Testing a larger context',
                 'summary': (
                     f'Automatic tuning is trying a {target:,}-token retained-history target on the next normal '
@@ -1776,7 +1799,7 @@ Rules:
                     'tuning_method': None, 'retry_measurements': {},
                     'reason': 'Stable accepted requests allow a bounded capacity reassessment',
                 },
-            })
+            }))
             await emit_event('timeline_activity_updated', message_id=self._auto_tuning_activity_id,
                              activity_type='context_compaction', status='running')
 
@@ -2260,11 +2283,11 @@ Rules:
         ]
         summary = '; '.join(f'{value:,} {label}' for value, label in counts if value)
         try:
-            row = self.workspace.add_activity_event(
+            row = (await _runner_storage_call(self.workspace.add_activity_event,
                 self.chat_id, 'context_retention', title='Context trimmed',
                 summary=summary + '. Saved originals remain available through history and attachment tools.',
                 status='complete', tone='indigo', run_id=self.run_id, details=pending,
-            )
+            ))
         except Exception as exc:
             log_event('runtime', 'context_retention_activity_failed',
                       workspace_id=getattr(self.workspace, 'id', None), chat_id=self.chat_id,
@@ -2930,11 +2953,11 @@ Rules:
                     'details': details,
                 }
                 if existing:
-                    row = self.workspace.update_activity_event(row.id, patch) or row
+                    row = (await _runner_storage_call(self.workspace.update_activity_event, row.id, patch)) or row
                 else:
-                    row = self.workspace.add_activity_event(
+                    row = (await _runner_storage_call(self.workspace.add_activity_event,
                         self.chat_id, 'prompt_processing', run_id=self.run_id, **patch,
-                    )
+                    ))
                 last_saved, last_phase = now, phase
                 last_prefill_snapshot = dict(snapshot) if isinstance(snapshot, dict) else None
                 if not notifications_disabled:
@@ -3026,9 +3049,11 @@ Rules:
                 details['error'] = type(error).__name__
                 details['last_error_code'] = str(getattr(error, 'code', '') or '')
                 details['status_code'] = int(getattr(error, 'status_code', 0) or 0)
-            # Establish the durable queue hold synchronously before any await.
+            # Establish the durable queue hold before continuing recovery.
             if self._backend_recovery_callback is not None:
-                self._backend_recovery_callback(state, dict(details))
+                result = self._backend_recovery_callback(state, dict(details))
+                if inspect.isawaitable(result):
+                    await result
             titles = {
                 'retrying': 'GPU hang detected · retry 1/1',
                 'succeeded': 'Backend recovered · retry 1/1 succeeded',
@@ -3042,11 +3067,11 @@ Rules:
                      'details': details}
             existing = bool(activity_id)
             if existing:
-                self.workspace.update_activity_event(activity_id, patch)
+                (await _runner_storage_call(self.workspace.update_activity_event, activity_id, patch))
             else:
-                row = self.workspace.add_activity_event(
+                row = (await _runner_storage_call(self.workspace.add_activity_event,
                     self.chat_id, 'backend_recovery', run_id=self.run_id, **patch,
-                )
+                ))
                 activity_id = row.id
             recovery_terminal = state != 'retrying'
             log_event('runtime', 'backend_hang_recovery', state=state, **details)
@@ -3160,7 +3185,7 @@ Rules:
         except (TypeError, ValueError):
             provider_capacity = 1
         concurrency = min(global_slots, provider_capacity)
-        chat = self.workspace.get_chat(self.chat_id)
+        chat = (await _runner_storage_call(self.workspace.get_chat, self.chat_id))
         label = f'{self.workspace.name} · {chat.title if chat else self.chat_id}'
         queue_wait_started = 0.0
         queue_wait_info: dict[str, Any] = {}
@@ -3201,7 +3226,7 @@ Rules:
             if not queue_wait_active or (owner_task is not None and owner_task.done()):
                 return
             waited = max(MODEL_SLOT_TIMELINE_THRESHOLD_SECONDS, time.perf_counter() - queue_wait_started)
-            row = self.workspace.add_activity_event(
+            row = (await _runner_storage_call(self.workspace.add_activity_event,
                 self.chat_id,
                 'model_slot_wait',
                 title='Waiting for model slot',
@@ -3214,7 +3239,7 @@ Rules:
                     'owner': str(queue_wait_info.get('owner') or ''),
                     'position': int(queue_wait_info.get('position') or 0),
                 },
-            )
+            ))
             queue_wait_activity_id = row.id
             await emit_event(
                 'timeline_activity',
@@ -3249,9 +3274,45 @@ Rules:
                 concurrency=concurrency,
             )
 
-        async with MODEL_GENERATION_SCHEDULER.slot(
-            limit=concurrency, label=label, on_wait=waiting,
-        ):
+        @asynccontextmanager
+        async def scheduled_slot():
+            nonlocal queue_wait_active
+            try:
+                async with MODEL_GENERATION_SCHEDULER.slot(
+                    limit=concurrency, label=label, on_wait=waiting,
+                ):
+                    yield
+            finally:
+                was_waiting = queue_wait_active
+                queue_wait_active = False
+                if owner_task is not None:
+                    owner_task.remove_done_callback(settle_unfinished_queue_wait)
+                interrupted = False
+                cancellation_count = owner_task.cancelling() if owner_task is not None else 0
+                if queue_wait_task is not None:
+                    if not queue_wait_task.done():
+                        queue_wait_task.cancel()
+                    while not queue_wait_task.done():
+                        try:
+                            await asyncio.shield(queue_wait_task)
+                        except asyncio.CancelledError:
+                            interrupted = interrupted or bool(
+                                owner_task is not None and owner_task.cancelling() > cancellation_count)
+                        except Exception:
+                            pass
+                    if not queue_wait_task.cancelled():
+                        queue_wait_task.exception()
+                if was_waiting and queue_wait_activity_id:
+                    await _runner_storage_call(self.workspace.update_activity_event,
+                        queue_wait_activity_id, {
+                            'title': 'Model slot wait ended',
+                            'summary': 'The run ended before a model slot was acquired.',
+                            'status': 'failed', 'tone': 'red',
+                        })
+                if interrupted:
+                    raise asyncio.CancelledError
+
+        async with scheduled_slot():
             queue_wait_active = False
             if queue_wait_started:
                 waited = max(0.0, time.perf_counter() - queue_wait_started)
@@ -3261,9 +3322,10 @@ Rules:
                     try:
                         await queue_wait_task
                     except asyncio.CancelledError:
-                        pass
+                        if owner_task is not None and owner_task.cancelling():
+                            raise
                 if waited >= MODEL_SLOT_TIMELINE_THRESHOLD_SECONDS and not queue_wait_activity_id:
-                    row = self.workspace.add_activity_event(
+                    row = (await _runner_storage_call(self.workspace.add_activity_event,
                         self.chat_id,
                         'model_slot_wait',
                         title='Model slot acquired',
@@ -3276,14 +3338,14 @@ Rules:
                             'owner': str(queue_wait_info.get('owner') or ''),
                             'position': int(queue_wait_info.get('position') or 0),
                         },
-                    )
+                    ))
                     queue_wait_activity_id = row.id
                     await emit_event(
                         'timeline_activity', message_id=row.id,
                         activity_type='model_slot_wait', status='success',
                     )
                 elif queue_wait_activity_id:
-                    self.workspace.update_activity_event(
+                    (await _runner_storage_call(self.workspace.update_activity_event,
                         queue_wait_activity_id,
                         {
                             'title': 'Model slot acquired',
@@ -3291,7 +3353,7 @@ Rules:
                             'status': 'success',
                             'details': {'wait_seconds': waited},
                         },
-                    )
+                    ))
                     await emit_event(
                         'timeline_activity_updated', message_id=queue_wait_activity_id,
                         activity_type='model_slot_wait', status='success',
@@ -3322,7 +3384,7 @@ Rules:
                 # eligible history which an earlier epoch had omitted.
                 request_controls = [row for row in api_messages if row.get('_harnessy_ephemeral')
                                     and row.get('_harnessy_region') in {'automatic_continuation', 'completion_check'}]
-                api_messages[:] = self._api_messages() + request_controls
+                api_messages[:] = (await _runner_storage_call(self._api_messages)) + request_controls
                 self._request_ephemeral_row_ids.update(id(row) for row in request_controls)
                 if recovery_hot_target is not None:
                     recovery_hot_target = min(
@@ -3359,7 +3421,7 @@ Rules:
                     if measurement == probe_activity_measurement:
                         return
                     probe_activity_measurement = measurement
-                    self.workspace.update_activity_event(recovery_activity_id, {
+                    (await _runner_storage_call(self.workspace.update_activity_event, recovery_activity_id, {
                         'details': {
                             'current_input_tokens_estimated': assembled,
                             'current_history_target_tokens_estimated': target,
@@ -3367,7 +3429,7 @@ Rules:
                             'selected_history_ceiling': self._active_context_policy()['ceiling_tokens'],
                             'context_tuning': self._context_tuning_snapshot(),
                         },
-                    })
+                    }))
                     await emit_event(
                         'timeline_activity_updated', message_id=recovery_activity_id,
                         activity_type='context_compaction', status='running',
@@ -3555,7 +3617,7 @@ Rules:
                             if request_actual_prompt_tokens is not None else
                             'The backend did not report an actual input-token count. '
                         )
-                        self.workspace.update_activity_event(
+                        (await _runner_storage_call(self.workspace.update_activity_event,
                             recovery_activity_id,
                             {
                                 'title': 'Backend memory recovery succeeded' if memory_waits and not recovery_attempts else 'Context tuned successfully',
@@ -3601,7 +3663,7 @@ Rules:
                                     'recommended_active_context_tokens': recommended,
                                 },
                             },
-                        )
+                        ))
                         await emit_event(
                             'timeline_activity_updated',
                             message_id=recovery_activity_id,
@@ -3611,7 +3673,7 @@ Rules:
                     return
                 except StreamStallError as exc:
                     if recovery_activity_id:
-                        self.workspace.update_activity_event(
+                        (await _runner_storage_call(self.workspace.update_activity_event,
                             recovery_activity_id,
                             {
                                 'title': 'Context compaction retry stalled',
@@ -3619,7 +3681,7 @@ Rules:
                                 'status': 'failed',
                                 'tone': 'red',
                             },
-                        )
+                        ))
                         await emit_event(
                             'timeline_activity_updated',
                             message_id=recovery_activity_id,
@@ -3678,11 +3740,11 @@ Rules:
                         }
                         existing = bool(recovery_activity_id)
                         if existing:
-                            self.workspace.update_activity_event(recovery_activity_id, patch)
+                            (await _runner_storage_call(self.workspace.update_activity_event, recovery_activity_id, patch))
                         else:
-                            row = self.workspace.add_activity_event(
+                            row = (await _runner_storage_call(self.workspace.add_activity_event,
                                 self.chat_id, 'context_compaction', run_id=self.run_id, **patch,
-                            )
+                            ))
                             recovery_activity_id = row.id
                         self._auto_tuning_activity_id = recovery_activity_id
                         log_event(
@@ -3703,11 +3765,11 @@ Rules:
                         try:
                             await wait_for_model_memory(delay)
                         except asyncio.CancelledError:
-                            self.workspace.update_activity_event(recovery_activity_id, {
+                            (await _runner_storage_call(self.workspace.update_activity_event, recovery_activity_id, {
                                 'title': 'Memory recovery stopped',
                                 'summary': 'The run was stopped while waiting to retry model loading.',
                                 'status': 'failed', 'tone': 'red',
-                            })
+                            }))
                             await emit_event(
                                 'timeline_activity_updated', message_id=recovery_activity_id,
                                 activity_type='context_compaction', status='failed',
@@ -3734,7 +3796,7 @@ Rules:
                             active_context_mode=self._active_context_policy()['mode'],
                         )
                         if recovery_activity_id:
-                            self.workspace.update_activity_event(
+                            (await _runner_storage_call(self.workspace.update_activity_event,
                                 recovery_activity_id,
                                 {
                                     'title': 'Context compaction retry failed',
@@ -3752,7 +3814,7 @@ Rules:
                                         'model_load_memory': {},
                                     },
                                 },
-                            )
+                            ))
                             await emit_event(
                                 'timeline_activity_updated',
                                 message_id=recovery_activity_id,
@@ -3809,7 +3871,7 @@ Rules:
                             current_target - PREFILL_MEMORY_TUNING_STEP_TOKENS,
                         )
                         if recovery_activity_id:
-                            self.workspace.update_activity_event(
+                            (await _runner_storage_call(self.workspace.update_activity_event,
                                 recovery_activity_id,
                                 {
                                     'title': 'Context tuning exhausted',
@@ -3827,7 +3889,7 @@ Rules:
                                         'recommended_active_context_tokens': recommended,
                                     },
                                 },
-                            )
+                            ))
                             await emit_event(
                                 'timeline_activity_updated',
                                 message_id=recovery_activity_id,
@@ -3893,11 +3955,11 @@ Rules:
                         }
                         existing_minimum_activity = bool(recovery_activity_id)
                         if recovery_activity_id:
-                            self.workspace.update_activity_event(recovery_activity_id, patch)
+                            (await _runner_storage_call(self.workspace.update_activity_event, recovery_activity_id, patch))
                         else:
-                            row = self.workspace.add_activity_event(
+                            row = (await _runner_storage_call(self.workspace.add_activity_event,
                                 self.chat_id, 'context_compaction', run_id=self.run_id, **patch,
-                            )
+                            ))
                             recovery_activity_id = row.id
                         await emit_event(
                             'timeline_activity_updated' if existing_minimum_activity else 'timeline_activity', message_id=recovery_activity_id,
@@ -3908,7 +3970,7 @@ Rules:
                     self._context_recovery_count += 1
                     recovery_targets.append(recovery_hot_target)
                     self._freeze_context_epoch(
-                        api_messages, self.workspace.list_messages(self.chat_id),
+                        api_messages, (await _runner_storage_call(self.workspace.list_messages, self.chat_id)),
                         reason='prefill_memory_tuning', runway_tokens=0,
                     )
                     after_tokens = int(
@@ -3964,7 +4026,7 @@ Rules:
                         recovery_activity_id = self._auto_tuning_activity_id
                     existing_activity = bool(recovery_activity_id)
                     if recovery_activity_id:
-                        self.workspace.update_activity_event(
+                        (await _runner_storage_call(self.workspace.update_activity_event,
                             recovery_activity_id,
                             {
                                 'title': 'Tuning context downward',
@@ -3973,9 +4035,9 @@ Rules:
                                 'tone': 'amber',
                                 'details': activity_details,
                             },
-                        )
+                        ))
                     else:
-                        activity_row = self.workspace.add_activity_event(
+                        activity_row = (await _runner_storage_call(self.workspace.add_activity_event,
                             self.chat_id,
                             'context_compaction',
                             title='Tuning context downward',
@@ -3984,7 +4046,7 @@ Rules:
                             tone='amber',
                             run_id=self.run_id,
                             details=activity_details,
-                        )
+                        ))
                         recovery_activity_id = activity_row.id
                     self._auto_tuning_activity_id = recovery_activity_id
                     self._record_context_tuning(
@@ -4040,7 +4102,7 @@ Rules:
                         recovery_attempt=recovery_attempts,
                     )
                     if recovery_activity_id:
-                        self.workspace.update_activity_event(
+                        (await _runner_storage_call(self.workspace.update_activity_event,
                             recovery_activity_id,
                             {
                                 'title': 'Context compaction retry stopped',
@@ -4048,7 +4110,7 @@ Rules:
                                 'status': 'failed',
                                 'tone': 'red',
                             },
-                        )
+                        ))
                         await emit_event(
                             'timeline_activity_updated',
                             message_id=recovery_activity_id,
@@ -4058,7 +4120,7 @@ Rules:
                     raise
                 except Exception:
                     if recovery_activity_id:
-                        self.workspace.update_activity_event(
+                        (await _runner_storage_call(self.workspace.update_activity_event,
                             recovery_activity_id,
                             {
                                 'title': 'Context compaction retry failed',
@@ -4066,7 +4128,7 @@ Rules:
                                 'status': 'failed',
                                 'tone': 'red',
                             },
-                        )
+                        ))
                         await emit_event(
                             'timeline_activity_updated',
                             message_id=recovery_activity_id,
@@ -4093,7 +4155,7 @@ Rules:
         if not advice:
             return
         advice_key = str(advice.get('advice_key') or '')
-        for message in self.workspace.list_messages(self.chat_id, include_activity=True):
+        for message in (await _runner_storage_call(self.workspace.list_messages, self.chat_id, include_activity=True)):
             if str(getattr(message, 'role', '') or '') != 'activity':
                 continue
             metadata = message.metadata if isinstance(message.metadata, dict) else {}
@@ -4101,7 +4163,7 @@ Rules:
             details = activity_data.get('details') if isinstance(activity_data.get('details'), dict) else {}
             if str(details.get('advice_key') or '') == advice_key:
                 return
-        row = self.workspace.add_activity_event(
+        row = (await _runner_storage_call(self.workspace.add_activity_event,
             self.chat_id,
             'tuning_reminder',
             title=str(advice.get('title') or 'Model tuning reminder'),
@@ -4110,7 +4172,7 @@ Rules:
             tone=str(advice.get('tone') or 'cyan'),
             run_id=self.run_id,
             details=dict(advice.get('details') or {}),
-        )
+        ))
         numeric_details = dict(advice.get('details') or {})
         log_event(
             'runtime', 'model_tuning_reminder',
@@ -4135,7 +4197,7 @@ Rules:
         emit_event: Callable[..., Awaitable[None]],
     ) -> None:
         backend_still_active = exc.health.get('request_state') == 'active' and exc.health.get('request_scoped') is True
-        row = self.workspace.add_activity_event(
+        row = (await _runner_storage_call(self.workspace.add_activity_event,
             self.chat_id,
             'stream_stall',
             title='Model stream stalled',
@@ -4159,7 +4221,7 @@ Rules:
                 'evidence': exc.health.get('evidence'),
                 'automatic_retry': False,
             },
-        )
+        ))
         log_event(
             'runtime', 'model_stream_stalled',
             workspace_id=getattr(self.workspace, 'id', None), chat_id=self.chat_id,
@@ -4189,7 +4251,7 @@ Rules:
         ownership; a worker thread cannot safely be killed midway through save.
         """
         workspace_key = str(self.workspace.root.resolve())
-        conflict_ids = self.workspace.project_conflict_ids(self.chat_id)
+        conflict_ids = (await _runner_storage_call(self.workspace.project_conflict_ids, self.chat_id))
         reason = ''
         if any(PROCESS_JOBS.has_running(workspace_key=workspace_key, chat_id=cid)
                for cid in conflict_ids):
@@ -4504,7 +4566,7 @@ Rules:
         if revision_error is not None and terminal_status == 'success' and mode != 'background':
             raise revision_error
 
-    def _notify_completion_gate(self, state: str, *, candidate_id: str,
+    async def _notify_completion_gate(self, state: str, *, candidate_id: str,
                                 attempt: int, check_sequence: int,
                                 continuations: int, continuation_total: int,
                                 reason: str | None = None,
@@ -4515,7 +4577,7 @@ Rules:
         start another queued project without confirming the current reply.
         """
         if self._completion_gate_callback is not None:
-            self._completion_gate_callback(state, {
+            result = self._completion_gate_callback(state, {
                 'run_id': self.run_id, 'workspace_id': getattr(self.workspace, 'id', ''),
                 'chat_id': self.chat_id,
                 'model': getattr(self.client, 'model', self.profile.get('model')),
@@ -4535,6 +4597,8 @@ Rules:
                     'completion_backend_recovery_exhausted': exhaustion.completion_backend_recovery_exhausted,
                 } if exhaustion is not None else {}),
             })
+            if inspect.isawaitable(result):
+                await result
 
     async def _check_completion(
         self, candidate: Any, *, attempt: int, step: int,
@@ -4549,14 +4613,14 @@ Rules:
         lives in a UI activity card, never as fabricated conversation messages.
         Keeping the ordinary schemas preserves eligible backend prefix caches.
         """
-        self._notify_completion_gate(
+        await self._notify_completion_gate(
             'checking', candidate_id=candidate.id, attempt=attempt,
             check_sequence=check_sequence, continuations=continuations,
             continuation_total=continuation_total,
         )
         prompt = build_completion_check_prompt(str(candidate.content or '').strip())
         started = time.perf_counter()
-        row = self.workspace.add_activity_event(
+        row = (await _runner_storage_call(self.workspace.add_activity_event,
             self.chat_id, 'completion_check',
             title='HarnessyXO is checking whether the reply is final',
             summary='Asking the model whether the latest request is complete or work remains.',
@@ -4570,7 +4634,7 @@ Rules:
                      'continuation_applied': False,
                      'candidate_message_id': candidate.id, 'candidate_reply': candidate.content or '',
                      'check_prompt': prompt, 'check_reply': '', 'check_reasoning': ''},
-        )
+        ))
         self._last_completion_check_activity_id = row.id
         answer = ''
         reasoning = ''
@@ -4608,7 +4672,7 @@ Rules:
             nonlocal usage, raw_usage, request_debug, first_token_at, first_reasoning_at, first_answer_at, last_saved
             # Budgeting/recovery can rebase this list; its final control row is
             # explicitly ephemeral and is excluded from a frozen epoch.
-            api_messages.extend(self._api_messages())
+            api_messages.extend((await _runner_storage_call(self._api_messages)))
             control = {'role': 'user', 'content': prompt, '_harnessy_ephemeral': True,
                        '_harnessy_region': 'completion_check'}
             api_messages.append(control)
@@ -4654,9 +4718,9 @@ Rules:
                             reply_too_large = True
                             break
                         if now - last_saved >= 2.0:
-                            self.workspace.update_activity_event(row.id, {'details': {
+                            (await _runner_storage_call(self.workspace.update_activity_event, row.id, {'details': {
                                 'check_reply': answer, 'check_reasoning': reasoning,
-                            }})
+                            }}))
                             await emit_event('timeline_activity_updated', message_id=row.id,
                                              activity_type='completion_check', status='running')
                             last_saved = now
@@ -4728,12 +4792,12 @@ Rules:
             if decision.status == 'CONTINUE':
                 details.update(unmet_requirement=decision.unmet_requirement,
                                next_action=decision.next_action)
-            self.workspace.update_activity_event(row.id, {
+            (await _runner_storage_call(self.workspace.update_activity_event, row.id, {
                 'title': 'Completion check stopped' if cancelled else 'HarnessyXO finished checking the reply',
                 'summary': 'The run was stopped during the check.' if cancelled else summary,
                 'status': status, 'tone': 'amber' if cancelled else ('red' if status == 'failed' else 'indigo'),
                 'details': details,
-            })
+            }))
             log_event('runtime', 'completion_check_finished', chat_id=self.chat_id, run_id=self.run_id,
                       attempt=attempt, check_sequence=check_sequence, status=status, decision=decision.status,
                       error_code=details['error_code'], finish_reason=finish_reason,
@@ -4742,13 +4806,13 @@ Rules:
             await emit_event('timeline_activity_updated', message_id=row.id,
                              activity_type='completion_check', status=status)
             if usage or answer or reasoning:
-                self._record_model_step_metric(
+                (await _runner_storage_call(self._record_model_step_metric,
                     step=step, step_started=started, first_token_at=first_token_at,
                     first_reasoning_at=first_reasoning_at, first_answer_at=first_answer_at,
                     usage=usage, raw_usage={**raw_usage, 'request_purpose': 'completion_check'},
                     request_debug=request_debug, api_messages=api_messages,
                     generated_text=reasoning + answer, reasoning_while_off=False,
-                )
+                ))
         return decision
 
     async def run(
@@ -4797,107 +4861,119 @@ Rules:
                 return result_text
         except asyncio.CancelledError:
             terminal_status = 'cancelled'
-            # Stop can land during follow-up intake before a check starts or
-            # after its verdict returns. Those awaits sit outside the check's
-            # own cancellation handler. Finalize this run's pending candidate
-            # synchronously so it cannot remain marked as checking forever.
+            # Accepted writes have settled before cancellation reaches here.
+            # A newly committed activity may not yet have returned its ID to
+            # the caller, so find unfinished rows by this run's durable ID.
             try:
-                for message in self.workspace.list_messages(self.chat_id):
-                    metadata = message.metadata or {}
-                    if (message.role != 'assistant' or metadata.get('run_id') != self.run_id
-                            or not metadata.get('completion_check_pending')):
-                        continue
-                    patch: dict[str, Any] = {'completion_check_pending': False,
-                                             'terminal_stop_reason': 'user_cancelled'}
-                    if run_started_perf is not None:
-                        patch['turn_elapsed_seconds'] = max(0.0, time.perf_counter() - run_started_perf)
-                    self.workspace.update_message_metadata(self.chat_id, message.id, patch)
+                await _runner_storage_call(self._settle_cancelled_run_timeline, run_started_perf)
             except Exception as exc:
                 log_event('runtime', 'completion_check_cancel_cleanup_failed',
                           chat_id=self.chat_id, run_id=self.run_id,
                           exception_class=type(exc).__name__)
             raise
         finally:
-            final_strategy = getattr(self, '_context_strategy', {}) or {}
-            self._record_context_tuning(
-                'run_finished', outcome='completed' if terminal_status == 'success' else terminal_status,
-                actual_prompt_tokens=final_strategy.get('current_request_actual_prompt_tokens'),
-                actual_prompt_tokens_source=final_strategy.get('current_request_actual_prompt_tokens_source') or 'unavailable',
-            )
-            # A probe can fail/cancel while rebuilding history or waiting for a
-            # model slot, before the stream's own activity finalizer exists.
-            if self._auto_tuning_activity_id:
-                try:
-                    rows = self.workspace.get_messages_by_ids(self.chat_id, [self._auto_tuning_activity_id])
-                    row = rows[0] if rows else None
-                    activity_state = (row.metadata or {}).get('activity', {}) if row else {}
-                    if activity_state.get('status') == 'running':
-                        self.workspace.update_activity_event(self._auto_tuning_activity_id, {
-                            'title': 'Context tuning ended', 'status': 'failed', 'tone': 'red',
-                            'summary': 'The job ended before the pending context trial completed.',
-                        })
-                except Exception as exc:
-                    log_event('runtime', 'context_tuning_activity_finalize_failed',
-                              chat_id=self.chat_id, error=f'{type(exc).__name__}: {exc}')
-            # A mutating agent keeps dependency-family ownership until the whole
-            # run ends, not just one file write. Unrelated projects may use other
-            # slots, while parents/descendants cannot interleave stale state.
-            if mutation_lease_acquired:
-                handed_off = False
-                try:
-                    message_head_id = await asyncio.to_thread(
-                        self.workspace.latest_model_context_message_id, self.chat_id,
-                    )
-                    if revision_mode == 'background':
-                        entered = asyncio.get_running_loop().create_future()
+            try:
+                final_strategy = getattr(self, '_context_strategy', {}) or {}
+                self._record_context_tuning(
+                    'run_finished', outcome='completed' if terminal_status == 'success' else terminal_status,
+                    actual_prompt_tokens=final_strategy.get('current_request_actual_prompt_tokens'),
+                    actual_prompt_tokens_source=final_strategy.get('current_request_actual_prompt_tokens_source') or 'unavailable',
+                )
+                # A probe can fail/cancel while rebuilding history or waiting for a
+                # model slot, before the stream's own activity finalizer exists.
+                if self._auto_tuning_activity_id:
+                    try:
+                        rows = await _runner_storage_call(
+                            self.workspace.get_messages_by_ids, self.chat_id, [self._auto_tuning_activity_id])
+                        row = rows[0] if rows else None
+                        activity_state = (row.metadata or {}).get('activity', {}) if row else {}
+                        if activity_state.get('status') == 'running':
+                            (await _runner_storage_call(self.workspace.update_activity_event, self._auto_tuning_activity_id, {
+                                'title': 'Context tuning ended', 'status': 'failed', 'tone': 'red',
+                                'summary': 'The job ended before the pending context trial completed.',
+                            }))
+                    except Exception as exc:
+                        log_event('runtime', 'context_tuning_activity_finalize_failed',
+                                  chat_id=self.chat_id, error=f'{type(exc).__name__}: {exc}')
+            finally:
+                # A mutating agent keeps dependency-family ownership until the whole
+                # run ends, not just one file write. Unrelated projects may use other
+                # slots, while parents/descendants cannot interleave stale state.
+                if mutation_lease_acquired:
+                    handed_off = False
+                    try:
+                        message_head_id = await asyncio.to_thread(
+                            self.workspace.latest_model_context_message_id, self.chat_id,
+                        )
+                        if revision_mode == 'background':
+                            entered = asyncio.get_running_loop().create_future()
 
-                        async def finalize() -> None:
-                            # Ownership transfers only after this coroutine has
-                            # entered the finalizer's cancellation-safe body.
-                            entered.set_result(True)
+                            async def finalize() -> None:
+                                # Ownership transfers only after this coroutine has
+                                # entered the finalizer's cancellation-safe body.
+                                entered.set_result(True)
+                                await self._finalize_project_revision(
+                                    terminal_status=terminal_status,
+                                    message_head_id=message_head_id,
+                                    mode=revision_mode,
+                                    on_event=on_event,
+                                )
+
+                            task = asyncio.create_task(
+                                finalize(), name=f'harnessy-project-history-{self.chat_id[:8]}',
+                            )
+                            self.project_revision_task = task
+
+                            def settled_before_entry(done: asyncio.Task) -> None:
+                                if not entered.done():
+                                    entered.set_result(False)
+
+                            task.add_done_callback(settled_before_entry)
+                            try:
+                                if not await asyncio.shield(entered):
+                                    await task  # propagate cancellation/failure before handoff
+                                handed_off = True
+                            except BaseException:
+                                task.cancel()
+                                while not task.done():
+                                    try:
+                                        await asyncio.shield(task)
+                                    except (asyncio.CancelledError, Exception):
+                                        pass
+                                if not task.cancelled():
+                                    task.exception()
+                                raise
+                        else:
                             await self._finalize_project_revision(
                                 terminal_status=terminal_status,
                                 message_head_id=message_head_id,
                                 mode=revision_mode,
                                 on_event=on_event,
                             )
+                    finally:
+                        if not handed_off:
+                            # Includes head-query failures and cancellation before
+                            # the background task ever executes its first line.
+                            await self._release_project_writer()
 
-                        task = asyncio.create_task(
-                            finalize(), name=f'harnessy-project-history-{self.chat_id[:8]}',
-                        )
-                        self.project_revision_task = task
-
-                        def settled_before_entry(done: asyncio.Task) -> None:
-                            if not entered.done():
-                                entered.set_result(False)
-
-                        task.add_done_callback(settled_before_entry)
-                        try:
-                            if not await asyncio.shield(entered):
-                                await task  # propagate cancellation/failure before handoff
-                            handed_off = True
-                        except BaseException:
-                            task.cancel()
-                            while not task.done():
-                                try:
-                                    await asyncio.shield(task)
-                                except (asyncio.CancelledError, Exception):
-                                    pass
-                            if not task.cancelled():
-                                task.exception()
-                            raise
-                    else:
-                        await self._finalize_project_revision(
-                            terminal_status=terminal_status,
-                            message_head_id=message_head_id,
-                            mode=revision_mode,
-                            on_event=on_event,
-                        )
-                finally:
-                    if not handed_off:
-                        # Includes head-query failures and cancellation before
-                        # the background task ever executes its first line.
-                        await self._release_project_writer()
+    def _settle_cancelled_run_timeline(self, run_started_perf: float | None) -> None:
+        """Finish accepted timeline writes before this run releases ownership."""
+        for message in self.workspace.list_messages(self.chat_id, include_activity=True):
+            metadata = message.metadata or {}
+            if metadata.get('run_id') != self.run_id:
+                continue
+            if message.role == 'assistant' and metadata.get('completion_check_pending'):
+                patch: dict[str, Any] = {'completion_check_pending': False,
+                                         'terminal_stop_reason': 'user_cancelled'}
+                if run_started_perf is not None:
+                    patch['turn_elapsed_seconds'] = max(0.0, time.perf_counter() - run_started_perf)
+                self.workspace.update_message_metadata(self.chat_id, message.id, patch)
+            elif message.role == 'activity' and (metadata.get('activity') or {}).get('status') == 'running':
+                self.workspace.update_activity_event(message.id, {
+                    'status': 'cancelled', 'tone': 'amber',
+                    'summary': 'The run was stopped.',
+                    'details': {'terminal_stop_reason': 'user_cancelled'},
+                })
 
     async def _release_project_writer(self) -> None:
         release = asyncio.create_task(self.toolbox.release_mutation_lease())
@@ -5008,10 +5084,10 @@ Rules:
         await self._startup_stage('prompt_checkpoint', self._checkpoint_user_prompt(
             user_text, attachment_ids, metadata=user_metadata,
         ))
-        chat = self.workspace.get_chat(self.chat_id)
+        chat = (await _runner_storage_call(self.workspace.get_chat, self.chat_id))
         if chat and chat.title == 'New chat':
-            title_source = user_text or (self.workspace.list_attachments(self.chat_id)[-1].name if attachment_ids else 'New chat')
-            self.workspace.set_chat_title(self.chat_id, title_source[:70])
+            title_source = user_text or ((await _runner_storage_call(self.workspace.list_attachments, self.chat_id))[-1].name if attachment_ids else 'New chat')
+            (await _runner_storage_call(self.workspace.set_chat_title, self.chat_id, title_source[:70]))
 
         # Compare live parent/ancestor files and memory only when the run
         # actually starts (never when a persisted prompt is merely queued).
@@ -5047,7 +5123,7 @@ Rules:
             return max(0.0, time.perf_counter() - turn_started_perf)
 
         attachments_marked_sent = False
-        attachment_lookup = {a.id: a for a in self.workspace.list_attachments(self.chat_id)}
+        attachment_lookup = {a.id: a for a in (await _runner_storage_call(self.workspace.list_attachments, self.chat_id))}
         expected_image_count = sum(
             1 for aid in attachment_ids
             if aid in attachment_lookup and _looks_like_image(attachment_lookup[aid])[0] and self.profile.get('supports_vision')
@@ -5142,16 +5218,16 @@ Rules:
                     completion_continuations_used = max(0, completion_continuations_used - 1)
                     completion_continuations_total = max(0, completion_continuations_total - 1)
                     if pending_completion_candidate_id:
-                        self.workspace.update_message_metadata(self.chat_id, pending_completion_candidate_id, {
+                        (await _runner_storage_call(self.workspace.update_message_metadata, self.chat_id, pending_completion_candidate_id, {
                             'continuation_reason': 'queued_followup',
-                        })
+                        }))
                     if pending_completion_activity_id:
-                        self.workspace.update_activity_event(pending_completion_activity_id, {
+                        (await _runner_storage_call(self.workspace.update_activity_event, pending_completion_activity_id, {
                             'summary': 'A new user message superseded the planned automatic continuation. The run is continuing with that message.',
                             'details': {'superseded_by_followup': True, 'continuation_applied': False,
                                         'continuation_count': completion_continuations_used,
                                         'continuation_total': completion_continuations_total},
-                        })
+                        }))
                         await emit_event('timeline_activity_updated', message_id=pending_completion_activity_id,
                                          activity_type='completion_check', status='success')
                     pending_completion_activity_id = ''
@@ -5300,7 +5376,7 @@ Rules:
                 )
                 partial_tools = [tool_acc[i] for i in sorted(tool_acc)]
                 generated = partial_reasoning + partial_content
-                partial_metric = self._record_model_step_metric(
+                partial_metric = (await _runner_storage_call(self._record_model_step_metric,
                     step=step,
                     step_started=step_started,
                     first_token_at=step_first_token_at,
@@ -5313,8 +5389,8 @@ Rules:
                     generated_text=generated,
                     reasoning_while_off=step_reasoning_while_off,
                     phase_durations=phase_clock.totals(),
-                )
-                assistant_message = self.workspace.add_message(
+                ))
+                assistant_message = (await _runner_storage_call(self.workspace.add_message,
                     self.chat_id,
                     'assistant',
                     partial_content or '',
@@ -5337,7 +5413,7 @@ Rules:
                         'discarded_partial_tool_call_count': len(partial_tools),
                         'turn_elapsed_seconds': turn_elapsed_seconds(),
                     },
-                )
+                ))
                 await self._maybe_record_output_tuning_reminder(
                     reasoning_text=partial_reasoning,
                     answer_text=partial_content,
@@ -5360,7 +5436,7 @@ Rules:
             # Build the complete message list (including image bytes) before
             # attachments are consumed from the pending queue.
             await self._prepare_auto_context_probe(step=step, emit_event=emit_event)
-            api_messages = self._api_messages()
+            api_messages = (await _runner_storage_call(self._api_messages))
             if pending_continuation_reason:
                 completion_continuation = pending_continuation_reason == 'completion_check'
                 if completion_continuation:
@@ -5436,7 +5512,7 @@ Rules:
                 # Completion checks already have an expandable activity card.
                 # Keep their resume cue request-only without a duplicate card.
                 if not completion_continuation:
-                    continuation_activity = self.workspace.add_activity_event(
+                    continuation_activity = (await _runner_storage_call(self.workspace.add_activity_event,
                         self.chat_id,
                         'automatic_continuation',
                         title='Automatic continuation',
@@ -5449,7 +5525,7 @@ Rules:
                         tone='indigo',
                         run_id=self.run_id,
                         details={'reason': pending_continuation_reason, 'request_only': True},
-                    )
+                    ))
                     await emit_event(
                         'timeline_activity',
                         message_id=continuation_activity.id,
@@ -5463,7 +5539,7 @@ Rules:
                 pending_continuation_reason = ''
             if step == 0 and attachment_ids:
                 for attachment_id in attachment_ids:
-                    delivery = self.workspace.attachment_delivery_for(self.chat_id, attachment_id)
+                    delivery = (await _runner_storage_call(self.workspace.attachment_delivery_for, self.chat_id, attachment_id))
                     if delivery:
                         await emit_event(
                             'attachment_strategy', attachment_id=attachment_id, delivery=delivery,
@@ -5511,7 +5587,7 @@ Rules:
                                     f'({current_images}/{expected_image_count}). Attachments were kept pending.'
                                 )
                         if attachment_ids and not attachments_marked_sent:
-                            self.workspace.mark_attachments_sent(attachment_ids)
+                            (await _runner_storage_call(self.workspace.mark_attachments_sent, attachment_ids))
                             attachments_marked_sent = True
                             await emit_event(
                                 'attachments_sent', attachment_ids=list(attachment_ids),
@@ -5799,7 +5875,7 @@ Rules:
                     merged_timings.update(final_timings)
                 step_raw_usage = {**step_raw_usage, 'timings': merged_timings}
 
-            step_metric = self._record_model_step_metric(
+            step_metric = (await _runner_storage_call(self._record_model_step_metric,
                 step=step,
                 step_started=step_started,
                 first_token_at=step_first_token_at,
@@ -5812,7 +5888,7 @@ Rules:
                 generated_text=generated_for_metric,
                 reasoning_while_off=step_reasoning_while_off,
                 phase_durations=phase_clock.totals(),
-            )
+            ))
 
             # A per-inference output ceiling is not the end of a HarnessyXO agent
             # run.  Do not execute a possibly truncated tool call and do not
@@ -5823,7 +5899,7 @@ Rules:
                 'max_completion_tokens', 'output_limit',
             }
             if step_finish_reason in output_limit_reasons:
-                assistant_message = self.workspace.add_message(
+                assistant_message = (await _runner_storage_call(self.workspace.add_message,
                     self.chat_id, 'assistant', content_text or '',
                     metadata={
                         'run_id': self.run_id,
@@ -5842,7 +5918,7 @@ Rules:
                         'continuation_reason': 'output_limit',
                         'discarded_partial_tool_call_count': len(tool_calls),
                     },
-                )
+                ))
                 await self._maybe_record_output_tuning_reminder(
                     reasoning_text=reasoning_text,
                     answer_text=content_text,
@@ -5886,7 +5962,7 @@ Rules:
                     call.setdefault('type', 'function')
                     if not call.get('id'):
                         call['id'] = f'call_{step}_{i}'
-                assistant_message = self.workspace.add_message(
+                assistant_message = (await _runner_storage_call(self.workspace.add_message,
                     self.chat_id, 'assistant', content_text or None, tool_calls=tool_calls,
                     metadata={
                         'run_id': self.run_id,
@@ -5902,7 +5978,7 @@ Rules:
                         'answer_started_at': datetime_from_perf(step_started, step_first_answer_at),
                         'generation_metric': step_metric,
                     },
-                )
+                ))
                 await self._maybe_record_output_tuning_reminder(
                     reasoning_text=reasoning_text,
                     answer_text=content_text,
@@ -6070,7 +6146,7 @@ Rules:
                         environment_id=execution_record.get('environment_id'),
                         duration_seconds=tool_duration,
                     )
-                    tool_message = self.workspace.add_message(
+                    tool_message = (await _runner_storage_call(self.workspace.add_message,
                         self.chat_id, 'tool', result, name=name, tool_call_id=call['id'],
                         metadata={
                             'run_id': self.run_id,
@@ -6093,7 +6169,7 @@ Rules:
                             'thinking': self.thinking,
                             'model_settings': self._message_model_settings(),
                         },
-                    )
+                    ))
                     adaptive_retrieval_event = self._record_adaptive_retrieval(
                         name, result, tool_message_id=tool_message.id, step=step,
                     )
@@ -6117,10 +6193,10 @@ Rules:
                             promotion_cycle=adaptive_retrieval_event.get('promotion_cycle'),
                         )
                     if tool_ok:
-                        self.workspace.link_memory_events(
+                        (await _runner_storage_call(self.workspace.link_memory_events,
                             list(execution_record.get('memory_event_ids') or []),
                             message_id=tool_message.id, chat_id=self.chat_id,
-                        )
+                        ))
                     log_event(
                         'tools', 'tool_execution_complete', step=step + 1, call_id=call.get('id'),
                         workspace_id=getattr(self.workspace, 'id', None), chat_id=self.chat_id, run_id=self.run_id,
@@ -6162,7 +6238,7 @@ Rules:
                     if name in {'search_attachment', 'read_attachment'} and isinstance(args, dict):
                         attachment_id = str(args.get('attachment_id') or '')
                         if attachment_id:
-                            delivery = self.workspace.attachment_delivery_for(self.chat_id, attachment_id)
+                            delivery = (await _runner_storage_call(self.workspace.attachment_delivery_for, self.chat_id, attachment_id))
                             if delivery:
                                 await emit_event(
                                     'attachment_strategy', attachment_id=attachment_id, delivery=delivery,
@@ -6194,7 +6270,7 @@ Rules:
                         skipped_tool_count=skipped_tool_count,
                         terminal_stop_reason='workspace_infrastructure_failure',
                     )
-                    blocked_activity = self.workspace.add_activity_event(
+                    blocked_activity = (await _runner_storage_call(self.workspace.add_activity_event,
                         self.chat_id,
                         'run_blocked',
                         title='Run blocked',
@@ -6208,7 +6284,7 @@ Rules:
                             'write_applied': infrastructure_failure.get('write_applied') is True,
                             'skipped_tool_count': skipped_tool_count,
                         },
-                    )
+                    ))
                     await emit_event(
                         'timeline_activity',
                         message_id=blocked_activity.id,
@@ -6234,7 +6310,7 @@ Rules:
             if not content_text.strip():
                 incomplete_completion_retries += 1
                 if incomplete_completion_retries <= 2:
-                    assistant_message = self.workspace.add_message(
+                    assistant_message = (await _runner_storage_call(self.workspace.add_message,
                         self.chat_id, 'assistant', '',
                         metadata={
                             'run_id': self.run_id,
@@ -6252,7 +6328,7 @@ Rules:
                             'backend_done_reason': step_finish_reason or 'unspecified',
                             'continuation_reason': 'missing_final_answer',
                         },
-                    )
+                    ))
                     log_event(
                         'runtime', 'model_missing_final_answer_continue',
                         workspace_id=getattr(self.workspace, 'id', None), chat_id=self.chat_id,
@@ -6291,7 +6367,7 @@ Rules:
                 checks_used=completion_checks_used, continuations_used=completion_continuations_used,
                 reason='all_final_replies' if needs_completion_check else 'disabled',
             )
-            assistant_message = self.workspace.add_message(
+            assistant_message = (await _runner_storage_call(self.workspace.add_message,
                 self.chat_id, 'assistant', final_text,
                 metadata={
                     'run_id': self.run_id,
@@ -6311,7 +6387,7 @@ Rules:
                     'turn_elapsed_seconds': None if needs_completion_check else turn_elapsed_seconds(),
                     'completion_check_pending': needs_completion_check,
                 },
-            )
+            ))
             await self._maybe_record_output_tuning_reminder(
                 reasoning_text=reasoning_text,
                 answer_text=content_text,
@@ -6342,10 +6418,10 @@ Rules:
                 )
             followup_count = await ingest_followups(final=not needs_completion_check)
             if followup_count:
-                self.workspace.update_message_metadata(self.chat_id, assistant_message.id, {
+                (await _runner_storage_call(self.workspace.update_message_metadata, self.chat_id, assistant_message.id, {
                     'terminal_stop_reason': '', 'turn_elapsed_seconds': None,
                     'completion_check_pending': False, 'continuation_reason': 'queued_followup',
-                })
+                }))
                 await emit_event(
                     'run_continue', reason='queued_followup', step=step, count=followup_count,
                     message=f'{followup_count} queued follow-up message' + ('s' if followup_count != 1 else '') + ' delivered…',
@@ -6368,10 +6444,10 @@ Rules:
                             continuation_total=completion_continuations_total,
                         )
                     except asyncio.CancelledError:
-                        self.workspace.update_message_metadata(self.chat_id, assistant_message.id, {
+                        (await _runner_storage_call(self.workspace.update_message_metadata, self.chat_id, assistant_message.id, {
                             'completion_check_pending': False, 'terminal_stop_reason': 'user_cancelled',
                             'turn_elapsed_seconds': turn_elapsed_seconds(),
-                        })
+                        }))
                         raise
                     except Exception as exc:
                         if (isinstance(exc, AgentRunTerminalError)
@@ -6383,7 +6459,7 @@ Rules:
                         else:
                             # App/storage failures retain the hard hold; they are
                             # not evidence that a bounded verification completed.
-                            self.workspace.update_message_metadata(self.chat_id, assistant_message.id, {
+                            (await _runner_storage_call(self.workspace.update_message_metadata, self.chat_id, assistant_message.id, {
                                 'completion_check_pending': False,
                                 'completion_check_status': 'INVALID',
                                 'completion_check_attempts': candidate_attempts,
@@ -6391,7 +6467,7 @@ Rules:
                                 'terminal_stop_reason': str(getattr(exc, 'terminal_reason', '')
                                                             or 'agent_failure'),
                                 'turn_elapsed_seconds': turn_elapsed_seconds(),
-                            })
+                            }))
                             raise
                     # A real user message has priority over a verdict generated
                     # against the older context, including COMPLETE/NEEDS_INPUT.
@@ -6413,10 +6489,10 @@ Rules:
                         else await ingest_followups(final=committing_stop)
                     )
                     if followups_during_check and self._last_completion_check_activity_id:
-                        self.workspace.update_activity_event(self._last_completion_check_activity_id, {
+                        (await _runner_storage_call(self.workspace.update_activity_event, self._last_completion_check_activity_id, {
                             'summary': 'A new user message arrived during this check. Its verdict was superseded; the run is continuing with that message.',
                             'details': {'superseded_by_followup': True},
-                        })
+                        }))
                         await emit_event('timeline_activity_updated',
                                          message_id=self._last_completion_check_activity_id,
                                          activity_type='completion_check', status='success')
@@ -6424,25 +6500,25 @@ Rules:
                         break
                     if decision.error_code == 'backend_failure':
                         break
-                self.workspace.update_message_metadata(self.chat_id, assistant_message.id, {
+                (await _runner_storage_call(self.workspace.update_message_metadata, self.chat_id, assistant_message.id, {
                     'completion_check_pending': False, 'completion_check_status': decision.status,
                     'completion_check_attempts': candidate_attempts,
                     'completion_check_sequence': completion_checks_used,
-                })
+                }))
                 if followups_during_check:
                     # The verdict is obsolete, but the owner still keeps its
                     # slot and admission hold while processing the new input.
                     # Do not leave its visible phase stuck at an active check.
-                    self._notify_completion_gate(
+                    await self._notify_completion_gate(
                         'continuing', candidate_id=assistant_message.id,
                         attempt=candidate_attempts, check_sequence=completion_checks_used,
                         continuations=completion_continuations_used,
                         continuation_total=completion_continuations_total,
                         reason='New input arrived during the check; the same run is continuing with that input.',
                     )
-                    self.workspace.update_message_metadata(self.chat_id, assistant_message.id, {
+                    (await _runner_storage_call(self.workspace.update_message_metadata, self.chat_id, assistant_message.id, {
                         'continuation_reason': 'queued_followup',
-                    })
+                    }))
                     await emit_event('run_continue', reason='queued_followup', step=step,
                                      count=followups_during_check,
                                      message='Queued follow-up delivered · continuing…')
@@ -6453,7 +6529,7 @@ Rules:
                         else ''
                     )
                     if pause_reason:
-                        self.workspace.update_activity_event(self._last_completion_check_activity_id, {
+                        (await _runner_storage_call(self.workspace.update_activity_event, self._last_completion_check_activity_id, {
                             'title': 'Completion not confirmed · automatic continuation paused',
                             'summary': 'The model still reports unfinished work after two automatic continuations without a new successful tool action. This project is marked Unconfirmed to avoid a loop; other queued projects can continue.',
                             'status': 'unconfirmed', 'tone': 'amber',
@@ -6461,7 +6537,7 @@ Rules:
                                         'continuation_count': completion_continuations_used,
                                         'continuation_total': completion_continuations_total,
                                         'continuation_limit': MAX_COMPLETION_CONTINUATIONS},
-                        })
+                        }))
                         await emit_event('timeline_activity_updated', message_id=self._last_completion_check_activity_id,
                                          activity_type='completion_check', status='unconfirmed')
                         decision = CompletionDecision(status='INVALID', error_code=pause_reason)
@@ -6471,25 +6547,25 @@ Rules:
                         pending_completion_decision = decision
                         pending_completion_activity_id = self._last_completion_check_activity_id
                         pending_completion_candidate_id = assistant_message.id
-                        self.workspace.update_activity_event(self._last_completion_check_activity_id, {
+                        (await _runner_storage_call(self.workspace.update_activity_event, self._last_completion_check_activity_id, {
                             'summary': 'The model reported unfinished work. HarnessyXO is continuing within the existing request.',
                             'details': {'continuation_applied': True,
                                         'continuation_count': completion_continuations_used,
                                         'continuation_total': completion_continuations_total,
                                         'continuation_limit': MAX_COMPLETION_CONTINUATIONS},
-                        })
+                        }))
                         await emit_event('timeline_activity_updated', message_id=self._last_completion_check_activity_id,
                                          activity_type='completion_check', status='success')
                 if decision.status == 'CONTINUE':
-                    self._notify_completion_gate(
+                    await self._notify_completion_gate(
                         'continuing', candidate_id=assistant_message.id,
                         attempt=candidate_attempts, check_sequence=completion_checks_used,
                         continuations=completion_continuations_used,
                         continuation_total=completion_continuations_total,
                     )
-                    self.workspace.update_message_metadata(self.chat_id, assistant_message.id, {
+                    (await _runner_storage_call(self.workspace.update_message_metadata, self.chat_id, assistant_message.id, {
                         'continuation_reason': 'completion_check',
-                    })
+                    }))
                     await self._save_completed_group_checkpoint(
                         assistant_message.id, step=step, emit_event=emit_event, on_status=on_status,
                     )
@@ -6504,7 +6580,7 @@ Rules:
                             decision.error_code == 'backend_failure' and self._backend_recovery_blocked),
                     )
                     if self._last_completion_check_activity_id:
-                        self.workspace.update_activity_event(self._last_completion_check_activity_id, {
+                        (await _runner_storage_call(self.workspace.update_activity_event, self._last_completion_check_activity_id, {
                             'title': 'Completion unconfirmed · verification ended',
                             'summary': ('The available verification attempts ended without confirming completion. '
                                         'This project remains Unconfirmed; other queued projects can continue.'),
@@ -6514,22 +6590,22 @@ Rules:
                                         'completion_exhausted': True,
                                         'completion_failure_origin': 'completion_check',
                                         'completion_backend_recovery_exhausted': exhausted.completion_backend_recovery_exhausted},
-                        })
+                        }))
                         await emit_event('timeline_activity_updated', message_id=self._last_completion_check_activity_id,
                                          activity_type='completion_check',
                                          status='unconfirmed')
-                    self.workspace.update_message_metadata(self.chat_id, assistant_message.id, {
+                    (await _runner_storage_call(self.workspace.update_message_metadata, self.chat_id, assistant_message.id, {
                         'terminal_stop_reason': 'completion_unconfirmed',
                         'completion_check_status': decision.status,
                         'completion_check_pause_reason': decision.error_code,
                         'completion_exhausted': True,
                         'completion_failure_origin': 'completion_check',
                         'turn_elapsed_seconds': turn_elapsed_seconds(),
-                    })
+                    }))
                     log_event('harnessy', 'agent_run_stop', workspace_id=getattr(self.workspace, 'id', None),
                               chat_id=self.chat_id, reason='completion_unconfirmed', step=step + 1,
                               checks_used=completion_checks_used, error_code=decision.error_code)
-                    self._notify_completion_gate(
+                    await self._notify_completion_gate(
                         'exhausted', candidate_id=assistant_message.id,
                         attempt=candidate_attempts, check_sequence=completion_checks_used,
                         continuations=completion_continuations_used,
@@ -6544,7 +6620,7 @@ Rules:
                     final_text = decision.question
                     # The strict question field is an intentional user-facing
                     # result. No control JSON or internal reasoning is streamed.
-                    question_message = self.workspace.add_message(
+                    question_message = (await _runner_storage_call(self.workspace.add_message,
                         self.chat_id, 'assistant', final_text,
                         metadata={'run_id': self.run_id, 'model_profile_id': self.profile.get('id'),
                                   'model': getattr(self.client, 'model', self.profile.get('model')),
@@ -6552,7 +6628,7 @@ Rules:
                                   'completion_check_question': True,
                                   'terminal_stop_reason': 'model_stop',
                                   'turn_elapsed_seconds': turn_elapsed_seconds()},
-                    )
+                    ))
                     await emit_event('model_step_start', step=step + 1, max_steps=max_steps)
                     await on_token(final_text)
                     await emit_event('model_step_complete', step=step + 1, message_id=question_message.id,
@@ -6561,16 +6637,16 @@ Rules:
                                      backend_done_reason='stop')
                     checkpoint_message_id = question_message.id
                 else:
-                    self.workspace.update_message_metadata(self.chat_id, assistant_message.id, {
+                    (await _runner_storage_call(self.workspace.update_message_metadata, self.chat_id, assistant_message.id, {
                         'terminal_stop_reason': 'model_stop', 'turn_elapsed_seconds': turn_elapsed_seconds(),
-                    })
+                    }))
                     checkpoint_message_id = assistant_message.id
                 await self._save_completed_group_checkpoint(
                     checkpoint_message_id, step=step, emit_event=emit_event, on_status=on_status,
                 )
                 # The final atomic follow-up intake above has closed admission.
                 # Only this surviving valid verdict may release the queue hold.
-                self._notify_completion_gate(
+                await self._notify_completion_gate(
                     'needs_input' if decision.status == 'NEEDS_INPUT' else 'complete',
                     candidate_id=assistant_message.id, attempt=candidate_attempts,
                     check_sequence=completion_checks_used,
@@ -6594,7 +6670,7 @@ Rules:
             if max_steps is None:  # defensive; itertools.count() cannot exhaust
                 raise RuntimeError('Unlimited agent step iterator ended unexpectedly.')
             final_text = f'Agent stopped after reaching the maximum of {max_steps} steps.'
-            stop_message = self.workspace.add_message(self.chat_id, 'assistant', final_text,
+            stop_message = (await _runner_storage_call(self.workspace.add_message, self.chat_id, 'assistant', final_text,
                                        metadata={
                                            'run_id': self.run_id,
                                            'model_profile_id': self.profile.get('id'),
@@ -6608,7 +6684,7 @@ Rules:
                                            'answer_started_at': datetime_from_perf(step_started, step_first_answer_at),
                                            'terminal_stop_reason': 'max_steps',
                                            'turn_elapsed_seconds': turn_elapsed_seconds(),
-                                       })
+                                       }))
             log_event(
                 'harnessy', 'agent_run_stop', workspace_id=getattr(self.workspace, 'id', None),
                 chat_id=self.chat_id, reason='max_steps', step=max_steps, max_steps=max_steps,

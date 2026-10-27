@@ -61,6 +61,7 @@ from harnessy.core.message_settings import model_settings_snapshot, message_sett
 from harnessy.core.theme import PRIMARY_COLOR, THEME_CSS  # noqa: E402
 from harnessy.ui.accounts import build_accounts_panel  # noqa: E402
 from harnessy.ui.auth_recovery import AUTH_RECOVERY_JS  # noqa: E402
+from harnessy.ui.composer_recovery import COMPOSER_RECOVERY_JS  # noqa: E402
 from harnessy.core.thinking import (canonical, resolve_thinking, thinking_choices, composer_options,
     control_note, profile_identity, DETECTION_FIELDS, PRESETS as THINKING_PRESETS, OFF_MODES,
     thinking_tooltip, model_default_label, level_label, observed_default_label, profile_thinking_options,
@@ -70,6 +71,7 @@ from harnessy.core.choices import make_choice_options  # noqa: E402
 from harnessy.core.machine import (DEFAULT_MODEL_PROFILE, DEFAULT_TOOL_PERMISSIONS, MachineStore,
                                   WorkspaceRegistration, normalize_prompt_navigator_options,
                                   completion_blocking_hold, completion_hold_label, completion_wait_reason)  # noqa: E402
+from harnessy.core.admission_barriers import ADMISSION_BARRIERS  # noqa: E402
 from harnessy.core.notifications import (  # noqa: E402
     MAX_NTFY_REPLY_CHARS,
     NTFY_OUTBOUND_TAG,
@@ -1455,6 +1457,7 @@ class HarnessyPage:
         self._timeline_deletion_applied: dict[tuple[str, str], str] = {}
         self._composer_draft_write_errors: set[tuple[str, str]] = set()
         self._composer_owner: tuple[str, str] | None = None
+        self._preparing_chat_sends: set[tuple[str, str]] = set()
         self.file_clipboard: dict[str, dict[str, Any]] = {}
         self.file_selections: dict[str, list[Path]] = {}
         self.environment_subtabs: dict[str, str] = {}
@@ -1488,6 +1491,10 @@ class HarnessyPage:
         self.sidebar_chat_busy_controls: dict[tuple[str, str], list[tuple[Any, bool]]] = {}
         self._sidebar_agent_slots: dict[str, Any] = {}
         self._sidebar_completion_holds: list[dict[str, Any]] = []
+        self._sidebar_refresh_busy = False
+        self._sidebar_refresh_task: asyncio.Task[Any] | None = None
+        self._sidebar_tick_registrations: dict[str, WorkspaceRegistration] | None = None
+        self._sidebar_snapshot_error_at = 0.0
         self._sidebar_run_queue_jobs: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self.new_chat_area = None
         self.tabbar_area = None
@@ -1528,6 +1535,9 @@ class HarnessyPage:
         self._statusbar_generation = 0
         self._chat_render_generation = 0
         self._backend_ping_task: asyncio.Task[Any] | None = None
+        self._backend_profile_lookup_task: asyncio.Task[Any] | None = None
+        self._backend_selection_token = None
+        self._backend_requested_selection = None
         self._backend_generation = 0
         self._backend_profile_key = ''
         self._backend_checked_at = 0.0
@@ -1541,6 +1551,7 @@ class HarnessyPage:
         self._status_profile: dict[str, Any] = {}
         self._status_estimate = 0
         self._status_revision: tuple[Any, ...] | None = None
+        self._status_metric_task: asyncio.Task[Any] | None = None
         self._live_sync_seen: dict[tuple[str, str], tuple[str, int, int]] = {}
         self._transcript_persisted_seen: dict[tuple[str, str], tuple[int, str, int]] = {}
         self._live_sync_view: AssistantView | None = None
@@ -1750,6 +1761,7 @@ class HarnessyPage:
         ui.on('harnessy_transcript_window', self._browser_transcript_window)
         ui.on('harnessy_transcript_follow', self._browser_transcript_follow)
         ui.on('harnessy_browser_reconnected', self._browser_reconnected)
+        ui.on('harnessy_composer_draft', self._browser_composer_draft)
         ui.on('harnessy_sidebar_reorder', self._browser_sidebar_reorder)
         ui.on('harnessy_sidebar_chat_move', self._browser_sidebar_chat_move)
         ui.on('harnessy_tab_reorder', self._browser_tab_reorder)
@@ -1869,7 +1881,7 @@ class HarnessyPage:
                         self._action_menu_button(app_menu, 'Download Diagnostics', 'bug_report', self._open_diagnostics_download_dialog)
                         self._action_menu_button(app_menu, 'Users / Password', 'manage_accounts', lambda: self.open_settings('Users / Password'))
                         ui.separator().classes('hy-action-menu-separator')
-                        self._action_menu_button(app_menu, 'Log out', 'logout', lambda: ui.navigate.to('/logout'))
+                        self._action_menu_button(app_menu, 'Log out', 'logout', lambda: ui.navigate.to('/logout')).props('data-hy-sign-out=true')
             ui.separator()
             with ui.column().classes('w-full hy-sidebar-scroll px-2 py-2 gap-1').style('flex:1'):
                 def section_header(key: str, label: str):
@@ -2290,13 +2302,14 @@ class HarnessyPage:
         except Exception:
             pass
 
-    def _set_sidebar_run_snapshot(self, jobs: list[dict[str, Any]]) -> None:
+    def _set_sidebar_run_snapshot(self, jobs: list[dict[str, Any]], *, completion_holds=None) -> None:
         self._sidebar_run_queue_jobs.clear()
         for job in jobs:
             key = (str(job.get('workspace_id') or ''), str(job.get('chat_id') or ''))
             self._sidebar_run_queue_jobs.setdefault(key, []).append(job)
         self._sidebar_agent_slots = GLOBAL_AGENT_SLOTS.snapshot()
-        self._sidebar_completion_holds = self.machine.list_completion_holds()
+        self._sidebar_completion_holds = (self.machine.list_completion_holds()
+                                          if completion_holds is None else completion_holds)
 
     def _update_sidebar_chat_run_indicators(self, key: tuple[str, str]) -> None:
         def belongs(row: dict[str, Any]) -> bool:
@@ -2368,17 +2381,72 @@ class HarnessyPage:
                 + ' queued/running in this workspace · click to view the global queue'
             )
 
-    def _refresh_sidebar_busy_indicators(self) -> None:
-        self._refresh_workspace_recovery_banner()
-        self._refresh_workspace_generations()
-        try:
-            self._refresh_sidebar_busy_indicators_impl()
-        except WorkspaceDatabaseError:
-            # Another page may have acquired maintenance between the cheap
-            # generation check and this timer's first database call.
-            self._refresh_workspace_generations()
+    @staticmethod
+    def _read_sidebar_status_snapshot(machine, stores, checkpoint) -> dict[str, Any]:
+        """Collect periodic disk/database observations without touching UI."""
+        registrations = machine.list_workspaces()
+        jobs = _run_queue_jobs_with_positions(machine)
+        holds = machine.list_completion_holds()
+        recovery_holds = {reg.id: machine.workspace_recovery_hold(reg.id) for reg in registrations}
+        generations = []
+        for workspace_id, store, generation in stores:
+            failure = None
+            try:
+                with workspace_shared_access(store.root, expected_generation=generation):
+                    require_workspace_not_quarantined(store.root)
+            except WorkspaceDatabaseError as exc:
+                failure = exc
+            generations.append((workspace_id, store, failure))
+        checkpoint_ready = False
+        if checkpoint is not None:
+            store, chat_id, job_ids = checkpoint
+            checkpoint_ready = any(store.has_queued_prompt_checkpoint(chat_id, job_id) for job_id in job_ids)
+        return dict(registrations=registrations, jobs=jobs, holds=holds,
+                    recovery_holds=recovery_holds, generations=generations,
+                    checkpoint_ready=checkpoint_ready)
 
-    def _refresh_sidebar_busy_indicators_impl(self) -> None:
+    def _refresh_sidebar_busy_indicators(self):
+        task = self._sidebar_refresh_task
+        if task is None or task.done():
+            task = background_tasks.create(self._refresh_sidebar_busy_indicators_async(), name='harnessy-sidebar-status-read')
+            self._sidebar_refresh_task = task
+        return task
+
+    async def _refresh_sidebar_busy_indicators_async(self) -> None:
+        if self._sidebar_refresh_busy:
+            return
+        self._sidebar_refresh_busy = True
+        tab_key = self.active_tab_key
+        active = next((tab for tab in self.open_tabs if tab.key == tab_key), None)
+        store = self.workspace_cache.get(active.workspace_id) if active is not None else None
+        checkpoint = ((store, active.chat_id, tuple(self._queued_run_starting_ids))
+                      if store is not None and active.chat_id and self._queued_run_starting_ids else None)
+        stores = [(key, store, store._workspace_generation) for key, store in self.workspace_cache.items()
+                  if key not in self._workspace_load_failures]
+        try:
+            snapshot = await asyncio.to_thread(self._read_sidebar_status_snapshot, self.machine, stores, checkpoint)
+            if self.sidebar_workspace_area is None or not self._ui_elements_alive(self.sidebar_workspace_area):
+                return
+            # This cache exists only during the synchronous UI application.
+            # Actions and permission checks still read the current registry.
+            self._sidebar_tick_registrations = {reg.id: reg for reg in snapshot['registrations']}
+            self._refresh_workspace_recovery_banner(holds=snapshot['recovery_holds'])
+            self._refresh_workspace_generations(observations=snapshot['generations'])
+            self._refresh_sidebar_busy_indicators_impl(
+                snapshot['jobs'], completion_holds=snapshot['holds'],
+                checkpoint_ready=self.active_tab_key == tab_key and snapshot['checkpoint_ready'],
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if time.monotonic() - self._sidebar_snapshot_error_at >= 5.0:
+                self._sidebar_snapshot_error_at = time.monotonic()
+                log_event('runtime', 'sidebar_status_refresh_deferred', error_class=type(exc).__name__)
+        finally:
+            self._sidebar_tick_registrations = None
+            self._sidebar_refresh_busy = False
+
+    def _refresh_sidebar_busy_indicators_impl(self, queue_jobs, *, completion_holds, checkpoint_ready=False) -> None:
         self._sync_timeline_replacement_ui()
         # A headless queued run can finish while its formerly selected chat
         # is off-screen. Reconcile every cached owner, not only the mounted
@@ -2395,12 +2463,11 @@ class HarnessyPage:
             task = self._reconcile_chat_agent_task(active_tab.workspace_id, active_tab.chat_id)
             self._set_generation_ui_busy(bool(task is not None and not task.done()))
 
-        queue_jobs = _run_queue_jobs_with_positions(self.machine)
         queue_signature = self._run_queue_signature_for(queue_jobs)
         queue_changed = queue_signature != self._run_queue_signature
         if queue_changed:
             self._run_queue_signature = queue_signature
-        self._set_sidebar_run_snapshot(queue_jobs)
+        self._set_sidebar_run_snapshot(queue_jobs, completion_holds=completion_holds)
         self._update_sidebar_workspace_queue_badges()
         if (active_tab is not None and active_tab.kind == 'chat' and active_tab.chat_id
                 and active_tab.key not in self._blocked_restore_tabs
@@ -2411,11 +2478,8 @@ class HarnessyPage:
                 # A prompt checkpoint does not change the running queue row.
                 # Observe it independently of transcript paging/browser acks,
                 # and stop polling as soon as the startup notice is retired.
-                if queue_changed or any(
-                    ws.has_queued_prompt_checkpoint(active_tab.chat_id, job_id)
-                    for job_id in self._queued_run_starting_ids
-                ):
-                    self._draw_queued_run_prompts(ws, active_tab.chat_id)
+                if queue_changed or checkpoint_ready:
+                    self._draw_queued_run_prompts(ws, active_tab.chat_id, queue_jobs=queue_jobs)
 
         # VM/agent progress must not destroy the workspace row/menu DOM. Only
         # update the tiny indicator that actually changed.
@@ -3662,6 +3726,8 @@ class HarnessyPage:
                     _TIMELINE_REPLACEMENTS[key] = token
                     lease_acquired = False
                     try:
+                        from harnessy.ui.composer_drafts import COMPOSER_DRAFTS
+                        await COMPOSER_DRAFTS.flush(ws, chat_id)
                         progress.set_text('Waiting for the workspace writer…')
                         await WORKSPACE_MUTATIONS.acquire(
                             workspace_id=ws.id, owner_id=owner, label='Undo timeline rewind',
@@ -3674,6 +3740,7 @@ class HarnessyPage:
                             )
                         progress.set_text('Restoring the pre-rewind project and chat…')
                         result = await asyncio.to_thread(ws.undo_latest_rewind, chat_id)
+                        await self._reset_restored_composer_draft(ws, chat_id)
                         deletion = _TIMELINE_REPLACEMENT_JOBS.get(key)
                         if deletion and deletion.delete_only and not deletion.running:
                             _TIMELINE_REPLACEMENT_JOBS.pop(key, None)
@@ -4373,6 +4440,8 @@ class HarnessyPage:
         self.activate_tab(key)
 
     def _find_reg(self, workspace_id: str) -> WorkspaceRegistration | None:
+        if getattr(self, '_sidebar_tick_registrations', None) is not None:
+            return self._sidebar_tick_registrations.get(workspace_id)
         return next((r for r in self.machine.list_workspaces() if r.id == workspace_id), None)
 
     def open_chat_tab(self, chat_id: str, *, ws: WorkspaceStore | None = None) -> None:
@@ -4953,13 +5022,14 @@ class HarnessyPage:
         except (WorkspaceDatabaseError, RuntimeError) as exc:
             ui.notify(str(exc), type='warning', timeout=7000)
 
-    def _refresh_workspace_recovery_banner(self) -> None:
+    def _refresh_workspace_recovery_banner(self, *, holds=None) -> None:
         area = getattr(self, '_recovery_hold_area', None)
         if area is None or not self._ui_elements_alive(area):
             return
         tab = next((t for t in self.open_tabs if t.key == self.active_tab_key), None)
         reg = self._find_reg(tab.workspace_id) if tab and tab.workspace_id != HOME_SCOPE_ID else self.registration
-        hold = self.machine.workspace_recovery_hold(reg.id) if reg is not None else None
+        hold = ((self.machine.workspace_recovery_hold(reg.id) if holds is None else holds.get(reg.id))
+                if reg is not None else None)
         area.set_visibility(hold is not None)
         if hold is not None and reg is not None:
             snapshot = RECOVERY_OPERATIONS.snapshot(reg.path, state_root=self.machine.root)
@@ -4973,15 +5043,25 @@ class HarnessyPage:
             self._recovery_hold_label.set_text(f'{reg.name}: queued work is paused for database recovery.')
             self._recovery_resume_button.set_enabled(not snapshot.get('busy') and ready)
 
-    def _refresh_workspace_generations(self) -> None:
+    def _refresh_workspace_generations(self, *, observations=None) -> None:
         changed = False
-        for workspace_id, store in list(self.workspace_cache.items()):
+        if observations is None:
+            observations = []
+            for workspace_id, store in list(self.workspace_cache.items()):
+                failure = None
+                try:
+                    with workspace_shared_access(store.root, expected_generation=store._workspace_generation):
+                        require_workspace_not_quarantined(store.root)
+                except WorkspaceDatabaseError as exc:
+                    failure = exc
+                observations.append((workspace_id, store, failure))
+        for workspace_id, store, failure in observations:
             if workspace_id in self._workspace_load_failures:
                 continue
-            try:
-                with workspace_shared_access(store.root, expected_generation=store._workspace_generation):
-                    require_workspace_not_quarantined(store.root)
-            except WorkspaceDatabaseError as exc:
+            if self.workspace_cache.get(workspace_id) is not store:
+                continue
+            if failure is not None:
+                exc = failure
                 self._workspace_load_failures[workspace_id] = exc
                 for tab in self.open_tabs:
                     if tab.workspace_id == workspace_id:
@@ -5045,6 +5125,12 @@ class HarnessyPage:
         return self.chat_runtime[key]
 
     def _persist_chat_runtime(self, workspace_id: str, chat_id: str) -> None:
+        snapshot = self._chat_runtime_snapshot(workspace_id, chat_id)
+        if snapshot is not None:
+            ws, key, value = snapshot
+            ws.set_state(key, value)
+
+    def _chat_runtime_snapshot(self, workspace_id: str, chat_id: str):
         runtime = self.chat_runtime.get((workspace_id, chat_id))
         if not runtime:
             return
@@ -5053,7 +5139,7 @@ class HarnessyPage:
             ws = self.workspace
         if ws is None:
             return
-        ws.set_state(
+        return (ws,
             f'chat_runtime:{chat_id}',
             json.dumps({
                 'profile_id': str(runtime.get('profile_id') or ''),
@@ -5062,18 +5148,25 @@ class HarnessyPage:
             }, separators=(',', ':')),
         )
 
+    async def _persist_chat_runtime_async(self, workspace_id: str, chat_id: str) -> None:
+        snapshot = self._chat_runtime_snapshot(workspace_id, chat_id)
+        if snapshot is not None:
+            ws, key, value = snapshot
+            await _finish_background_storage(ws.set_state, key, value)
+
     @staticmethod
     def _chat_composer_draft_key(chat_id: str) -> str:
         return f'chat_composer_draft:{chat_id}'
 
     def _load_chat_composer_draft(self, ws: WorkspaceStore, chat_id: str) -> str:
+        from harnessy.ui.composer_drafts import COMPOSER_DRAFTS
         key = (ws.id, str(chat_id))
         self._apply_timeline_deletion_state(key)
         if key not in self.chat_composer_drafts:
             try:
-                self.chat_composer_drafts[key] = ws.get_state(
-                    self._chat_composer_draft_key(chat_id), '',
-                )
+                pending = COMPOSER_DRAFTS.pending(ws, chat_id)
+                self.chat_composer_drafts[key] = pending if pending is not None else ws.get_state(
+                    self._chat_composer_draft_key(chat_id), '')
             except Exception as exc:
                 self.chat_composer_drafts[key] = ''
                 log_event(
@@ -5083,19 +5176,15 @@ class HarnessyPage:
         return self.chat_composer_drafts[key]
 
     def _persist_chat_composer_draft(self, ws: WorkspaceStore, chat_id: str, value: Any) -> bool:
+        from harnessy.ui.composer_drafts import COMPOSER_DRAFTS
         key = (ws.id, str(chat_id))
         text = str(value or '')
         unchanged = self.chat_composer_drafts.get(key) == text
         self.chat_composer_drafts[key] = text
-        if unchanged and key not in self._composer_draft_write_errors:
+        if (unchanged and key not in self._composer_draft_write_errors
+                and not COMPOSER_DRAFTS.failed(ws, chat_id)):
             return True
-        try:
-            # Composer text is UI state, not a transcript mutation. It is never
-            # included in model context until the user explicitly sends it.
-            ws.set_state(self._chat_composer_draft_key(chat_id), text)
-            self._composer_draft_write_errors.discard(key)
-            return True
-        except Exception as exc:
+        def failed(exc: Exception) -> None:
             first_failure = key not in self._composer_draft_write_errors
             self._composer_draft_write_errors.add(key)
             if first_failure:
@@ -5111,7 +5200,12 @@ class HarnessyPage:
                 except RuntimeError as notify_exc:
                     if not _is_stale_ui_error(notify_exc):
                         raise
-            return False
+        # The input event updates the page immediately. One process-owned
+        # worker coalesces keystrokes and waits for SQLite/memory locks away
+        # from the event loop; tab remounts can read its latest pending value.
+        COMPOSER_DRAFTS.submit(ws, chat_id, text, on_error=failed,
+                              on_saved=lambda: self._composer_draft_write_errors.discard(key))
+        return True
 
     def _persist_mounted_composer_change(self, ws: WorkspaceStore, chat_id: str, event: Any) -> None:
         key = (ws.id, str(chat_id))
@@ -5121,23 +5215,63 @@ class HarnessyPage:
             return
         self._persist_chat_composer_draft(ws, chat_id, event.value)
 
+    def _browser_composer_draft(self, event: Any) -> None:
+        """Accept a browser draft only for its mounted chat and current epoch."""
+        from harnessy.ui.composer_drafts import COMPOSER_DRAFTS
+        data = event.args if isinstance(event.args, dict) else {}
+        workspace_id, chat_id = str(data.get('workspace_id') or ''), str(data.get('chat_id') or '')
+        key = (workspace_id, chat_id)
+        self._apply_timeline_deletion_state(key)
+        if (key in _TIMELINE_REPLACEMENTS or self._composer_owner != key
+                or self.composer is None
+                or data.get('composer_id') != f'hy-composer-{workspace_id}-{chat_id}'
+                or not isinstance(data.get('value'), str)):
+            return
+        ws = self.workspace_cache.get(workspace_id)
+        if ws is None or data.get('revision') != COMPOSER_DRAFTS.browser_revision(ws, chat_id):
+            return
+        self._persist_chat_composer_draft(ws, chat_id, data['value'])
+
     def _clear_chat_composer_draft(
         self, ws: WorkspaceStore, chat_id: str, *, persist: bool = True,
     ) -> None:
+        from harnessy.ui.composer_drafts import COMPOSER_DRAFTS
         key = (ws.id, str(chat_id))
         self.chat_composer_drafts[key] = ''
         self._composer_draft_write_errors.discard(key)
         if persist:
-            try:
-                ws.set_state(self._chat_composer_draft_key(chat_id), '')
-            except Exception as exc:
+            def failed(exc: Exception) -> None:
                 self._composer_draft_write_errors.add(key)
                 log_event(
                     'harnessy', 'composer_draft_clear_failed', workspace_id=ws.id, chat_id=chat_id,
                     error=f'{type(exc).__name__}: {exc}',
                 )
+            epoch = COMPOSER_DRAFTS.submit(ws, chat_id, '', reset=True, on_error=failed,
+                                         on_saved=lambda: self._composer_draft_write_errors.discard(key))
         if self._composer_owner == key and self.composer is not None:
             self.composer.value = ''
+        if persist:
+            # Input's non-loopback setter queues updateValue() JavaScript too.
+            # Restore text typed since Send only after that clear has executed.
+            self._reset_browser_composer_draft(ws, chat_id, str(epoch), '', preserve_newer=True)
+
+    def _reset_browser_composer_draft(self, ws: WorkspaceStore, chat_id: str, epoch: str,
+                                      text: str, *, preserve_newer: bool) -> None:
+        payload = json.dumps({'workspace_id': ws.id, 'chat_id': chat_id, 'revision': epoch,
+                              'text': text, 'preserve_newer': preserve_newer})
+        try:
+            ui.run_javascript(f'window.harnessyResetComposerDraft?.({payload});')
+        except RuntimeError as exc:
+            if not _is_stale_ui_error(exc):
+                raise
+
+    async def _reset_restored_composer_draft(self, ws: WorkspaceStore, chat_id: str) -> None:
+        from harnessy.ui.composer_drafts import COMPOSER_DRAFTS
+        text = await asyncio.to_thread(ws.get_state, self._chat_composer_draft_key(chat_id), '')
+        epoch = COMPOSER_DRAFTS.submit(ws, chat_id, str(text), reset=True)
+        await COMPOSER_DRAFTS.flush(ws, chat_id)
+        self.chat_composer_drafts.pop((ws.id, str(chat_id)), None)
+        self._reset_browser_composer_draft(ws, chat_id, str(epoch), str(text), preserve_newer=False)
 
     def _capture_mounted_composer_draft(self) -> None:
         owner = self._composer_owner
@@ -5371,19 +5505,25 @@ class HarnessyPage:
         queued_count = len(_AGENT_FOLLOWUPS.get(key) or [])
         # Reconcile both 1→N and N→0. Consumed follow-ups must disappear from
         # the composer immediately even when the queue is now empty.
-        reg_for_queue = self._find_reg(tab.workspace_id)
-        if reg_for_queue is not None:
-            self._draw_tool_approvals(self._load_workspace(reg_for_queue), tab.chat_id)
+        reg_for_queue = await asyncio.to_thread(self._find_reg, tab.workspace_id)
+        ws = await asyncio.to_thread(self._load_workspace, reg_for_queue) if reg_for_queue is not None else None
+        if (self.active_tab_key != tab.key or tab.key in self._blocked_restore_tabs
+                or (ws is not None and self.workspace_cache.get(tab.workspace_id) is not ws)):
+            return
+        if ws is not None:
+            self._draw_tool_approvals(ws, tab.chat_id)
         if self._queued_followup_seen.get(key) != self._queued_followup_signature(key) and self.queued_followup_area is not None:
-            if reg_for_queue is not None:
-                self._draw_queued_followups(self._load_workspace(reg_for_queue), tab.chat_id)
+            if ws is not None:
+                self._draw_queued_followups(ws, tab.chat_id)
         # A queued steering message is valid only while a real backend runner
         # exists. If that runner disappeared (failure/race/UI setup exception),
         # automatically turn the oldest queued message into the next normal
         # turn instead of leaving the composer permanently deadlocked.
-        if queued_count and self._reconcile_chat_agent_task(*key) is None and reg_for_queue is not None:
-            await self._recover_orphaned_followups(self._load_workspace(reg_for_queue), tab.chat_id)
+        if queued_count and self._reconcile_chat_agent_task(*key) is None and ws is not None:
+            await self._recover_orphaned_followups(ws, tab.chat_id)
             queued_count = len(_AGENT_FOLLOWUPS.get(key) or [])
+            if self.active_tab_key != tab.key:
+                return
         state = _AGENT_LIVE_STATES.get(key)
         if not isinstance(state, dict):
             return
@@ -5406,7 +5546,7 @@ class HarnessyPage:
                 and reg_for_queue is not None):
             self._checkpoint_event_seen[key] = checkpoint_signature
             self._invalidate_checkpoint_status_cache(str(state.get('checkpoint_message_id') or '') or None)
-            self._schedule_completed_group_badges(self._load_workspace(reg_for_queue), tab.chat_id)
+            self._schedule_completed_group_badges(ws, tab.chat_id)
 
         # Direct callbacks own the original live renderer. A busy presentation
         # transaction can defer their durable refresh, so retry that revision
@@ -5421,13 +5561,11 @@ class HarnessyPage:
                         persisted_revision)
             if (persisted_revision > 0 and self._transcript_persisted_seen.get(key) != expected
                     and reg_for_queue is not None):
-                await self._refresh_transcript_preserving_view(self._load_workspace(reg_for_queue), tab.chat_id)
+                await self._refresh_transcript_preserving_view(ws, tab.chat_id)
             return
 
-        reg = self._find_reg(tab.workspace_id)
-        if reg is None:
+        if ws is None:
             return
-        ws = self._load_workspace(reg)
         attachment_signature = (
             str(state.get('run_id') or ''),
             int(state.get('attachment_revision') or 0),
@@ -5655,11 +5793,8 @@ class HarnessyPage:
                         draft_text = self._load_chat_composer_draft(ws, chat.id)
                         self.composer = ui.textarea(
                             value=draft_text, placeholder='Message HarnessyXO…',
-                        ).props('borderless autogrow rows=1').classes('w-full')
+                        ).props('borderless autogrow rows=1 data-hy-composer-recovery=true').classes('w-full')
                         self._composer_owner = (ws.id, chat.id)
-                        self.composer.on_value_change(
-                            lambda e, store=ws, cid=chat.id: self._persist_mounted_composer_change(store, cid, e)
-                        )
                         self._install_enter_handler(self.composer, ws, chat.id)
                         with ui.row().classes('hy-composer-controls w-full items-center no-wrap'):
                             self.composer_upload = ui.upload(multiple=True, auto_upload=True, on_upload=lambda e: self.handle_composer_upload(e, ws, chat.id)) \
@@ -5690,7 +5825,7 @@ class HarnessyPage:
                             with ui.row().classes('hy-send-split items-center no-wrap'):
                                 self.send_button = ui.button(
                                     icon='arrow_upward', on_click=lambda: self.send_message(ws, chat.id),
-                                ).props('unelevated dense color=primary text-color=white aria-label="Send now"').classes('hy-send-primary')
+                                ).props('unelevated dense color=primary text-color=white aria-label="Send now" data-hy-prompt-submit=true').classes('hy-send-primary')
                                 self.send_button.tooltip('Send now' if tab.key not in self.busy_tabs else 'Queue a follow-up inside the active agent run')
                                 with ui.button(icon='arrow_drop_down').props(
                                     'unelevated dense color=primary text-color=white aria-label="Send options"'
@@ -5710,7 +5845,7 @@ class HarnessyPage:
                                         ui.button(
                                             'Add to global run queue · Auto', icon='schedule_send',
                                             on_click=lambda: self.queue_run_message(ws, chat.id),
-                                        ).props('flat no-caps align=left').classes('hy-action-menu-btn')
+                                        ).props('flat no-caps align=left data-hy-prompt-submit=true').classes('hy-action-menu-btn')
                                         if slot_limit > 1:
                                             for slot_number in range(1, slot_limit + 1):
                                                 ui.button(
@@ -5718,7 +5853,7 @@ class HarnessyPage:
                                                     on_click=lambda n=slot_number: self.queue_run_message(
                                                         ws, chat.id, preferred_slot=n,
                                                     ),
-                                                ).props('flat no-caps align=left').classes('hy-action-menu-btn')
+                                                ).props('flat no-caps align=left data-hy-prompt-submit=true').classes('hy-action-menu-btn')
                                         ui.separator().classes('hy-action-menu-separator')
                                         ui.button(
                                             'View Project / Chat run queue', icon='queue',
@@ -5744,6 +5879,11 @@ class HarnessyPage:
             f'{str(self._prompt_navigator_enabled()).lower()}, {json.dumps(self._prompt_navigator_options())});'
             f'window.harnessySetupDisplayDensity && window.harnessySetupDisplayDensity({json.dumps(self._username)});'
         )
+        from harnessy.ui.composer_drafts import COMPOSER_DRAFTS
+        recovery_payload = json.dumps({'username': self._username, 'workspace_id': ws.id,
+            'chat_id': chat.id, 'composer_id': composer_id,
+            'revision': COMPOSER_DRAFTS.browser_revision(ws, chat.id)})
+        setup_js += f'window.harnessySetupComposerRecovery && window.harnessySetupComposerRecovery({recovery_payload});'
         if jump_top:
             # Setup performs a two-frame saved-scroll restore. Queue the explicit
             # user navigation one frame later so stale local scroll state cannot
@@ -6241,6 +6381,7 @@ class HarnessyPage:
             self._sync_tab_activity_ui()
 
     async def _run_timeline_replacement(self, ws: WorkspaceStore, job: TimelineReplacementJob) -> None:
+        from harnessy.ui.composer_drafts import COMPOSER_DRAFTS
         key = (ws.id, job.chat_id)
 
         def chat_running() -> bool:
@@ -6256,6 +6397,9 @@ class HarnessyPage:
                 _wake_run_queue()
 
         try:
+            # Admission is already held, so input events cannot add another
+            # save while we drain the previous draft before restoring state.
+            await COMPOSER_DRAFTS.flush(ws, job.chat_id)
             await job.run(
                 ws, coordinator=WORKSPACE_MUTATIONS, enqueue=self._enqueue_run_message,
                 chat_running=chat_running, on_restored=restored,
@@ -6263,9 +6407,13 @@ class HarnessyPage:
                 if job.delete_only or job.resume_from_checkpoint else None,
             )
         finally:
-            if _TIMELINE_REPLACEMENTS.get(key) == job.token:
-                _TIMELINE_REPLACEMENTS.pop(key, None)
-                _wake_run_queue()
+            try:
+                if job.restored:
+                    await self._reset_restored_composer_draft(ws, job.chat_id)
+            finally:
+                if _TIMELINE_REPLACEMENTS.get(key) == job.token:
+                    _TIMELINE_REPLACEMENTS.pop(key, None)
+                    _wake_run_queue()
 
     @staticmethod
     def _timeline_replacement_blocker_slots(
@@ -9692,9 +9840,9 @@ class HarnessyPage:
     def _install_enter_handler(self, element, ws: WorkspaceStore, chat_id: str) -> None:
         enter_to_send = bool(self.settings.get('general', {}).get('enter_to_send', True))
         if enter_to_send:
-            js = '''(e) => { if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey) { e.preventDefault(); emit(); } }'''
+            js = '''(e) => { if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey) { e.preventDefault(); if (window.harnessyCanSubmitComposer?.(e)) emit(); } }'''
         else:
-            js = '''(e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); emit(); } }'''
+            js = '''(e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); if (window.harnessyCanSubmitComposer?.(e)) emit(); } }'''
         element.on('keydown', lambda: self.send_message(ws, chat_id), js_handler=js)
 
     @staticmethod
@@ -9741,14 +9889,14 @@ class HarnessyPage:
             ui.label(f'{missing} attachment(s) unavailable').classes('text-xs text-negative')
         return strategy_label
 
-    def _draw_queued_run_prompts(self, ws: WorkspaceStore, chat_id: str) -> None:
+    def _draw_queued_run_prompts(self, ws: WorkspaceStore, chat_id: str, *, queue_jobs=None) -> None:
         """Keep request actions attached to one real prompt, across retry attempts."""
         area = self.queued_run_area
         if (area is None or not self._ui_elements_alive(area)
                 or self.active_tab_key != self._chat_tab_key(ws.id, chat_id)):
             return
         jobs = [
-            row for row in _run_queue_jobs_with_positions(self.machine)
+            row for row in (_run_queue_jobs_with_positions(self.machine) if queue_jobs is None else queue_jobs)
             if row.get('workspace_id') == ws.id and row.get('chat_id') == chat_id
             and (row.get('status') == 'pending' or
                  (row.get('status') == 'running' and
@@ -10076,7 +10224,7 @@ class HarnessyPage:
             return
 
         self._clear_chat_composer_draft(ws, chat_id)
-        self._persist_chat_runtime(ws.id, chat_id)
+        await self._persist_chat_runtime_async(ws.id, chat_id)
         self._draw_pending_attachments(ws, chat_id)
         self._draw_queued_run_prompts(ws, chat_id)
         queued = next(
@@ -10813,23 +10961,31 @@ class HarnessyPage:
         except ThinkingConfigurationError as exc:
             ui.notify(str(exc), type='warning', timeout=9000)
             return
-        self._persist_chat_runtime(ws.id, chat_id)
-        image_pending = [a for a in pending if self._attachment_is_image(a)]
-        if image_pending and not bool(profile.get('supports_vision')):
-            ui.notify(
-                'The selected model profile is not marked as vision-capable. Choose a vision model or enable Vision / image input in Models settings. The image has been kept attached.',
-                type='warning', timeout=9000,
-            )
+        if key in self._preparing_chat_sends:
+            ui.notify('Your previous message is still being prepared. This draft is kept.', type='info')
             return
-        if image_pending:
-            probe = OpenAICompatibleClient(profile, thinking=selected_thinking)
-            capabilities = await probe.model_capabilities()
-            if capabilities is not None and capabilities and 'vision' not in capabilities:
+        self._preparing_chat_sends.add(key)
+        try:
+            await self._persist_chat_runtime_async(ws.id, chat_id)
+            image_pending = [a for a in pending if self._attachment_is_image(a)]
+            if image_pending and not bool(profile.get('supports_vision')):
                 ui.notify(
-                    'The selected model does not report vision capability. Enabling Vision in HarnessyXO cannot make a text-only model see images. The image has been kept attached.',
-                    type='warning', timeout=10000,
+                    'The selected model profile is not marked as vision-capable. Choose a vision model or enable Vision / image input in Models settings. The image has been kept attached.',
+                    type='warning', timeout=9000,
                 )
                 return
+            if image_pending:
+                probe = OpenAICompatibleClient(profile, thinking=selected_thinking)
+                capabilities = await probe.model_capabilities()
+                if capabilities is not None and capabilities and 'vision' not in capabilities:
+                    ui.notify(
+                        'The selected model does not report vision capability. Enabling Vision in HarnessyXO cannot make a text-only model see images. The image has been kept attached.',
+                        type='warning', timeout=10000,
+                    )
+                    return
+
+        finally:
+            self._preparing_chat_sends.discard(key)
 
         # Sending a NEW turn is an explicit return to the latest chat. Never
         # append it into the middle of a virtualized historical page.
@@ -11960,10 +12116,10 @@ class HarnessyPage:
                 run_lane_position=0, completion_wait_reason='',
                 status=f'Agent slot {int(agent_slot_lease.slot)} · preparing request…',
             )
-            run_settings = self.machine.load_settings()
+            run_settings = await asyncio.to_thread(self.machine.load_settings)
             completion_gate['check_enabled'] = bool(run_settings['agent'].get('completion_check_enabled', True))
-            self.machine.begin_completion_run(completion_details)
             completion_gate["started"] = True
+            await _finish_background_storage(self.machine.begin_completion_run, completion_details)
             runner = AgentRunner(
                 ws, chat_id, run_settings, profile=profile,
                 thinking=requested_thinking, skill=selected_skill,
@@ -12063,7 +12219,7 @@ class HarnessyPage:
                 view.markdown.set_content(self._transcript_markdown(notice))
                 view.copy_state['answer'] = notice
             try:
-                ws.add_message(
+                await _finish_background_storage(ws.add_message,
                     chat_id, 'assistant', persisted_content,
                     metadata={
                         'run_id': str(process_live_state['run_id']),
@@ -12139,7 +12295,7 @@ class HarnessyPage:
                 view.markdown.set_content(self._transcript_markdown(live_text))
                 view.copy_state['answer'] = live_text
             try:
-                ws.add_message(
+                await _finish_background_storage(ws.add_message,
                     chat_id, 'assistant', persisted_content,
                     metadata={
                         'run_id': str(process_live_state['run_id']),
@@ -12168,13 +12324,17 @@ class HarnessyPage:
                         raise
         finally:
             phase_state['active'] = False
+            settlement_error = None
             if completion_gate['started']:
-                _settle_completion_gate(
-                    self.machine, completion_details, completion_gate,
-                    successful=terminal_notification.get('outcome') == 'success',
-                    stopped=asyncio.current_task() in _USER_STOPPED_TASKS or bool(process_live_state.get('stopping')),
-                    interrupted=bool(asyncio.current_task() and getattr(asyncio.current_task(), 'cancelling', lambda: 0)()),
-                )
+                try:
+                    await _settle_completion_gate(
+                        self.machine, completion_details, completion_gate,
+                        successful=terminal_notification.get('outcome') == 'success',
+                        stopped=asyncio.current_task() in _USER_STOPPED_TASKS or bool(process_live_state.get('stopping')),
+                        interrupted=bool(asyncio.current_task() and getattr(asyncio.current_task(), 'cancelling', lambda: 0)()),
+                    )
+                except (Exception, asyncio.CancelledError) as exc:
+                    settlement_error = exc
             if agent_slot_lease is not None:
                 await GLOBAL_AGENT_SLOTS.release(agent_slot_lease)
             notification_outcome = str(terminal_notification.get('outcome') or '')
@@ -12252,6 +12412,8 @@ class HarnessyPage:
                 # Do not force-scroll here. The browser-local follow controller
                 # will settle the rebuilt transcript only when follow mode is
                 # active; a user who scrolled up must stay exactly where they are.
+            if settlement_error is not None:
+                raise settlement_error
 
     async def handle_composer_upload(self, e: events.UploadEventArguments, ws: WorkspaceStore, chat_id: str) -> None:
         release_activity = TAB_ACTIVITY.acquire(self._chat_tab_key(ws.id, chat_id))
@@ -12393,6 +12555,30 @@ class HarnessyPage:
         self._refresh_status_metrics()
         self._request_backend_health()
 
+    def _request_status_metric_refresh(self, ws: WorkspaceStore, key, revision) -> None:
+        task = getattr(self, '_status_metric_task', None)
+        if task is not None and not task.done():
+            return
+
+        async def read_latest() -> None:
+            try:
+                latest = await asyncio.to_thread(ws.latest_generation_metric, key[1]) or {}
+                live = _AGENT_LIVE_STATES.get(key) or {}
+                current_revision = (live.get('run_id'), live.get('persisted_revision'), live.get('finished'))
+                if (self._status_key == key and self.active_tab_key == self._chat_tab_key(*key)
+                        and self.workspace_cache.get(key[0]) is ws and current_revision == revision):
+                    self._status_latest = latest
+                    self._status_revision = revision
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log_event('runtime', 'metric_status_refresh_deferred', error_class=type(exc).__name__)
+            finally:
+                if self._status_metric_task is asyncio.current_task():
+                    self._status_metric_task = None
+
+        self._status_metric_task = background_tasks.create(read_latest(), name='harnessy-status-metric-read')
+
     def _refresh_status_metrics(self) -> None:
         """Update only changed text. No transcript redraw, model request or scan per tick."""
         key = self._status_key
@@ -12409,8 +12595,9 @@ class HarnessyPage:
             if revision != self._status_revision:
                 ws = self.workspace_cache.get(key[0])
                 if ws:
-                    self._status_latest = ws.latest_generation_metric(key[1]) or {}
-                self._status_revision = revision
+                    self._request_status_metric_refresh(ws, key, revision)
+                else:
+                    self._status_revision = revision
             latest = self._status_latest if metric_matches_profile(self._status_latest, self._status_profile) else {}
             values = run_presentation(live, latest, time.perf_counter())
             slot_state = GLOBAL_AGENT_SLOTS.snapshot()
@@ -12473,10 +12660,25 @@ class HarnessyPage:
         # Never shown, logged or added to tool/model context.
         return json.dumps([profile.get(k) for k in ('id', 'base_url', 'model', 'api_mode', 'api_key', 'context_window')])
 
-    def _health_profile(self) -> dict[str, Any]:
+    def _health_profile_selection(self):
         tab = next((t for t in self.open_tabs if t.key == self.active_tab_key), None)
-        profile_id = self._runtime_for_chat(tab.workspace_id, tab.chat_id)['profile_id'] if tab and tab.kind == 'chat' and tab.chat_id else None
-        return self.machine.get_model_profile(profile_id, self.settings)
+        key = (tab.workspace_id, tab.chat_id) if tab and tab.kind == 'chat' and tab.chat_id else None
+        profile_id = (self.chat_runtime.get(key) or {}).get('profile_id') if key else None
+        ws = self.workspace_cache.get(key[0]) if key else None
+        token = (self.active_tab_key, profile_id, id(self.settings), id(ws))
+        return token, (profile_id, ws, key[1] if key else None, self.settings)
+
+    def _health_profile(self, selection=None) -> dict[str, Any]:
+        profile_id, ws, chat_id, settings = selection or self._health_profile_selection()[1]
+        if not profile_id and ws is not None and chat_id:
+            try:
+                raw = ws.get_state(f'chat_runtime:{chat_id}', '')
+                saved = json.loads(raw) if raw else {}
+            except (TypeError, json.JSONDecodeError):
+                saved = {}
+            if isinstance(saved, dict):
+                profile_id = str(saved.get('profile_id') or '') or None
+        return self.machine.get_model_profile(profile_id, settings)
 
     def _request_backend_health(self) -> None:
         """One page-owned, rate-limited probe; profile switches cancel stale work."""
@@ -12488,7 +12690,48 @@ class HarnessyPage:
                 return
         except RuntimeError:
             return
-        profile = self._health_profile()
+        token, selection = self._health_profile_selection()
+        if token != self._backend_requested_selection:
+            self._backend_requested_selection = token
+            self._backend_generation += 1
+            previous_ping = self._backend_ping_task
+            if previous_ping is not None and not previous_ping.done():
+                previous_ping.cancel()
+            self._backend_ping_task = None
+            self._backend_checked_at = 0.0
+            self._backend_status = {}
+            self._backend_dot.classes(remove='offline', add='checking')
+            self._backend_label.set_text('Model server checking')
+        pending = self._backend_profile_lookup_task
+        if pending is not None and not pending.done():
+            return
+        if token == self._backend_selection_token and time.monotonic() - self._backend_checked_at < 15:
+            return
+        profile_id, ws, chat_id, settings = selection
+        selection = (profile_id, ws, chat_id, deepcopy(settings))
+
+        async def read_profile() -> None:
+            try:
+                profile = await asyncio.to_thread(self._health_profile, selection)
+                if (token != self._health_profile_selection()[0]
+                        or not self._ui_elements_alive(self._backend_dot, self._backend_label, self._backend_tooltip)):
+                    return
+                client = self._backend_label.client
+                if hasattr(client, 'has_socket_connection') and not client.has_socket_connection:
+                    return
+                self._backend_selection_token = token
+                self._apply_backend_health_profile(profile)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log_event('runtime', 'backend_profile_refresh_deferred', error_class=type(exc).__name__)
+            finally:
+                if self._backend_profile_lookup_task is asyncio.current_task():
+                    self._backend_profile_lookup_task = None
+
+        self._backend_profile_lookup_task = background_tasks.create(read_profile(), name='harnessy-health-profile-read')
+
+    def _apply_backend_health_profile(self, profile: dict[str, Any]) -> None:
         key = self._health_profile_key(profile)
         changed = key != self._backend_profile_key
         previous_ping = self._backend_ping_task
@@ -13045,6 +13288,7 @@ class HarnessyPage:
         # Scripts appended by add_body_html after that response do not execute.
         # This bridge also survives authentication closing Socket.IO.
         ui.add_body_html('<script>' + AUTH_RECOVERY_JS + '</script>')
+        ui.add_body_html('<script>' + COMPOSER_RECOVERY_JS + '</script>')
         ui.add_body_html(CODE_COPY_BRIDGE)
         # xterm.js is the only browser-side dependency which is not supplied by
         # NiceGUI itself. If it cannot be loaded, the terminal tab shows a clear
@@ -22485,8 +22729,8 @@ async def _run_headless_turn(
                               'model': str(profile.get('model') or ''), 'model_profile_id': str(profile.get('id') or ''),
                               'thinking': str(requested_thinking), 'project_label': f'{ws.name} / {chat.title}'}
         completion_gate['check_enabled'] = bool(settings['agent'].get('completion_check_enabled', True))
-        machine.begin_completion_run(completion_details)
         completion_gate['started'] = True
+        await _finish_background_storage(machine.begin_completion_run, completion_details)
         runner = AgentRunner(
             ws, chat_id, settings, profile=profile, thinking=requested_thinking,
             skill='auto', run_id=str(state['run_id']),
@@ -22522,7 +22766,7 @@ async def _run_headless_turn(
     except asyncio.CancelledError:
         outcome = 'stopped'
         try:
-            ws.add_message(
+            await _finish_background_storage(ws.add_message,
                 chat_id, 'assistant', '**Generation stopped.**',
                 metadata={
                     'cancelled': True,
@@ -22557,7 +22801,7 @@ async def _run_headless_turn(
             state['retry_allowed'] = not (isinstance(health, dict) and health.get('request_state') == 'active'
                                           and health.get('request_scoped') is True)
         try:
-            ws.add_message(
+            await _finish_background_storage(ws.add_message,
                 chat_id, 'assistant', error_text,
                 metadata={
                     'error': True,
@@ -22575,13 +22819,17 @@ async def _run_headless_turn(
             pass
     finally:
         _AGENT_FOLLOWUP_OPEN[key] = False
+        settlement_error = None
         if completion_gate['started']:
-            _settle_completion_gate(
-                machine, completion_details, completion_gate,
-                successful=outcome == 'success',
-                stopped=current_task in _USER_STOPPED_TASKS or bool((state or {}).get('stopping')),
-                interrupted=bool(current_task and getattr(current_task, 'cancelling', lambda: 0)()),
-            )
+            try:
+                await _settle_completion_gate(
+                    machine, completion_details, completion_gate,
+                    successful=outcome == 'success',
+                    stopped=current_task in _USER_STOPPED_TASKS or bool((state or {}).get('stopping')),
+                    interrupted=bool(current_task and getattr(current_task, 'cancelling', lambda: 0)()),
+                )
+            except (Exception, asyncio.CancelledError) as exc:
+                settlement_error = exc
         if owns_agent_slot and agent_slot_lease is not None:
             await GLOBAL_AGENT_SLOTS.release(agent_slot_lease)
         if state is not None and _AGENT_LIVE_STATES.get(key) is state:
@@ -22606,6 +22854,8 @@ async def _run_headless_turn(
             terminal_reason=notification_terminal_reason,
             retry_allowed=(state or {}).get('retry_allowed', True),
         )
+        if settlement_error is not None:
+            raise settlement_error
     return outcome
 
 
@@ -22631,11 +22881,14 @@ def _run_queue_limit(machine: MachineStore) -> int:
         return 1
 
 
-def _run_queue_observation_data(machine: MachineStore) -> dict[str, Any]:
+def _run_queue_observation_data(
+    machine: MachineStore, *, observed_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Project existing machine state; never construct a store during export."""
-    holds = machine.list_completion_holds(include_generating=True, include_released=True)
-    recoveries = machine.list_backend_recoveries()
-    jobs = machine.list_run_jobs(active_only=True, limit=5000)
+    holds = (observed_state['holds'] if observed_state is not None else
+             machine.list_completion_holds(include_generating=True, include_released=True))
+    recoveries = observed_state['recoveries'] if observed_state is not None else machine.list_backend_recoveries()
+    jobs = observed_state['jobs'] if observed_state is not None else machine.list_run_jobs(active_only=True, limit=5000)
     blocking = [row for row in holds if row.get('state') not in {'generating', 'unconfirmed_released'}]
     paused = bool(blocking or recoveries)
     resume_allowed = paused and not any(row.get('state') in {'checking', 'continuing', 'running'} for row in blocking)
@@ -22656,7 +22909,8 @@ def _run_queue_observation_data(machine: MachineStore) -> dict[str, Any]:
                    'running_jobs': sum(row.get('status') == 'running' for row in jobs)},
         'completion_holds_limited': len(holds) > 64, 'backend_recoveries_limited': len(recoveries) > 64,
         'jobs_limited': len(jobs) > 64,
-        'slot_limit': runtime['limit'] if type(runtime.get('limit')) is int else _run_queue_limit(machine),
+        'slot_limit': (runtime['limit'] if type(runtime.get('limit')) is int else
+                       observed_state['limit'] if observed_state is not None else _run_queue_limit(machine)),
         'active_slots': int(runtime.get('active_count') or 0),
         'pending_slots': len(runtime.get('queued') or []),
     }
@@ -22664,11 +22918,12 @@ def _run_queue_observation_data(machine: MachineStore) -> dict[str, Any]:
 
 def _observe_run_queue_snapshot(
     machine: MachineStore, *, source: str = 'state_change', force: bool = False,
+    observed_state: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Emit only changed, content-free facts from a live MachineStore."""
     try:
         from harnessy.diagnostics.queue_observations import validate_queue_event
-        data = _run_queue_observation_data(machine)
+        data = _run_queue_observation_data(machine, observed_state=observed_state)
         clean = validate_queue_event('run_queue_snapshot', {**data, 'source': source})
         if not clean:
             return None
@@ -22702,10 +22957,11 @@ def _observe_run_queue_snapshot(
 def _observe_run_queue_admission(
     machine: MachineStore, *, workspace_id: str, chat_id: str, request_id: str,
     phase: str, include_backend: bool, job_id: str = '', gate_kind: str = '', queue_position: int = 0,
+    observed_state: dict[str, Any] | None = None,
 ) -> None:
     try:
         from harnessy.diagnostics.queue_observations import validate_queue_event
-        data = _observe_run_queue_snapshot(machine, source='admission')
+        data = _observe_run_queue_snapshot(machine, source='admission', observed_state=observed_state)
         fields: dict[str, Any] = {'workspace_id': workspace_id, 'chat_id': chat_id,
             'request_id': request_id, 'phase': phase, 'include_backend': include_backend,
             'same_owner_exempt': False, 'queue_position': queue_position}
@@ -22718,9 +22974,11 @@ def _observe_run_queue_admission(
                           active_slots=data.get('active_slots', 0))
             # Admission uses every current owner, independently of the bounded
             # rows retained in a diagnostic snapshot.
-            holds = machine.list_completion_holds()
+            holds = ([row for row in observed_state['holds']
+                      if row.get('state') not in {'generating', 'unconfirmed_released'}]
+                     if observed_state is not None else machine.list_completion_holds())
             fields['same_owner_exempt'] = any(row.get('workspace_id') == workspace_id and row.get('chat_id') == chat_id for row in holds)
-            recoveries = machine.list_backend_recoveries()
+            recoveries = observed_state['recoveries'] if observed_state is not None else machine.list_backend_recoveries()
             blocker = completion_blocking_hold(holds, workspace_id, chat_id)
             if phase == 'waiting' and gate_kind in {'', 'unavailable'} and include_backend and recoveries:
                 fields.update(gate_kind='backend_recovery', blocker=recoveries[0])
@@ -22789,16 +23047,53 @@ def _backend_recovery_queue_summary(recoveries: list[dict[str, Any]]) -> str:
     return f'Queue paused · backend needs attention · {label}'
 
 
-def _record_backend_recovery(
+async def _finish_background_storage(function, *args, **kwargs):
+    """Let one accepted write settle before cancellation releases ownership."""
+    worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if worker.done() and not worker.cancelled():
+            worker.exception()
+        raise
+
+
+def _read_queue_observation_state(machine: MachineStore) -> dict[str, Any]:
+    return dict(holds=machine.list_completion_holds(include_generating=True, include_released=True),
+                recoveries=machine.list_backend_recoveries(),
+                jobs=machine.list_run_jobs(active_only=True, limit=5000), limit=_run_queue_limit(machine))
+
+
+async def _record_backend_recovery(
     machine: MachineStore, state: str, details: dict[str, Any], *, project_label: str = '',
 ) -> None:
-    machine.record_backend_recovery(state, {**details, 'project_label': project_label})
-    _observe_run_queue_snapshot(machine, source='state_change')
+    tracked = tuple(_RUN_QUEUE_JOB_TASKS)
+    durable_write = lambda: machine.record_backend_recovery(state, {**details, 'project_label': project_label})
+    if state != 'succeeded':
+        durable_write = ADMISSION_BARRIERS.operation(
+            machine._admission_key, 'backend', details, state, durable_write)
+    def write():
+        durable_write()
+        return (_read_queue_observation_state(machine),
+                {job_id: machine.get_run_job(job_id) for job_id in tracked})
+    try:
+        observed, jobs = await _finish_background_storage(write)
+    finally:
+        _wake_run_queue()
+    _observe_run_queue_snapshot(machine, source='state_change', observed_state=observed)
     # Remove already-waiting queue workers from slot admission immediately.
     # Their persisted jobs remain pending, cancellable and in their old order.
     if state != 'succeeded':
         for job_id, task in list(_RUN_QUEUE_JOB_TASKS.items()):
-            if not task.done() and (job := machine.get_run_job(job_id)) and job['status'] == 'pending':
+            if (not task.done() and (job := jobs.get(job_id)) and job['status'] == 'pending'
+                    and task not in _AGENT_TASKS.values()):
                 task.cancel()
     _wake_run_queue()
 
@@ -22856,20 +23151,29 @@ async def _acquire_verified_agent_slot(
 
 
 def _completion_gate_callback(machine: MachineStore, base: dict[str, Any], outcome: dict[str, Any]):
-    def record(state: str, details: dict[str, Any]) -> None:
+    async def record(state: str, details: dict[str, Any]) -> None:
+        payload = {**details, **base}
+        persisted_state = 'checking' if state == 'exhausted' else state
+        durable_write = lambda: machine.record_completion_gate(persisted_state, payload)
+        if persisted_state in {'checking', 'continuing', 'unconfirmed', 'interrupted'}:
+            durable_write = ADMISSION_BARRIERS.operation(
+                machine._admission_key, 'completion', payload, persisted_state, durable_write)
         if state == 'exhausted':
             # Attempts are finished, but cleanup still owns the global slot.
             # Persist their audit details without admitting the next run yet.
             outcome['exhausted_details'] = dict(details)
             outcome['verified'] = False
-            machine.record_completion_gate('checking', {**details, **base})
+            await _finish_background_storage(durable_write)
             _wake_run_queue()
             return
-        accepted = machine.record_completion_gate(state, {**details, **base})
+        accepted = await _finish_background_storage(durable_write)
         if accepted:
             outcome['verified'] = state in {'complete', 'needs_input'}
-        _observe_run_queue_snapshot(machine, source='state_change')
-        _wake_run_queue()
+        try:
+            observed = await asyncio.to_thread(_read_queue_observation_state, machine)
+            _observe_run_queue_snapshot(machine, source='state_change', observed_state=observed)
+        finally:
+            _wake_run_queue()
     return record
 
 
@@ -22886,7 +23190,7 @@ def _completion_gate_exception(outcome: dict[str, Any], exc: Exception, terminal
     outcome['completion_error_code'] = str(getattr(exc, 'completion_error_code', '') or '')
 
 
-def _settle_completion_gate(
+def _write_completion_gate_settlement(
     machine: MachineStore, details: dict[str, Any], outcome: dict[str, Any], *,
     stopped: bool, interrupted: bool, successful: bool = True,
 ) -> None:
@@ -22914,8 +23218,25 @@ def _settle_completion_gate(
             details = {**details, 'reason': 'The model reported completion, but the run failed while finishing. '
                        'Inspect the project error before continuing or resuming the queue.'}
         machine.record_completion_gate('interrupted' if interrupted else 'unconfirmed', details)
-    _observe_run_queue_snapshot(machine, source='state_change')
-    _wake_run_queue()
+
+
+async def _settle_completion_gate(
+    machine: MachineStore, details: dict[str, Any], outcome: dict[str, Any], *,
+    stopped: bool, interrupted: bool, successful: bool = True,
+) -> None:
+    durable_write = ADMISSION_BARRIERS.operation(
+        machine._admission_key, 'completion', details, 'running',
+        lambda: _write_completion_gate_settlement(
+            machine, details, dict(outcome), stopped=stopped,
+            interrupted=interrupted, successful=successful))
+    def write():
+        durable_write()
+        return _read_queue_observation_state(machine)
+    try:
+        observed = await _finish_background_storage(write)
+        _observe_run_queue_snapshot(machine, source='state_change', observed_state=observed)
+    finally:
+        _wake_run_queue()
 
 
 def _wake_run_queue() -> None:
@@ -23157,53 +23478,115 @@ def _migrate_finished_completion_holds(machine: MachineStore) -> int:
     return released
 
 
-async def _run_queue_supervisor(machine: MachineStore) -> None:
+def _prepare_run_queue_supervisor(machine: MachineStore) -> int:
+    """Keep startup database recovery and migration off the UI event loop."""
     machine.recover_interrupted_backend_recoveries()
     machine.recover_interrupted_completion_holds()
-    await asyncio.to_thread(_migrate_finished_completion_holds, machine)
-    interrupted = machine.recover_interrupted_run_jobs()
-    _observe_run_queue_snapshot(machine, source='startup', force=True)
-    if interrupted:
-        log_event('harnessy', 'run_queue_recovered_interrupted', count=interrupted)
+    _migrate_finished_completion_holds(machine)
+    return machine.recover_interrupted_run_jobs()
+
+
+def _run_queue_poll_state(machine: MachineStore, tracked_job_ids: tuple[str, ...]) -> dict[str, Any]:
+    """Read one polling bundle without touching asyncio slots or task objects."""
+    limit = _run_queue_limit(machine)
+    changed = machine.rebalance_run_queue_lanes(limit)
+    holds = machine.list_completion_holds(include_generating=True, include_released=True)
+    recoveries = machine.list_backend_recoveries()
+    jobs = machine.list_run_jobs(active_only=True, limit=5000)
+    # Preserve the dispatcher list's normal bound and its current ordering.
+    dispatch_jobs = machine.list_run_jobs(active_only=True)
+    tracked = {job_id: machine.get_run_job(job_id) for job_id in tracked_job_ids}
+    candidates = [*jobs[:64], *dispatch_jobs, *(row for row in tracked.values() if row)]
+    keys = {(str(row['workspace_id']), str(row['chat_id'])) for row in candidates
+            if row.get('status') == 'pending'}
+    reasons = {key: machine.run_admission_reason(*key, include_backend=True) for key in keys}
+    return {'limit': limit, 'changed': changed, 'holds': holds, 'recoveries': recoveries,
+            'jobs': jobs, 'dispatch_jobs': dispatch_jobs, 'tracked_jobs': tracked,
+            'admission_reasons': reasons, 'paused': machine.run_queue_paused()}
+
+
+def _run_queue_database_busy(exc: Exception) -> bool:
+    import sqlite3
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    code = getattr(exc, 'sqlite_errorcode', None)
+    return (isinstance(code, int) and code & 255 in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+            or code is None and str(exc).lower() in {'database is locked', 'database table is locked'})
+
+
+async def _run_queue_supervisor(machine: MachineStore) -> None:
+    initialized = False
+    startup_observed = False
+    interrupted = 0
     last_limit: int | None = None
     last_diagnostic_signature = ''
+
+    async def wait_for_wake() -> None:
+        try:
+            await asyncio.wait_for(_RUN_QUEUE_WAKE.wait(), timeout=0.75)
+            _RUN_QUEUE_WAKE.clear()
+        except asyncio.TimeoutError:
+            pass
+
     try:
         while True:
-            limit = _run_queue_limit(machine)
+            try:
+                if not initialized:
+                    interrupted = await asyncio.to_thread(_prepare_run_queue_supervisor, machine)
+                    initialized = True
+                observed = await asyncio.to_thread(_run_queue_poll_state, machine, tuple(_RUN_QUEUE_JOB_TASKS))
+            except Exception as exc:
+                if not _run_queue_database_busy(exc):
+                    raise
+                # An unrelated writer may remain busy for SQLite's full
+                # timeout. Wait in the worker, then defer this poll rather
+                # than freezing the page or terminating queue supervision.
+                log_event('runtime', 'run_queue_poll_deferred', reason='database_busy')
+                await wait_for_wake()
+                continue
+            limit = observed['limit']
             await GLOBAL_AGENT_SLOTS.set_limit(limit)
-            changed = machine.rebalance_run_queue_lanes(limit)
-            snapshot = _observe_run_queue_snapshot(machine, source='state_change')
+            changed = observed['changed']
+            if not startup_observed:
+                _observe_run_queue_snapshot(machine, source='startup', force=True, observed_state=observed)
+                if interrupted:
+                    log_event('harnessy', 'run_queue_recovered_interrupted', count=interrupted)
+                startup_observed = True
+            snapshot = _observe_run_queue_snapshot(machine, source='state_change', observed_state=observed)
             diagnostic_signature = json.dumps(snapshot, sort_keys=True) if snapshot else ''
             if snapshot and diagnostic_signature != last_diagnostic_signature and snapshot.get('queue_paused'):
                 for job in snapshot.get('jobs') or []:
                     if job.get('status') == 'pending':
-                        reason = machine.run_admission_reason(str(job.get('workspace_id') or ''),
-                            str(job.get('chat_id') or ''), include_backend=True)
+                        reason = observed['admission_reasons'].get((str(job.get('workspace_id') or ''),
+                            str(job.get('chat_id') or '')), '')
                         if reason:
                             _observe_run_queue_admission(machine, workspace_id=str(job.get('workspace_id') or ''),
                                 chat_id=str(job.get('chat_id') or ''), request_id=str(job.get('id') or ''),
                                 job_id=str(job.get('id') or ''), phase='waiting', include_backend=True,
-                                gate_kind='unavailable')
+                                gate_kind='unavailable', observed_state=observed)
             last_diagnostic_signature = diagnostic_signature
-            paused = machine.run_queue_paused()
+            paused = observed['paused']
             if paused or changed or (last_limit is not None and last_limit != limit):
                 # A waiting worker captured its old preference and ceiling.
                 # Restart only unstarted workers so they use the current choice.
                 for job_id, task in list(_RUN_QUEUE_JOB_TASKS.items()):
-                    if (not task.done() and (job := machine.get_run_job(job_id)) and job['status'] == 'pending'
+                    job = observed['tracked_jobs'].get(job_id)
+                    # The worker may have started while the poll was reading
+                    # SQLite. Its live task ownership wins over a stale row.
+                    running = bool(job and _AGENT_TASKS.get((str(job['workspace_id']), str(job['chat_id']))) is task)
+                    if (not task.done() and not running and job and job['status'] == 'pending'
                             and (changed or (last_limit is not None and last_limit != limit)
-                                 or machine.run_admission_reason(job['workspace_id'], job['chat_id'], include_backend=True))):
+                                 or observed['admission_reasons'].get((str(job['workspace_id']), str(job['chat_id'])), ''))):
                         task.cancel()
             last_limit = limit
             for job_id, task in list(_RUN_QUEUE_JOB_TASKS.items()):
                 if task.done():
                     _RUN_QUEUE_JOB_TASKS.pop(job_id, None)
             pending_jobs = [
-                row for row in machine.list_run_jobs(active_only=True)
+                row for row in observed['dispatch_jobs']
                 if row.get('status') == 'pending'
                 and (str(row['workspace_id']), str(row['chat_id'])) not in _TIMELINE_REPLACEMENTS
-                and not machine.run_admission_reason(
-                    row['workspace_id'], row['chat_id'], include_backend=True)
+                and not observed['admission_reasons'].get((str(row['workspace_id']), str(row['chat_id'])), '')
             ]
             for row in pending_jobs:
                 job_id = str(row.get('id') or '')
@@ -23213,11 +23596,7 @@ async def _run_queue_supervisor(machine: MachineStore) -> None:
                     _execute_queued_run(machine, job_id), name=f'harnessy-run-queue-job-{job_id[:12]}',
                 )
                 _RUN_QUEUE_JOB_TASKS[job_id] = task
-            try:
-                await asyncio.wait_for(_RUN_QUEUE_WAKE.wait(), timeout=0.75)
-                _RUN_QUEUE_WAKE.clear()
-            except asyncio.TimeoutError:
-                pass
+            await wait_for_wake()
     except asyncio.CancelledError:
         queue_tasks = [task for task in _RUN_QUEUE_JOB_TASKS.values() if not task.done()]
         for task in queue_tasks:
@@ -24152,6 +24531,10 @@ def _register_attachment_api(machine: MachineStore) -> None:
 
 
 def run_app() -> None:
+    # The privacy-safe label catalogue parses installed source once. Build it
+    # before starting the UI loop, never on a model event or a timer's first log.
+    from harnessy.diagnostics.operational import _installed_labels
+    _installed_labels()
     settings_root = settings_dir()
     try:
         # Validate the credential root before MachineStore reads or creates any
@@ -24172,7 +24555,10 @@ def run_app() -> None:
 
     workspace_load_tasks: set[asyncio.Task[Any]] = set()
 
-    @ui.page('/')
+    # Retain the mounted page through temporary socket lag. Keep the normal
+    # heartbeat/disconnection indicators; this is UI lifetime, not a claim that
+    # the connection is healthy, and it does not retry prompts or agent work.
+    @ui.page('/', reconnect_timeout=180.0)
     def index(settings: str = '', retry_workspace: str = '', recovery_workspace: str = '') -> None:
         page = HarnessyPage(machine)
         client = ui.context.client
@@ -24384,6 +24770,8 @@ def run_app() -> None:
             # cancellation, so Ctrl+C never waits for a multi-minute USB scan.
             await asyncio.gather(*revision_tasks, return_exceptions=True)
         _PROJECT_REVISION_TASKS.clear()
+        from harnessy.ui.composer_drafts import COMPOSER_DRAFTS
+        await COMPOSER_DRAFTS.flush_all()
         notification_tasks = [task for task in _NOTIFICATION_TASKS if not task.done()]
         for task in notification_tasks:
             task.cancel()

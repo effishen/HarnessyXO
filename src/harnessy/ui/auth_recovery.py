@@ -35,6 +35,7 @@ AUTH_RECOVERY_JS = r'''
       ]);
       if (response.status === 401) {
         state.redirecting = true;
+        window.harnessyLockComposerDrafts?.();
         window.location.assign('/login');
       }
     } catch (_) {

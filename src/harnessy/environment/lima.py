@@ -260,7 +260,11 @@ class LimaVMEnvironment(WorkspaceEnvironment):
     TIMEOUT_CONTROLLER_STOP_GRACE = 1.5
     TIMEOUT_DIAGNOSTIC_RESOURCES = 2.0
     TIMEOUT_DIAGNOSTIC_PRESERVE = 3.0
+    TIMEOUT_DIAGNOSTIC_STARTUP = 3.0
+    TIMEOUT_DIAGNOSTIC_STARTUP_QUIET = 6.0
     CONTROLLER_HEARTBEAT_SECONDS = 15.0
+    STARTUP_QUIET_SECONDS = 30.0
+    STARTUP_CAPTURE_INTERVAL_SECONDS = 60.0
 
 
     def __init__(self, workspace_root: Path, config: EnvironmentConfig) -> None:
@@ -2602,6 +2606,50 @@ exit $rc
                     'status': 'unavailable', 'collection_error': evidence,
                     **({'errno': evidence['errno']} if 'errno' in evidence else {})}
 
+    async def _capture_lima_startup_observation(
+        self, *, selected_home: Path, controller_pid: int | None, command_id: str,
+        operation_id: str, reason: str, controller_action: str,
+        command_started_at_epoch: float, elapsed_seconds: float,
+        last_output_age_seconds: float,
+    ) -> None:
+        """Observe the selected instance before cleanup can remove its evidence."""
+        from harnessy.diagnostics.technical import technical_error_evidence
+
+        try:
+            from harnessy.diagnostics.lima_startup import capture_lima_startup
+
+            capture_timeout = (self.TIMEOUT_DIAGNOSTIC_STARTUP_QUIET if reason == 'quiet_startup'
+                               else self.TIMEOUT_DIAGNOSTIC_STARTUP)
+            await asyncio.wait_for(capture_lima_startup(
+                self.workspace_root, environment_id=self.config.id,
+                runtime_root=self.environment_root, selected_home=selected_home,
+                instance_name=self.INSTANCE, controller_pid=controller_pid,
+                command_id=command_id, operation_id=operation_id, reason=reason,
+                controller_action=controller_action,
+                command_started_at_epoch=command_started_at_epoch,
+                elapsed_seconds=elapsed_seconds,
+                last_output_age_seconds=last_output_age_seconds,
+            ), timeout=capture_timeout)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            evidence = technical_error_evidence(exc)
+            if isinstance(exc, asyncio.TimeoutError):
+                evidence['timeout_seconds'] = capture_timeout
+            log_event('runtime', 'lima_startup_capture_unavailable', workspace=str(self.workspace_root),
+                      provider='lima', command_id=command_id, controller_action=controller_action,
+                      capture_reason=reason, technical_error=evidence,
+                      **self._controller_diagnostic_fields())
+
+    @staticmethod
+    def _controller_quiet_detail(elapsed_seconds: float, quiet_seconds: float) -> str:
+        def duration(seconds: float) -> str:
+            minutes, seconds = divmod(max(0, int(seconds)), 60)
+            return f'{minutes}m {seconds}s' if minutes else f'{seconds}s'
+
+        return (f'No new startup output for {duration(quiet_seconds)}; '
+                f'Lima controller is still running ({duration(elapsed_seconds)} elapsed).')
+
     async def _run(
         self, *args: str, timeout: float | None = 120.0, check: bool = False,
         input_text: str | None = None, diagnostic_probe: bool = False,
@@ -2628,6 +2676,30 @@ exit $rc
         final_capture_sizes: dict[str, int] | None = None
         pending_progress = {'stdout': False, 'stderr': False}
         last_output_at: float | None = None
+        selected_home: Path | None = None
+        process = None
+        last_startup_capture_at: float | None = None
+        failure_startup_captured = False
+
+        async def capture_startup(reason: str, *, failure: bool = False) -> None:
+            nonlocal last_startup_capture_at, failure_startup_captured
+            if (controller_action not in {'start', 'create'} or selected_home is None
+                    or (failure and failure_startup_captured)):
+                return
+            if failure:
+                failure_startup_captured = True
+            if all(not handle.closed for handle in capture_files.values()):
+                captured_sizes()
+            now = time.monotonic()
+            last_startup_capture_at = now
+            await self._capture_lima_startup_observation(
+                selected_home=selected_home, controller_pid=process.pid if process is not None else None,
+                command_id=command_id, operation_id=diagnostic_fields.get('operation_id', ''),
+                reason=reason, controller_action=controller_action,
+                command_started_at_epoch=started_at_epoch,
+                elapsed_seconds=max(0.0, now - started),
+                last_output_age_seconds=max(0.0, now - (last_output_at if last_output_at is not None else started)),
+            )
 
         def captured_sizes() -> dict[str, int]:
             nonlocal last_output_at
@@ -2649,6 +2721,7 @@ exit $rc
             now = time.monotonic()
             log_event('runtime', event, workspace=str(self.workspace_root), provider='lima',
                       command_id=command_id, controller_action=controller_action,
+                      controller_pid=process.pid,
                       controller_returncode=process.returncode,
                       controller_state='running' if process.returncode is None else 'exited',
                       completion_phase=phase, elapsed_seconds=max(0.0, now - started),
@@ -2696,6 +2769,7 @@ exit $rc
 
         async def preserve_failure(reason: str, resources: dict[str, Any]) -> None:
             if trusted_control_plane:
+                await capture_startup(reason, failure=True)
                 await self._preserve_vm_failure(
                     reason=reason, operation=controller_action, command_id=command_id,
                     controller_stdout=stdout_buffer.decode('utf-8', errors='replace'),
@@ -2745,6 +2819,8 @@ exit $rc
             host_resources=launch_resources, **diagnostic_fields,
         )
         try:
+            host_env = self._host_env(allow_legacy=bool(args and args[0] in {'list', 'stop', 'delete', '--version', 'info'}))
+            selected_home = Path(host_env['LIMA_HOME'])
             if trusted_control_plane:
                 # A background hostagent can inherit the controller's handles.
                 # Anonymous regular files let wait() observe the direct child
@@ -2758,8 +2834,12 @@ exit $rc
                 stdin=asyncio.subprocess.PIPE if input_text is not None else None,
                 stdout=capture_files.get('stdout', asyncio.subprocess.PIPE),
                 stderr=capture_files.get('stderr', asyncio.subprocess.PIPE),
-                env=self._host_env(allow_legacy=bool(args and args[0] in {'list', 'stop', 'delete', '--version', 'info'})),
+                env=host_env,
             )
+            if trusted_control_plane:
+                log_event('runtime', 'environment_command_spawned', workspace=str(self.workspace_root),
+                          provider='lima', command_id=command_id, controller_action=controller_action,
+                          controller_pid=process.pid, **diagnostic_fields)
         except asyncio.CancelledError:
             for handle in capture_files.values():
                 handle.close()
@@ -2877,6 +2957,8 @@ exit $rc
                         pending_progress[stream_name] = bool(pending or decoder.getstate()[0])
 
                 async def stream_command() -> tuple[bytes, bytes]:
+                    quiet_capture_task = None
+
                     async def parent_exit() -> None:
                         await process.wait()
                         if trusted_control_plane:
@@ -2884,10 +2966,32 @@ exit $rc
                             capture_observation('environment_command_parent_exited', phase='collecting_output')
 
                     async def heartbeat() -> None:
+                        nonlocal quiet_capture_task
                         while True:
                             await asyncio.sleep(self.CONTROLLER_HEARTBEAT_SECONDS)
                             capture_observation('environment_command_heartbeat',
                                 phase='running_controller' if process.returncode is None else 'collecting_output')
+                            if controller_action not in {'start', 'create'} or process.returncode is not None:
+                                continue
+                            now = time.monotonic()
+                            quiet = max(0.0, now - (last_output_at if last_output_at is not None else started))
+                            if quiet < self.STARTUP_QUIET_SECONDS:
+                                continue
+                            if observer is not None:
+                                try:
+                                    callback_result = observer('heartbeat', self._controller_quiet_detail(now - started, quiet))
+                                    if asyncio.iscoroutine(callback_result):
+                                        await callback_result
+                                except Exception as callback_exc:
+                                    log_event('runtime', 'environment_command_progress_callback_failed',
+                                              workspace=str(self.workspace_root), provider='lima',
+                                              command_id=command_id,
+                                              error=f'{type(callback_exc).__name__}: {callback_exc}',
+                                              **diagnostic_fields)
+                            if ((quiet_capture_task is None or quiet_capture_task.done())
+                                    and (last_startup_capture_at is None
+                                         or now - last_startup_capture_at >= self.STARTUP_CAPTURE_INTERVAL_SECONDS)):
+                                quiet_capture_task = asyncio.create_task(capture_startup('quiet_startup'))
 
                     readers = {name: CapturedReader(name) if trusted_control_plane else getattr(process, name)
                                for name in ('stdout', 'stderr')}
@@ -2900,10 +3004,10 @@ exit $rc
                         if trusted_control_plane:
                             capture_observation('environment_command_output_handoff', phase='collecting_output')
                     finally:
-                        for task in (*tasks, heartbeat_task):
+                        for task in (*tasks, heartbeat_task, quiet_capture_task):
                             if task is not None and not task.done():
                                 task.cancel()
-                        await asyncio.gather(*(task for task in (*tasks, heartbeat_task) if task is not None),
+                        await asyncio.gather(*(task for task in (*tasks, heartbeat_task, quiet_capture_task) if task is not None),
                                              return_exceptions=True)
                     return bytes(stdout_buffer), bytes(stderr_buffer)
 
@@ -2912,6 +3016,9 @@ exit $rc
         except asyncio.TimeoutError as exc:
             elapsed = max(0.0, time.monotonic() - started)
             observed_returncode = process.returncode
+            # Read the process tree and monitor while the controller and its
+            # hostagent still exist; termination can remove that evidence.
+            await capture_startup('controller_timeout', failure=True)
             await stop_controller()
             failure_resources = await self._collect_host_resources() if trusted_control_plane else {}
             log_event(
@@ -3209,7 +3316,7 @@ exit $rc
         create_progress_state: dict[str, Any] = {}
 
         async def observe_create(_stream: str, line: str) -> None:
-            update = self._lima_progress_update(line)
+            update = (line, None) if _stream == 'heartbeat' else self._lima_progress_update(line)
             if update is None:
                 return
             detail, stage_percent = update
@@ -3217,7 +3324,8 @@ exit $rc
                 return
             await self._emit_progress(
                 progress, 'creating_vm', 'Creating workspace VM…', detail=detail,
-                stage_progress_percent=stage_percent, progress_source='lima',
+                stage_progress_percent=stage_percent,
+                progress_source='controller_observation' if _stream == 'heartbeat' else 'lima',
                 stage_timeout_seconds=self.TIMEOUT_CREATE,
             )
 
@@ -3603,7 +3711,7 @@ print(json.dumps(facts))
             start_progress_state: dict[str, Any] = {}
 
             async def observe_start(_stream: str, line: str) -> None:
-                update = self._lima_progress_update(line)
+                update = (line, None) if _stream == 'heartbeat' else self._lima_progress_update(line)
                 if update is None:
                     return
                 detail, stage_percent = update
@@ -3611,7 +3719,8 @@ print(json.dumps(facts))
                     return
                 await report(
                     'starting_vm', 'Starting workspace VM…', detail=detail,
-                    stage_progress_percent=stage_percent, progress_source='lima',
+                    stage_progress_percent=stage_percent,
+                    progress_source='controller_observation' if _stream == 'heartbeat' else 'lima',
                     stage_timeout_seconds=self.TIMEOUT_START,
                 )
 
