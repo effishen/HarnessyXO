@@ -80,7 +80,7 @@ class SSHFSSetupError(RuntimeError):
 
 
 class DesktopSetupError(RuntimeError):
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, *, failure_reason: str = '') -> None:
         messages = {
             'DESKTOP_KERNEL_UNSUPPORTED': 'Desktop setup needs a graphics-capable guest kernel. Use Retry Setup to finish preparing this VM.',
             'DESKTOP_BOOT_POLICY_CUSTOM': 'A desktop kernel is staged, but the guest has custom boot settings. Choose the desktop-capable kernel in the guest boot settings, then restart the VM.',
@@ -99,7 +99,19 @@ class DesktopSetupError(RuntimeError):
             'DESKTOP_REPAIR_CANCELLED': 'Desktop setup was cancelled.',
         }
         self.error_code = code if isinstance(code, str) and code in messages else 'DESKTOP_REPAIR_FAILED'
-        super().__init__(messages[self.error_code] + ' CLI readiness is checked separately; the VM disk and project files were preserved.')
+        reasons = {
+            'dns_failed': 'The guest could not resolve a package repository hostname.',
+            'network_timeout': 'The guest could not reach its package repository before the network timeout.',
+            'repository_error': 'A guest package repository reported an error.',
+            'package_unavailable': 'A required package is unavailable from the configured repositories.',
+            'package_lock': 'Another guest package operation holds the package-manager lock.',
+            'storage_full': 'The guest could not write package data because its storage is full or read-only.',
+            'command_timeout': 'The package command reached its time limit.',
+            'package_command_failed': 'The guest package command failed.',
+        }
+        self.failure_reason = failure_reason if isinstance(failure_reason, str) and failure_reason in reasons else 'unknown'
+        detail = (' ' + reasons[self.failure_reason]) if self.failure_reason in reasons else ''
+        super().__init__(messages[self.error_code] + detail + ' CLI readiness is checked separately; the VM disk and project files were preserved.')
 
 
 class _LimaDesktopView:
@@ -793,10 +805,17 @@ if [ "$PUBLIC_NETWORK" = "1" ]; then
   for ip in $DNS4; do
     ipt -A OUTPUT -d "$ip" -p udp --dport 53 -j ACCEPT
     ipt -A OUTPUT -d "$ip" -p tcp --dport 53 -j ACCEPT
+    # Lima's host resolver DNATs guest DNS to the private gateway and an
+    # ephemeral host-agent port before filter OUTPUT.  Match the original
+    # configured DNS endpoint, never arbitrary traffic to that gateway.
+    ipt -A OUTPUT -p udp -m conntrack --ctstate DNAT --ctdir ORIGINAL --ctorigdst "$ip" --ctorigdstport 53 -j ACCEPT
+    ipt -A OUTPUT -p tcp -m conntrack --ctstate DNAT --ctdir ORIGINAL --ctorigdst "$ip" --ctorigdstport 53 -j ACCEPT
   done
   for ip in $DNS6; do
     ip6t -A OUTPUT -d "$ip" -p udp --dport 53 -j ACCEPT
     ip6t -A OUTPUT -d "$ip" -p tcp --dport 53 -j ACCEPT
+    ip6t -A OUTPUT -p udp -m conntrack --ctstate DNAT --ctdir ORIGINAL --ctorigdst "$ip" --ctorigdstport 53 -j ACCEPT
+    ip6t -A OUTPUT -p tcp -m conntrack --ctstate DNAT --ctdir ORIGINAL --ctorigdst "$ip" --ctorigdstport 53 -j ACCEPT
   done
 fi
 
@@ -3699,7 +3718,7 @@ exit $rc
         elif snapshot.get('state') == 'checking' and code == 'NONE':
             message = ''
         else:
-            message = str(DesktopSetupError(code))
+            message = str(DesktopSetupError(code, failure_reason=str(snapshot.get('failure_reason') or '')))
         return {'desktop_ready': ready, 'desktop_state': str(snapshot.get('state') or 'unknown'),
                 'desktop_error': '' if ready else message}
 
@@ -3853,7 +3872,8 @@ exit $rc
         result = await self._run_desktop_repair(allow_kernel_repair=True, progress=progress)
         self._check_setup_cancelled(cancel_event)
         if result.get('state') not in {'ready', 'reboot_required'}:
-            raise DesktopSetupError(str(result.get('error_code') or 'DESKTOP_REPAIR_FAILED'))
+            raise DesktopSetupError(str(result.get('error_code') or 'DESKTOP_REPAIR_FAILED'),
+                                    failure_reason=str(result.get('failure_reason') or ''))
         candidate = str(result.get('candidate_kernel_sha256') or '')
         rebooted = result.get('state') == 'reboot_required'
         if rebooted:
