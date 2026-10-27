@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.25
+
+- Install and verify the SSHFS prerequisite during early VM setup, before Lima requires it for shared folders. Keep the normal installed-package check short and leave heavy tool provisioning after startup.
+- Recover an idle running VM left degraded by missing SSHFS: prepare its file-sharing helper, stop it normally, then restart and verify the actual shared folders and isolation. Preserve the existing virtual disk and project files.
+- Respect the saved outbound-network setting during prerequisite setup. Bound package installation and report specific setup failures without waiting through Lima's long missing-SSHFS retry window. Keep the environment out of Ready until all required checks pass.
+- Save guest and Lima startup observations when an account-owned VM folder was created with group-write permissions. Keep capture files private, and allow read-only diagnostics for a guest still completing setup.
+- Native Kali startup on the Spark still needs confirmation after updating. Use Start on the existing VM; no rebuild is required.
+
 ## v0.7.24
 
 - Use reverse SSHFS for Kali's shared folders instead of relying on 9p support in its cloud kernel. Existing Kali VMs apply the new mount configuration on their next Start, preserving their virtual disk and workspace files.

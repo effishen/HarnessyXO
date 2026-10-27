@@ -1,4 +1,6 @@
-# HarnessyXO v0.7.24 Features
+# HarnessyXO v0.7.25 Features
+
+- Prepare SSHFS before Lima requires shared-folder mounts. Missing-helper setup and package failures have bounded waits and specific errors. An idle degraded VM can retry setup using its existing disk; model commands still require verified mounts and isolation.
 
 - Kali QEMU VMs use reverse SSHFS for shared folders, so their cloud kernel does not need 9p support. Start reconciles older Kali mount definitions while preserving the existing virtual disk. Shared folders are checked before desktop and isolation setup can complete.
 
