@@ -93,7 +93,8 @@ class EnvironmentOperationRegistry:
             'provisioning_optional_packages', 'provisioning_ghidra',
             'provisioning_ghidra_arm64', 'provisioning_python_re',
             'provisioning_skipped_offline', 'finalizing_provisioning',
-            'checking_workspace_files', 'installing_isolation', 'applying_isolation', 'verifying_isolation', 'ready',
+            'checking_workspace_files', 'installing_isolation', 'applying_isolation', 'verifying_isolation',
+            'desktop_checking', 'desktop_installing', 'desktop_kernel', 'desktop_verifying', 'ready',
         ),
         'stop': ('stopping_vm',),
         'tools': (
@@ -116,7 +117,7 @@ class EnvironmentOperationRegistry:
             'provisioning_ghidra', 'provisioning_ghidra_arm64', 'provisioning_python_re',
             'provisioning_skipped_offline',
             'finalizing_provisioning', 'checking_workspace_files', 'installing_isolation', 'applying_isolation',
-            'verifying_isolation', 'ready',
+            'verifying_isolation', 'desktop_checking', 'desktop_installing', 'desktop_kernel', 'desktop_verifying', 'ready',
         ),
         'rebuild': (
             'rebuilding', 'creating_vm', 'preparing_file_sharing', 'starting_vm', 'waiting_for_guest',
@@ -125,7 +126,7 @@ class EnvironmentOperationRegistry:
             'provisioning_ghidra', 'provisioning_ghidra_arm64', 'provisioning_python_re',
             'provisioning_skipped_offline',
             'finalizing_provisioning', 'checking_workspace_files', 'installing_isolation', 'applying_isolation',
-            'verifying_isolation', 'ready',
+            'verifying_isolation', 'desktop_checking', 'desktop_installing', 'desktop_kernel', 'desktop_verifying', 'ready',
         ),
     }
 

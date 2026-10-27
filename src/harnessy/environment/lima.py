@@ -2866,7 +2866,7 @@ exit $rc
 
     async def _run(
         self, *args: str, timeout: float | None = 120.0, check: bool = False,
-        input_text: str | None = None, diagnostic_probe: bool = False,
+        input_text: str | None = None, diagnostic_probe: bool = False, output_observer=None,
     ) -> tuple[int, str, str]:
         from harnessy.diagnostics.technical import technical_error_evidence
 
@@ -3097,7 +3097,8 @@ exit $rc
 
         try:
             payload = input_text.encode('utf-8') if input_text is not None else None
-            observer = None if diagnostic_probe else self._controller_output_callback
+            observer = output_observer if output_observer is not None else (
+                None if diagnostic_probe else self._controller_output_callback)
             if observer is None and not trusted_control_plane and not diagnostic_probe:
                 communicate = process.communicate(payload)
                 stdout_b, stderr_b = await asyncio.wait_for(communicate, timeout=timeout) if timeout else await communicate
@@ -3132,7 +3133,9 @@ exit $rc
                             log_event(
                                 'runtime', 'environment_command_progress_callback_failed',
                                 workspace=str(self.workspace_root), provider='lima',
-                                command_id=command_id, error=f'{type(callback_exc).__name__}: {callback_exc}',
+                                command_id=command_id,
+                                **({'technical_error': technical_error_evidence(callback_exc)} if output_observer is not None
+                                   else {'error': f'{type(callback_exc).__name__}: {callback_exc}'}),
                                 **diagnostic_fields,
                             )
 
@@ -3598,6 +3601,8 @@ exit $rc
         code = str(snapshot.get('error_code') or 'DESKTOP_PROBE_FAILED')
         if snapshot.get('state') == 'reboot_required':
             message = 'Desktop support is staged. Use Repair Desktop to restart and verify it.'
+        elif snapshot.get('state') == 'checking' and code == 'NONE':
+            message = ''
         else:
             message = str(DesktopSetupError(code))
         return {'desktop_ready': ready, 'desktop_state': str(snapshot.get('state') or 'unknown'),
@@ -3630,9 +3635,47 @@ exit $rc
         return await self._record_desktop_snapshot(snapshot)
 
     async def _run_desktop_repair(self, *, allow_kernel_repair: bool, progress=None) -> dict:
-        from .desktop_setup import (build_desktop_repair_script, parse_desktop_repair,
+        from .desktop_setup import (build_desktop_repair_script, parse_desktop_repair, parse_desktop_event,
                                     DESKTOP_REPAIR_TIMEOUT_SECONDS)
-        await self._emit_progress(progress, 'desktop_installing', 'Preparing guest desktop support…',
+        expected_boot_id = str(self._read_readiness().get('boot_id') or '')
+        progress_phase = ''
+        phase_started_elapsed = 0.0
+
+        def duration(seconds: float) -> str:
+            minutes, seconds = divmod(max(0, int(seconds)), 60)
+            return f'{minutes}m {seconds}s' if minutes else f'{seconds}s'
+
+        async def observe_desktop(_stream: str, line: str) -> None:
+            nonlocal progress_phase, phase_started_elapsed
+            event = parse_desktop_event(line)
+            if event is None or not expected_boot_id or event['boot_id'] != expected_boot_id:
+                return
+            phase, label = {
+                'checking': ('desktop_checking', 'Checking guest desktop prerequisites'),
+                'package_index': ('desktop_installing', 'Refreshing guest package indexes'),
+                'packages': ('desktop_installing', 'Installing guest desktop packages'),
+                'kernel': ('desktop_kernel', 'Preparing a desktop-capable guest kernel'),
+                'boot': ('desktop_kernel', 'Checking the guest boot configuration'),
+                'session': ('desktop_installing', 'Starting the guest graphical session'),
+                'verifying': ('desktop_verifying', 'Checking the active guest display and session'),
+            }[event['stage']]
+            if phase != progress_phase:
+                progress_phase, phase_started_elapsed = phase, event['elapsed_seconds']
+            await self._record_desktop_snapshot({
+                'schema_version': 1, 'state': 'checking', 'error_code': 'NONE',
+                'failure_reason': 'unknown', 'boot_id': event['boot_id'], 'phase': event['stage'],
+                **{name: event[name] for name in ('elapsed_seconds', 'command_elapsed_seconds',
+                                                 'output_bytes', 'last_output_age_seconds')},
+            })
+            detail = (f'{label} · {duration(event["elapsed_seconds"])} elapsed · '
+                      f'{event["output_bytes"]:,} bytes of command output')
+            age = event['last_output_age_seconds']
+            detail += (' · no command output yet' if age is None else f' · last output {duration(age)} ago')
+            await self._emit_progress(progress, phase, 'Preparing guest desktop support…',
+                detail=detail, stage_progress_percent=None, progress_source='controller_observation',
+                stage_timeout_seconds=max(1.0, DESKTOP_REPAIR_TIMEOUT_SECONDS - phase_started_elapsed))
+
+        await self._emit_progress(progress, 'desktop_checking', 'Preparing guest desktop support…',
             detail='Checking the display manager, desktop session and guest graphics support.',
             stage_timeout_seconds=DESKTOP_REPAIR_TIMEOUT_SECONDS)
         try:
@@ -3640,12 +3683,14 @@ exit $rc
                 'sudo', '-n', '--', '/bin/sh', '-c',
                 build_desktop_repair_script(architecture='amd64' if self.config.architecture == 'x86_64' else self.config.architecture,
                     public_network=bool(self.config.network), allow_kernel_repair=allow_kernel_repair),
-                timeout=DESKTOP_REPAIR_TIMEOUT_SECONDS + 5, check=False, diagnostic_probe=True)
+                timeout=DESKTOP_REPAIR_TIMEOUT_SECONDS + 5, check=False, diagnostic_probe=True,
+                output_observer=observe_desktop)
             snapshot = parse_desktop_repair(stdout)
             if rc != 0 and snapshot.get('state') not in {'failed', 'manual_boot_required'}:
                 snapshot = {**snapshot, 'state': 'failed', 'error_code': 'DESKTOP_REPAIR_FAILED'}
         except asyncio.TimeoutError:
             snapshot = {'schema_version': 1, 'state': 'failed', 'error_code': 'DESKTOP_REPAIR_TIMEOUT',
+                        'failure_reason': 'command_timeout',
                         'boot_id': str(self._read_readiness().get('boot_id') or '')}
         except Exception:
             snapshot = {'schema_version': 1, 'state': 'failed', 'error_code': 'DESKTOP_REPAIR_FAILED',
@@ -3657,8 +3702,12 @@ exit $rc
         if not self.config.desktop:
             return
         try:
+            await self._emit_progress(progress, 'desktop_checking', 'Checking the guest desktop…')
             snapshot = await self._probe_desktop()
             if snapshot.get('state') == 'ready':
+                return
+            if (snapshot.get('kernel_repair_needed') is True
+                    or (snapshot.get('cloud_kernel') is True and snapshot.get('kernel_graphics') == 'unsupported')):
                 return
             snapshot = await self._run_desktop_repair(allow_kernel_repair=False, progress=progress)
             if snapshot.get('state') == 'ready':

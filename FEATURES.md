@@ -1,4 +1,6 @@
-# HarnessyXO v0.7.26 Features
+# HarnessyXO v0.7.27 Features
+
+- Start skips desktop package installation when the running Kali cloud kernel is already known to lack the required graphics support. It completes the terminal/model checks and points to **Repair Desktop** for the kernel and GUI setup. Desktop installation reports its current step, elapsed time and recent package-output activity; saved diagnostics retain fixed failure reasons.
 
 - Terminal/model Ready and Desktop Ready are separate. Verify the running graphical session and active display before opening the browser desktop; a VNC connection alone does not prove that the guest has graphics output.
 - Desktop-enabled Lima Linux VMs have **Repair Desktop**. Finish their tasks and close their tabs first. Repair keeps the VM disk and older kernels, can add the generic Kali kernel when the cloud kernel lacks graphics support, and verifies supported boot settings before restarting. Custom boot policies remain explicit. **VM_DESKTOP.json** retains bounded, content-free observations.
