@@ -91,6 +91,7 @@ class EnvironmentOperationRegistry:
         'resources': ('resources_checking', 'resources_applying', 'resources_saving', 'resources_complete'),
         'network': ('checking_host_dependencies', 'network_stopping', 'network_applying', 'network_starting', 'ready'),
         'start': (
+            'waiting_for_vm_shutdown', 'waiting_for_guest_control',
             'creating_vm', 'reconciling_environment', 'preparing_file_sharing', 'starting_vm', 'waiting_for_guest',
             'checking_provisioning', 'adopting_provisioning', 'provisioning_packages',
             'provisioning_package_index', 'provisioning_required_packages',
@@ -115,6 +116,7 @@ class EnvironmentOperationRegistry:
             'reconciling_restore_files', 'restarting_restore_vm', 'verifying_restore_restart',
         ),
         'reset': (
+            'waiting_for_vm_shutdown', 'waiting_for_guest_control',
             'factory_reset', 'restarting_reset_vm', 'preparing_file_sharing', 'starting_vm', 'waiting_for_guest',
             'checking_provisioning', 'adopting_provisioning', 'provisioning_packages', 'provisioning_package_index',
             'provisioning_required_packages', 'provisioning_optional_packages',
@@ -124,6 +126,7 @@ class EnvironmentOperationRegistry:
             'verifying_isolation', 'desktop_checking', 'desktop_installing', 'desktop_kernel', 'desktop_verifying', 'ready',
         ),
         'rebuild': (
+            'waiting_for_vm_shutdown', 'waiting_for_guest_control',
             'rebuilding', 'creating_vm', 'preparing_file_sharing', 'starting_vm', 'waiting_for_guest',
             'checking_provisioning', 'adopting_provisioning', 'provisioning_packages', 'provisioning_package_index',
             'provisioning_required_packages', 'provisioning_optional_packages',

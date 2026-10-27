@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.7.29
+
+- Preserve an accepted Stop transition before running the native stop command. After an app restart, Start / Retry Setup waits for shutdown settlement before attempting guest file-sharing or desktop setup.
+- Handle older in-flight shutdowns with bounded read-only control/status checks. Continue only when the guest control channel recovers or the controller confirms that the VM stopped. Cancellation prevents subsequent startup; expiry reports an unavailable control channel or pending shutdown without forcing the VM down.
+- Report an unavailable guest control channel separately from an SSHFS prerequisite failure. Keep saved readiness evidence intact when a transient probe fails, and retain reviewed SSH failure categories even for diagnostic probes and commands whose exit status is checked by their caller.
+- Preserve the existing VM disk, project files and normal desktop setup path. Native Spark shutdown, package installation and graphical output still need confirmation after updating.
+
 ## v0.7.28
 
 - Complete the selected desktop during normal human Start / Retry Setup, Create, Rebuild and Factory Reset. Install the matching generic Kali kernel and desktop when needed, perform the verified controlled restart, then require actual graphical-session and display proof before reporting success.

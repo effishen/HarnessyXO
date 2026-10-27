@@ -43,6 +43,16 @@ class LimaUnavailableError(RuntimeError):
     pass
 
 
+class GuestControlUnavailableError(RuntimeError):
+    def __init__(self, *, stopping: bool = False) -> None:
+        self.error_code = 'VM_SHUTDOWN_PENDING' if stopping else 'GUEST_CONTROL_UNAVAILABLE'
+        message = ('The previous VM shutdown has not finished. Wait for Stop to complete, then retry Start.'
+                   if stopping else
+                   'The VM is reported running, but its guest control connection is unavailable. '
+                   'Wait for it to become reachable or stop it explicitly, then retry Start.')
+        super().__init__(message + ' Guest readiness could not be verified; the VM disk and project files were preserved.')
+
+
 class SSHFSSetupError(RuntimeError):
     def __init__(self, code: str, *, failure_reason: str = '') -> None:
         messages = {
@@ -314,6 +324,8 @@ class LimaVMEnvironment(WorkspaceEnvironment):
     TIMEOUT_WORKSPACE_MOUNTS = 5.0
     TIMEOUT_SSHFS_SETUP = 195.0
     SSHFS_SETUP_POLL_SECONDS = 3.0
+    TIMEOUT_GUEST_CONTROL = 180.0
+    GUEST_CONTROL_POLL_SECONDS = 2.0
     CONTROLLER_HEARTBEAT_SECONDS = 15.0
     STARTUP_QUIET_SECONDS = 30.0
     STARTUP_CAPTURE_INTERVAL_SECONDS = 60.0
@@ -606,16 +618,13 @@ class LimaVMEnvironment(WorkspaceEnvironment):
     async def _prepare_running_sshfs(self, progress=None) -> None:
         from .sshfs_setup import build_sshfs_setup_script
 
+        # Transport failure is not evidence that SSHFS or its prerequisites
+        # are missing. Do not revoke a saved CLI proof before this read works.
+        boot_id = await self._guest_boot_id()
         await self._emit_progress(progress, 'preparing_file_sharing', 'Preparing guest file sharing…',
             detail='Checking SSHFS and FUSE before restarting the file-sharing connection.',
             stage_timeout_seconds=self.TIMEOUT_SSHFS_SETUP)
         self._write_readiness(ready=False, phase='preparing_file_sharing')
-        try:
-            boot_id = await self._guest_boot_id()
-        except Exception:
-            await self._raise_sshfs_setup_failure('SSHFS_SETUP_VERIFY_FAILED')
-        if not boot_id:
-            await self._raise_sshfs_setup_failure('SSHFS_SETUP_VERIFY_FAILED')
         try:
             rc, _, _ = await self._run(
                 'shell', '--workdir', '/', self.INSTANCE, 'sudo', '-n', '--', '/bin/sh', '-c',
@@ -3243,12 +3252,16 @@ exit $rc
             await capture_startup('controller_timeout', failure=True)
             await stop_controller()
             failure_resources = await self._collect_host_resources() if trusted_control_plane else {}
+            from harnessy.diagnostics.lima_transport import lima_shell_transport_evidence
+            guest_transport = lima_shell_transport_evidence(controller_action,
+                stderr=bytes(stderr_buffer), returncode=observed_returncode, timed_out=True)
             log_event(
                 'runtime', 'environment_command_timeout', workspace=str(self.workspace_root),
                 provider='lima', command_id=command_id, controller_action=controller_action, argv=cmd[1:],
                 timeout_seconds=timeout, elapsed_seconds=elapsed,
                 controller_returncode=observed_returncode,
                 controller_evidence=controller_evidence(), host_resources=failure_resources, **diagnostic_fields,
+                **({'guest_transport': guest_transport} if guest_transport else {}),
             )
             record_startup('controller_timeout', observed_returncode, elapsed)
             await preserve_failure('controller_timeout', failure_resources)
@@ -3276,6 +3289,9 @@ exit $rc
         stderr = stderr_b.decode(errors='replace')
         elapsed = max(0.0, time.monotonic() - started)
         failure_resources = await self._collect_host_resources() if trusted_control_plane and process.returncode else {}
+        from harnessy.diagnostics.lima_transport import lima_shell_transport_evidence
+        guest_transport = lima_shell_transport_evidence(controller_action, stderr=stderr,
+                                                       returncode=int(process.returncode or 0))
         log_event(
             'runtime', 'environment_command_finished', workspace=str(self.workspace_root),
             provider='lima', command_id=command_id, controller_action=controller_action, argv=cmd[1:],
@@ -3283,6 +3299,7 @@ exit $rc
             stdout_chars=len(stdout), stderr_chars=len(stderr),
             controller_evidence=controller_evidence() if process.returncode else {},
             host_resources=failure_resources, **diagnostic_fields,
+            **({'guest_transport': guest_transport} if guest_transport else {}),
         )
         record_startup('controller_error' if process.returncode else 'completed', process.returncode, elapsed)
         if process.returncode:
@@ -3442,11 +3459,84 @@ exit $rc
         }
 
     async def _guest_boot_id(self) -> str:
-        rc, stdout, _ = await self._run(
-            'shell', self.INSTANCE, 'cat', '/proc/sys/kernel/random/boot_id',
-            timeout=5, check=False,
-        )
-        return stdout.strip() if rc == 0 else ''
+        try:
+            rc, stdout, _ = await self._run(
+                'shell', self.INSTANCE, 'cat', '/proc/sys/kernel/random/boot_id',
+                timeout=5, check=False,
+            )
+        except (OSError, RuntimeError, asyncio.TimeoutError):
+            raise GuestControlUnavailableError() from None
+        value = stdout.strip()
+        if rc != 0 or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', value):
+            raise GuestControlUnavailableError()
+        return value
+
+    async def _wait_for_guest_control_or_stopped(self, progress=None, *,
+            cancel_event: asyncio.Event | None = None, stopping: bool = False) -> EnvironmentStatus:
+        """Observe an existing VM transition; never stop, start or repair it here."""
+        deadline = asyncio.get_running_loop().time() + self.TIMEOUT_GUEST_CONTROL
+        last_phase = ''
+        while True:
+            self._check_setup_cancelled(cancel_event)
+            phase = 'waiting_for_vm_shutdown' if stopping else 'waiting_for_guest_control'
+            if phase != last_phase:
+                last_phase = phase
+                await self._emit_progress(progress, phase,
+                    'Waiting for the previous VM shutdown…' if stopping else 'Waiting for guest control…',
+                    detail=('The VM is still shutting down. Setup will continue after Lima confirms it is stopped.'
+                            if stopping else
+                            'The VM is reported running but its control connection is unavailable. '
+                            'Waiting for control to recover or a previous shutdown to finish; no setup is running.'),
+                    stage_timeout_seconds=self.TIMEOUT_GUEST_CONTROL,
+                    stage_progress_percent=None, progress_source='controller_observation')
+            self._check_setup_cancelled(cancel_event)
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                error = GuestControlUnavailableError(stopping=stopping)
+                log_event('runtime', 'vm_guest_control_unavailable', workspace=str(self.workspace_root),
+                          provider='lima', error_code=error.error_code,
+                          **self._controller_diagnostic_fields())
+                raise error
+            try:
+                async with asyncio.timeout(remaining):
+                    row = await self._instance_row()
+                    raw = str((row or {}).get('status') or (row or {}).get('Status') or '').lower()
+                    if raw == 'stopping':
+                        stopping = True
+                    if raw == 'stopped':
+                        status = await self.status()
+                        if status.created and status.state == 'stopped' and not status.running:
+                            self._check_setup_cancelled(cancel_event)
+                            self._clear_readiness('stopped')
+                            return status
+                    elif raw == 'running' and not stopping:
+                        await self._guest_boot_id()
+                        status = await self.status()
+                        if status.created and status.running:
+                            self._check_setup_cancelled(cancel_event)
+                            return status
+            except (OSError, RuntimeError, asyncio.TimeoutError):
+                # Missing/failed/unknown list output does not prove Stopped.
+                pass
+            self._check_setup_cancelled(cancel_event)
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining > 0:
+                await asyncio.sleep(min(self.GUEST_CONTROL_POLL_SECONDS, remaining))
+
+    async def _settle_guest_before_change(self, status: EnvironmentStatus, progress=None, *,
+            cancel_event: asyncio.Event | None = None) -> EnvironmentStatus:
+        stopping = (self._read_readiness().get('phase') == 'stopping_vm'
+                    or status.phase == 'stopping_vm' or status.state == 'stopping')
+        if stopping:
+            return await self._wait_for_guest_control_or_stopped(
+                progress=progress, cancel_event=cancel_event, stopping=True)
+        if status.running:
+            try:
+                await self._guest_boot_id()
+            except GuestControlUnavailableError:
+                return await self._wait_for_guest_control_or_stopped(
+                    progress=progress, cancel_event=cancel_event)
+        return status
 
     async def _current_boot_is_verified(self) -> bool:
         state = self._read_readiness()
@@ -3856,6 +3946,14 @@ exit $rc
         async with self._workspace_start_lock():
             self._refresh_saved_network_policy()
             self._check_setup_cancelled(cancel_event)
+            if action in {'reset', 'rebuild'}:
+                if self._read_readiness().get('phase') == 'stopping_vm':
+                    await self._wait_for_guest_control_or_stopped(progress=progress,
+                        cancel_event=cancel_event, stopping=True)
+                else:
+                    await self._settle_guest_before_change(await self.status(), progress=progress,
+                                                           cancel_event=cancel_event)
+                self._check_setup_cancelled(cancel_event)
             if action == 'reset':
                 await self._reset_locked(progress=progress, cancel_event=cancel_event)
             elif action == 'rebuild':
@@ -4245,16 +4343,31 @@ print(json.dumps(facts))
             self._write_readiness(ready=False, phase=phase)
             await self._emit_progress(progress, phase, message, **meta)
 
-        status = await self.status()
+        status = (await self._wait_for_guest_control_or_stopped(progress=progress,
+                      cancel_event=cancel_event, stopping=True)
+                  if self._read_readiness().get('phase') == 'stopping_vm' else await self.status())
+        if (self._read_readiness().get('phase') == 'stopping_vm'
+                or status.phase == 'stopping_vm' or status.state == 'stopping'):
+            status = await self._settle_guest_before_change(status, progress=progress,
+                                                           cancel_event=cancel_event)
+            self._check_setup_cancelled(cancel_event)
+        host_checked = False
         if not status.running:
             self._preflight_acceleration_access()
             await self._ensure_host_prerequisites(progress=progress)
+            host_checked = True
         if not status.created:
             await report('creating_vm', 'Creating workspace VM…')
             self._check_setup_cancelled(cancel_event)
             status = await self._call_with_optional_progress(self.create, progress=progress)
         binding_needs_reconcile = not self._runtime_binding_matches()
-        if status.running and not binding_needs_reconcile and await self._current_boot_is_verified():
+        verified = bool(status.running and not binding_needs_reconcile and await self._current_boot_is_verified())
+        if status.running and not verified:
+            status = await self._settle_guest_before_change(status, progress=progress,
+                                                           cancel_event=cancel_event)
+            self._check_setup_cancelled(cancel_event)
+            verified = bool(status.running and not binding_needs_reconcile and await self._current_boot_is_verified())
+        if verified:
             if not self._read_verified_guest():
                 await self._record_verified_guest()
             if ensure_desktop:
@@ -4282,6 +4395,9 @@ print(json.dumps(facts))
                 raise RuntimeError(message)
         if not status.running:
             self._check_setup_cancelled(cancel_event)
+            if not host_checked:
+                self._preflight_acceleration_access()
+                await self._ensure_host_prerequisites(progress=progress)
             if binding_needs_reconcile or not self._references_binding_matches():
                 await report(
                     'reconciling_environment', 'Updating workspace VM configuration…',
@@ -4512,18 +4628,32 @@ print(json.dumps(facts))
 
     @_lifecycle_diagnostics('stop')
     async def stop(self, *, force: bool = False) -> EnvironmentStatus:
+        if self._read_readiness().get('phase') == 'stopping_vm':
+            return await self._wait_for_guest_control_or_stopped(stopping=True)
         status = await self.status()
-        if not status.created or not status.running:
+        if (self._read_readiness().get('phase') == 'stopping_vm'
+                or status.phase == 'stopping_vm' or status.state == 'stopping'):
+            return await self._wait_for_guest_control_or_stopped(stopping=True)
+        if not status.created and status.available:
             self._clear_readiness('stopped')
             return status
+        if not status.running:
+            if status.created and status.state == 'stopped':
+                self._clear_readiness('stopped')
+                return status
+            raise GuestControlUnavailableError(stopping=True)
         args = ['stop']
         if force:
             args.append('--force')
         args.append(self.INSTANCE)
+        previous = self._read_readiness()
+        self._write_readiness(ready=False, phase='stopping_vm',
+                              boot_id=str(previous.get('boot_id') or ''),
+                              guard_hash=str(previous.get('guard_hash') or ''))
         await self._run(*args, timeout=self.TIMEOUT_STOP, check=True)
-        self._clear_readiness('stopped')
+        status = await self._wait_for_guest_control_or_stopped(stopping=True)
         log_event('harnessy', 'vm_stopped', workspace=str(self.workspace_root), provider='lima', force=force)
-        return await self.status()
+        return status
 
     async def _ensure_running(self) -> None:
         self._refresh_saved_network_policy()

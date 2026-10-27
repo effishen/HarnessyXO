@@ -327,6 +327,7 @@ _VM_DIAGNOSTIC_ENUMS = {
     'failed_stage': frozenset({
         'queued', 'starting', 'running', 'failed', 'timed_out', 'cancelled', 'access_denied', 'unknown',
         'checking_host_dependencies', 'installing_host_dependencies', 'host_dependencies_ready',
+        'waiting_for_vm_shutdown', 'waiting_for_guest_control',
         'creating_vm', 'reconciling_environment', 'preparing_file_sharing', 'starting_vm', 'waiting_for_guest',
         'checking_provisioning', 'adopting_provisioning', 'provisioning_packages',
         'provisioning_package_index', 'provisioning_required_packages', 'provisioning_optional_packages',
