@@ -18,7 +18,7 @@ from .presets import PRESETS
 _PROVIDER_CACHE: dict[tuple[str, str], tuple[dict, WorkspaceEnvironment]] = {}
 _OPERATION_CONTEXT: ContextVar[tuple[str, str]] = ContextVar('environment_operation', default=('', ''))
 _OPERATION_ACTIONS = frozenset({'create', 'start', 'stop', 'reset', 'rebuild', 'destroy',
-                              'restore', 'snapshot', 'tools', 'network', 'resources', 'remove'})
+                              'restore', 'snapshot', 'tools', 'network', 'resources', 'remove', 'desktop'})
 
 
 def current_environment_operation() -> dict[str, str]:

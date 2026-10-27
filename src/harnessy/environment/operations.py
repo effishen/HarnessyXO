@@ -75,11 +75,14 @@ class EnvironmentOperationRegistry:
         'tools': 2400.0,
         'resources': 240.0,
         'remove': 300.0,
+        'desktop': 2400.0,
     }
 
     TERMINAL_STATUSES = {'succeeded', 'failed', 'timed_out', 'cancelled', 'interrupted'}
 
     WORKFLOW_STAGES = {
+        'desktop': ('desktop_checking', 'desktop_installing', 'desktop_kernel',
+                    'desktop_restarting', 'desktop_verifying', 'desktop_ready'),
         'remove': ('removal_checking', 'removal_destroying', 'removal_complete'),
         'resources': ('resources_checking', 'resources_applying', 'resources_saving', 'resources_complete'),
         'network': ('checking_host_dependencies', 'network_stopping', 'network_applying', 'network_starting', 'ready'),
@@ -362,6 +365,8 @@ class EnvironmentOperationRegistry:
         manager = EnvironmentManager(workspace_root, environment_id=environment_id)
         if manager.config is None:
             raise RuntimeError('Create a VM environment before starting an environment operation.')
+        if action == 'desktop' and (manager.config.provider != 'lima' or not manager.config.desktop):
+            raise ValueError('Desktop repair is available for a Lima Linux VM with its desktop enabled.')
         if action == 'tools' and payload.get('expected_preset') is not None:
             if payload['expected_preset'] != manager.config.preset:
                 raise RuntimeError('The VM tool preset changed since this editor opened. Reopen Manage Optional Tools before applying.')
@@ -387,6 +392,8 @@ class EnvironmentOperationRegistry:
             policy_release = reserve_environment_change(workspace_root, 'VM resources', environment_id=environment_id)
         elif action == 'remove':
             policy_release = reserve_environment_change(workspace_root, 'VM removal', environment_id=environment_id)
+        elif action == 'desktop':
+            policy_release = reserve_environment_change(workspace_root, 'desktop repair', environment_id=environment_id)
         else:
             policy_release = None
         try:
@@ -455,6 +462,7 @@ class EnvironmentOperationRegistry:
             'tools': 'Applying optional tool selection…',
             'resources': 'Applying VM resource settings…',
             'remove': 'Removing VM environment…',
+            'desktop': 'Repairing VM desktop…',
         }.get(action, 'Working…')
 
     @staticmethod
@@ -469,6 +477,13 @@ class EnvironmentOperationRegistry:
                     f'Snapshot creation could not be verified: {snapshot_tag or "requested snapshot"} '
                     'is not in the provider list. Refresh/reconcile before taking another snapshot.'
                 )
+            return
+        if action == 'desktop':
+            if (getattr(result, 'desktop_ready', None) is not True
+                    or getattr(result, 'running', None) is not True
+                    or getattr(result, 'ready', None) is not True):
+                detail = str(getattr(result, 'desktop_error', '') or 'The guest desktop did not become ready.')
+                raise RuntimeError(detail)
             return
         if result is None:
             return
@@ -654,6 +669,8 @@ class EnvironmentOperationRegistry:
                 )
             if action == 'start':
                 return await provider.start(progress=progress)
+            if action == 'desktop':
+                return await provider.repair_desktop(progress=progress, reservation_held=True)
             if action == 'network':
                 return await provider.apply_network_policy(
                     payload.get('enabled'), expected=payload.get('expected'),
@@ -758,6 +775,7 @@ class EnvironmentOperationRegistry:
                 ENVIRONMENT_STATUS.publish_snapshots(workspace_root, result, environment_id=environment_id)
                 self._update(workspace_root, environment_id=environment_id, verified_snapshots=list(result), snapshot_needs_reconciliation=False)
             success = {
+                'desktop': 'Desktop Ready',
                 'network': 'Public outbound policy applied. VM disk and working roots were preserved.',
                 'start': 'Environment is Ready.',
                 'stop': 'Environment stopped.',

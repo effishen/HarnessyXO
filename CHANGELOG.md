@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.7.26
+
+- Track Desktop readiness separately from terminal/model readiness. Check actual graphics output, LightDM, Xorg, the Xfce session and X11 instead of trusting an installation marker and an enabled service.
+- Check the guest desktop before opening its browser display. An inactive desktop shows a useful setup message instead of treating a connected VNC listener as proof that the desktop works.
+- Add **Repair Desktop** to desktop-enabled Lima Linux VMs. Repair the desktop while the VM is idle. When the Kali cloud kernel lacks VirtIO GPU support, install an architecture-matched generic kernel and verify a supported boot selection before a controlled restart. Keep the existing VM disk and cloud kernel; custom boot policies receive an explicit manual-selection message.
+- Keep terminal/model access available when only the optional desktop needs attention. Show Desktop status separately on the VM card, and block conflicting work during repair.
+- Include bounded saved graphics observations in **VM_DESKTOP.json**, including current-boot service/session checks, DRM/connector counts and fixed failure codes. Export does not run guest commands or include paths, process arguments or raw logs.
+- Native graphical output on the Spark still needs confirmation after updating. Start the existing VM, close its active tabs/tasks, then use **Repair Desktop** if the card reports that its desktop needs repair.
+
 ## v0.7.25
 
 - Install and verify the SSHFS prerequisite during early VM setup, before Lima requires it for shared folders. Keep the normal installed-package check short and leave heavy tool provisioning after startup.
