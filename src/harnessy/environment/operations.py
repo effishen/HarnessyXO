@@ -722,13 +722,36 @@ class EnvironmentOperationRegistry:
                 return await method()
             raise ValueError(f'Unknown environment action: {action}')
 
+        async def execute_selected():
+            check_model_access()
+            manager = EnvironmentManager(workspace_root, environment_id=environment_id)
+            config = manager.config
+            if config is None:
+                raise RuntimeError('The selected VM environment no longer exists.')
+            if action == 'remove' and config.provider in {'lima', 'managed'}:
+                # A failed first Create can leave only a registry definition.
+                # Do not require a working controller or storage migration just
+                # to remove it. Existing VM data still uses the stopped check.
+                from .lima_runtime import verify_uncreated_lima_home
+                set_phase('removal_checking', 'Checking VM before removal…')
+                if verify_uncreated_lima_home(manager.environment_root) is not None:
+                    from .file_views import FILE_VIEWS
+                    from .status import ENVIRONMENT_STATUS
+                    await FILE_VIEWS.close_environment(workspace_root, environment_id=environment_id)
+                    await ENVIRONMENT_STATUS.close(workspace_root, environment_id=environment_id)
+                    check_model_access()
+                    set_phase('removal_destroying', 'Removing the failed VM definition…')
+                    if not manager.remove_uncreated(environment_id):
+                        raise RuntimeError('VM files appeared during removal. No VM data was removed; reload its status and retry.')
+                    return None
+            return await execute(manager.provider())
+
         try:
             check_model_access()
-            provider = EnvironmentManager(workspace_root, environment_id=environment_id).provider()
             state = self.state(workspace_root, environment_id=environment_id)
             remaining = max(0.1, state.deadline - time.time()) if state.deadline else self._deadline_seconds(action)
             with environment_operation_context(operation_id, action):
-                result = await self._wait_for_operation(execute(provider), remaining)
+                result = await self._wait_for_operation(execute_selected(), remaining)
             self._validate_result(action, result, snapshot_tag=str(payload.get('name') or ''))
             if action == 'snapshot':
                 from .status import ENVIRONMENT_STATUS

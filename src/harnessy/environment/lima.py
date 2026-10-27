@@ -284,9 +284,9 @@ class LimaVMEnvironment(WorkspaceEnvironment):
         for owned_path in (self.vm_root, self.templates_root, self.state_root, self.snapshots_root,
                            self.files_root, self.private_worktrees_root):
             _validate_registry_path(owned_path, self.workspace_root)
-        self.vm_root.mkdir(parents=True, exist_ok=True)
+        self.vm_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.templates_root.mkdir(parents=True, exist_ok=True)
-        self.state_root.mkdir(parents=True, exist_ok=True)
+        self.state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.snapshots_root.mkdir(parents=True, exist_ok=True)
         self.files_root.mkdir(parents=True, exist_ok=True)
         self.private_worktrees_root.mkdir(parents=True, exist_ok=True)
@@ -2758,7 +2758,7 @@ exit $rc
                 stdin=asyncio.subprocess.PIPE if input_text is not None else None,
                 stdout=capture_files.get('stdout', asyncio.subprocess.PIPE),
                 stderr=capture_files.get('stderr', asyncio.subprocess.PIPE),
-                env=self._host_env(allow_legacy=bool(args and args[0] in {'list', 'stop', '--version', 'info'})),
+                env=self._host_env(allow_legacy=bool(args and args[0] in {'list', 'stop', 'delete', '--version', 'info'})),
             )
         except asyncio.CancelledError:
             for handle in capture_files.values():

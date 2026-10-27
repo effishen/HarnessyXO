@@ -249,6 +249,35 @@ class EnvironmentManager:
         finally:
             temporary.unlink(missing_ok=True)
 
+    def remove_uncreated(self, environment_id: str) -> bool:
+        """Remove a failed definition only after proving it has no VM instance.
+
+        This path does not construct a provider, migrate its home, or require
+        Lima to work. Callers must close background observers before removal.
+        Existing or ambiguous VM data must use the normal stopped-VM path.
+        """
+        cfg = self.get(environment_id)
+        if cfg is None or not cfg.id:
+            raise ValueError('Choose an existing named VM environment to remove.')
+        if cfg.provider not in {'lima', 'managed'}:
+            return False
+        root = environment_root(self.workspace_root, cfg.id)
+        _validate_registry_path(root, self.workspace_root)
+        from .activity import active_work
+        if active_work(self.workspace_root, environment_id=cfg.id):
+            raise RuntimeError("Stop this VM's active commands and terminals before removing it.")
+        from .lima_runtime import verify_uncreated_lima_home
+        home = verify_uncreated_lima_home(root)
+        if home is None:
+            return False
+        from .file_views import FILE_VIEWS
+        FILE_VIEWS.forget_environment(self.workspace_root, environment_id=cfg.id)
+        if home != root / 'vm' / 'lima' and home.exists():
+            shutil.rmtree(home)
+        shutil.rmtree(root)
+        clear_environment_provider_cache(self.workspace_root, cfg.id)
+        return True
+
     def remove(self, environment_id: str, *, verified_stopped: bool = False) -> None:
         """Delete only an explicitly selected environment's owned metadata.
 

@@ -41,6 +41,34 @@ def _owned_directory(path: Path, *, create: bool = False, private: bool = False)
         raise RuntimeError('The Lima storage directory must be a real, private account-owned directory.')
 
 
+def _secure_metadata_directory(path: Path) -> None:
+    """Repair old app-owned mkdir permissions without following a redirect.
+
+    Earlier builds used the process umask for these controller directories.
+    A normal shared-group umask can therefore leave them 0775. Tighten this
+    account's real directory through its verified descriptor; never chmod the
+    user's workspace, home directory, or a caller-supplied redirect.
+    """
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | getattr(os, 'O_NOFOLLOW', 0))
+    except OSError as exc:
+        raise RuntimeError('The Lima metadata directory is unavailable or was redirected.') from exc
+    try:
+        info = os.fstat(descriptor)
+        current = path.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+                or not stat.S_ISDIR(current.st_mode)
+                or (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino)):
+            raise RuntimeError('The Lima metadata directory is not owned by this account or was redirected.')
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            os.fchmod(descriptor, 0o700)
+        after = path.lstat()
+        if (info.st_dev, info.st_ino) != (after.st_dev, after.st_ino) or not stat.S_ISDIR(after.st_mode):
+            raise RuntimeError('The Lima metadata directory changed while securing it. No VM command was run.')
+    finally:
+        os.close(descriptor)
+
+
 def _regular_json(path: Path) -> dict:
     fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
     with os.fdopen(fd, 'rb') as stream:
@@ -70,6 +98,12 @@ def _write_binding(path: Path, value: dict) -> None:
 
 def _legacy_home(environment_root: Path) -> Path:
     return Path(environment_root).absolute() / 'vm' / 'lima'
+
+
+def _validate_runtime_anchors(environment_root: Path) -> None:
+    from .base import _validate_registry_path
+    for path in (environment_root / 'state' / 'lima-home.json', _legacy_home(environment_root)):
+        _validate_registry_path(path, environment_root)
 
 
 def _candidate_ancestors(legacy: Path):
@@ -190,6 +224,7 @@ def _verify_relocatable_backings(legacy: Path) -> None:
 def bound_lima_home(environment_root: Path) -> Path:
     """Read an existing verified binding without creating or migrating a VM."""
     root = Path(environment_root).absolute()
+    _validate_runtime_anchors(root)
     legacy = _legacy_home(root)
     binding = root / 'state' / 'lima-home.json'
     if not binding.exists() and not binding.is_symlink():
@@ -210,11 +245,12 @@ def bound_lima_home(environment_root: Path) -> Path:
 def prepare_lima_home(environment_root: Path, *, allow_legacy: bool = False) -> Path:
     """Adopt only a stopped legacy home using an inode-preserving rename."""
     root = Path(environment_root).absolute()
+    _validate_runtime_anchors(root)
     legacy = _legacy_home(root)
     state_root = root / 'state'
-    _owned_directory(state_root)
+    _secure_metadata_directory(state_root)
     legacy.mkdir(mode=0o700, parents=True, exist_ok=True)
-    _owned_directory(legacy)
+    _secure_metadata_directory(legacy)
     binding = state_root / 'lima-home.json'
     key = str(legacy)
     with _LOCKS.setdefault(key, threading.RLock()):
@@ -324,3 +360,95 @@ def clear_lima_home(environment_root: Path, home: Path) -> None:
             shutil.rmtree(child)
         else:
             child.unlink()
+
+
+def _uncreated_home(home: Path) -> bool:
+    """Recognize only an absent/empty home or Lima's key/config bootstrap.
+
+    Any instance directory, disk cache, PID/socket, special file or unknown
+    tree is inconclusive. Missing PID files alone never prove a VM stopped.
+    """
+    if not home.exists() and not home.is_symlink():
+        return True
+    info = home.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        raise RuntimeError('The selected Lima home is not a real account-owned directory.')
+    entries = list(home.iterdir())
+    if len(entries) > 16:
+        return False
+    allowed_config = {'user', 'user.pub', 'networks.yaml', 'default.yaml', 'override.yaml', 'base.yaml'}
+    total_bytes = 0
+    for entry in entries:
+        metadata = entry.lstat()
+        if entry.name != '_config':
+            return False
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            raise RuntimeError('Lima bootstrap metadata was redirected or belongs to another account.')
+        children = list(entry.iterdir())
+        if len(children) > len(allowed_config):
+            return False
+        for child in children:
+            detail = child.lstat()
+            if (child.name not in allowed_config or not stat.S_ISREG(detail.st_mode)
+                    or detail.st_nlink != 1 or detail.st_uid != os.geteuid()):
+                return False
+            total_bytes += detail.st_size
+            if total_bytes > 1024 * 1024:
+                return False
+    return True
+
+
+def verify_uncreated_lima_home(environment_root: Path) -> Path | None:
+    """Verify a failed-first-create Remove without constructing its provider.
+
+    Returns the verified (possibly absent) home only when both legacy and bound
+    locations contain no VM instance/data/process evidence. Returns None for
+    existing or ambiguous VM data, and raises for an invalid storage binding.
+    This does not create directories, migrate storage, stop a VM or delete data.
+    The caller must hold its selected environment's removal lease and recheck
+    immediately before deleting that registered environment and returned home.
+    """
+    root = Path(environment_root).absolute()
+    _validate_runtime_anchors(root)
+    # Removing the registration also recursively removes these environment
+    # siblings. An empty Lima home must not hide snapshot or other VM data.
+    for snapshot_root in (root / 'snapshots', root / 'vm' / 'snapshots'):
+        if snapshot_root.exists() or snapshot_root.is_symlink():
+            info = snapshot_root.lstat()
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+                    or next(snapshot_root.iterdir(), None) is not None):
+                return None
+    for container in (root, root / 'vm', root / 'state'):
+        if not container.is_dir():
+            continue
+        for entry in container.iterdir():
+            if entry.name.endswith(('.pid', '.sock')) or (container == root and entry.name == 'qemu'):
+                return None
+            if container == root / 'vm' and entry.name not in {'lima', 'snapshots'}:
+                return None
+    legacy = _legacy_home(root)
+    binding = root / 'state' / 'lima-home.json'
+    if not binding.exists() and not binding.is_symlink():
+        return legacy if _uncreated_home(legacy) else None
+    value = _regular_json(binding)
+    if value.get('schema') != 1 or value.get('legacy_home') != str(legacy):
+        raise RuntimeError('The Lima storage binding belongs to another environment.')
+    target = Path(str(value.get('lima_home') or ''))
+    _validate_target(legacy, target)
+    if value.get('state') == 'ready' or (value.get('state') == 'moving' and target.exists()):
+        if not target.is_dir():
+            raise RuntimeError('The saved Lima home is missing; restore its volume before removing this environment.')
+        info = target.stat()
+        if (info.st_dev, info.st_ino) != tuple(value.get('source_identity') or ()):
+            raise RuntimeError('The saved Lima home was replaced; no VM data was removed.')
+        selected = target
+    elif value.get('state') == 'moving':
+        info = legacy.stat()
+        if (info.st_dev, info.st_ino) != tuple(value.get('source_identity') or ()):
+            raise RuntimeError('The original Lima storage changed during relocation; no VM data was removed.')
+        selected = legacy
+    else:
+        raise RuntimeError('The Lima storage binding is invalid.')
+    if not _uncreated_home(legacy) or (selected != legacy and not _uncreated_home(selected)):
+        return None
+    return selected

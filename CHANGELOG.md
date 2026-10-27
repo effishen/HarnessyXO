@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.22
+
+- Recover VM controls after a failed status check. Start, Stop and Remove can retry after the first check fails; active VM work and ongoing operations still block conflicting actions. Removal checks the VM again before deleting anything.
+- Fix VM folders created under a Linux group-write umask. Secure HarnessyXO-owned Lima metadata without rejecting the VM or changing workspace project files.
+- Remove a failed VM definition without requiring Lima to start or relocate it when no VM instance was created. Keep existing or ambiguous VM data on the normal stopped-VM removal path. Workspace project files, conversations and other VMs are preserved.
+- Delete a stopped legacy VM using its existing Lima home, without requiring storage relocation first.
+- After updating and restarting HarnessyXO, use the failed VM's Remove button, type its name to confirm, then create it again.
+
 ## v0.7.21
 
 - Double-click a project to open its own folder with uploads, editing, new files/folders, moves, renames and deletes available. Apply permissions per folder: live parents, Project Access sources and References stay read-only. Locked projects and permanent archives stay read-only.
