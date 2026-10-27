@@ -75,9 +75,9 @@ class _LimaDesktopView:
     def desktop_info(self):
         if not self.provider.config.desktop:
             raise ValueError('This VM was created without a graphical desktop.')
-        root = self.provider.vm_root / self.provider.INSTANCE
+        root = self.provider._runtime_home() / self.provider.INSTANCE
         display_path = root / 'vncdisplay'
-        _validate_registry_path(display_path, self.provider.workspace_root)
+        self.provider._validate_vm_path(display_path)
         if not display_path.is_file():
             raise RuntimeError('The graphical display is not available yet. Start the VM first.')
         display = display_path.read_text().strip()
@@ -85,7 +85,7 @@ class _LimaDesktopView:
         if not match:
             raise RuntimeError('The VM returned an unsupported graphical display address.')
         password_path = root / 'vncpassword'
-        _validate_registry_path(password_path, self.provider.workspace_root)
+        self.provider._validate_vm_path(password_path)
         port = 5900 + int(match.group(1))
         return {'url': f'vnc://127.0.0.1:{port}', 'port': str(port),
                 'password': password_path.read_text().strip() if password_path.is_file() else '', 'username': 'harnessy'}
@@ -290,6 +290,8 @@ class LimaVMEnvironment(WorkspaceEnvironment):
         self.snapshots_root.mkdir(parents=True, exist_ok=True)
         self.files_root.mkdir(parents=True, exist_ok=True)
         self.private_worktrees_root.mkdir(parents=True, exist_ok=True)
+        from .lima_runtime import prepare_lima_home
+        self.vm_root = prepare_lima_home(self.environment_root, allow_legacy=True)
         self._runtime_guard_verified = False
         self._runtime_boot_id = ''
         self._controller_output_callback = None
@@ -360,38 +362,20 @@ class LimaVMEnvironment(WorkspaceEnvironment):
             )
         return binary
 
-    def _runtime_home(self) -> Path:
-        # macOS sockaddr_un is only 104 bytes. Its normal tempfile directory
-        # can itself be long, so use the OS /tmp namespace and a private
-        # account-owned directory; durable disks stay below the workspace.
-        _validate_registry_path(self.vm_root, self.workspace_root)
-        actual = self.vm_root.resolve()
-        digest = hashlib.sha256(str(actual).encode()).hexdigest()[:16]
-        base = Path('/tmp') / f'hy-lima-{os.getuid()}'
-        if base.is_symlink():
-            raise RuntimeError('The VM runtime alias directory cannot be a symbolic link.')
-        base.mkdir(exist_ok=True, mode=0o700)
-        if not base.is_dir() or base.stat().st_uid != os.getuid():
-            raise RuntimeError('The VM runtime alias directory is not owned by this account.')
-        base.chmod(0o700)
-        alias = base / digest
-        if alias.is_symlink():
-            if alias.resolve() != actual:
-                raise RuntimeError('The VM runtime alias points to a different environment. No VM command was run.')
-        elif alias.exists():
-            raise RuntimeError('The VM runtime alias is occupied by a non-link path. No VM command was run.')
-        else:
-            try:
-                alias.symlink_to(actual, target_is_directory=True)
-            except FileExistsError:
-                if not alias.is_symlink() or alias.resolve() != actual:
-                    raise RuntimeError('The VM runtime alias changed while it was being created.')
-        return alias
+    def _runtime_home(self, *, allow_legacy: bool = True) -> Path:
+        from .lima_runtime import prepare_lima_home
+        _validate_registry_path(self.environment_root / 'vm' / 'lima', self.workspace_root)
+        self.vm_root = prepare_lima_home(self.environment_root, allow_legacy=allow_legacy)
+        return self.vm_root
 
-    def _host_env(self) -> dict[str, str]:
+    def _validate_vm_path(self, path: Path) -> None:
+        from .lima_runtime import validate_lima_path
+        validate_lima_path(self.environment_root, path)
+
+    def _host_env(self, *, allow_legacy: bool = False) -> dict[str, str]:
         env = os.environ.copy()
         env['PATH'] = repaired_path()
-        env['LIMA_HOME'] = str(self._runtime_home())
+        env['LIMA_HOME'] = str(self._runtime_home(allow_legacy=allow_legacy))
         # HarnessyXO never uses `limactl shell --preserve-env`. Block everything
         # anyway so a future controller refactor cannot accidentally propagate
         # host credentials merely by adding that flag.
@@ -2774,7 +2758,7 @@ exit $rc
                 stdin=asyncio.subprocess.PIPE if input_text is not None else None,
                 stdout=capture_files.get('stdout', asyncio.subprocess.PIPE),
                 stderr=capture_files.get('stderr', asyncio.subprocess.PIPE),
-                env=self._host_env(),
+                env=self._host_env(allow_legacy=bool(args and args[0] in {'list', 'stop', '--version', 'info'})),
             )
         except asyncio.CancelledError:
             for handle in capture_files.values():
@@ -4264,14 +4248,14 @@ print(json.dumps(facts))
         status = await self.status()
         if not status.available:
             raise RuntimeError('Restore VM backend access before removing this environment. Existing virtual disks were preserved.')
-        for path in (self.vm_root, self.snapshots_root):
-            _validate_registry_path(path, self.workspace_root)
+        self._validate_vm_path(self.vm_root)
+        _validate_registry_path(self.snapshots_root, self.workspace_root)
         if status.created:
             await self._preserve_vm_failure(reason='before_delete', operation='delete')
             await self.stop(force=True)
             await self._run('delete', '--force', self.INSTANCE, timeout=self.TIMEOUT_DELETE, check=True)
-        shutil.rmtree(self.vm_root, ignore_errors=True)
-        self.vm_root.mkdir(parents=True, exist_ok=True)
+        from .lima_runtime import clear_lima_home
+        clear_lima_home(self.environment_root, self.vm_root)
         shutil.rmtree(self.snapshots_root, ignore_errors=True)
         self.snapshots_root.mkdir(parents=True, exist_ok=True)
         self._record_lifecycle('destroyed')

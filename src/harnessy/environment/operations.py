@@ -624,9 +624,17 @@ class EnvironmentOperationRegistry:
                 snapshot_child = 'vm/snapshots' if provider.config.provider == 'managed' else 'snapshots'
                 for attribute, name in (('vm_root', vm_child), ('snapshots_root', snapshot_child)):
                     child = Path(getattr(provider, attribute, owned / name))
-                    if child != owned / name:
+                    expected_child = owned / name
+                    if attribute == 'vm_root' and provider.config.provider in {'lima', 'managed'}:
+                        from .lima_runtime import bound_lima_home
+                        expected_child = bound_lima_home(owned)
+                    if child != expected_child:
                         raise RuntimeError('VM storage ownership could not be verified. No files were removed.')
-                    _validate_registry_path(child, workspace_root)
+                    if attribute == 'vm_root' and provider.config.provider in {'lima', 'managed'}:
+                        from .lima_runtime import validate_lima_path
+                        validate_lima_path(owned, child)
+                    else:
+                        _validate_registry_path(child, workspace_root)
                 current = await provider.status()
                 if current.running or str(current.state).lower() not in {'stopped', 'not_created'}:
                     raise RuntimeError('Stop this VM and verify that it is stopped before removing it.')

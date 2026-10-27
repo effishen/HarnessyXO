@@ -6,6 +6,7 @@ import stat
 import tarfile
 import zipfile
 import threading
+import uuid
 from pathlib import Path, PurePosixPath
 
 ARCHIVE_SUFFIXES = ('.zip', '.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz2', '.tar.xz', '.txz')
@@ -16,12 +17,15 @@ def is_archive(path: str | Path) -> bool:
     return any(name.endswith(suffix) for suffix in ARCHIVE_SUFFIXES)
 
 
-def safe_extract_archive(source: Path, destination: Path, *, max_members: int = 100_000, max_bytes: int = 8 * 1024**3) -> None:
+def safe_extract_archive(source: Path, destination: Path, *, max_members: int = 100_000,
+                         max_bytes: int = 8 * 1024**3, authorize=None) -> None:
+    if authorize is not None:
+        authorize(destination)
     destination.mkdir(parents=True, exist_ok=True)
     if source.name.lower().endswith('.zip'):
-        _extract_zip(source, destination, max_members=max_members, max_bytes=max_bytes)
+        _extract_zip(source, destination, max_members=max_members, max_bytes=max_bytes, authorize=authorize)
     elif is_archive(source):
-        _extract_tar(source, destination, max_members=max_members, max_bytes=max_bytes)
+        _extract_tar(source, destination, max_members=max_members, max_bytes=max_bytes, authorize=authorize)
     else:
         raise ValueError(f'Unsupported archive format: {source.name}')
 
@@ -38,7 +42,27 @@ def _clean_member_path(name: str) -> Path:
     return Path(*[part for part in p.parts if part not in ('', '.')])
 
 
-def _extract_zip(source: Path, destination: Path, *, max_members: int, max_bytes: int) -> None:
+def _write_archive_file(source, target: Path, *, mode: int = 0, authorize=None) -> None:
+    """Replace a completed member without modifying another hardlink's bytes."""
+    staging = target.with_name('.harnessy-extract-' + uuid.uuid4().hex)
+    try:
+        previous_mode = stat.S_IMODE(target.stat().st_mode) if target.is_file() else None
+        with staging.open('xb') as output:
+            shutil.copyfileobj(source, output, length=1024 * 1024)
+        permissions = mode & 0o777 if mode else previous_mode
+        if permissions is not None:
+            try:
+                os.chmod(staging, permissions)
+            except OSError:
+                pass
+        if authorize is not None:
+            authorize(target)
+        staging.replace(target)
+    finally:
+        staging.unlink(missing_ok=True)
+
+
+def _extract_zip(source: Path, destination: Path, *, max_members: int, max_bytes: int, authorize=None) -> None:
     with zipfile.ZipFile(source) as zf:
         infos = zf.infolist()
         if len(infos) > max_members:
@@ -55,20 +79,17 @@ def _extract_zip(source: Path, destination: Path, *, max_members: int, max_bytes
                 raise ValueError(f'Symlinks are not accepted in uploaded ZIPs: {info.filename}')
             target = destination / rel
             _ensure_inside(destination, target)
+            if authorize is not None:
+                authorize(target)
             if info.is_dir():
                 target.mkdir(parents=True, exist_ok=True)
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
-            with zf.open(info, 'r') as src, target.open('wb') as dst:
-                shutil.copyfileobj(src, dst, length=1024 * 1024)
-            if mode:
-                try:
-                    os.chmod(target, mode & 0o777)
-                except OSError:
-                    pass
+            with zf.open(info, 'r') as src:
+                _write_archive_file(src, target, mode=mode, authorize=authorize)
 
 
-def _extract_tar(source: Path, destination: Path, *, max_members: int, max_bytes: int) -> None:
+def _extract_tar(source: Path, destination: Path, *, max_members: int, max_bytes: int, authorize=None) -> None:
     with tarfile.open(source, 'r:*') as tf:
         members = tf.getmembers()
         if len(members) > max_members:
@@ -84,6 +105,8 @@ def _extract_tar(source: Path, destination: Path, *, max_members: int, max_bytes
                 raise ValueError(f'Links/devices are not accepted in uploaded TARs: {member.name}')
             target = destination / rel
             _ensure_inside(destination, target)
+            if authorize is not None:
+                authorize(target)
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True)
                 continue
@@ -93,12 +116,8 @@ def _extract_tar(source: Path, destination: Path, *, max_members: int, max_bytes
             src = tf.extractfile(member)
             if src is None:
                 continue
-            with src, target.open('wb') as dst:
-                shutil.copyfileobj(src, dst, length=1024 * 1024)
-            try:
-                os.chmod(target, member.mode & 0o777)
-            except OSError:
-                pass
+            with src:
+                _write_archive_file(src, target, mode=member.mode, authorize=authorize)
 
 
 def _ensure_inside(root: Path, target: Path) -> None:

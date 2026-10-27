@@ -798,7 +798,8 @@ def preserve_vm_failure(workspace_root: Path | str, *, reason: str, operation: s
                 'evidence': technical_error_evidence(text[-PER_FILE_TAIL_BYTES:], source=name)})
         for name in ('ha.stderr.log', 'ha.stdout.log'):
             _check_capture_cancelled(cancel_event)
-            item = _read_tail(vm_root / 'vm' / 'lima' / 'harnessy' / name,
+            from harnessy.environment.lima_runtime import bound_lima_home
+            item = _read_tail(bound_lima_home(vm_root) / 'harnessy' / name,
                               PER_FILE_TAIL_BYTES if time.monotonic() < deadline else 0)
             _check_capture_cancelled(cancel_event)
             data = item['data']
@@ -957,7 +958,8 @@ def collect_vm_diagnostics(latest: Path, include_content: bool = False) -> dict[
                 log_root = _runtime(runtime_root, 'qemu')
                 filenames = ('qemu.stderr.log', 'qemu.control-plane.log', 'serial.log', RADIO_SETUP_FILENAME)
             else:
-                log_root = runtime_root / 'vm' / 'lima' / 'harnessy'
+                from harnessy.environment.lima_runtime import bound_lima_home
+                log_root = bound_lima_home(runtime_root) / 'harnessy'
                 filenames = VM_LOG_FILENAMES
             for filename in filenames:
                 kind = 'radio_setup' if filename == RADIO_SETUP_FILENAME else 'qemu' if filename.startswith('qemu.') else 'hostagent' if filename.startswith('ha.') else 'serial'

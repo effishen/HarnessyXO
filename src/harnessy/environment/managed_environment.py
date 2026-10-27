@@ -64,6 +64,9 @@ class _ManagedController(TestTargetManager):
         self.backend = 'lima'
         for path in (self.root, self.home, self.instance_dir):
             _validate_registry_path(path, owner.workspace_root)
+        from .lima_runtime import prepare_lima_home
+        self.home = prepare_lima_home(owner.environment_root, allow_legacy=True)
+        self.instance_dir = self.home / self.instance
         from harnessy.diagnostics.test_target_logs import register_test_target_runtime
         register_test_target_runtime(self.root, 'lima')
         self._remember_for_shutdown()
@@ -74,13 +77,15 @@ class _ManagedController(TestTargetManager):
         return ENVIRONMENT_OPERATIONS.state(self.owner.workspace_root, environment_id=self.environment_id).busy
 
     def _env(self):
-        for path in (self.root, self.home, self.instance_dir):
-            _validate_registry_path(path, self.owner.workspace_root)
+        _validate_registry_path(self.root, self.owner.workspace_root)
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.home.mkdir(parents=True, exist_ok=True, mode=0o700)
-        from .lima import LimaVMEnvironment
+        from .lima_runtime import prepare_lima_home, validate_lima_path
+        self.home = prepare_lima_home(self.owner.environment_root, allow_legacy=True)
+        self.instance_dir = self.home / self.instance
+        self.owner.vm_root = self.home
+        validate_lima_path(self.owner.environment_root, self.instance_dir)
         env = os.environ.copy()
-        env.update(PATH=repaired_path(), LIMA_HOME=str(LimaVMEnvironment._runtime_home(self.owner)))
+        env.update(PATH=repaired_path(), LIMA_HOME=str(self.home))
         env['LIMA_SHELLENV_BLOCK'] = '*'
         env.pop('LIMA_SHELLENV_ALLOW', None)
         for name in ('SSH_AUTH_SOCK', 'SSH_AGENT_PID', 'LIMA_INSTANCE', 'LIMA_SHELL', 'LIMA_WORKDIR'):
@@ -578,8 +583,13 @@ finally {
             raise RuntimeError('Stop the Windows VM before removing it.')
         if state.created:
             await self.controller._run('delete', '--force', self.controller.instance, timeout=180)
+        from .lima_runtime import bound_lima_home, clear_lima_home, validate_lima_path
+        home = bound_lima_home(self.environment_root)
+        validate_lima_path(self.environment_root, home)
+        await asyncio.to_thread(clear_lima_home, self.environment_root, home)
         _validate_registry_path(self.controller.root, self.workspace_root)
         await asyncio.to_thread(shutil.rmtree, self.controller.root, True)
+        (self.controller.root / 'lima').mkdir(mode=0o700, parents=True, exist_ok=True)
         self._record(ready=False, phase='destroyed')
 
     def desktop_manager(self, workspace=None):

@@ -266,11 +266,20 @@ class EnvironmentManager:
         from .activity import active_work
         if active_work(self.workspace_root, environment_id=cfg.id):
             raise RuntimeError("Stop this VM's active commands and terminals before removing it.")
-        if not verified_stopped and ((root / 'vm' / 'lima' / 'harnessy').exists()
+        from .lima_runtime import bound_lima_home
+        lima_home = bound_lima_home(root) if cfg.provider in {'lima', 'managed'} else root / 'vm' / 'lima'
+        if not verified_stopped and ((lima_home / 'harnessy').exists()
                                      or (root / 'vm' / 'qemu.pid').exists()):
             raise RuntimeError('Stop and destroy the selected VM before removing its environment.')
+        if lima_home != root / 'vm' / 'lima':
+            # Only a destroyed, verified empty controller home can be removed
+            # while deleting its workspace binding. Never orphan virtual disks.
+            if any(lima_home.iterdir()):
+                raise RuntimeError('Destroy this VM before removing its environment; its relocated storage still contains data.')
         from .file_views import FILE_VIEWS
         FILE_VIEWS.forget_environment(self.workspace_root, environment_id=cfg.id)
+        if lima_home != root / 'vm' / 'lima':
+            lima_home.rmdir()
         shutil.rmtree(root)
         clear_environment_provider_cache(self.workspace_root, cfg.id)
 

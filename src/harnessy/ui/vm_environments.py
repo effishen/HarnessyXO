@@ -355,6 +355,116 @@ def open_vm_creator(workbench, workspace, on_saved) -> None:
     dialog.open()
 
 
+def open_vm_settings(workbench, workspace, environment_id: str | None = None) -> None:
+    """Open a VM's Manage → Settings panel, or the VM creator entry point."""
+    configs = EnvironmentManager(workspace.root).list()
+    selected = next((item for item in configs if item.id == environment_id), None)
+    if selected is None and configs:
+        selected = configs[0]
+    if not hasattr(workbench, 'environment_subtabs'):
+        workbench.environment_subtabs = {}
+    if not hasattr(workbench, 'vm_environment_selection'):
+        workbench.vm_environment_selection = {}
+    workbench.environment_subtabs[workspace.id] = 'VM Environments'
+    if selected is not None:
+        workbench.vm_environment_selection[workspace.id] = selected.id
+        workbench.environment_subtabs[f'{workspace.id}:active_vm'] = selected.id
+        workbench.environment_subtabs[f'{workspace.id}:{selected.id}'] = 'Settings'
+    workbench._save_ui_session()
+    workbench.open_tool_tab('environment', workbench._find_reg(workspace.id))
+    workbench.refresh_tabs()
+
+
+def render_vm_settings(workbench, workspace, environment_id: str, *, on_saved=None) -> None:
+    """Render the editable definition and model grants inside Manage Settings."""
+    manager = EnvironmentManager(workspace.root, environment_id=environment_id)
+    config = manager.config
+    if config is None:
+        ui.label('This VM environment is no longer registered.').classes('text-sm hy-muted')
+        return
+    with ui.column().classes('w-full gap-4').props(f'data-hy-vm-settings={environment_id}'):
+        with ui.card().classes('hy-env-card w-full p-4 gap-3'):
+            ui.label('Model access').classes('font-semibold')
+            enabled = ui.switch('Enabled for model use', value=config.enabled).props('dense data-hy-vm-model-enabled=true')
+            ui.label('Off prevents the model from starting or using this VM. Guest console and allowed Project files terminals remain available.').classes('text-xs hy-muted')
+            project_access = ProjectAccessEditor(workspace, config)
+            ui.label(
+                'Saving rechecks project access. Independent copies already deployed or read cannot be recalled; guest files are preserved. A stopped VM stays stopped.'
+                if config.files_mode == 'copy' else
+                'Saving updates this VM’s project file views while it is running. In-use views show Unmount pending until their project tasks and terminals finish. A stopped VM stays stopped.'
+            ).classes('text-xs hy-muted').style('overflow-wrap:anywhere')
+        with ui.card().classes('hy-env-card w-full p-4 gap-3'):
+            ui.label('VM configuration').classes('font-semibold')
+            name = ui.input('VM name', value=config.name).classes('w-full')
+            purpose = ui.textarea('Purpose / model instructions', value=config.purpose).props('autogrow').classes('w-full')
+            image_id = get_preset(config.preset).image_id
+            compatible_presets = {
+                item.id: TOOL_BUNDLES.get(item.tools_id, item.tools_id)
+                for item in PRESETS.values() if item.image_id == image_id
+            }
+            tool_preset = ui.select(compatible_presets, value=config.preset, label='Tool preset').props('outlined').classes('w-full')
+            ui.label('Changes the available optional-tool list. Installed tools stay in this VM. Review and install your choices in Manage Optional Tools; required packages are checked on the next Start.').classes('text-xs hy-muted')
+            if len(compatible_presets) == 1:
+                tool_preset.disable()
+                ui.label('This OS currently has one tool preset. You can still select its individual optional tools.').classes('text-xs hy-muted')
+            elif ENVIRONMENT_OPERATIONS.is_busy(workspace.root, environment_id=config.id) or active_work(workspace.root, environment_id=config.id):
+                tool_preset.disable()
+                ui.label('Finish this VM’s current operation and active work before changing its tool preset.').classes('text-xs hy-muted')
+        opened_scope = (config.project_access, frozenset(config.allowed_project_ids))
+        error = ui.label('').classes('text-sm text-negative').props('role=alert')
+
+        def save() -> None:
+            try:
+                from harnessy.environment.base import environment_config_lock
+                with environment_config_lock(workspace.root, config.id):
+                    latest = manager.get(config.id)
+                    if latest is None:
+                        raise ValueError('This VM is no longer registered.')
+                    value = str(name.value or '').strip()
+                    if not value:
+                        raise ValueError('Enter a VM name.')
+                    preset_id = latest.preset
+                    optional_tools = latest.optional_tools
+                    if tool_preset.value != config.preset:
+                        if latest.preset != config.preset:
+                            raise ValueError('This VM’s tool preset changed while Settings was open. Reopen Settings to use its current preset.')
+                        preset_id = str(tool_preset.value or '')
+                        if preset_id not in compatible_presets:
+                            raise ValueError('Choose a tool preset for this VM’s current OS.')
+                        previous_tools = get_preset(latest.preset).optional_tool_ids if '*' in latest.optional_tools else latest.optional_tools
+                        optional_tools = tuple(tool for tool in get_preset(preset_id).optional_tool_ids if tool in previous_tools)
+                    chosen_scope = (project_access.project_access, frozenset(project_access.allowed_project_ids))
+                    latest_scope = (latest.project_access, frozenset(latest.allowed_project_ids))
+                    if chosen_scope != opened_scope and latest_scope != opened_scope:
+                        raise ValueError('Project access changed while Settings was open. Reopen Settings before changing it.')
+                    if bool(enabled.value) != bool(config.enabled) and latest.enabled != config.enabled:
+                        raise ValueError('Model access changed while Settings was open. Reopen Settings before changing it.')
+                    manager.save(replace(latest, name=value, purpose=str(purpose.value or '').strip(),
+                        enabled=bool(enabled.value) if bool(enabled.value) != bool(config.enabled) else latest.enabled,
+                        preset=preset_id, optional_tools=optional_tools,
+                        project_access=project_access.project_access if chosen_scope != opened_scope else latest.project_access,
+                        allowed_project_ids=project_access.allowed_project_ids if chosen_scope != opened_scope else latest.allowed_project_ids))
+                if preset_id != config.preset:
+                    ui.notify(
+                        'Tool preset saved. Review choices in Manage Optional Tools, or use Start / Retry Setup to check required tools.'
+                        if get_preset(preset_id).optional_tool_ids else
+                        'Tool preset saved. Use Start / Retry Setup to check its required tools.', type='positive')
+                else:
+                    ui.notify('VM settings saved.', type='positive')
+                if on_saved is not None:
+                    on_saved(config.id)
+                else:
+                    if hasattr(workbench, 'refresh_sidebar'):
+                        workbench.refresh_sidebar()
+                    workbench.refresh_tabs()
+            except Exception as exc:
+                if not error.is_deleted:
+                    error.set_text(str(exc))
+
+        with ui.row().classes('w-full justify-end gap-2'):
+            ui.button('Save Settings', icon='save', on_click=save).props('unelevated no-caps data-hy-vm-settings-save=true')
+
+
 def render_vm_environments(workbench, tab, workspace) -> None:
     manager = EnvironmentManager(workspace.root)
     if not hasattr(workbench, 'vm_environment_selection'):
@@ -465,74 +575,6 @@ def render_vm_environments(workbench, tab, workspace) -> None:
             dialog.on_value_change(lambda event: radio_editors.pop(environment_id, None) if not event.value else None)
         sync_cards()
         dialog.open()
-
-    def edit(config) -> None:
-        with vm_dialog() as editor, ui.card().classes('w-[620px] max-w-[94vw] gap-3').style('max-height:92vh;overflow-y:auto'):
-            ui.label('VM Settings').classes('text-lg font-semibold')
-            name = ui.input('VM name', value=config.name).classes('w-full')
-            purpose = ui.textarea('Purpose / model instructions', value=config.purpose).props('autogrow').classes('w-full')
-            image_id = get_preset(config.preset).image_id
-            compatible_presets = {
-                item.id: TOOL_BUNDLES.get(item.tools_id, item.tools_id)
-                for item in PRESETS.values() if item.image_id == image_id
-            }
-            tool_preset = ui.select(compatible_presets, value=config.preset, label='Tool preset').props('outlined').classes('w-full')
-            ui.label('Changes the available optional-tool list. Installed tools stay in this VM. Review and install your choices in Manage Optional Tools; required packages are checked on the next Start.').classes('text-xs hy-muted')
-            if len(compatible_presets) == 1:
-                tool_preset.disable()
-                ui.label('This OS currently has one tool preset. You can still select its individual optional tools.').classes('text-xs hy-muted')
-            elif ENVIRONMENT_OPERATIONS.is_busy(workspace.root, environment_id=config.id) or active_work(workspace.root, environment_id=config.id):
-                tool_preset.disable()
-                ui.label('Finish this VM’s current operation and active work before changing its tool preset.').classes('text-xs hy-muted')
-            project_access = ProjectAccessEditor(workspace, config)
-            ui.label(
-                'Saving rechecks project access. Independent copies already deployed or read cannot be recalled; guest files are preserved. A stopped VM stays stopped.'
-                if config.files_mode == 'copy' else
-                'Saving updates this VM’s project file views while it is running. In-use views show Unmount pending until their project tasks and terminals finish. A stopped VM stays stopped.'
-            ).classes('text-xs hy-muted').style('overflow-wrap:anywhere')
-            opened_scope = (config.project_access, frozenset(config.allowed_project_ids))
-            error = ui.label('').classes('text-sm text-negative')
-            with ui.row().classes('w-full justify-end gap-2'):
-                ui.button('Cancel', on_click=editor.close).props('flat no-caps')
-                def save() -> None:
-                    try:
-                        latest = manager.get(config.id)
-                        if latest is None:
-                            raise ValueError('This VM is no longer registered.')
-                        value = str(name.value or '').strip()
-                        if not value:
-                            raise ValueError('Enter a VM name.')
-                        preset_id = latest.preset
-                        optional_tools = latest.optional_tools
-                        if tool_preset.value != config.preset:
-                            if latest.preset != config.preset:
-                                raise ValueError('This VM’s tool preset changed while Settings was open. Reopen Settings to use its current preset.')
-                            preset_id = str(tool_preset.value or '')
-                            if preset_id not in compatible_presets:
-                                raise ValueError('Choose a tool preset for this VM’s current OS.')
-                            previous_tools = get_preset(latest.preset).optional_tool_ids if '*' in latest.optional_tools else latest.optional_tools
-                            optional_tools = tuple(tool for tool in get_preset(preset_id).optional_tool_ids if tool in previous_tools)
-                        chosen_scope = (project_access.project_access, frozenset(project_access.allowed_project_ids))
-                        latest_scope = (latest.project_access, frozenset(latest.allowed_project_ids))
-                        if chosen_scope != opened_scope and latest_scope != opened_scope:
-                            raise ValueError('Project access changed while Settings was open. Reopen Settings before changing it.')
-                        manager.save(replace(latest, name=value, purpose=str(purpose.value or '').strip(),
-                                             preset=preset_id, optional_tools=optional_tools,
-                                             project_access=project_access.project_access if chosen_scope != opened_scope else latest.project_access,
-                                             allowed_project_ids=project_access.allowed_project_ids if chosen_scope != opened_scope else latest.allowed_project_ids))
-                        if preset_id != config.preset:
-                            ui.notify(
-                                'Tool preset saved. Review choices in Manage Optional Tools, or use Start / Retry Setup to check required tools.'
-                                if get_preset(preset_id).optional_tool_ids else
-                                'Tool preset saved. Use Start / Retry Setup to check its required tools.',
-                                type='positive',
-                            )
-                        editor.close(); selected(config.id)
-                    except Exception as exc:
-                        if not error.is_deleted:
-                            error.set_text(str(exc))
-                ui.button('Save', icon='save', on_click=save).props('unelevated no-caps')
-        editor.open()
 
     def remove(config) -> None:
         with vm_dialog() as dialog, ui.card().classes('w-[560px] max-w-[94vw] gap-3'):
@@ -655,17 +697,7 @@ def render_vm_environments(workbench, tab, workspace) -> None:
                         ui.label(f'Project access: {count} selected' if count else 'Project access: None · project-files terminals and model use are blocked').classes('text-xs hy-muted' if count else 'text-xs text-negative')
                     from harnessy.ui.project_file_views import render_file_view_status
                     render_file_view_status(workspace, config.id)
-                    availability = ui.switch('Enabled for model use', value=config.enabled).props('dense')
-                    availability.tooltip('Off prevents the model from starting or using this VM. Guest console and allowed Project files terminals remain available.')
-                    def set_enabled(event, environment_id=config.id) -> None:
-                        try:
-                            latest = manager.get(environment_id)
-                            if latest is None:
-                                raise ValueError('This VM no longer exists.')
-                            manager.save(replace(latest, enabled=bool(event.value)))
-                        except Exception as exc:
-                            ui.notify(str(exc), type='negative')
-                    availability.on_value_change(set_enabled)
+                    ui.label('Model use: Enabled' if config.enabled else 'Model use: Disabled · change in Manage → Settings').classes('text-xs hy-muted' if config.enabled else 'text-xs text-negative')
                     with ui.row().classes('hy-env-status-banner w-full items-start gap-3 p-3 no-wrap').props(f'data-hy-vm-progress={config.id}') as progress_panel:
                         spinner = ui.spinner(size='20px').classes('hy-vm-busy-spinner shrink-0')
                         progress_icon = ui.icon('info', size='20px').classes('shrink-0')
@@ -693,11 +725,10 @@ def render_vm_environments(workbench, tab, workspace) -> None:
                         if config.provider == 'openwrt':
                             ui.button('Emulated radios', icon='wifi', on_click=lambda _=None, eid=config.id: edit_radios(eid)).props('outline no-caps')
                         manage = ui.button('Manage', icon='tune', on_click=lambda _=None, eid=config.id: toggle_manage(eid)).props('outline no-caps')
-                        ui.button('Settings', icon='settings', on_click=lambda _=None, item=config: edit(item)).props('flat dense no-caps aria-label="VM settings"')
                         delete = ui.button(icon='delete_outline', on_click=lambda _=None, item=config: remove(item)).props('flat round dense color=negative aria-label="Remove VM environment"')
                     details = ui.column().classes('w-full gap-0 mt-2 pt-2').style('min-width:0;border-top:1px solid var(--hy-border)').props(f'data-hy-vm-details={config.id}')
                     details.set_visibility(False)
-                    card_states[config.id] = dict(config=config, card=vm_card, spinner=spinner, status=status, operation=operation, detail=detail, timing=timing, progress=progress, progress_panel=progress_panel, progress_icon=progress_icon, start=start_button, stop=stop_button, terminal=terminal, terminal_options=terminal_options, graphical=graphical, manage=manage, details=details, delete=delete, availability=availability, radio_wifi=radio_wifi, radio_bluetooth=radio_bluetooth, running=False)
+                    card_states[config.id] = dict(config=config, card=vm_card, spinner=spinner, status=status, operation=operation, detail=detail, timing=timing, progress=progress, progress_panel=progress_panel, progress_icon=progress_icon, start=start_button, stop=stop_button, terminal=terminal, terminal_options=terminal_options, graphical=graphical, manage=manage, details=details, delete=delete, radio_wifi=radio_wifi, radio_bluetooth=radio_bluetooth, running=False)
         tab_syncing['value'] = False
         sync_details()
 

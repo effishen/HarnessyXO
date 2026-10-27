@@ -102,6 +102,7 @@ from harnessy.core.transcript import (  # noqa: E402
     assistant_stream_groups, locate_transcript_window, reconcile_transcript_window, shift_transcript_window,
 )
 from harnessy.core.textfiles import TextFileDraft
+from harnessy.core.project_file_access import project_file_access, require_project_write, parse_project_files_scope
 from harnessy.environment.activity import active_work
 from harnessy.core.instructions import DEFAULT_GLOBAL_INSTRUCTIONS
 from harnessy.core.chat_export import CONTENT_DETAIL, EXPORT_TYPES, ExportOptions
@@ -1321,6 +1322,7 @@ class ToolScope:
     hidden_root_names: tuple[str, ...] = ()
     live_links: tuple[tuple[str, str], ...] = ()
     archived: bool = False
+    project_root: Path | None = None
 
 
 def _guest_console_files_text(capabilities: dict[str, Any]) -> str:
@@ -1681,7 +1683,7 @@ class HarnessyPage:
                     if key.removesuffix(':active_vm') in regs and re.fullmatch(r'[0-9a-f]{32}', value):
                         self.environment_subtabs[key] = value
                 else:
-                    self.environment_subtabs[key] = value if value in {'Details', 'Snapshots', 'VM Environments', 'External Targets'} else 'VM Environments'
+                    self.environment_subtabs[key] = value if value in {'Details', 'Settings', 'Snapshots', 'VM Environments', 'External Targets'} else 'VM Environments'
         selections = raw.get('vm_environment_selection')
         if isinstance(selections, dict):
             self.vm_environment_selection = {str(key): str(value) for key, value in selections.items() if str(key) in regs}
@@ -4351,10 +4353,11 @@ class HarnessyPage:
             output_directory = f'Archived snapshot / Project-{chat.public_id}'
         return ToolScope(
             f'{CHAT_FILES_SCOPE_PREFIX}{ws.id}:{chat_id}', f'{chat.public_id} Project Files', root,
-            read_only=True, workspace_id=ws.id, chat_id=chat_id,
+            read_only=chat.archived_at is not None or bool(chat.locked), workspace_id=ws.id, chat_id=chat_id,
             identity=identity, output_directory=output_directory,
             hidden_root_names=hidden_root_names, live_links=tuple(live_links),
             archived=chat.archived_at is not None,
+            project_root=project_root if chat.archived_at is None else root,
         )
 
     def open_chat_working_files(self, ws: WorkspaceStore, chat_id: str) -> None:
@@ -4364,6 +4367,7 @@ class HarnessyPage:
             ui.notify(str(exc), type='warning')
             return
         key = f'files:{ws.id}:{chat_id}'
+        self.file_paths[scope.id] = scope.project_root or scope.root
         if not any(t.key == key for t in self.open_tabs):
             self.open_tabs.append(OpenTab(key, 'files', ws.id, chat_id, scope.name))
         self.activate_tab(key)
@@ -5646,6 +5650,8 @@ class HarnessyPage:
                                 f'Show full {density_label.lower()} cards; turn off for one-line rows'
                             )
                     with ui.column().classes('hy-chat-width hy-composer px-3 pt-2 pb-2 gap-1').props(f'id={composer_id}'):
+                        from harnessy.ui.project_vm_access import render_project_vm_warning
+                        render_project_vm_warning(self, ws, chat.id)
                         draft_text = self._load_chat_composer_draft(ws, chat.id)
                         self.composer = ui.textarea(
                             value=draft_text, placeholder='Message HarnessyXO…',
@@ -13636,15 +13642,19 @@ async function hyCollectEntry(entry, prefix, out) {
 }
 async function hyFilesFromDrop(dt) {
   const out = [];
-  const items = Array.from(dt.items || []);
-  if (items.length && items.some(i => i.webkitGetAsEntry)) {
-    for (const item of items) {
-      const entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
-      if (entry) await hyCollectEntry(entry, '', out);
-    }
+  // Browsers protect the drag store after the drop callback returns. Capture
+  // every entry/File now, before traversing any asynchronous directory entry.
+  const files = Array.from(dt.files || []);
+  const items = Array.from(dt.items || []).filter(item => !item.kind || item.kind === 'file').map(item => ({
+    entry: item.webkitGetAsEntry ? item.webkitGetAsEntry() : null,
+    file: item.getAsFile ? item.getAsFile() : null,
+  }));
+  for (const item of items) {
+    if (item.entry) await hyCollectEntry(item.entry, '', out);
+    else if (item.file) out.push({file:item.file, relativePath:item.file.name});
   }
   if (!out.length) {
-    for (const file of Array.from(dt.files || [])) out.push({file, relativePath:file.name});
+    for (const file of files) out.push({file, relativePath:file.name});
   }
   return out;
 }
@@ -13780,6 +13790,16 @@ function hyFileDropDestination(e) {
   if (row) return hyDecodePath(row.dataset.hyPath);
   return (window.harnessyFileExplorer || {}).current_path || null;
 }
+function hyFileDropWritable(destination, state) {
+  const policy = state || window.harnessyFileExplorer || {};
+  if (policy.read_only || !destination) return false;
+  const within = (path, root) => path === root || path.startsWith(root.replace(/\/$/, '') + '/');
+  if (policy.writable_root && !within(destination, policy.writable_root)) return false;
+  return !(policy.readonly_paths || []).some(root => within(destination, root));
+}
+function hyRejectFileDrop() {
+  emitEvent('harnessy_file_uploaded', {ok:false, error:'This folder is read-only. Upload into this project’s own folder.'});
+}
 function hyClearFileDropVisuals() {
   document.querySelectorAll('.hy-file-row.hy-drop-target').forEach(el => el.classList.remove('hy-drop-target'));
   document.querySelectorAll('.hy-file-listing.hy-drag-active').forEach(el => el.classList.remove('hy-drag-active'));
@@ -13860,9 +13880,10 @@ function hyUploadExplorerFile(item, destination, workspaceId, progress) {
     xhr.send(item.file);
   });
 }
-async function hyUploadExplorerFiles(items, destination) {
-  const explorer = window.harnessyFileExplorer || {};
-  if (!explorer.workspace_id || !destination || !items || !items.length) return;
+async function hyUploadExplorerFiles(items, destination, targetState) {
+  const explorer = targetState || window.harnessyFileExplorer || {};
+  if (!explorer.workspace_id || !items || !items.length) return;
+  if (!hyFileDropWritable(destination, explorer)) { hyRejectFileDrop(); return; }
   const workspaceId = explorer.workspace_id;
   const uploadState = window.harnessyExplorerUpload || (window.harnessyExplorerUpload = {});
   uploadState.cancelled = false;
@@ -13900,15 +13921,16 @@ async function hyUploadExplorerFiles(items, destination) {
   emitEvent('harnessy_file_uploaded', {ok: !cancelled && errors.length === 0, batch_done:true, uploaded, last, errors, cancelled});
 }
 window.harnessyPickExplorerFiles = function() {
-  const destination = (window.harnessyFileExplorer || {}).current_path;
-  if (!destination) return;
+  const targetState = {...(window.harnessyFileExplorer || {})};
+  const destination = targetState.current_path;
+  if (!hyFileDropWritable(destination, targetState)) { hyRejectFileDrop(); return; }
   const picker = document.createElement('input');
   picker.type = 'file';
   picker.multiple = true;
   picker.style.display = 'none';
   picker.addEventListener('change', async () => {
     const items = Array.from(picker.files || []).map(file => ({file, relativePath:file.name}));
-    try { await hyUploadExplorerFiles(items, destination); }
+    try { await hyUploadExplorerFiles(items, destination, targetState); }
     finally { picker.remove(); }
   }, {once:true});
   document.body.appendChild(picker);
@@ -13922,6 +13944,7 @@ document.addEventListener('dragstart', (e) => {
   row.classList.add('hy-dragging');
   e.dataTransfer.setData('application/x-harnessy-path', source);
   e.dataTransfer.setData('text/plain', source);
+  e.dataTransfer.setData('application/x-harnessy-source-readonly', row.dataset.hyMutable === '0' ? '1' : '0');
   e.dataTransfer.effectAllowed = 'copyMove';
   try { e.dataTransfer.setDragImage(row, Math.min(90, Math.max(18, row.clientWidth * .25)), 18); } catch (_) {}
   if (row.dataset.hyFile === '1') {
@@ -13945,22 +13968,30 @@ document.addEventListener('dragover', (e) => {
     const listing = (e.target && e.target.closest ? e.target.closest('.hy-file-listing') : null) || document.querySelector('.hy-file-listing');
     if (listing && hasFiles) listing.classList.add('hy-drag-active');
   }
-  dt.dropEffect = internal ? ((e.altKey || e.ctrlKey) ? 'copy' : 'move') : 'copy';
+  const destination = hyFileDropDestination(e);
+  dt.dropEffect = !hyFileDropWritable(destination) ? 'none' : internal ? ((e.altKey || e.ctrlKey) ? 'copy' : 'move') : 'copy';
 }, true);
 
 document.addEventListener('drop', async (e) => {
   if (!hyEventPathHasClass(e, 'hy-file-explorer') || !e.dataTransfer) return;
   const destination = hyFileDropDestination(e);
+  const targetState = {...(window.harnessyFileExplorer || {})};
   const source = e.dataTransfer.getData('application/x-harnessy-path');
   const files = Array.from(e.dataTransfer.files || []);
   if (!source && !files.length && !Array.from(e.dataTransfer.items || []).length) return;
   e.preventDefault(); e.stopPropagation(); hyClearFileDropVisuals();
+  if (!hyFileDropWritable(destination, targetState)) { hyRejectFileDrop(); return; }
   if (source) {
-    emitEvent('harnessy_file_move', {workspace_id:(window.harnessyFileExplorer || {}).workspace_id, source, destination, copy: !!(e.altKey || e.ctrlKey)});
+    const copy = !!(e.altKey || e.ctrlKey) || e.dataTransfer.getData('application/x-harnessy-source-readonly') === '1';
+    emitEvent('harnessy_file_move', {workspace_id:targetState.workspace_id, source, destination, copy});
     return;
   }
-  const items = await hyFilesFromDrop(e.dataTransfer);
-  await hyUploadExplorerFiles(items, destination);
+  try {
+    const items = await hyFilesFromDrop(e.dataTransfer);
+    await hyUploadExplorerFiles(items, destination, targetState);
+  } catch (err) {
+    emitEvent('harnessy_file_uploaded', {ok:false, error:`Could not read dropped files: ${String(err)}`});
+  }
 }, true);
 document.addEventListener('dragend', () => {
   hyClearFileDropVisuals();
@@ -16264,11 +16295,15 @@ window.harnessyTerminalFocus = function(terminalId) {
             if reg is not None:
                 self._draw_pending_attachments(self._load_workspace(reg), chat_id)
 
-    def _set_file_explorer_target(self, ws: WorkspaceStore, current: Path, client) -> None:
-        # A read-only project/history explorer has no browser upload target, so
-        # drag/drop cannot mutate the displayed snapshot or archived tree.
-        readonly = isinstance(ws, ToolScope) and ws.read_only
-        payload = json.dumps({'workspace_id': ws.id, 'current_path': None if readonly else str(current), 'read_only': readonly})
+    def _set_file_explorer_target(self, ws: WorkspaceStore | ToolScope, current: Path, client) -> None:
+        policy = {'read_only': isinstance(ws, ToolScope) and ws.read_only,
+                  'writable_root': str(self._file_scope_root(ws)), 'readonly_paths': []}
+        if isinstance(ws, ToolScope) and ws.chat_id:
+            store = self._file_scope_store(ws)
+            policy = (project_file_access(store, ws.chat_id).browser_policy() if store is not None
+                      else {'read_only': True, 'writable_root': None, 'readonly_paths': []})
+        payload = json.dumps({'workspace_id': ws.id, 'current_path': str(current),
+                              'current_writable': self._file_can_write(ws, current), **policy})
         self.file_selections[ws.id] = []
         client.run_javascript(
             f'window.harnessySetFileExplorerTarget ? window.harnessySetFileExplorerTarget({payload}) : (window.harnessyFileExplorer = {payload});',
@@ -16306,12 +16341,9 @@ window.harnessyTerminalFocus = function(terminalId) {
         ws = self._scope_for_id(wid)
         if ws is None:
             return
-        if isinstance(ws, ToolScope) and ws.read_only:
-            ui.notify('This Project Files panel is read-only. Use Workspace Files to make human edits.', type='warning')
-            return
         try:
-            source = Path(str(data.get('source') or '')).expanduser().resolve()
-            destination = Path(str(data.get('destination') or '')).expanduser().resolve()
+            source = self._file_requested_path(ws, str(data.get('source') or ''))
+            destination = self._file_requested_path(ws, str(data.get('destination') or ''))
             if not self._file_path_in_scope(ws, source) or not self._file_path_in_scope(ws, destination):
                 raise ValueError('File move/copy is outside this File Explorer scope')
             if not source.exists():
@@ -16324,6 +16356,9 @@ window.harnessyTerminalFocus = function(terminalId) {
             if not self._file_path_in_scope(ws, target):
                 raise ValueError('File destination is outside this File Explorer scope')
             def work():
+                self._file_require_write(ws, target)
+                if not bool(data.get('copy')):
+                    self._file_require_write(ws, source, structural=True)
                 if bool(data.get('copy')):
                     if source.is_dir() and not source.is_symlink():
                         shutil.copytree(source, target)
@@ -16415,7 +16450,7 @@ window.harnessyTerminalFocus = function(terminalId) {
         elif action == 'open' and len(targets) == 1:
             self._file_open(ws, targets[0])
         elif action == 'rename' and len(targets) == 1:
-            self._file_rename(targets[0])
+            self._file_rename(ws, targets[0])
         elif action == 'rename' and len(targets) > 1:
             ui.notify('Rename works on one selected item at a time.', type='warning')
         elif action == 'clear':
@@ -17930,6 +17965,33 @@ window.harnessyTerminalFocus = function(terminalId) {
                 return candidate
         return None
 
+    def _file_require_write(self, ws: WorkspaceStore | ToolScope, path: Path, *, structural: bool = False) -> Path:
+        """Check the current source policy at the actual write boundary."""
+        if isinstance(ws, ToolScope) and ws.chat_id:
+            store = self._file_scope_store(ws)
+            if store is None:
+                raise PermissionError('This project is no longer available.')
+            return require_project_write(store, ws.chat_id, path, structural=structural)
+        if isinstance(ws, ToolScope) and ws.read_only:
+            raise PermissionError('This folder is read-only.')
+        target = path.expanduser().resolve(strict=False)
+        if not self._file_path_in_scope(ws, target):
+            raise PermissionError('The destination is outside this File Explorer scope.')
+        return target
+
+    def _file_can_write(self, ws: WorkspaceStore | ToolScope, path: Path, *, structural: bool = False) -> bool:
+        try:
+            self._file_require_write(ws, path, structural=structural)
+            return True
+        except (OSError, ValueError, RuntimeError):
+            return False
+
+    def _file_restore_history(self, store: WorkspaceStore, scope: WorkspaceStore | ToolScope,
+                              relative: str, version_id: str, *, destination: str | None = None):
+        target = store.files_root / (destination if destination is not None else relative)
+        self._file_require_write(scope, target, structural=True)
+        return store.restore_file_version(relative, version_id, destination=destination)
+
     @staticmethod
     def _file_parent_path(ws: WorkspaceStore | ToolScope, current: Path) -> Path:
         if isinstance(ws, ToolScope):
@@ -18030,19 +18092,24 @@ window.harnessyTerminalFocus = function(terminalId) {
 
     def _render_files_tab(self, tab: OpenTab, ws: WorkspaceStore | ToolScope) -> None:
         scope_root = self._file_scope_root(ws)
-        readonly = isinstance(ws, ToolScope) and ws.read_only
-        current = self.file_paths.setdefault(ws.id, scope_root)
+        initial = ws.project_root if isinstance(ws, ToolScope) and ws.project_root else scope_root
+        current = self.file_paths.setdefault(ws.id, initial)
         if not current.exists() or not current.is_dir() or not self._file_path_in_scope(ws, current):
-            current = scope_root
+            current = initial
             self.file_paths[ws.id] = current
+        access_policy = None
+        if isinstance(ws, ToolScope) and ws.chat_id:
+            access_policy = project_file_access(self._file_scope_store(ws), ws.chat_id)
+        readonly = (not access_policy.can_write(current, revalidate=False) if access_policy is not None
+                    else not self._file_can_write(ws, current))
         output_labels = self._file_output_labels(ws, current)
         parent_path = self._file_parent_path(ws, current)
         can_go_up = parent_path != current and self._file_path_in_scope(ws, parent_path)
         with ui.column().classes('hy-tool-panel hy-file-explorer w-full no-wrap gap-0'):
-            if readonly:
+            if isinstance(ws, ToolScope) and ws.chat_id:
                 identity = ws.identity or {}
                 with ui.column().classes('w-full px-3 py-2 gap-0 hy-working-files-identity'):
-                    ui.label(f"{ws.name} · {identity.get('working_root_label', 'Canonical project')} · Read-only panel").classes('text-sm font-semibold')
+                    ui.label(f"{ws.name} · {'Read-only folder' if readonly else 'Own files · writable'}").classes('text-sm font-semibold')
                     ui.label(f"Root ID: {identity.get('working_root_id', 'unavailable')}").classes('text-xs hy-muted')
                     ui.label(
                         ('Permanent archive snapshot: ' if ws.archived else 'Exact model-visible Project Files root: ')
@@ -18082,7 +18149,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                     history_store = self._file_scope_store(ws)
                     if history_store is not None and not (isinstance(ws, ToolScope) and ws.archived):
                         ui.button(
-                            icon='history', on_click=lambda store=history_store: self.open_file_history_browser(store),
+                            icon='history', on_click=lambda store=history_store: self.open_file_history_browser(store, scope=ws),
                         ).props('flat round dense').tooltip('Browse File History, including deleted files')
                     if not readonly:
                         ui.button(icon='create_new_folder', on_click=lambda: self._file_new_folder(ws, current)).props('flat round dense aria-label="New folder"').tooltip('New folder')
@@ -18142,7 +18209,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                 if not entries:
                     ui.label('Empty folder.' if readonly else 'Empty folder — drop files anywhere in this area to upload.').classes('hy-muted p-4')
                 for item_path in entries[:5000]:
-                    self._file_row(ws, item_path, output_labels=output_labels, owner_tab_key=tab.key)
+                    self._file_row(ws, item_path, output_labels=output_labels, owner_tab_key=tab.key, access_policy=access_policy)
                 with ui.context_menu():
                     if not readonly:
                         ui.menu_item('New file', on_click=lambda: self._file_new_file(ws, current))
@@ -18156,7 +18223,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                             ui.separator().classes('hy-action-menu-separator')
                         ui.menu_item(
                             'Browse File History',
-                            on_click=lambda store=history_store: self.open_file_history_browser(store),
+                            on_click=lambda store=history_store: self.open_file_history_browser(store, scope=ws),
                         )
                     if not readonly or history_store is not None and not (isinstance(ws, ToolScope) and ws.archived):
                         ui.separator().classes('hy-action-menu-separator')
@@ -18234,12 +18301,18 @@ window.harnessyTerminalFocus = function(terminalId) {
             # row is replaced underneath an unmoved pointer.
 
     def _file_row(self, ws: WorkspaceStore | ToolScope, p: Path, *, output_labels: dict[str, str] | None = None,
-                  owner_tab_key: str | None = None) -> None:
-        readonly = isinstance(ws, ToolScope) and ws.read_only
+                  owner_tab_key: str | None = None, access_policy=None) -> None:
+        readonly = (not access_policy.can_write(p, revalidate=False) if access_policy is not None
+                    else not self._file_can_write(ws, p))
+        mutable = (access_policy.can_write(p, structural=True, revalidate=False) if access_policy is not None
+                   else self._file_can_write(ws, p, structural=True))
         encoded = quote(str(p), safe='')
-        is_dir = p.is_dir()
-        is_file = p.is_file()
-        props = f'draggable={"false" if readonly else "true"} data-hy-path={encoded} data-hy-dir={1 if is_dir else 0} data-hy-file={1 if is_file else 0}'
+        displayed_source = self._file_live_link_target(ws, p)
+        is_dir = displayed_source.is_dir()
+        is_file = displayed_source.is_file()
+        props = (f'draggable={"false" if isinstance(ws, ToolScope) and ws.read_only else "true"} '
+                 f'data-hy-path={encoded} data-hy-dir={1 if is_dir else 0} data-hy-file={1 if is_file else 0} '
+                 f'data-hy-writable={0 if readonly else 1} data-hy-mutable={1 if mutable else 0}')
         try:
             stat = p.stat()
         except OSError:
@@ -18307,10 +18380,11 @@ window.harnessyTerminalFocus = function(terminalId) {
                     if history_store is not None and not (isinstance(ws, ToolScope) and ws.archived):
                         ui.menu_item(
                             'File History',
-                            on_click=lambda target=p, store=history_store: self.open_file_history_dialog(store, target),
+                            on_click=lambda target=p, store=history_store: self.open_file_history_dialog(store, target, scope=ws),
                         )
                 if readonly:
                     ui.separator().classes('hy-action-menu-separator')
+                    ui.menu_item('Copy', on_click=lambda target=p: self._file_set_clipboard(ws, self._file_targets(ws, target), 'copy'))
                     ui.menu_item(
                         'Copy full path',
                         on_click=lambda target=p: self._write_clipboard(
@@ -18320,15 +18394,20 @@ window.harnessyTerminalFocus = function(terminalId) {
                     return
                 ui.separator().classes('hy-action-menu-separator')
                 ui.menu_item('Copy', on_click=lambda target=p: self._file_set_clipboard(ws, self._file_targets(ws, target), 'copy'))
-                ui.menu_item('Cut', on_click=lambda target=p: self._file_set_clipboard(ws, self._file_targets(ws, target), 'cut'))
-                ui.menu_item('Rename / Move…', on_click=lambda target=p: self._file_rename(target) if len(self._file_targets(ws, target)) == 1 else ui.notify('Rename works on one selected item at a time.', type='warning'))
-                ui.separator().classes('hy-action-menu-separator')
-                ui.menu_item('Pack as ZIP', on_click=lambda target=p: self._file_zip(ws, self._file_targets(ws, target)))
+                if mutable:
+                    ui.menu_item('Cut', on_click=lambda target=p: self._file_set_clipboard(ws, self._file_targets(ws, target), 'cut'))
+                    ui.menu_item('Rename / Move…', on_click=lambda target=p: self._file_rename(ws, target) if len(self._file_targets(ws, target)) == 1 else ui.notify('Rename works on one selected item at a time.', type='warning'))
+                sibling_writable = (access_policy.can_write(p.parent, revalidate=False) if access_policy is not None
+                                    else self._file_can_write(ws, p.parent))
+                if sibling_writable:
+                    ui.separator().classes('hy-action-menu-separator')
+                    ui.menu_item('Pack as ZIP', on_click=lambda target=p: self._file_zip(ws, self._file_targets(ws, target)))
                 if is_file and is_archive(p):
                     ui.menu_item('Extract Here', on_click=lambda target=p: self._file_extract(ws, target, 'here'))
                     ui.menu_item(f'Extract to {_archive_base_name(p)}', on_click=lambda target=p: self._file_extract(ws, target, 'folder'))
                 ui.separator().classes('hy-action-menu-separator')
-                ui.menu_item('Delete', on_click=lambda target=p: self._file_delete(ws, self._file_targets(ws, target)))
+                if mutable:
+                    ui.menu_item('Delete', on_click=lambda target=p: self._file_delete(ws, self._file_targets(ws, target)))
 
     def _download_scope_file(self, ws: WorkspaceStore | ToolScope, path: Path) -> None:
         if not self._file_path_in_scope(ws, path) or not path.is_file():
@@ -18401,7 +18480,9 @@ window.harnessyTerminalFocus = function(terminalId) {
 
     async def open_file_history_dialog(
         self, ws: WorkspaceStore, path: Path | str, *, _tab: OpenTab | None = None,
+        scope: WorkspaceStore | ToolScope | None = None,
     ) -> None:
+        scope = scope or (self._chat_files_scope(ws, _tab.chat_id) if _tab is not None and _tab.chat_id else ws)
         try:
             versions = await asyncio.to_thread(ws.list_file_versions, path)
             relative = versions[0]['path'] if versions else Path(path).name
@@ -18413,11 +18494,11 @@ window.harnessyTerminalFocus = function(terminalId) {
             return
 
         if _tab is None:
-            key = self._history_tab_key(ws.id, path)
+            key = self._history_tab_key(scope.id, path)
             tab = next((row for row in self.open_tabs if row.key == key), None)
             if tab is None:
                 tab = OpenTab(
-                    key, 'history', ws.id, None,
+                    key, 'history', ws.id, scope.chat_id if isinstance(scope, ToolScope) else None,
                     f'File History · {Path(relative).name}', file_path=str(path),
                 )
                 self.open_tabs.append(tab)
@@ -18499,6 +18580,8 @@ window.harnessyTerminalFocus = function(terminalId) {
                 original = Path(relative)
                 default_name = f'{original.stem}_restored{original.suffix}'
                 default_path = (original.parent / default_name).as_posix()
+                if isinstance(scope, ToolScope) and scope.project_root is not None and not self._file_can_write(scope, ws.files_root / default_path):
+                    default_path = (scope.project_root.relative_to(ws.files_root) / default_name).as_posix()
                 with ui.dialog().props('persistent') as restore_dialog, ui.card().classes('w-[620px] max-w-[94vw] gap-3'):
                     ui.label('Restore historical version as a copy').classes('text-lg font-semibold')
                     ui.label('The current file is left unchanged. HarnessyXO records a safety checkpoint before restoring.').classes('text-sm hy-muted')
@@ -18509,7 +18592,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                         async def restore_copy() -> None:
                             try:
                                 result = await asyncio.to_thread(
-                                    ws.restore_file_version, relative, version_id,
+                                    self._file_restore_history, ws, scope, relative, version_id,
                                     destination=str(destination.value or '').strip(),
                                 )
                                 restore_dialog.close()
@@ -18533,7 +18616,7 @@ window.harnessyTerminalFocus = function(terminalId) {
 
                         async def replace_current() -> None:
                             try:
-                                result = await asyncio.to_thread(ws.restore_file_version, relative, version_id)
+                                result = await asyncio.to_thread(self._file_restore_history, ws, scope, relative, version_id)
                                 replace_dialog.close()
                                 ui.notify(
                                     f"Restored {relative} · safety {result['safety_snapshot_id'][:8]}",
@@ -18700,9 +18783,11 @@ window.harnessyTerminalFocus = function(terminalId) {
             draw_versions()
         await draw_detail()
 
-    async def open_file_history_browser(self, ws: WorkspaceStore) -> None:
+    async def open_file_history_browser(self, ws: WorkspaceStore, *, scope: WorkspaceStore | ToolScope | None = None) -> None:
+        scope = scope or ws
         try:
             paths = await asyncio.to_thread(ws.list_file_history_paths)
+            paths = [item for item in paths if self._file_path_in_scope(scope, ws.files_root / str(item['path']))]
         except Exception as exc:
             ui.notify(f'Could not browse File History: {exc}', type='negative', timeout=9000)
             return
@@ -18726,7 +18811,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                     def open_path_callback(value: dict[str, Any]):
                         async def callback() -> None:
                             dialog.close()
-                            await self.open_file_history_dialog(ws, ws.files_root / str(value['path']))
+                            await self.open_file_history_dialog(ws, ws.files_root / str(value['path']), scope=scope)
                         return callback
                     for item in matches[:1000]:
                         with ui.row().classes('w-full items-center no-wrap py-2 px-2 cursor-pointer').on(
@@ -18794,6 +18879,7 @@ window.harnessyTerminalFocus = function(terminalId) {
         self._sync_tab_activity_ui()
         try:
             target = _unique_external_path(destination / Path(e.file.name).name)
+            target = self._file_require_write(ws, target)
             await e.file.save(target)
             ui.notify(f'Uploaded {target.name}', type='positive')
         except Exception as exc:
@@ -18805,9 +18891,17 @@ window.harnessyTerminalFocus = function(terminalId) {
 
     def _file_set_clipboard(self, ws: WorkspaceStore | ToolScope, paths: Path | list[Path], mode: str) -> None:
         items = [paths] if isinstance(paths, Path) else list(paths)
-        items = [p.resolve() for p in items if p.exists() and self._file_path_in_scope(ws, p)]
+        items = [self._file_live_link_target(ws, p) for p in items]
+        items = [p for p in items if p.exists() and self._file_path_in_scope(ws, p)]
         if not items:
             return
+        if mode == 'cut':
+            try:
+                for path in items:
+                    self._file_require_write(ws, path, structural=True)
+            except (OSError, ValueError, RuntimeError) as exc:
+                ui.notify(str(exc), type='warning')
+                return
         self.file_clipboard[ws.id] = {'paths': [str(p) for p in items], 'mode': mode}
         verb = 'Copied' if mode == 'copy' else 'Cut'
         ui.notify(f"{verb} {len(items)} item{'s' if len(items) != 1 else ''}")
@@ -18830,12 +18924,15 @@ window.harnessyTerminalFocus = function(terminalId) {
         mode = str(clip.get('mode') or 'copy')
 
         def work() -> int:
+            self._file_require_write(ws, dest)
             created = 0
             for source in sources:
                 if source.is_dir() and dest.is_relative_to(source):
                     raise ValueError(f'Cannot paste {source.name} into itself')
                 target = _unique_external_path(dest / source.name)
+                self._file_require_write(ws, target)
                 if mode == 'cut':
+                    self._file_require_write(ws, source, structural=True)
                     shutil.move(str(source), str(target))
                 elif source.is_dir() and not source.is_symlink():
                     shutil.copytree(source, target)
@@ -18852,11 +18949,14 @@ window.harnessyTerminalFocus = function(terminalId) {
         self._launch_file_operation(ws, 'Paste', work, success)
 
     def _file_new_folder(self, ws: WorkspaceStore, current: Path) -> None:
-        self._name_dialog('New folder', 'Folder name', lambda name: (current / name).mkdir(parents=False, exist_ok=False))
+        def create(name: str) -> None:
+            target = self._file_require_write(ws, current / name)
+            target.mkdir(parents=False, exist_ok=False)
+        self._name_dialog('New folder', 'Folder name', create)
 
     def _file_new_file(self, ws: WorkspaceStore, current: Path) -> None:
         def create(name: str) -> None:
-            p = current / name
+            p = self._file_require_write(ws, current / name)
             p.parent.mkdir(parents=True, exist_ok=True)
             p.touch(exist_ok=False)
             self.open_file_tab(ws, p)
@@ -18886,7 +18986,7 @@ window.harnessyTerminalFocus = function(terminalId) {
             ui.label('This file tab has no path. Close it and reopen the file.').classes('text-negative p-4')
             return
         path = Path(tab.file_path)
-        readonly = isinstance(ws, ToolScope) and ws.read_only
+        readonly = not self._file_can_write(ws, path)
         if not self._file_path_in_scope(ws, path):
             ui.label('This file is no longer in the selected canonical project scope. Reopen Project Files.').classes('text-negative p-4')
             return
@@ -18972,6 +19072,7 @@ window.harnessyTerminalFocus = function(terminalId) {
 
             def save() -> None:
                 try:
+                    self._file_require_write(ws, path)
                     changed_on_disk = state['draft'].save(str(state.get('value') or ''))
                     # TextFileDraft.save updates its baseline text/digest in place.
                     sync_dirty()
@@ -19010,14 +19111,17 @@ window.harnessyTerminalFocus = function(terminalId) {
                 path = items[0]
                 if path.is_dir():
                     output = _unique_external_path(path.parent / f'{path.name}.zip')
+                    self._file_require_write(ws, output)
                     make_zip(path, output, exclude_names={FILES_PROBE_DIR_NAME})
                 else:
                     output = _unique_external_path(path.parent / f'{path.stem}.zip')
+                    self._file_require_write(ws, output)
                     with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
                         zf.write(path, path.name)
             else:
                 parent = items[0].parent
                 output = _unique_external_path(parent / 'selection.zip')
+                self._file_require_write(ws, output)
                 with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
                     for item in items:
                         if item.is_dir() and not item.is_symlink():
@@ -19033,26 +19137,30 @@ window.harnessyTerminalFocus = function(terminalId) {
     def _file_extract(self, ws: WorkspaceStore | ToolScope, path: Path, mode: str) -> None:
         def work() -> str:
             if mode == 'here':
-                safe_extract_archive(path, path.parent)
+                self._file_require_write(ws, path.parent)
+                safe_extract_archive(path, path.parent, authorize=lambda target: self._file_require_write(ws, target))
                 return f'Extracted {path.name} here'
             if mode == 'folder':
                 dest = _unique_external_path(path.parent / _archive_base_name(path))
+                self._file_require_write(ws, dest)
                 dest.mkdir(parents=True, exist_ok=False)
-                safe_extract_archive(path, dest)
+                safe_extract_archive(path, dest, authorize=lambda target: self._file_require_write(ws, target))
                 return f'Extracted to {dest.name}'
             raise ValueError(f'Unknown extraction mode: {mode}')
 
         self._launch_file_operation(ws, 'Extract', work, lambda message: message)
 
-    def _file_rename(self, path: Path) -> None:
+    def _file_rename(self, ws: WorkspaceStore | ToolScope, path: Path) -> None:
         with ui.dialog() as dialog, ui.card().classes('w-[470px] max-w-[92vw]'):
             ui.label('Rename').classes('text-lg font-semibold')
             field = ui.input('Name', value=path.name).classes('w-full')
             def rename() -> None:
                 try:
                     name = (field.value or '').strip()
-                    if not name or '/' in name:
+                    if not name or name in {'.', '..'} or '/' in name or '\\' in name:
                         raise ValueError('Invalid name')
+                    self._file_require_write(ws, path, structural=True)
+                    self._file_require_write(ws, path.with_name(name))
                     path.rename(path.with_name(name))
                     dialog.close(); self.refresh_tabs()
                 except Exception as exc:
@@ -19069,12 +19177,13 @@ window.harnessyTerminalFocus = function(terminalId) {
             return
         try:
             for path in items:
+                self._file_require_write(ws, path, structural=True)
                 if path.is_dir() and not path.is_symlink():
                     validate_workspace_delete_target(
                         path, state_root=self.machine.root,
                         other_workspace_roots=(item.path for item in self.machine.list_workspaces()),
                     )
-        except ValueError as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             ui.notify(f'Cannot delete this folder: {exc}', type='negative', timeout=9000)
             return
         with ui.dialog() as dialog, ui.card().classes('w-[600px] max-w-[92vw]'):
@@ -19096,6 +19205,7 @@ window.harnessyTerminalFocus = function(terminalId) {
                     for path in items:
                         if not path.exists() and not path.is_symlink():
                             continue
+                        self._file_require_write(ws, path, structural=True)
                         if path.is_dir() and not path.is_symlink():
                             validate_workspace_delete_target(
                                 path, state_root=self.machine.root,
@@ -19454,10 +19564,11 @@ window.harnessyTerminalFocus = function(terminalId) {
                     else (tool for tool in preset.optional_tool_ids if tool in configured_optional)
                 )
                 selected_subtab = getattr(self, 'environment_subtabs', {}).get(f'{ws.id}:{environment_id}', 'Details')
-                if selected_subtab not in {'Details', 'Snapshots'}:
+                if selected_subtab not in {'Details', 'Settings', 'Snapshots'}:
                     selected_subtab = 'Details'
                 with ui.tabs(value=selected_subtab).classes('hy-env-width px-3').props('dense no-caps align=left indicator-color=primary') as env_tabs:
                     details_tab = ui.tab('Details')
+                    settings_tab = ui.tab('Settings')
                     snapshots_tab = ui.tab('Snapshots')
                 if not hasattr(self, 'environment_subtabs'):
                     self.environment_subtabs = {}
@@ -19482,7 +19593,9 @@ window.harnessyTerminalFocus = function(terminalId) {
                                         readiness_detail = ui.label('').classes('text-xs hy-muted').style('white-space:pre-wrap;overflow-wrap:anywhere')
                                 with ui.card().classes('hy-env-card p-4 gap-1 min-w-0').style('flex:1 1 280px;max-width:100%'):
                                     from .workspace_resources import WorkspaceResourceEditor
-                                    resource_editor = WorkspaceResourceEditor(config, lambda **payload: queue_action('resources', **payload), dialog_parent=dialog_parent)
+                                    ui.label('Resources').classes('text-xs hy-muted')
+                                    resource_summary_label = ui.label(WorkspaceResourceEditor._summary(config)).classes('text-sm font-semibold')
+                                    resource_capacity_label = ui.label(f'{config.disk_gb:,} GiB sparse disk capacity').classes('text-sm')
                                     network_status_label = ui.label(f'{network_prefix} enabled' if config.network else f'{network_prefix} disabled').classes('text-xs hy-muted')
                                     if preset.optional_tool_ids:
                                         optional_tools_summary_label = ui.label(
@@ -19496,6 +19609,11 @@ window.harnessyTerminalFocus = function(terminalId) {
                                     ui.label(guest_project_root).classes('text-sm font-semibold')
                                     ui.label('Workspace source location').classes('text-xs hy-muted')
                                     ui.label(str(ws.files_root)).classes('text-xs hy-muted').style('max-width:100%;min-width:0;white-space:normal;overflow-wrap:anywhere')
+                                    vm_storage_path_label = None
+                                    if config.provider in {'lima', 'managed'}:
+                                        ui.label('VM storage location').classes('text-xs hy-muted')
+                                        vm_storage_path_label = ui.label('').classes('text-xs hy-muted').style('overflow-wrap:anywhere')
+                                        ui.label('Include this folder when backing up VM disks. Workspace source files are stored separately.').classes('text-xs hy-muted')
                                     from harnessy.ui.vm_environments import FILE_MODES
                                     ui.label(FILE_MODES.get(config.files_mode, config.files_mode)).classes('text-sm font-semibold')
                                     ui.label('Project commands and Project files terminals use the same view: own files plus read-only ancestors, direct Project Access sources and References. Guest console uses a separate home view, with live read-only References where supported.').classes('text-xs hy-muted')
@@ -19533,6 +19651,12 @@ window.harnessyTerminalFocus = function(terminalId) {
                                         start_button = ui.button('Start', icon='play_arrow').props('flat no-caps')
                                         stop_button = ui.button('Stop', icon='stop').props('flat no-caps')
 
+                    with ui.tab_panel(settings_tab).classes('p-0'):
+                        with ui.column().classes('hy-env-width p-4 gap-4'):
+                            from harnessy.ui.vm_environments import render_vm_settings
+                            render_vm_settings(self, ws, environment_id)
+                            with ui.card().classes('hy-env-card w-full p-4 gap-2'):
+                                resource_editor = WorkspaceResourceEditor(config, lambda **payload: queue_action('resources', **payload), dialog_parent=dialog_parent)
                             if preset.optional_tool_ids:
                                 with ui.card().classes('hy-env-card w-full p-4 gap-2'):
                                     with ui.row().classes('w-full items-center gap-2 flex-wrap'):
@@ -19978,6 +20102,16 @@ window.harnessyTerminalFocus = function(terminalId) {
                             operation_error.set_text('')
 
                     saved_config = manager.config
+                    if vm_storage_path_label is not None:
+                        from harnessy.environment.base import environment_root
+                        from harnessy.environment.lima_runtime import bound_lima_home
+                        try:
+                            vm_storage_path_label.set_text(str(bound_lima_home(environment_root(ws.root, environment_id))))
+                        except (OSError, ValueError, RuntimeError):
+                            vm_storage_path_label.set_text('Storage location unavailable; restore its volume before starting this VM.')
+                    if saved_config is not None:
+                        resource_summary_label.set_text(WorkspaceResourceEditor._summary(saved_config))
+                        resource_capacity_label.set_text(f'{saved_config.disk_gb:,} GiB sparse disk capacity')
                     resource_editor.sync(saved_config, {**latest_status, 'resource_operation': op.action == 'resources' and not embedded},
                                          busy=busy, active=bool(active_work(ws.root, environment_id=environment_id)))
                     if saved_config is not None:
@@ -23755,8 +23889,11 @@ def _unique_external_path(path: Path) -> Path:
 
 
 
-def _external_upload_target(destination_text: str, relative_path: str, *, scope_root: Path | None = None) -> Path:
-    destination = Path(str(destination_text or '')).expanduser().resolve()
+def _external_upload_target(destination_text: str, relative_path: str, *, scope_root: Path | None = None,
+                            authorize=None) -> Path:
+    requested_destination = Path(str(destination_text or '')).expanduser()
+    destination = (authorize(requested_destination) if authorize is not None
+                   else requested_destination.resolve())
     root = scope_root.resolve() if scope_root is not None else None
     if root is not None and not (destination == root or root in destination.parents):
         raise ValueError('Upload destination is outside this workspace Files/ scope')
@@ -23770,41 +23907,74 @@ def _external_upload_target(destination_text: str, relative_path: str, *, scope_
     if not safe_parts:
         raise ValueError('Invalid upload filename')
     target = destination.joinpath(*safe_parts)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target = _unique_external_path(target)
     resolved_target = target.resolve(strict=False)
     if root is not None and not (resolved_target == root or root in resolved_target.parents):
         raise ValueError('Upload path escapes this workspace Files/ scope')
+    if authorize is not None:
+        target = authorize(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target = _unique_external_path(target)
+    if authorize is not None:
+        target = authorize(target)
     return target
 
 
 async def _file_api_scope_root(machine: MachineStore, workspace_id: str) -> Path | None:
     if workspace_id == HOME_SCOPE_ID:
         return None
-    reg = machine.get_workspace(workspace_id)
+    project_scope = parse_project_files_scope(workspace_id)
+    reg = machine.get_workspace(project_scope[0] if project_scope else workspace_id)
     if not reg:
         raise ValueError('Workspace is not registered')
     ws = await asyncio.to_thread(_prepare_runtime_workspace, reg.path, reg.name)
+    if project_scope:
+        access = project_file_access(ws, project_scope[1])
+        return access.require_write(access.own_root)
     return ws.files_root.resolve()
 
 
-async def _stream_request_to_file(request: Request, target: Path) -> int:
+async def _file_api_write_guard(machine: MachineStore, scope_id: str):
+    project_scope = parse_project_files_scope(scope_id)
+    if project_scope is None:
+        return None
+    reg = machine.get_workspace(project_scope[0])
+    if reg is None:
+        raise ValueError('Workspace is not registered')
+    ws = await asyncio.to_thread(_prepare_runtime_workspace, reg.path, reg.name)
+    access = project_file_access(ws, project_scope[1])
+    return access.require_write
+
+
+async def _stream_request_to_file(request: Request, target: Path, *, authorize=None) -> int:
     written = 0
+    created_identity = None
     try:
         # Exclusive creation is an extra collision guard after
         # _unique_external_path; the browser uploader never overwrites silently.
+        if authorize is not None:
+            authorize(target)
         with target.open('xb') as f:
+            metadata = os.fstat(f.fileno())
+            created_identity = (metadata.st_dev, metadata.st_ino)
             async for chunk in request.stream():
                 if not chunk:
                     continue
+                if authorize is not None:
+                    authorize(target)
                 f.write(chunk)
                 written += len(chunk)
+            if authorize is not None:
+                authorize(target)
         return written
     except BaseException:
         # Browser cancellation, disconnect, ENOSPC, permission errors, etc. must
         # not leave a giant half-file masquerading as a completed upload.
         try:
-            target.unlink(missing_ok=True)
+            # An exclusive-open collision did not create this file. Never
+            # delete another upload's file while cleaning up our own failure.
+            metadata = target.lstat() if created_identity is not None else None
+            if metadata is not None and (metadata.st_dev, metadata.st_ino) == created_identity:
+                target.unlink(missing_ok=True)
         except Exception:
             pass
         raise
@@ -23919,13 +24089,15 @@ def _register_attachment_api(machine: MachineStore) -> None:
         try:
             workspace_id = str(request.query_params.get('workspace_id') or '')
             scope_root = await _file_api_scope_root(machine, workspace_id)
+            authorize = await _file_api_write_guard(machine, workspace_id)
             release_activity = TAB_ACTIVITY.acquire(HarnessyPage._tool_tab_key('files', workspace_id))
             target = _external_upload_target(
                 str(request.query_params.get('destination') or ''),
                 str(request.query_params.get('relative_path') or 'upload.bin'),
                 scope_root=scope_root,
+                authorize=authorize,
             )
-            written = await _stream_request_to_file(request, target)
+            written = await _stream_request_to_file(request, target, authorize=authorize)
             return {'ok': True, 'workspace_id': workspace_id, 'final': str(target), 'bytes': written}
         except Exception as exc:
             return {'ok': False, 'error': f'{type(exc).__name__}: {exc}'}
@@ -23942,6 +24114,7 @@ def _register_attachment_api(machine: MachineStore) -> None:
             form = await request.form()
             workspace_id = str(form.get('workspace_id') or '')
             scope_root = await _file_api_scope_root(machine, workspace_id)
+            authorize = await _file_api_write_guard(machine, workspace_id)
             release_activity = TAB_ACTIVITY.acquire(HarnessyPage._tool_tab_key('files', workspace_id))
             upload = form.get('file')
             if upload is None or not hasattr(upload, 'read'):
@@ -23950,19 +24123,13 @@ def _register_attachment_api(machine: MachineStore) -> None:
                 str(form.get('destination') or ''),
                 str(form.get('relative_path') or getattr(upload, 'filename', '') or 'upload.bin'),
                 scope_root=scope_root,
+                authorize=authorize,
             )
-            written = 0
-            try:
-                with target.open('xb') as f:
-                    while True:
-                        chunk = await upload.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        written += len(chunk)
-            except BaseException:
-                target.unlink(missing_ok=True)
-                raise
+            class MultipartBody:
+                async def stream(self):
+                    while chunk := await upload.read(1024 * 1024):
+                        yield chunk
+            written = await _stream_request_to_file(MultipartBody(), target, authorize=authorize)
             return {'ok': True, 'workspace_id': workspace_id, 'final': str(target), 'bytes': written}
         except Exception as exc:
             return {'ok': False, 'error': f'{type(exc).__name__}: {exc}'}
