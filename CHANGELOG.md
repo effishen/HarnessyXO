@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.24
+
+- Use reverse SSHFS for Kali's shared folders instead of relying on 9p support in its cloud kernel. Existing Kali VMs apply the new mount configuration on their next Start, preserving their virtual disk and workspace files.
+- Verify the backing folders before continuing desktop and isolation setup. Keep a VM that has booted separate from an environment that is Ready, and identify which shared folders are missing.
+- Include bounded shared-folder observations in **VM_MOUNTS.json**. Retain the mount transport, filesystem type, read-only state and guest 9p capability without exporting file contents or host paths. Diagnostics export uses saved observations.
+- Recognize Kali's kernel version in boot diagnostics when its version uses a plus sign before the distribution suffix.
+- Native Kali startup on the Spark still needs confirmation after updating. No VM rebuild is required for the mount configuration change.
+
 ## v0.7.23
 
 - Keep background database polling, composer saves, model-request storage/build work and file searches off the UI loop. Coalesce repeated status reads and skip queue maintenance writes when nothing needs changing. Keep accepted writes ordered when Stop is pressed.

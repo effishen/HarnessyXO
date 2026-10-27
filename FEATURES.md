@@ -1,4 +1,6 @@
-# HarnessyXO v0.7.23 Features
+# HarnessyXO v0.7.24 Features
+
+- Kali QEMU VMs use reverse SSHFS for shared folders, so their cloud kernel does not need 9p support. Start reconciles older Kali mount definitions while preserving the existing virtual disk. Shared folders are checked before desktop and isolation setup can complete.
 
 - Keep background queue polling, composer persistence, model storage/context preparation and file scans off the UI loop. Repeated status reads are coalesced, and busy storage can wait while the interface keeps handling events.
 - Keep the loaded page through brief connection interruptions. Unsent text has a bounded backup scoped to the signed-in user and project in the browser tab. Reconnect restores typing; Send and queue actions require a connection. Accepted sends, timeline restores and sign-out discard stale drafts.
@@ -16,6 +18,7 @@
 
 ## VM and external-device diagnostics
 
+- **VM_MOUNTS.json** retains bounded shared-folder checks with fixed folder roles, mount transport, filesystem type, read-only state and guest 9p capability. Missing shares keep the environment out of Ready. Export reads the saved checks without running guest commands or including host paths and project contents.
 - Lima create/start automatically saves selected-instance observations after 30 seconds without new output, at most once a minute afterward, and at failure before controller cleanup. **LIMA_STARTUP.json** and **lima-startup/** include verified hostagent/controller/QEMU process state, capability-check children, owned QMP status and serial-log coverage. Early and final captures are retained together. Missing and unsupported sources are explicit; diagnostics export reads saved observations without starting a VM or contacting its guest.
 - The startup card reports controller liveness and how long there has been no new output, separately from guest boot progress. The Kali running-status timeout remains under investigation; the new captures help identify its cause.
 - **Download Diagnostics** includes **GUEST_LOGS.json** and sanitized guest-log records alongside VM boot/controller evidence. Available OpenWrt and Linux connections receive fixed read-only system, kernel and SSH checks; stopped VMs are not started. Windows guest-log capture is reported as unsupported. Offline packaging uses saved observations.

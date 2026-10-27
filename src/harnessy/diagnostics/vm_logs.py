@@ -492,7 +492,9 @@ def _signals(line: str, kind: str, line_number: int) -> list[dict[str, Any]]:
 
     if kind == 'hostagent' and metadata.get('level') in {'warning', 'error', 'fatal', 'panic'}:
         add('hostagent_' + ('fatal' if metadata['level'] == 'panic' else metadata['level']))
-    kernel = re.search(r'\bLinux version (\d{1,3}\.\d{1,3}\.\d{1,4})(?:[-\s]|$)', message)
+    # Kali cloud kernels use a '+' flavour delimiter. Retain only the bounded
+    # numeric release; arbitrary build/flavour suffixes remain omitted.
+    kernel = re.search(r'\bLinux version (\d{1,3}\.\d{1,3}\.\d{1,4})(?:[-+\s]|$)', message)
     if kernel:
         add('kernel_boot', measurements={'kernel_version': kernel.group(1)})
     elif 'booting linux on physical cpu' in lower:
