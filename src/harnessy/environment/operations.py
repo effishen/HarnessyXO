@@ -90,7 +90,7 @@ class EnvironmentOperationRegistry:
             'provisioning_optional_packages', 'provisioning_ghidra',
             'provisioning_ghidra_arm64', 'provisioning_python_re',
             'provisioning_skipped_offline', 'finalizing_provisioning',
-            'installing_isolation', 'applying_isolation', 'verifying_isolation', 'ready',
+            'checking_workspace_files', 'installing_isolation', 'applying_isolation', 'verifying_isolation', 'ready',
         ),
         'stop': ('stopping_vm',),
         'tools': (
@@ -112,7 +112,7 @@ class EnvironmentOperationRegistry:
             'provisioning_required_packages', 'provisioning_optional_packages',
             'provisioning_ghidra', 'provisioning_ghidra_arm64', 'provisioning_python_re',
             'provisioning_skipped_offline',
-            'finalizing_provisioning', 'installing_isolation', 'applying_isolation',
+            'finalizing_provisioning', 'checking_workspace_files', 'installing_isolation', 'applying_isolation',
             'verifying_isolation', 'ready',
         ),
         'rebuild': (
@@ -121,7 +121,7 @@ class EnvironmentOperationRegistry:
             'provisioning_required_packages', 'provisioning_optional_packages',
             'provisioning_ghidra', 'provisioning_ghidra_arm64', 'provisioning_python_re',
             'provisioning_skipped_offline',
-            'finalizing_provisioning', 'installing_isolation', 'applying_isolation',
+            'finalizing_provisioning', 'checking_workspace_files', 'installing_isolation', 'applying_isolation',
             'verifying_isolation', 'ready',
         ),
     }

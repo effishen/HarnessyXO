@@ -262,6 +262,7 @@ class LimaVMEnvironment(WorkspaceEnvironment):
     TIMEOUT_DIAGNOSTIC_PRESERVE = 3.0
     TIMEOUT_DIAGNOSTIC_STARTUP = 3.0
     TIMEOUT_DIAGNOSTIC_STARTUP_QUIET = 6.0
+    TIMEOUT_WORKSPACE_MOUNTS = 5.0
     CONTROLLER_HEARTBEAT_SECONDS = 15.0
     STARTUP_QUIET_SECONDS = 30.0
     STARTUP_CAPTURE_INTERVAL_SECONDS = 60.0
@@ -3565,6 +3566,66 @@ print(json.dumps(facts))
         except Exception as exc:
             return f'Unable to collect guest guard diagnostics: {type(exc).__name__}: {exc}'
 
+    async def _probe_workspace_backing_mounts(self, *, phase: str = 'before_guard', boot_id: str = '') -> dict:
+        from .mount_readiness import (build_guest_mount_probe_script, parse_mount_probe,
+                                      unavailable_mount_snapshot)
+
+        references_required = self._references_binding_matches()
+        try:
+            rc, stdout, _stderr = await self._run(
+                'shell', '--workdir', '/', self.INSTANCE, 'python3', '-c',
+                build_guest_mount_probe_script(), timeout=self.TIMEOUT_WORKSPACE_MOUNTS,
+                check=False, diagnostic_probe=True,
+            )
+            snapshot = (parse_mount_probe(stdout, require_references=references_required,
+                                           expected_transport=self._mount_type()) if rc == 0
+                        else unavailable_mount_snapshot('transport_unavailable', require_references=references_required))
+        except asyncio.TimeoutError:
+            snapshot = unavailable_mount_snapshot('timeout', require_references=references_required)
+        except (ValueError, TypeError):
+            snapshot = unavailable_mount_snapshot('invalid_output', require_references=references_required)
+        except Exception:
+            snapshot = unavailable_mount_snapshot('probe_failed', require_references=references_required)
+        try:
+            from harnessy.diagnostics.workspace_mounts import record_workspace_mounts
+
+            await _bounded_diagnostic_io(
+                record_workspace_mounts, self.workspace_root,
+                environment_id=self.config.id, runtime_root=self.environment_root,
+                transport=self._mount_type(), state=snapshot['state'], phase=phase,
+                mounts=snapshot['mounts'], kernel_9p_supported=snapshot['kernel_9p_supported'],
+                references_required=references_required, boot_id=boot_id or None,
+                probe_error=snapshot['probe_error'], timeout=self.TIMEOUT_DIAGNOSTIC_RESOURCES,
+            )
+        except Exception:
+            # Observing a share determines readiness; retaining its receipt must
+            # never turn a working share into a lifecycle failure.
+            pass
+        return snapshot
+
+    def _require_workspace_mount_snapshot(self, snapshot: dict) -> None:
+        if (snapshot.get('state') == 'ready' and not snapshot.get('missing_roles')
+                and not snapshot.get('probe_error')):
+            return
+        from .mount_readiness import WorkspaceMountReadinessError
+
+        error = WorkspaceMountReadinessError(snapshot, transport=self._mount_type())
+        # The binding file records desired controller configuration, not proof
+        # that the guest mounted it. Reconcile on the next explicit Start.
+        self._write_readiness(ready=False, phase='mounts_unavailable', error=str(error))
+        _validate_registry_path(self.runtime_binding_path, self.workspace_root)
+        self.runtime_binding_path.unlink(missing_ok=True)
+        log_event('runtime', 'vm_workspace_mounts_unavailable', workspace=str(self.workspace_root),
+                  provider='lima', error_code=error.error_code, missing_roles=list(error.missing_roles),
+                  probe_error=snapshot.get('probe_error', 'probe_failed'),
+                  **self._controller_diagnostic_fields())
+        raise error
+
+    async def _verify_workspace_backing_mounts(self) -> dict:
+        snapshot = await self._probe_workspace_backing_mounts()
+        self._require_workspace_mount_snapshot(snapshot)
+        return snapshot
+
     async def _verify_workspace_view_isolation(self) -> None:
         """Prove that an isolated controller view works before declaring the VM Ready."""
         command = (
@@ -3627,6 +3688,11 @@ print(json.dumps(facts))
                 provider='lima', boot_id=boot_id, service_state=service_state,
             )
         except Exception as exc:
+            snapshot = await self._probe_workspace_backing_mounts(phase='verification_failed', boot_id=boot_id)
+            # A disappearing backing share is a file-sharing failure even when
+            # detected by the final namespace check after network setup.
+            if snapshot.get('state') == 'unavailable' and snapshot.get('missing_roles'):
+                self._require_workspace_mount_snapshot(snapshot)
             detail = await self._guard_failure_detail()
             message = f'{type(exc).__name__}: {exc}'
             if detail:
@@ -3635,12 +3701,15 @@ print(json.dumps(facts))
             log_event(
                 'harnessy', 'vm_isolation_guard_failed', workspace=str(self.workspace_root),
                 provider='lima', detail=message,
+                projection_error_code=workspace_projection_failure(72, str(exc)),
             )
             raise RuntimeError(
                 'Workspace VM started, but its isolation/readiness setup failed. '
                 'The VM is not Ready and no workspace terminal or model command was run. '
                 f'{message}'
             ) from exc
+        snapshot = await self._probe_workspace_backing_mounts(phase='after_guard', boot_id=boot_id)
+        self._require_workspace_mount_snapshot(snapshot)
         self._write_readiness(ready=True, phase='ready', boot_id=boot_id, guard_hash=self._expected_guard_hash())
         log_event('runtime', 'vm_isolation_guard_verified', workspace=str(self.workspace_root), provider='lima', boot_id=boot_id)
 
@@ -3694,6 +3763,10 @@ print(json.dumps(facts))
             )
             await self.stop()
             status = await self.status()
+            if status.running:
+                message = 'The VM did not stop. Its file-sharing configuration was not changed. Stop it before trying Start again.'
+                self._write_readiness(ready=False, phase='binding_reconcile_failed', error=message)
+                raise RuntimeError(message)
         if not status.running:
             if binding_needs_reconcile or not self._references_binding_matches():
                 await report(
@@ -3752,6 +3825,9 @@ print(json.dumps(facts))
         # Package installation is explicit one-time disk setup, never a Lima
         # per-boot provision script. Existing older VMs are adopted in place.
         await self._ensure_preset_provisioned(progress=progress)
+        await report('checking_workspace_files', 'Checking workspace file sharing…',
+                     stage_timeout_seconds=self.TIMEOUT_WORKSPACE_MOUNTS)
+        await self._verify_workspace_backing_mounts()
         await self._ensure_desktop(progress=progress)
         await self._enforce_runtime_guard(progress=progress)
         await self._record_verified_guest()

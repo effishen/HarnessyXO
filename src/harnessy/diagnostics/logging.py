@@ -331,7 +331,7 @@ _VM_DIAGNOSTIC_ENUMS = {
         'checking_provisioning', 'adopting_provisioning', 'provisioning_packages',
         'provisioning_package_index', 'provisioning_required_packages', 'provisioning_optional_packages',
         'provisioning_ghidra', 'provisioning_ghidra_arm64', 'provisioning_python_re', 'provisioning_rea',
-        'provisioning_skipped_offline', 'finalizing_provisioning', 'installing_isolation',
+        'provisioning_skipped_offline', 'finalizing_provisioning', 'checking_workspace_files', 'installing_isolation',
         'applying_isolation', 'verifying_isolation', 'ready', 'stopping_vm',
         'tools_saving', 'tools_removing', 'tools_pending', 'tools_installing', 'tools_complete',
         'preparing_snapshot', 'stopping_snapshot_vm', 'cloning_snapshot', 'saving_snapshot',
@@ -2387,6 +2387,11 @@ def _privacy_manifest(*, include_content: bool = False) -> str:
         'timestamps, freshness and explicitly last-known observations distinguish old readings from current '
         'failures. Fixed roles replace guest paths; file names and content are excluded. Export only reads '
         'receipts and never starts a VM, runs SSH or scans project files.\n\n'
+        'VM_MOUNTS.json records up to eight persisted backing-mount observations per VM: fixed Files, '
+        'worktrees and references roles, mount transport, directory/mount/read-only state, reviewed '
+        'filesystem kinds, kernel 9p support, boot identity and fixed failure codes. Missing and invalid '
+        'receipts remain explicit. Paths, mount sources, commands and file content are excluded in both '
+        'export modes. Export reads saved observations only and never runs SSH or verifies live mounts.\n\n'
         'VM_RESOURCES.json records bounded persisted guest CPU usage/iowait percentages, vCPU count and '
         'sample interval, memory/cache/swap byte counters, load averages and uptime. Resource timestamps '
         'and freshness are separate from disk observations; last-known readings remain explicitly stale. '
@@ -2674,6 +2679,14 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
                 storage_report = {'schema_version': 1, 'status': 'collector_failed',
                                   'environments': [], 'technical_error': technical_error_evidence(exc)}
             try:
+                from .workspace_mounts import collect_workspace_mount_diagnostics
+                mount_report = collect_workspace_mount_diagnostics(latest)
+            except Exception as exc:
+                from .technical import technical_error_evidence
+                mount_report = {'schema_version': 1, 'status': 'collector_failed',
+                                'scope': 'persisted_runtime_observations', 'environments': [],
+                                'technical_error': technical_error_evidence(exc)}
+            try:
                 from .vm_resources import collect_resource_diagnostics
                 resource_report = collect_resource_diagnostics(latest)
             except Exception as exc:
@@ -2702,9 +2715,11 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
                            'VM_LOGS.json records VM log source coverage; available retained VM evidence is under vm-logs/.\n')
             from .file_views import summary_lines as file_view_summary_lines
             from .vm_storage import summary_lines as storage_summary_lines
+            from .workspace_mounts import summary_lines as mount_summary_lines
             from .vm_resources import summary_lines as resource_summary_lines
             summary += file_view_summary_lines(file_view_report)
             summary += storage_summary_lines(storage_report)
+            summary += mount_summary_lines(mount_report)
             summary += resource_summary_lines(resource_report)
             try:
                 from .guest_logs import summary_lines as guest_summary_lines
@@ -2726,6 +2741,7 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
             zf.writestr('SUMMARY.txt', summary)
             zf.writestr('FILE_VIEWS.json', json.dumps(file_view_report, ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('VM_STORAGE.json', json.dumps(storage_report, ensure_ascii=False, indent=2, allow_nan=False))
+            zf.writestr('VM_MOUNTS.json', json.dumps(mount_report, ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('VM_RESOURCES.json', json.dumps(resource_report, ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('INCIDENTS.json', json.dumps(incidents, ensure_ascii=False, indent=2))
             zf.writestr('PERMISSIONS.json', json.dumps(incidents.get('permission_audit', {
@@ -2754,7 +2770,8 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
             zf.writestr('COLLECTOR_ERRORS.json', json.dumps({
                 'schema_version': 1, 'collectors': {name: value for name, value in
                     (('summary', incidents), ('workspace_vm', vm_report), ('test_targets', target_report), ('host', host_report),
-                     ('file_views', file_view_report), ('vm_storage', storage_report), ('vm_resources', resource_report),
+                     ('file_views', file_view_report), ('vm_storage', storage_report), ('vm_mounts', mount_report),
+                     ('vm_resources', resource_report),
                      ('guest_logs', guest_report), ('vm_stalls', vm_stall_report),
                      ('lima_startup', lima_startup_report), ('external_devices', external_device_report))
                     if value.get('technical_error')},
