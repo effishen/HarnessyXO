@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.7.27
+
+- Skip automatic desktop package installation during Start when the running Kali cloud kernel is already verified to lack the required graphics support. Complete terminal/model startup after its independent checks; use **Repair Desktop** for the explicit kernel and graphical setup.
+- Show bounded desktop installation observations while work runs: the current setup step, command elapsed time, output byte count and time since its last output. Treat these as command activity, not proof of download progress or Desktop Ready.
+- Retain fixed desktop failure reasons and setup activity in **VM_DESKTOP.json**, including package-manager, network and storage categories. Keep raw package output, repository addresses and guest prose excluded.
+- Preserve the existing VM disk and controlled restart checks. Native Spark graphics and repository behavior still need confirmation after updating.
+
 ## v0.7.26
 
 - Track Desktop readiness separately from terminal/model readiness. Check actual graphics output, LightDM, Xorg, the Xfce session and X11 instead of trusting an installation marker and an enabled service.

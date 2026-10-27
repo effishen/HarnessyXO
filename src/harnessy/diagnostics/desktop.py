@@ -23,6 +23,11 @@ ERROR_CODES = frozenset({'NONE', 'DESKTOP_PROBE_FAILED', 'DESKTOP_PREREQUISITE_M
     'DESKTOP_KERNEL_UNSUPPORTED', 'DESKTOP_KERNEL_VERIFY_FAILED', 'DESKTOP_BOOT_POLICY_CUSTOM',
     'DESKTOP_BOOT_VERIFY_FAILED', 'DESKTOP_SESSION_NOT_READY', 'DESKTOP_REPAIR_TIMEOUT',
     'DESKTOP_REPAIR_CANCELLED', 'DESKTOP_REPAIR_BUSY', 'DESKTOP_ARCH_MISMATCH', 'DESKTOP_REPAIR_FAILED'})
+FAILURE_REASONS = frozenset({'dns_failed', 'network_timeout', 'repository_error',
+    'package_unavailable', 'package_lock', 'storage_full', 'package_command_failed',
+    'command_timeout', 'unknown'})
+PHASES = frozenset({'checking', 'package_index', 'packages', 'kernel', 'boot', 'session', 'verifying'})
+_LIVE_SECONDS = ('elapsed_seconds', 'command_elapsed_seconds', 'last_output_age_seconds')
 BOOLEAN_FIELDS = ('cloud_kernel', 'drm_configured', 'drm_supported', 'virtio_gpu_configured',
                   'virtio_gpu_module', 'virtio_gpu_loaded', 'scanout_active', 'framebuffer',
                   'lightdm_active', 'xorg_installed', 'xfce_installed', 'xorg_running',
@@ -61,6 +66,10 @@ def project_desktop(value: Any) -> dict[str, Any]:
         raise ValueError('Invalid desktop observation timestamp.')
     out = {'schema_version': 1, 'revision': '1', 'environment_id': eid,
            'workspace_id': wid, 'state': state, 'error_code': code, 'observed_at_epoch': stamp}
+    reason = value.get('failure_reason', 'unknown')
+    if not isinstance(reason, str) or reason not in FAILURE_REASONS:
+        raise ValueError('Invalid desktop failure reason.')
+    out['failure_reason'] = reason
     boot = value.get('boot_id')
     if boot is not None:
         if not isinstance(boot, str) or len(boot) != 36:
@@ -72,6 +81,26 @@ def project_desktop(value: Any) -> dict[str, Any]:
         if str(parsed) != boot.lower():
             raise ValueError('Invalid desktop boot identity.')
         out['boot_id'] = str(parsed)
+    live_fields = ('phase', *_LIVE_SECONDS, 'output_bytes')
+    if any(name in value for name in live_fields):
+        if 'boot_id' not in out:
+            raise ValueError('Live desktop observations require a boot identity.')
+        phase = value.get('phase')
+        if not isinstance(phase, str) or phase not in PHASES:
+            raise ValueError('Invalid desktop observation phase.')
+        out['phase'] = phase
+        for name in _LIVE_SECONDS:
+            item = value.get(name)
+            if item is None and name == 'last_output_age_seconds':
+                out[name] = None
+            elif type(item) not in (int, float) or not 0 <= item <= 900 or not math.isfinite(item):
+                raise ValueError('Invalid desktop observation duration.')
+            else:
+                out[name] = item
+        count = value.get('output_bytes')
+        if type(count) is not int or not 0 <= count <= 2**40:
+            raise ValueError('Invalid desktop output byte count.')
+        out['output_bytes'] = count
     for name in BOOLEAN_FIELDS:
         item = value.get(name)
         if item is not None and type(item) is not bool:
@@ -273,8 +302,16 @@ def summary_lines(report) -> str:
         if row.get('receipt_status') != 'included' or not isinstance(sample, dict):
             lines.append(label + ': desktop receipt ' + str(row.get('receipt_status', 'unavailable')) + '.')
         else:
+            phase = sample.get('phase')
+            if phase is None and sample.get('boot_id'):
+                receipts = row.get('receipts', [])
+                phase = next((item['phase'] for item in reversed(receipts[-MAX_RECEIPTS:])
+                              if isinstance(item, dict) and item.get('boot_id') == sample['boot_id']
+                              and item.get('phase') in PHASES), None)
             lines.append(label + ': last observed ' + sample['state'] + ', epoch '
-                         + str(sample['observed_at_epoch']) + ('; ' + sample['error_code'] if sample['error_code'] else '') + '.')
+                         + str(sample['observed_at_epoch']) + ('; ' + sample['error_code'] if sample['error_code'] else '')
+                         + ('; reason=' + sample['failure_reason'] if sample['failure_reason'] != 'unknown' else '')
+                         + ('; last observed phase=' + phase if phase is not None else '') + '.')
     if not rows:
         lines.append('  No retained per-VM desktop observations were discovered.')
     lines.append('  Retained observations do not establish the current boot or desktop health.')

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 
 DESKTOP_SETUP_REVISION = '1'
@@ -17,7 +18,9 @@ DESKTOP_SETUP_ERRORS = frozenset({'NONE', 'DESKTOP_PROBE_FAILED',
 DESKTOP_SETUP_STATES = frozenset({'ready', 'unavailable', 'checking', 'reboot_required',
     'manual_boot_required', 'failed', 'disabled', 'unknown'})
 DESKTOP_FAILURE_REASONS = frozenset({'dns_failed', 'network_timeout', 'repository_error',
-    'package_unavailable', 'package_lock', 'storage_full', 'package_command_failed', 'unknown'})
+    'command_timeout', 'package_unavailable', 'package_lock', 'storage_full', 'package_command_failed', 'unknown'})
+DESKTOP_EVENT_STAGES = frozenset({'checking', 'package_index', 'packages', 'kernel',
+                                 'boot', 'session', 'verifying'})
 _VERSION = re.compile(r'\d{1,3}\.\d{1,3}\.\d{1,4}')
 _UUID = re.compile(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}')
 _HASH = re.compile(r'[0-9a-f]{64}')
@@ -90,6 +93,37 @@ def parse_desktop_repair(stdout: str) -> dict:
     return _project(raw)
 
 
+def parse_desktop_event(line: str) -> dict | None:
+    """Accept only the bounded technical protocol, never child command output."""
+    if not isinstance(line, str) or len(line) > 2048 or not line.startswith('HARNESSY_DESKTOP_EVENT='):
+        return None
+    try:
+        raw = json.loads(line.partition('=')[2])
+    except (ValueError, TypeError):
+        return None
+    if (not isinstance(raw, dict) or type(raw.get('schema_version')) is not int
+            or raw['schema_version'] != 1 or not isinstance(raw.get('boot_id'), str)
+            or not _UUID.fullmatch(raw['boot_id']) or not isinstance(raw.get('stage'), str)
+            or raw['stage'] not in DESKTOP_EVENT_STAGES):
+        return None
+    result = {name: raw[name] for name in ('schema_version', 'boot_id', 'stage')}
+    for field in ('elapsed_seconds', 'command_elapsed_seconds', 'last_output_age_seconds'):
+        if field not in raw:
+            return None
+        value = raw[field]
+        if field == 'last_output_age_seconds' and value is None:
+            result[field] = None
+        elif type(value) in (int, float) and 0 <= value <= 900 and math.isfinite(value):
+            result[field] = float(value)
+        else:
+            return None
+    value = raw.get('output_bytes')
+    if type(value) is not int or not 0 <= value <= 2 ** 40:
+        return None
+    result['output_bytes'] = value
+    return result
+
+
 _GUEST = r'''
 import fcntl
 import hashlib
@@ -129,13 +163,34 @@ LOCK_FD = None
 RELEASE = os.uname().release
 RELEASE_SAFE = bool(re.fullmatch(r'[A-Za-z0-9._+-]{1,96}', RELEASE))
 BOOT_ID = ''
+EVENT_STARTED = time.monotonic()
+EVENT_STAGE = 'checking'
+HEARTBEAT_SECONDS = 10.0
 
 class Failure(Exception):
     def __init__(self, code, reason='unknown'):
         self.code, self.reason = code, reason
 
-def action(name, text):
+def event(stage=None, *, command_elapsed=0.0, output_bytes=0, last_output_age=None):
+    global EVENT_STAGE
+    if not LOG_ACTIONS:
+        return
+    if stage is not None:
+        EVENT_STAGE = stage
+    boot = BOOT_ID or text(PROC / 'sys/kernel/random/boot_id', 64, root=False)
+    if not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', boot):
+        return
+    payload = dict(schema_version=1, boot_id=boot, stage=EVENT_STAGE,
+        elapsed_seconds=round(min(900.0, max(0.0, time.monotonic() - EVENT_STARTED)), 3),
+        command_elapsed_seconds=round(min(900.0, max(0.0, command_elapsed)), 3),
+        output_bytes=min(2 ** 40, max(0, output_bytes)),
+        last_output_age_seconds=None if last_output_age is None else round(min(900.0, max(0.0, last_output_age)), 3))
+    print('HARNESSY_DESKTOP_EVENT=' + json.dumps(payload, separators=(',', ':')), flush=True)
+
+def action(name, text, stage=None):
     if LOG_ACTIONS:
+        if stage is not None:
+            event(stage)
         print('[%d] %s %s' % (int(time.time()), name, text), flush=True)
 
 def read_file(path, limit, root=True):
@@ -203,7 +258,7 @@ def terminate(process):
 def run(arguments, seconds):
     remaining = min(seconds, DEADLINE - time.monotonic())
     if remaining <= 0:
-        raise Failure('DESKTOP_REPAIR_TIMEOUT', 'network_timeout')
+        raise Failure('DESKTOP_REPAIR_TIMEOUT', 'command_timeout')
     environment = dict(os.environ, LC_ALL='C', LANG='C', DEBIAN_FRONTEND='noninteractive', NEEDRESTART_MODE='a')
     for key in list(environment):
         if key.startswith('GRUB_'):
@@ -216,18 +271,30 @@ def run(arguments, seconds):
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ)
     output = bytearray()
-    expires = time.monotonic() + remaining
+    started = time.monotonic()
+    expires = started + remaining
+    next_heartbeat = started + HEARTBEAT_SECONDS
+    output_bytes = 0
+    last_output = None
     exited = None
     try:
+        event(command_elapsed=0.0, output_bytes=0, last_output_age=None)
         while time.monotonic() < expires:
             for key, _ in selector.select(min(.1, max(.001, expires - time.monotonic()))):
                 data = os.read(key.fileobj.fileno(), 8192)
                 if data:
+                    output_bytes += len(data)
+                    last_output = time.monotonic()
                     output.extend(data)
                     del output[:-65536]
                 else:
                     selector.unregister(key.fileobj)
             code = process.poll()
+            now = time.monotonic()
+            if code is None and now >= next_heartbeat:
+                event(command_elapsed=now - started, output_bytes=output_bytes,
+                      last_output_age=None if last_output is None else now - last_output)
+                next_heartbeat = now + HEARTBEAT_SECONDS
             if code is not None:
                 if not selector.get_map():
                     return code, bytes(output)
@@ -381,6 +448,7 @@ PUBLIC_NETWORK = __PUBLIC_NETWORK__
 ALLOW_KERNEL = __ALLOW_KERNEL__
 LOG_ACTIONS = True
 DEADLINE = time.monotonic() + 880.0
+EVENT_STARTED = time.monotonic()
 RESULT = dict(schema_version=1, state='failed', error_code='DESKTOP_REPAIR_FAILED', failure_reason='unknown')
 
 def interrupted(signum, frame):
@@ -400,7 +468,7 @@ def classify(code, output):
     ):
         if any(word in value for word in words):
             return label
-    return 'network_timeout' if code == 124 else 'package_command_failed'
+    return 'command_timeout' if code == 124 else 'package_command_failed'
 
 def lock():
     global LOCK_FD
@@ -423,11 +491,12 @@ def apt(packages):
         raise Failure('DESKTOP_OFFLINE')
     options = ['-o', 'Acquire::Retries=1', '-o', 'Acquire::http::Timeout=15',
         '-o', 'Acquire::https::Timeout=15', '-o', 'DPkg::Lock::Timeout=30']
-    action('INSTALL', 'Refreshing guest package indexes for the graphical desktop')
+    action('INSTALL', 'Refreshing guest package indexes for the graphical desktop', 'package_index')
     code, output = run(['apt-get', *options, 'update'], 90)
     if code:
         raise Failure('DESKTOP_APT_UPDATE_FAILED', classify(code, output))
-    action('INSTALL', 'Installing selected graphical desktop dependencies')
+    action('INSTALL', 'Installing selected graphical desktop dependencies',
+           'kernel' if any(item.startswith('linux-image-') for item in packages) else 'packages')
     code, output = run(['apt-get', *options, 'install', '-y', '--no-install-recommends', *packages], 650)
     if code:
         raise Failure('DESKTOP_APT_INSTALL_FAILED', classify(code, output))
@@ -440,7 +509,7 @@ def install_desktop():
         raise Failure('DESKTOP_OFFLINE')
     if not shutil.which('dnf'):
         raise Failure('DESKTOP_PREREQUISITE_MISSING')
-    action('INSTALL', 'Installing selected graphical desktop dependencies')
+    action('INSTALL', 'Installing selected graphical desktop dependencies', 'packages')
     code, output = run(['dnf', '--setopt=timeout=15', '--setopt=retries=1', 'install', '-y',
         '@xfce-desktop-environment', 'lightdm', 'xorg-x11-server-Xorg', 'dbus-x11'], 650)
     if code:
@@ -549,6 +618,7 @@ def boot_policy():
     return True
 
 def select_boot(release):
+    action('CHECK', 'Inspecting the guest boot policy', 'boot')
     if not boot_policy():
         return False
     before_cfg = read_file(GRUB_CFG, 4194304)
@@ -559,7 +629,7 @@ def select_boot(release):
     GRUB_DROPINS.mkdir(mode=0o755, exist_ok=True)
     payload = ("# Managed by HarnessyXO desktop repair.\nGRUB_TOP_LEVEL='/boot/vmlinuz-" + release + "'\n").encode()
     atomic(OWN_GRUB, payload)
-    action('CONFIGURE', 'Selecting the verified generic kernel: /etc/default/grub.d/60_harnessy-desktop.cfg')
+    action('CONFIGURE', 'Selecting the verified generic kernel: /etc/default/grub.d/60_harnessy-desktop.cfg', 'boot')
     try:
         code, output = run(['update-grub'], 40)
         if code:
@@ -633,6 +703,7 @@ def select_boot(release):
     return True
 
 def configure_session():
+    action('CHECK', 'Checking the graphical session configuration', 'session')
     code, output = run(['id', '-un', os.environ.get('SUDO_USER', '')], 3) if os.environ.get('SUDO_USER') else (1, b'')
     user = output.decode(errors='replace').strip()
     if code or not re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}', user) or user == 'root':
@@ -640,7 +711,7 @@ def configure_session():
     LIGHTDM_DIR.mkdir(mode=0o755, parents=True, exist_ok=True)
     payload = ('[Seat:*]\nautologin-user=' + user + '\nautologin-user-timeout=0\nuser-session=xfce\n').encode()
     atomic(OWN_LIGHTDM, payload)
-    action('CONFIGURE', 'Graphical session: /etc/lightdm/lightdm.conf.d/50-harnessy.conf')
+    action('CONFIGURE', 'Graphical session: /etc/lightdm/lightdm.conf.d/50-harnessy.conf', 'session')
     for arguments in (['systemctl', 'set-default', 'graphical.target'], ['systemctl', 'enable', 'lightdm'], ['systemctl', 'restart', 'lightdm']):
         if run(arguments, 20)[0]:
             raise Failure('DESKTOP_SESSION_NOT_READY')
@@ -652,11 +723,15 @@ def main():
     if machine_arch() != EXPECTED_ARCH:
         raise Failure('DESKTOP_ARCH_MISMATCH')
     lock()
-    action('CHECK', 'Inspecting the current guest graphics and desktop session')
+    action('CHECK', 'Inspecting the current guest graphics and desktop session', 'checking')
     RESULT = probe()
     if RESULT['state'] == 'ready':
         return
     needs_kernel = RESULT['kernel_repair_needed']
+    if needs_kernel and not ALLOW_KERNEL:
+        raise Failure('DESKTOP_KERNEL_UNSUPPORTED')
+    if needs_kernel:
+        action('CHECK', 'Verifying the available generic graphics kernel', 'kernel')
     selected = candidate() if needs_kernel and ALLOW_KERNEL else None
     missing_desktop = not (RESULT['xorg_installed'] and RESULT['xfce_installed'] and executable('lightdm'))
     missing_kernel = needs_kernel and ALLOW_KERNEL and selected is None
@@ -668,8 +743,7 @@ def main():
     if not (executable('Xorg') and executable('startxfce4') and executable('lightdm')):
         raise Failure('DESKTOP_APT_INSTALL_FAILED')
     if needs_kernel:
-        if not ALLOW_KERNEL:
-            raise Failure('DESKTOP_KERNEL_UNSUPPORTED')
+        action('VERIFY', 'Verifying the installed generic graphics kernel', 'kernel')
         selected = candidate()
         if selected is None:
             raise Failure('DESKTOP_KERNEL_VERIFY_FAILED')
@@ -683,9 +757,10 @@ def main():
         action('REBOOT_REQUIRED', 'Verified generic kernel staged; the existing VM disk and fallback kernel are retained')
         return
     if RESULT['kernel_graphics'] == 'supported' and not RESULT['virtio_gpu_loaded']:
+        action('CONFIGURE', 'Loading the available guest graphics driver', 'kernel')
         run(['modprobe', 'virtio_gpu'], 10)
     configure_session()
-    action('VERIFY', 'Waiting for an active graphical scanout and Xfce session')
+    action('VERIFY', 'Waiting for an active graphical scanout and Xfce session', 'verifying')
     end = min(DEADLINE - 5, time.monotonic() + 30)
     while time.monotonic() < end:
         RESULT = probe()
