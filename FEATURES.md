@@ -1,9 +1,9 @@
-# HarnessyXO v0.7.27 Features
+# HarnessyXO v0.7.28 Features
 
-- Start skips desktop package installation when the running Kali cloud kernel is already known to lack the required graphics support. It completes the terminal/model checks and points to **Repair Desktop** for the kernel and GUI setup. Desktop installation reports its current step, elapsed time and recent package-output activity; saved diagnostics retain fixed failure reasons.
+- A desktop-enabled VM completes its kernel and graphical setup through normal **Start / Retry Setup**, Create, Rebuild and Factory Reset controls. These human actions verify the desktop before reporting success. Internal model/terminal startup retains independent CLI readiness. Desktop installation reports its current step, elapsed time and recent package-output activity; saved diagnostics retain fixed failure reasons.
 
 - Terminal/model Ready and Desktop Ready are separate. Verify the running graphical session and active display before opening the browser desktop; a VNC connection alone does not prove that the guest has graphics output.
-- Desktop-enabled Lima Linux VMs have **Repair Desktop**. Finish their tasks and close their tabs first. Repair keeps the VM disk and older kernels, can add the generic Kali kernel when the cloud kernel lacks graphics support, and verifies supported boot settings before restarting. Custom boot policies remain explicit. **VM_DESKTOP.json** retains bounded, content-free observations.
+- Complete desktop setup while the VM is idle. Setup can add the generic Kali kernel when the cloud kernel lacks graphics support and verifies supported boot settings before restarting. Existing VM disks and older kernels are retained during Start / Retry Setup; Rebuild and Factory Reset keep their existing reset behavior. Custom boot policies remain explicit. **VM_DESKTOP.json** retains bounded, content-free observations.
 
 - Prepare SSHFS before Lima requires shared-folder mounts. Missing-helper setup and package failures have bounded waits and specific errors. An idle degraded VM can retry setup using its existing disk; model commands still require verified mounts and isolation.
 

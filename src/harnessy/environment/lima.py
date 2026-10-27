@@ -72,21 +72,21 @@ class SSHFSSetupError(RuntimeError):
 class DesktopSetupError(RuntimeError):
     def __init__(self, code: str) -> None:
         messages = {
-            'DESKTOP_KERNEL_UNSUPPORTED': 'The guest kernel does not provide the graphics support this desktop needs. Use Repair Desktop to prepare a desktop-capable kernel.',
+            'DESKTOP_KERNEL_UNSUPPORTED': 'Desktop setup needs a graphics-capable guest kernel. Use Retry Setup to finish preparing this VM.',
             'DESKTOP_BOOT_POLICY_CUSTOM': 'A desktop kernel is staged, but the guest has custom boot settings. Choose the desktop-capable kernel in the guest boot settings, then restart the VM.',
-            'DESKTOP_BOOT_VERIFY_FAILED': 'The VM did not boot the verified desktop kernel. Check its guest boot settings before trying Repair Desktop again.',
+            'DESKTOP_BOOT_VERIFY_FAILED': 'The VM did not boot the verified desktop kernel. Check its guest boot settings before using Retry Setup again.',
             'DESKTOP_KERNEL_VERIFY_FAILED': 'The desktop kernel could not be verified. No automatic restart was performed.',
-            'DESKTOP_OFFLINE': 'Desktop packages are missing and public outbound is disabled. Enable public outbound, then use Repair Desktop.',
-            'DESKTOP_APT_UPDATE_FAILED': 'The guest could not refresh the desktop package list. Check its network and package repositories, then retry Repair Desktop.',
-            'DESKTOP_APT_INSTALL_FAILED': 'The guest could not install the desktop packages. Check its package manager, then retry Repair Desktop.',
-            'DESKTOP_SESSION_NOT_READY': 'The guest desktop session is not active. Use Repair Desktop to check its display manager and graphics support.',
+            'DESKTOP_OFFLINE': 'Desktop packages are missing and public outbound is disabled. Enable public outbound, then use Retry Setup.',
+            'DESKTOP_APT_UPDATE_FAILED': 'The guest could not refresh the desktop package list. Check its network and package repositories, then use Retry Setup.',
+            'DESKTOP_APT_INSTALL_FAILED': 'The guest could not install the desktop packages. Check its package manager, then use Retry Setup.',
+            'DESKTOP_SESSION_NOT_READY': 'The guest desktop session is not active. Use Retry Setup to finish preparing its display and session.',
             'DESKTOP_REPAIR_TIMEOUT': 'Desktop setup exceeded its time limit. Check the guest package manager and network before retrying.',
-            'DESKTOP_REPAIR_BUSY': 'Finish this VM’s active work before repairing its desktop.',
-            'DESKTOP_ARCH_MISMATCH': 'The desktop repair does not match this guest architecture.',
+            'DESKTOP_REPAIR_BUSY': 'Finish this VM’s active work before completing desktop setup.',
+            'DESKTOP_ARCH_MISMATCH': 'Desktop setup does not match this guest architecture.',
             'DESKTOP_PREREQUISITE_MISSING': 'A required guest desktop setup tool is missing.',
-            'DESKTOP_PROBE_FAILED': 'The guest desktop could not be checked. Retry Desktop after confirming that the VM is running.',
-            'DESKTOP_REPAIR_FAILED': 'Desktop setup failed. Check the guest display manager and package manager, then retry Repair Desktop.',
-            'DESKTOP_REPAIR_CANCELLED': 'Desktop repair was cancelled.',
+            'DESKTOP_PROBE_FAILED': 'The guest desktop could not be checked. Use Retry Setup after confirming that the VM is running.',
+            'DESKTOP_REPAIR_FAILED': 'Desktop setup failed. Check the guest display manager and package manager, then use Retry Setup.',
+            'DESKTOP_REPAIR_CANCELLED': 'Desktop setup was cancelled.',
         }
         self.error_code = code if isinstance(code, str) and code in messages else 'DESKTOP_REPAIR_FAILED'
         super().__init__(messages[self.error_code] + ' CLI readiness is checked separately; the VM disk and project files were preserved.')
@@ -700,17 +700,22 @@ class LimaVMEnvironment(WorkspaceEnvironment):
             if await drain_controller():
                 raise asyncio.CancelledError
 
-    async def _recover_running_sshfs(self, progress=None) -> EnvironmentStatus:
-        release = reserve_environment_change(self.workspace_root, 'file sharing setup', environment_id=self.config.id)
+    async def _recover_running_sshfs(self, progress=None, *, reservation_held: bool = False,
+                                     cancel_event: asyncio.Event | None = None) -> EnvironmentStatus:
+        release = ((lambda: None) if reservation_held else
+                   reserve_environment_change(self.workspace_root, 'file sharing setup', environment_id=self.config.id))
         try:
             await self._prepare_running_sshfs(progress=progress)
+            self._check_setup_cancelled(cancel_event)
             await self.stop()
             status = await self.status()
             if status.running or status.state != 'stopped':
                 message = 'The VM did not stop. Its file-sharing configuration was not changed. Stop it before trying Start again.'
                 self._write_readiness(ready=False, phase='binding_reconcile_failed', error=message)
                 raise RuntimeError(message)
+            self._check_setup_cancelled(cancel_event)
             await self._reconcile_runtime_binding(force=True)
+            self._check_setup_cancelled(cancel_event)
             self._clear_readiness('starting_vm')
             await self._start_lima_with_sshfs_monitor(progress=progress)
             return await self.status()
@@ -3600,7 +3605,7 @@ exit $rc
         ready = snapshot.get('state') == 'ready' and snapshot.get('error_code') == 'NONE'
         code = str(snapshot.get('error_code') or 'DESKTOP_PROBE_FAILED')
         if snapshot.get('state') == 'reboot_required':
-            message = 'Desktop support is staged. Use Repair Desktop to restart and verify it.'
+            message = 'Desktop support is staged. Use Retry Setup to restart and verify it.'
         elif snapshot.get('state') == 'checking' and code == 'NONE':
             message = ''
         else:
@@ -3740,61 +3745,82 @@ exit $rc
             raise DesktopSetupError(str(snapshot.get('error_code') or 'DESKTOP_SESSION_NOT_READY'))
         return snapshot
 
-    async def _repair_desktop_locked(self, progress=None, *, cancel_event: asyncio.Event | None = None) -> EnvironmentStatus:
-        def check_cancelled() -> None:
-            if cancel_event is not None and cancel_event.is_set():
-                raise asyncio.CancelledError
+    @staticmethod
+    def _check_setup_cancelled(cancel_event: asyncio.Event | None) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise asyncio.CancelledError
 
-        async with self._workspace_start_lock():
-            self._refresh_saved_network_policy()
-            if not self.config.desktop:
-                raise RuntimeError('Enable this VM’s desktop before repairing it.')
-            status = await self.status()
-            if not status.running or not await self._current_boot_is_verified():
-                raise RuntimeError('Finish Start / Retry Setup before repairing this desktop.')
-            original_boot = str(self._read_readiness().get('boot_id') or '')
-            await self._emit_progress(progress, 'desktop_checking', 'Checking the guest desktop…')
-            check_cancelled()
-            result = await self._run_desktop_repair(allow_kernel_repair=True, progress=progress)
-            check_cancelled()
-            if result.get('state') not in {'ready', 'reboot_required'}:
-                raise DesktopSetupError(str(result.get('error_code') or 'DESKTOP_REPAIR_FAILED'))
-            candidate = str(result.get('candidate_kernel_sha256') or '')
-            if result.get('state') == 'reboot_required':
-                if not re.fullmatch(r'[0-9a-f]{64}', candidate):
-                    raise DesktopSetupError('DESKTOP_KERNEL_VERIFY_FAILED')
-                await self._emit_progress(progress, 'desktop_restarting', 'Restarting the VM to verify desktop support…',
-                    detail='The existing VM disk and earlier kernels are preserved.',
-                    stage_timeout_seconds=self.TIMEOUT_STOP + self.TIMEOUT_START)
-                check_cancelled()
-                await self.stop()
-                stopped = await self.status()
-                if stopped.running or stopped.state != 'stopped':
-                    raise RuntimeError('The VM did not stop. Desktop repair did not restart it.')
-                check_cancelled()
-                await self._start_locked(progress=progress, ensure_desktop=False)
-                check_cancelled()
-            await self._emit_progress(progress, 'desktop_verifying', 'Verifying the active guest desktop…')
-            snapshot = await self._probe_desktop()
+    async def _setup_desktop_locked(self, progress=None, *, cancel_event: asyncio.Event | None = None) -> EnvironmentStatus:
+        """Complete explicit GUI setup while the caller owns the start lock and idle reservation."""
+        self._refresh_saved_network_policy()
+        if not self.config.desktop:
+            raise RuntimeError('Enable this VM’s desktop before setting it up.')
+        status = await self.status()
+        if not status.running or not await self._current_boot_is_verified():
+            raise RuntimeError('Finish Start / Retry Setup before setting up this desktop.')
+        original_boot = str(self._read_readiness().get('boot_id') or '')
+        self._check_setup_cancelled(cancel_event)
+        result = await self._run_desktop_repair(allow_kernel_repair=True, progress=progress)
+        self._check_setup_cancelled(cancel_event)
+        if result.get('state') not in {'ready', 'reboot_required'}:
+            raise DesktopSetupError(str(result.get('error_code') or 'DESKTOP_REPAIR_FAILED'))
+        candidate = str(result.get('candidate_kernel_sha256') or '')
+        rebooted = result.get('state') == 'reboot_required'
+        if rebooted:
+            if not re.fullmatch(r'[0-9a-f]{64}', candidate):
+                raise DesktopSetupError('DESKTOP_KERNEL_VERIFY_FAILED')
+            await self._emit_progress(progress, 'desktop_restarting', 'Restarting the VM to verify desktop support…',
+                detail='The existing VM disk and earlier kernels are preserved.',
+                stage_timeout_seconds=self.TIMEOUT_STOP + self.TIMEOUT_START)
+            self._check_setup_cancelled(cancel_event)
+            await self.stop()
+            stopped = await self.status()
+            if stopped.running or stopped.state != 'stopped':
+                raise RuntimeError('The VM did not stop. Desktop setup did not restart it.')
+            self._check_setup_cancelled(cancel_event)
+            await self._start_locked(progress=progress, ensure_desktop=False, report_ready=False,
+                                     reservation_held=True, cancel_event=cancel_event)
+            self._check_setup_cancelled(cancel_event)
+        await self._emit_progress(progress, 'desktop_verifying', 'Verifying the active guest desktop…',
+                                  stage_timeout_seconds=30)
+        deadline = asyncio.get_running_loop().time() + 30
+        while True:
+            self._check_setup_cancelled(cancel_event)
+            remaining = deadline - asyncio.get_running_loop().time()
+            try:
+                snapshot = await asyncio.wait_for(self._probe_desktop(), timeout=max(0.01, remaining))
+            except asyncio.TimeoutError:
+                raise DesktopSetupError('DESKTOP_SESSION_NOT_READY') from None
             if (snapshot.get('boot_id') != self._read_readiness().get('boot_id') or
-                    (result.get('state') == 'reboot_required' and (
-                        snapshot.get('boot_id') == original_boot
+                    (rebooted and (snapshot.get('boot_id') == original_boot
                         or not candidate or snapshot.get('running_kernel_sha256') != candidate))):
-                snapshot = await self._record_desktop_snapshot({**snapshot, 'state': 'failed',
+                await self._record_desktop_snapshot({**snapshot, 'state': 'failed',
                     'error_code': 'DESKTOP_BOOT_VERIFY_FAILED'})
-            if snapshot.get('state') != 'ready' or snapshot.get('error_code') != 'NONE':
+                raise DesktopSetupError('DESKTOP_BOOT_VERIFY_FAILED')
+            if snapshot.get('state') == 'ready' and snapshot.get('error_code') == 'NONE':
+                break
+            # Only a new, proven kernel may need a brief graphical-target settle.
+            # A wrong boot/kernel never enters this retry path.
+            remaining = deadline - asyncio.get_running_loop().time()
+            if (not rebooted or remaining <= 0 or snapshot.get('error_code') not in
+                    {'DESKTOP_SESSION_NOT_READY', 'DESKTOP_PREREQUISITE_MISSING'}):
                 raise DesktopSetupError(str(snapshot.get('error_code') or 'DESKTOP_SESSION_NOT_READY'))
-            await self._emit_progress(progress, 'desktop_ready', 'Guest desktop is ready.', stage_progress_percent=100.0)
-            return await self.status()
+            await asyncio.sleep(min(2, remaining))
+        self._check_setup_cancelled(cancel_event)
+        await self._emit_progress(progress, 'desktop_ready', 'Guest desktop is ready.', stage_progress_percent=100.0)
+        return await self.status()
 
-    @_lifecycle_diagnostics('desktop')
-    async def repair_desktop(self, progress=None, *, reservation_held: bool = False) -> EnvironmentStatus:
+    async def _repair_desktop_locked(self, progress=None, *, cancel_event: asyncio.Event | None = None) -> EnvironmentStatus:
+        async with self._workspace_start_lock():
+            return await self._setup_desktop_locked(progress=progress, cancel_event=cancel_event)
+
+    async def _reserved_desktop_work(self, work, *, reservation_held: bool, description: str) -> EnvironmentStatus:
         release = ((lambda: None) if reservation_held else
-                   reserve_environment_change(self.workspace_root, 'desktop repair', environment_id=self.config.id))
+                   reserve_environment_change(self.workspace_root, description, environment_id=self.config.id))
         worker = None
         cancel_event = asyncio.Event()
         try:
-            worker = asyncio.create_task(self._repair_desktop_locked(progress=progress, cancel_event=cancel_event))
+            worker = asyncio.create_task(work(cancel_event))
             return await asyncio.shield(worker)
         finally:
             interrupted = False
@@ -3818,6 +3844,40 @@ exit $rc
             release()
             if interrupted:
                 raise asyncio.CancelledError
+
+    @_lifecycle_diagnostics('desktop')
+    async def repair_desktop(self, progress=None, *, reservation_held: bool = False) -> EnvironmentStatus:
+        return await self._reserved_desktop_work(
+            lambda cancel: self._repair_desktop_locked(progress=progress, cancel_event=cancel),
+            reservation_held=reservation_held, description='desktop setup')
+
+    async def _desktop_lifecycle_locked(self, action: str, progress=None,
+                                        *, cancel_event: asyncio.Event) -> EnvironmentStatus:
+        async with self._workspace_start_lock():
+            self._refresh_saved_network_policy()
+            self._check_setup_cancelled(cancel_event)
+            if action == 'reset':
+                await self._reset_locked(progress=progress, cancel_event=cancel_event)
+            elif action == 'rebuild':
+                await self._rebuild_locked(progress=progress, cancel_event=cancel_event)
+            self._check_setup_cancelled(cancel_event)
+            await self._start_locked(progress=progress, ensure_desktop=False, report_ready=False,
+                                     reservation_held=True, cancel_event=cancel_event)
+            self._check_setup_cancelled(cancel_event)
+            await self._emit_progress(progress, 'desktop_checking', 'Checking the guest desktop…')
+            snapshot = await self._probe_desktop()
+            self._check_setup_cancelled(cancel_event)
+            if snapshot.get('boot_id') != self._read_readiness().get('boot_id'):
+                raise DesktopSetupError('DESKTOP_BOOT_VERIFY_FAILED')
+            if snapshot.get('state') != 'ready' or snapshot.get('error_code') != 'NONE':
+                await self._setup_desktop_locked(progress=progress, cancel_event=cancel_event)
+            self._check_setup_cancelled(cancel_event)
+            status = await self.status()
+            if not status.ready or not status.desktop_ready:
+                raise DesktopSetupError('DESKTOP_SESSION_NOT_READY')
+            await self._emit_progress(progress, 'ready', 'Environment Ready', stage_progress_percent=100.0,
+                                      progress_source='controller_observation')
+            return status
 
     def _read_verified_guest(self) -> dict[str, Any]:
         path = self.state_root / 'verified-guest.json'
@@ -4144,9 +4204,15 @@ print(json.dumps(facts))
         log_event('runtime', 'vm_isolation_guard_verified', workspace=str(self.workspace_root), provider='lima', boot_id=boot_id)
 
     @_lifecycle_diagnostics('start')
-    async def start(self, progress=None) -> EnvironmentStatus:
+    async def start(self, progress=None, *, setup_desktop: bool = False,
+                    reservation_held: bool = False) -> EnvironmentStatus:
+        if setup_desktop and self.config.desktop:
+            return await self._reserved_desktop_work(
+                lambda cancel: self._desktop_lifecycle_locked('start', progress=progress, cancel_event=cancel),
+                reservation_held=reservation_held, description='desktop setup')
         async with self._workspace_start_lock():
-            return await self._start_locked(progress=progress)
+            return await self._start_locked(progress=progress, ensure_desktop=False,
+                                            reservation_held=reservation_held)
 
     def _save_controller_config(self, config: EnvironmentConfig) -> None:
         save_environment_config(self.workspace_root, config, preserve_user_metadata=True)
@@ -4170,8 +4236,11 @@ print(json.dumps(facts))
         # update as well as live ACL/name/network changes made by another tab.
         self.config = saved
 
-    async def _start_locked(self, progress=None, *, ensure_desktop: bool = True) -> EnvironmentStatus:
+    async def _start_locked(self, progress=None, *, ensure_desktop: bool = False,
+                            report_ready: bool = True, reservation_held: bool = False,
+                            cancel_event: asyncio.Event | None = None) -> EnvironmentStatus:
         self._refresh_saved_network_policy()
+        self._check_setup_cancelled(cancel_event)
         async def report(phase: str, message: str, **meta: Any) -> None:
             self._write_readiness(ready=False, phase=phase)
             await self._emit_progress(progress, phase, message, **meta)
@@ -4182,6 +4251,7 @@ print(json.dumps(facts))
             await self._ensure_host_prerequisites(progress=progress)
         if not status.created:
             await report('creating_vm', 'Creating workspace VM…')
+            self._check_setup_cancelled(cancel_event)
             status = await self._call_with_optional_progress(self.create, progress=progress)
         binding_needs_reconcile = not self._runtime_binding_matches()
         if status.running and not binding_needs_reconcile and await self._current_boot_is_verified():
@@ -4189,10 +4259,12 @@ print(json.dumps(facts))
                 await self._record_verified_guest()
             if ensure_desktop:
                 await self._check_desktop_once()
-            await self._emit_progress(progress, 'ready', 'Environment Ready', stage_progress_percent=100.0, progress_source='lima')
+            if report_ready:
+                await self._emit_progress(progress, 'ready', 'Environment Ready', stage_progress_percent=100.0, progress_source='lima')
             return await self.status()
         if status.running and self._mount_type() == 'reverse-sshfs':
-            status = await self._recover_running_sshfs(progress=progress)
+            status = await self._recover_running_sshfs(progress=progress, reservation_held=reservation_held,
+                                                       cancel_event=cancel_event)
             binding_needs_reconcile = False
         elif status.running and binding_needs_reconcile:
             self._preflight_acceleration_access()
@@ -4201,6 +4273,7 @@ print(json.dumps(facts))
                 detail='Stopping the VM briefly to rebind working roots and remove legacy per-boot provisioning.',
                 stage_timeout_seconds=self.TIMEOUT_STOP + self.TIMEOUT_EDIT,
             )
+            self._check_setup_cancelled(cancel_event)
             await self.stop()
             status = await self.status()
             if status.running:
@@ -4208,6 +4281,7 @@ print(json.dumps(facts))
                 self._write_readiness(ready=False, phase='binding_reconcile_failed', error=message)
                 raise RuntimeError(message)
         if not status.running:
+            self._check_setup_cancelled(cancel_event)
             if binding_needs_reconcile or not self._references_binding_matches():
                 await report(
                     'reconciling_environment', 'Updating workspace VM configuration…',
@@ -4215,6 +4289,7 @@ print(json.dumps(facts))
                     stage_timeout_seconds=self.TIMEOUT_EDIT,
                 )
             await self._reconcile_runtime_binding()
+            self._check_setup_cancelled(cancel_event)
             self._clear_readiness('starting_vm')
             await report(
                 'starting_vm', 'Starting workspace VM…', detail='Launching Lima…',
@@ -4240,6 +4315,7 @@ print(json.dumps(facts))
             previous_observer = self._controller_output_callback
             self._controller_output_callback = observe_start
             try:
+                self._check_setup_cancelled(cancel_event)
                 # Bound Lima's own hostagent event watch as well as the outer
                 # application wait. Native SSH requirements retain their own
                 # retry limits, and success still requires our isolation guard.
@@ -4265,7 +4341,8 @@ print(json.dumps(facts))
                 await self._record_verified_guest()
             if ensure_desktop:
                 await self._check_desktop_once()
-            await self._emit_progress(progress, 'ready', 'Environment Ready', stage_progress_percent=100.0, progress_source='lima')
+            if report_ready:
+                await self._emit_progress(progress, 'ready', 'Environment Ready', stage_progress_percent=100.0, progress_source='lima')
             return await self.status()
         # Package installation is explicit one-time disk setup, never a Lima
         # per-boot provision script. Existing older VMs are adopted in place.
@@ -4277,7 +4354,8 @@ print(json.dumps(facts))
         if ensure_desktop:
             await self._ensure_desktop(progress=progress)
         await self._record_verified_guest()
-        await self._emit_progress(progress, 'ready', 'Environment Ready', stage_progress_percent=100.0, progress_source='lima')
+        if report_ready:
+            await self._emit_progress(progress, 'ready', 'Environment Ready', stage_progress_percent=100.0, progress_source='lima')
         return await self.status()
 
     async def apply_network_policy(self, enabled: bool, *, expected: bool | None = None,
@@ -4831,25 +4909,53 @@ print(json.dumps(facts))
         return await self._call_with_optional_progress(self.start, progress=restart_progress)
 
     @_lifecycle_diagnostics('reset')
-    async def reset(self, progress=None) -> EnvironmentStatus:
+    async def reset(self, progress=None, *, setup_desktop: bool = False,
+                    reservation_held: bool = False) -> EnvironmentStatus:
+        if setup_desktop and self.config.desktop:
+            return await self._reserved_desktop_work(
+                lambda cancel: self._desktop_lifecycle_locked('reset', progress=progress, cancel_event=cancel),
+                reservation_held=reservation_held, description='desktop setup')
+        async with self._workspace_start_lock():
+            self._refresh_saved_network_policy()
+            await self._reset_locked(progress=progress)
+            return await self._start_locked(progress=progress, ensure_desktop=False,
+                                            reservation_held=reservation_held)
+
+    async def _reset_locked(self, progress=None, *, cancel_event: asyncio.Event | None = None) -> None:
         status = await self.status()
         if not status.created:
-            return await self._call_with_optional_progress(self.start, progress=progress)
+            return
         self._preflight_acceleration_access()
         await self._preserve_vm_failure(reason='before_reset', operation='reset')
         await self._emit_progress(
             progress, 'factory_reset', 'Factory resetting VM while preserving working roots…',
             stage_timeout_seconds=self.TIMEOUT_RESET,
         )
+        self._check_setup_cancelled(cancel_event)
         await self.stop()
+        stopped = await self.status()
+        if stopped.running or stopped.state != 'stopped':
+            raise RuntimeError('The VM did not stop. Its disk was not reset.')
+        self._check_setup_cancelled(cancel_event)
         await self._run('factory-reset', self.INSTANCE, timeout=self.TIMEOUT_RESET, check=True)
         self._record_lifecycle('factory_reset')
         log_event('harnessy', 'vm_factory_reset', workspace=str(self.workspace_root))
         await self._emit_progress(progress, 'restarting_reset_vm', 'Starting reset workspace VM…')
-        return await self._call_with_optional_progress(self.start, progress=progress)
 
     @_lifecycle_diagnostics('rebuild')
-    async def rebuild(self, progress=None) -> EnvironmentStatus:
+    async def rebuild(self, progress=None, *, setup_desktop: bool = False,
+                      reservation_held: bool = False) -> EnvironmentStatus:
+        if setup_desktop and self.config.desktop:
+            return await self._reserved_desktop_work(
+                lambda cancel: self._desktop_lifecycle_locked('rebuild', progress=progress, cancel_event=cancel),
+                reservation_held=reservation_held, description='desktop setup')
+        async with self._workspace_start_lock():
+            self._refresh_saved_network_policy()
+            await self._rebuild_locked(progress=progress)
+            return await self._start_locked(progress=progress, ensure_desktop=False,
+                                            reservation_held=reservation_held)
+
+    async def _rebuild_locked(self, progress=None, *, cancel_event: asyncio.Event | None = None) -> None:
         self._preflight_acceleration_access()
         status = await self.status()
         if status.created:
@@ -4858,21 +4964,24 @@ print(json.dumps(facts))
                 progress, 'rebuilding', 'Removing old workspace VM state…',
                 stage_timeout_seconds=self.TIMEOUT_DELETE,
             )
+            self._check_setup_cancelled(cancel_event)
             await self.stop(force=True)
+            self._check_setup_cancelled(cancel_event)
             await self._run('delete', '--force', self.INSTANCE, timeout=self.TIMEOUT_DELETE, check=True)
         # Do not remove Files/ or private chat worktrees. All VM-owned bytes are
         # below vm_root and are recreated from environment.json + the template.
+        self._check_setup_cancelled(cancel_event)
         await self._prepare_guest_image(progress=progress)
         self._write_template()
         await self._emit_progress(
             progress, 'creating_vm', 'Creating clean workspace VM…',
             stage_timeout_seconds=self.TIMEOUT_CREATE,
         )
+        self._check_setup_cancelled(cancel_event)
         await self._run('create', '--name', self.INSTANCE, str(self.template_path), timeout=self.TIMEOUT_CREATE, check=True)
         self._write_runtime_binding()
         self._record_lifecycle('rebuild')
         log_event('harnessy', 'vm_rebuilt', workspace=str(self.workspace_root), files_preserved=True)
-        return await self._call_with_optional_progress(self.start, progress=progress)
 
     @_lifecycle_diagnostics('destroy')
     async def destroy(self) -> None:

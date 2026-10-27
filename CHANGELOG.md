@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.28
+
+- Complete the selected desktop during normal human Start / Retry Setup, Create, Rebuild and Factory Reset. Install the matching generic Kali kernel and desktop when needed, perform the verified controlled restart, then require actual graphical-session and display proof before reporting success.
+- Remove the dedicated **Repair Desktop** button. Use the existing **Retry Setup** action for an incomplete desktop, show its incomplete state on the VM card, and keep independently verified terminal/model access available after a desktop-only failure.
+- Reserve the idle VM before desktop setup and retain that reservation until accepted work finishes, including cancellation. Internal model/terminal startup remains CLI-only and does not install desktop packages or restart a working VM for graphics.
+- Configure the graphical session for the next boot when staging a new kernel. Start and verify it after the graphics-capable kernel boots, rather than requiring LightDM to start successfully on the unsupported cloud kernel.
+- Preserve the existing live setup progress and bounded diagnostics. Native Spark package installation, reboot and display output still need confirmation after updating.
+
 ## v0.7.27
 
 - Skip automatic desktop package installation during Start when the running Kali cloud kernel is already verified to lack the required graphics support. Complete terminal/model startup after its independent checks; use **Repair Desktop** for the explicit kernel and graphical setup.
