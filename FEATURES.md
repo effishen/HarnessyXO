@@ -1,4 +1,7 @@
-# HarnessyXO v0.7.21 Features
+# HarnessyXO v0.7.23 Features
+
+- Keep background queue polling, composer persistence, model storage/context preparation and file scans off the UI loop. Repeated status reads are coalesced, and busy storage can wait while the interface keeps handling events.
+- Keep the loaded page through brief connection interruptions. Unsent text has a bounded backup scoped to the signed-in user and project in the browser tab. Reconnect restores typing; Send and queue actions require a connection. Accepted sends, timeline restores and sign-out discard stale drafts.
 
 - Double-click a project to open its own writable folder. Upload or drop files, edit and save, create folders, move, rename and delete its own files. Live parents, Project Access sources and References stay read-only; locked and archived projects stay read-only. Permissions are checked again when an action writes, including open editors, File History restores, archive extraction and streamed uploads.
 - Dropping several files or directories preserves the entire drop and its original project destination when tabs change. Read-only destinations show an error. Failed uploads remove their own partial file without deleting another upload's existing file.
@@ -13,6 +16,8 @@
 
 ## VM and external-device diagnostics
 
+- Lima create/start automatically saves selected-instance observations after 30 seconds without new output, at most once a minute afterward, and at failure before controller cleanup. **LIMA_STARTUP.json** and **lima-startup/** include verified hostagent/controller/QEMU process state, capability-check children, owned QMP status and serial-log coverage. Early and final captures are retained together. Missing and unsupported sources are explicit; diagnostics export reads saved observations without starting a VM or contacting its guest.
+- The startup card reports controller liveness and how long there has been no new output, separately from guest boot progress. The Kali running-status timeout remains under investigation; the new captures help identify its cause.
 - **Download Diagnostics** includes **GUEST_LOGS.json** and sanitized guest-log records alongside VM boot/controller evidence. Available OpenWrt and Linux connections receive fixed read-only system, kernel and SSH checks; stopped VMs are not started. Windows guest-log capture is reported as unsupported. Offline packaging uses saved observations.
 - Keep collection bounded and rate-limited. Failure captures retain reviewed SSH/SSHFS error codes and the last successful guest observation, with timestamps and an observed boot ID. Unknown messages, commands, paths, addresses and credentials are omitted; saved records are validated again when exported, including in content-rich diagnostics.
 - **EXTERNAL_DEVICES.json** uses host-side observations of existing external SSH activity only: operation outcomes, transport errors, timing and byte counts. Diagnostics never connect to those devices, send additional commands or retrieve their logs.

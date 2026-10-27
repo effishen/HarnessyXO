@@ -2368,6 +2368,11 @@ def _privacy_manifest(*, include_content: bool = False) -> str:
         'Export reads saved receipts and validates them again in both content modes. Process command lines, '
         'addresses, raw monitor replies and serial text are excluded. Missing or unsupported observations '
         'remain explicit; these snapshots are evidence, not an automatic cause diagnosis.\n\n'
+        'LIMA_STARTUP.json and lima-startup/ preserve bounded startup and failure observations for the '
+        'exact selected Lima home: verified hostagent/QEMU identities, owned child probe roles, numeric '
+        'process counters, socket/serial coverage and read-only monitor status. Raw process arguments, '
+        'paths, environment values and unrelated processes are excluded. Missing, unsupported, cancelled '
+        'and timed-out observations remain explicit. Export reads saved receipts only.\n\n'
         'EXTERNAL_DEVICES.json contains host-side observations of already requested external SSH '
         'operations: opaque device identities, reviewed outcomes, permission decisions, timing, byte '
         'counts and transport error codes. Diagnostics do not connect to external devices, run '
@@ -2589,6 +2594,40 @@ def _collect_vm_stall_export(latest: Path) -> tuple[dict[str, Any], dict[str, by
                 'environments': [], 'technical_error': technical_error_evidence(exc)}, {}
 
 
+def _collect_lima_startup_export(latest: Path) -> tuple[dict[str, Any], dict[str, bytes]]:
+    """Revalidate saved selected-instance observations in both export modes."""
+    try:
+        from .lima_startup import (collect_lima_startup_diagnostics,
+                                  validate_lima_startup_receipt, validate_lima_startup_report)
+        collected = collect_lima_startup_diagnostics(latest)
+        report = validate_lima_startup_report(collected['report'])
+        declared = {row['archive_member']: row['environment_id'] for row in report['environments']
+                    if 'archive_member' in row}
+        source = collected['members']
+        if not isinstance(source, dict) or set(source) != set(declared) or len(source) > 32:
+            raise ValueError('Invalid Lima startup archive coverage')
+        members, total = {}, 0
+        for name, payload in source.items():
+            if (not re.fullmatch(r'lima-startup/[0-9a-f]{64}/[0-9a-f]{32}/lima-startup\.technical\.jsonl', name)
+                    or not isinstance(payload, bytes) or len(payload) > 128 * 1024):
+                raise ValueError('Invalid Lima startup archive member')
+            rows = []
+            for line in payload.splitlines()[-8:]:
+                safe = validate_lima_startup_receipt(json.loads(line))
+                if safe is None or safe['environment_id'] != declared[name]:
+                    raise ValueError('Invalid Lima startup observation')
+                rows.append(safe)
+            members[name] = b''.join((json.dumps(row, separators=(',', ':'), allow_nan=False) + '\n').encode() for row in rows)
+            total += len(members[name])
+            if total > 2 * 1024 * 1024:
+                raise ValueError('Lima startup archive exceeds its bound')
+        return report, members
+    except Exception as exc:
+        from .technical import technical_error_evidence
+        return {'schema_version': 1, 'status': 'unavailable', 'environments': [],
+                'technical_error': technical_error_evidence(exc)}, {}
+
+
 def collect_existing_diagnostics(app_root: Path, *, include_content: bool = False) -> Path | None:
     """Build a fresh diagnostics ZIP from current logs.
 
@@ -2618,6 +2657,7 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
             target_report, target_members = _collect_test_target_export(latest, include_content=include_content)
             guest_report, guest_members = _collect_guest_export(latest)
             vm_stall_report, vm_stall_members = _collect_vm_stall_export(latest)
+            lima_startup_report, lima_startup_members = _collect_lima_startup_export(latest)
             external_device_report = _collect_external_device_export(latest)
             try:
                 from .file_views import collect_file_view_diagnostics
@@ -2681,6 +2721,8 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
                 summary += external_device_summary_lines(external_device_report)
             except Exception:
                 summary += '\nExternal device observations: summary unavailable; see EXTERNAL_DEVICES.json.\n'
+            from .lima_startup import summary_lines as lima_startup_summary_lines
+            summary += lima_startup_summary_lines(lima_startup_report)
             zf.writestr('SUMMARY.txt', summary)
             zf.writestr('FILE_VIEWS.json', json.dumps(file_view_report, ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('VM_STORAGE.json', json.dumps(storage_report, ensure_ascii=False, indent=2, allow_nan=False))
@@ -2713,7 +2755,8 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
                 'schema_version': 1, 'collectors': {name: value for name, value in
                     (('summary', incidents), ('workspace_vm', vm_report), ('test_targets', target_report), ('host', host_report),
                      ('file_views', file_view_report), ('vm_storage', storage_report), ('vm_resources', resource_report),
-                     ('guest_logs', guest_report), ('vm_stalls', vm_stall_report), ('external_devices', external_device_report))
+                     ('guest_logs', guest_report), ('vm_stalls', vm_stall_report),
+                     ('lima_startup', lima_startup_report), ('external_devices', external_device_report))
                     if value.get('technical_error')},
             }, ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('VM_LOGS.json', json.dumps(vm_report, ensure_ascii=False, indent=2, allow_nan=False))
@@ -2724,6 +2767,9 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
                 zf.writestr(name, payload)
             zf.writestr('VM_STALLS.json', json.dumps(vm_stall_report, ensure_ascii=False, indent=2, allow_nan=False))
             for name, payload in vm_stall_members.items():
+                zf.writestr(name, payload)
+            zf.writestr('LIMA_STARTUP.json', json.dumps(lima_startup_report, ensure_ascii=False, indent=2, allow_nan=False))
+            for name, payload in lima_startup_members.items():
                 zf.writestr(name, payload)
             zf.writestr('EXTERNAL_DEVICES.json', json.dumps(external_device_report, ensure_ascii=False, indent=2, allow_nan=False))
             zf.writestr('TARGET_LOGS.json', json.dumps(target_report, ensure_ascii=False, indent=2, allow_nan=False))

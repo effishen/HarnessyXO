@@ -13,6 +13,7 @@ from typing import Any
 
 from ..diagnostics.sqlite import connect_database
 from .sqlite_store import StoreConnection, backup_legacy_store_database, enable_store_wal
+from .admission_barriers import ADMISSION_BARRIERS
 from .paths import settings_dir
 from .workspace_roots import validate_workspace_root
 from .instructions import DEFAULT_GLOBAL_INSTRUCTIONS
@@ -213,6 +214,7 @@ class MachineStore:
             )
         self.global_instructions_path = self.root / GLOBAL_INSTRUCTIONS_NAME
         self.db_path = self.root / 'machine.db'
+        self._admission_key = str(self.db_path.resolve())
         self.skills_dir = self.root / 'skills'
         self.skills_dir.mkdir(parents=True, exist_ok=True)
         self._maybe_import_legacy_machine_state()
@@ -280,8 +282,8 @@ class MachineStore:
             # Retain the existing best-effort settings-file import behavior.
             pass
 
-    def _connect(self) -> sqlite3.Connection:
-        con = connect_database(self.db_path, role='machine', factory=StoreConnection)
+    def _connect(self, *, timeout: float = 5.0) -> sqlite3.Connection:
+        con = connect_database(self.db_path, role='machine', factory=StoreConnection, timeout=timeout)
         con.row_factory = sqlite3.Row
         return con
 
@@ -413,9 +415,25 @@ class MachineStore:
         excluded = ([] if include_generating else ['generating']) + ([] if include_released else ['unconfirmed_released'])
         where = 'WHERE state NOT IN (' + ','.join('?' for _ in excluded) + ') ' if excluded else ''
         with self._connect() as con:
-            return [dict(row) for row in con.execute(
+            rows = [dict(row) for row in con.execute(
                 'SELECT * FROM completion_holds ' + where + 'ORDER BY updated_at,workspace_id,chat_id', excluded,
             ).fetchall()]
+            for pending in self._pending_admission_rows(con):
+                if pending['kind'] != 'completion' or not pending['failed']:
+                    continue
+                prior = con.execute('SELECT * FROM completion_holds WHERE workspace_id=? AND chat_id=?',
+                                    (pending['workspace_id'], pending['chat_id'])).fetchone()
+                if prior is not None and str(prior['run_id']) != pending['run_id']:
+                    continue
+                display = dict(prior) if prior is not None else {
+                    key: pending[key] for key in ('workspace_id', 'chat_id', 'run_id', 'project_label', 'model', 'updated_at')}
+                display.setdefault('details_json', '{}')
+                display.update(state='interrupted', transient=True,
+                               reason='The latest queue pause could not be saved. Retry this project or resume the queue.')
+                rows = [row for row in rows if (row['workspace_id'], row['chat_id']) !=
+                        (pending['workspace_id'], pending['chat_id'])]
+                rows.append(display)
+        return sorted(rows, key=lambda row: (row['updated_at'], row['workspace_id'], row['chat_id']))
 
     @staticmethod
     def _begin_completion_run(con: sqlite3.Connection, details: dict[str, Any]) -> None:
@@ -440,6 +458,8 @@ class MachineStore:
             con.execute('BEGIN IMMEDIATE')
             self._begin_completion_run(con, details)
             con.commit()
+        ADMISSION_BARRIERS.supersede(self._admission_key, str(details['workspace_id']),
+                                     str(details['chat_id']), str(details['run_id']))
 
     def record_completion_gate(self, state: str, details: dict[str, Any]) -> bool:
         """Persist a verdict boundary; stale runs cannot clear a resumed owner's hold."""
@@ -450,11 +470,16 @@ class MachineStore:
         workspace_id, chat_id = str(details.get('workspace_id') or ''), str(details.get('chat_id') or '')
         if not run_id or not workspace_id or not chat_id:
             raise ValueError('Completion gate needs run, workspace and chat IDs.')
+        if not ADMISSION_BARRIERS.current(self._admission_key, details):
+            return False
         with self._connect() as con:
             con.execute('BEGIN IMMEDIATE')
+            if not ADMISSION_BARRIERS.current(self._admission_key, details):
+                return False
             prior = con.execute('SELECT run_id,state FROM completion_holds WHERE workspace_id=? AND chat_id=?',
                                 (workspace_id, chat_id)).fetchone()
             if prior is not None and (prior['run_id'] != run_id or prior['state'] == 'unconfirmed_released'):
+                ADMISSION_BARRIERS.settle(self._admission_key, 'completion', details)
                 return False
             if state in {'complete', 'needs_input', 'stopped'}:
                 con.execute('DELETE FROM completion_holds WHERE workspace_id=? AND chat_id=? AND run_id=?',
@@ -475,6 +500,7 @@ class MachineStore:
                      str(details.get('model') or ''), reason[:4000], json.dumps(details)),
                 )
             con.commit()
+        ADMISSION_BARRIERS.settle(self._admission_key, 'completion', details)
         return True
 
     def release_completion_attempts(self, details: dict[str, Any]) -> bool:
@@ -492,8 +518,12 @@ class MachineStore:
             prior = con.execute('SELECT * FROM completion_holds WHERE workspace_id=? AND chat_id=?',
                                 (workspace_id, chat_id)).fetchone()
             if prior is None or prior['run_id'] != run_id:
+                ADMISSION_BARRIERS.settle(self._admission_key, 'completion', details)
                 return False
             if prior['state'] == 'unconfirmed_released':
+                ADMISSION_BARRIERS.settle(self._admission_key, 'completion', details)
+                if details.get('completion_backend_recovery_exhausted') is True:
+                    ADMISSION_BARRIERS.settle(self._admission_key, 'backend', details)
                 return True
             previous_details = json.loads(prior['details_json'] or '{}')
             merged = {**previous_details, **details, 'queue_released': True}
@@ -510,15 +540,27 @@ class MachineStore:
                     (run_id, workspace_id, chat_id),
                 )
             con.commit()
+        ADMISSION_BARRIERS.settle(self._admission_key, 'completion', details)
+        if merged.get('completion_backend_recovery_exhausted') is True:
+            ADMISSION_BARRIERS.settle(self._admission_key, 'backend', details)
         return True
 
-    @staticmethod
-    def _completion_admission_reason(con: sqlite3.Connection, workspace_id: str, chat_id: str) -> str:
+    def _pending_admission_rows(self, con: sqlite3.Connection) -> list[dict[str, Any]]:
+        if not ADMISSION_BARRIERS.pending(self._admission_key):
+            return []
+        owners = {(str(row['workspace_id']), str(row['chat_id'])): str(row['run_id'])
+                  for row in con.execute('SELECT workspace_id,chat_id,run_id FROM completion_holds').fetchall()}
+        return ADMISSION_BARRIERS.rows(self._admission_key, owners)
+
+    def _completion_admission_reason(self, con: sqlite3.Connection, workspace_id: str, chat_id: str,
+                                     *, pending=None) -> str:
         holds = con.execute("SELECT * FROM completion_holds WHERE state NOT IN ('generating','unconfirmed_released') "
                             "ORDER BY updated_at").fetchall()
         # A held owner must be able to recover even when several independent
         # projects failed. Its completion never clears the other owners.
-        owner = completion_blocking_hold([dict(row) for row in holds], workspace_id, chat_id)
+        pending = self._pending_admission_rows(con) if pending is None else pending
+        owner = completion_blocking_hold([dict(row) for row in holds] + [
+            row for row in pending if row['kind'] == 'completion'], workspace_id, chat_id)
         return completion_wait_reason(owner) if owner else ''
 
     def run_admission_reason(self, workspace_id: str, chat_id: str, *, include_backend: bool = False) -> str:
@@ -526,9 +568,11 @@ class MachineStore:
             if con.execute('SELECT 1 FROM workspace_recovery_holds WHERE workspace_id=?',
                            (str(workspace_id),)).fetchone():
                 return 'Workspace paused · review database recovery before continuing'
-            if include_backend and con.execute('SELECT 1 FROM backend_recoveries LIMIT 1').fetchone():
+            pending = self._pending_admission_rows(con)
+            if include_backend and (any(row['kind'] == 'backend' for row in pending)
+                                    or con.execute('SELECT 1 FROM backend_recoveries LIMIT 1').fetchone()):
                 return 'Queue paused · backend needs attention'
-            return self._completion_admission_reason(con, str(workspace_id), str(chat_id))
+            return self._completion_admission_reason(con, str(workspace_id), str(chat_id), pending=pending)
 
     def pause_workspace_for_recovery(self, workspace_id: str, receipt_id: str) -> dict[str, str]:
         """Persist this workspace's admission hold without pausing other workspaces."""
@@ -603,12 +647,25 @@ class MachineStore:
                      max(0, int(details.get('attempt', 1))), str(details.get('reason') or 'GPU backend failure')[:4000]),
                 )
             con.commit()
+        ADMISSION_BARRIERS.settle(self._admission_key, 'backend', details)
 
     def list_backend_recoveries(self) -> list[dict[str, Any]]:
         with self._connect() as con:
-            return [dict(row) for row in con.execute(
+            rows = [dict(row) for row in con.execute(
                 'SELECT * FROM backend_recoveries ORDER BY updated_at,run_id'
             ).fetchall()]
+            for pending in self._pending_admission_rows(con):
+                if pending['kind'] != 'backend' or not pending['failed']:
+                    continue
+                prior = next((row for row in rows if row['run_id'] == pending['run_id']), None)
+                display = dict(prior) if prior is not None else {
+                    key: pending[key] for key in ('workspace_id', 'chat_id', 'run_id', 'project_label', 'model', 'updated_at')}
+                display.setdefault('attempt', 0)
+                display.update(state='failed', transient=True,
+                               reason='The latest backend pause could not be saved. Check the backend and resume the queue.')
+                rows = [row for row in rows if row['run_id'] != pending['run_id']]
+                rows.append(display)
+        return sorted(rows, key=lambda row: (row['updated_at'], row['run_id']))
 
     def clear_rewound_chat_holds(self, workspace_id: str, chat_id: str) -> None:
         """Retire this chat's runtime notices after a committed deletion.
@@ -622,10 +679,12 @@ class MachineStore:
                 con.execute(f'DELETE FROM {table} WHERE workspace_id=? AND chat_id=?',
                             (str(workspace_id), str(chat_id)))
             con.commit()
+        ADMISSION_BARRIERS.clear_project(self._admission_key, str(workspace_id), str(chat_id))
 
     def run_queue_paused(self) -> bool:
         with self._connect() as con:
-            return (con.execute('SELECT 1 FROM backend_recoveries LIMIT 1').fetchone() is not None
+            return (bool(self._pending_admission_rows(con))
+                    or con.execute('SELECT 1 FROM backend_recoveries LIMIT 1').fetchone() is not None
                     or con.execute("SELECT 1 FROM completion_holds WHERE state NOT IN ('generating','unconfirmed_released') LIMIT 1").fetchone() is not None)
 
     def recover_interrupted_backend_recoveries(self) -> int:
@@ -641,15 +700,29 @@ class MachineStore:
 
     def resume_run_queue(self) -> bool:
         """Explicit acknowledgement only after every automatic retry settles."""
+        if ADMISSION_BARRIERS.pending(self._admission_key, active_only=True):
+            return False
         with self._connect() as con:
             con.execute('BEGIN IMMEDIATE')
-            if con.execute("SELECT 1 FROM backend_recoveries WHERE state='retrying' LIMIT 1").fetchone():
+            if ADMISSION_BARRIERS.pending(self._admission_key, active_only=True):
                 return False
-            if con.execute("SELECT 1 FROM completion_holds WHERE state IN ('checking','continuing','running') LIMIT 1").fetchone():
+            failed = [row for row in self._pending_admission_rows(con) if row['failed']]
+            backend_ids = {row['run_id'] for row in failed if row['kind'] == 'backend'}
+            completion_ids = {(row['workspace_id'], row['chat_id'], row['run_id'])
+                              for row in failed if row['kind'] == 'completion'}
+            if any(str(row['run_id']) not in backend_ids for row in con.execute(
+                "SELECT run_id FROM backend_recoveries WHERE state='retrying'").fetchall()):
+                return False
+            if any((str(row['workspace_id']), str(row['chat_id']), str(row['run_id'])) not in completion_ids
+                   for row in con.execute("SELECT workspace_id,chat_id,run_id FROM completion_holds "
+                                          "WHERE state IN ('checking','continuing','running')").fetchall()):
                 return False
             con.execute('DELETE FROM backend_recoveries')
             con.execute("DELETE FROM completion_holds WHERE state IN ('unconfirmed','interrupted')")
+            con.executemany('DELETE FROM completion_holds WHERE workspace_id=? AND chat_id=? AND run_id=?',
+                            list(completion_ids))
             con.commit()
+        ADMISSION_BARRIERS.clear_failed(self._admission_key, tokens={row['token'] for row in failed})
         return True
 
     @staticmethod
@@ -817,7 +890,8 @@ class MachineStore:
         """Mark one still-pending job running after its full-run lane is held."""
         with self._connect() as con:
             con.execute('BEGIN IMMEDIATE')
-            if con.execute('SELECT 1 FROM backend_recoveries LIMIT 1').fetchone():
+            if (any(row['kind'] == 'backend' for row in self._pending_admission_rows(con))
+                    or con.execute('SELECT 1 FROM backend_recoveries LIMIT 1').fetchone()):
                 # Share the pause check and claim transaction: a released
                 # scheduler lease alone does not authorize the next request.
                 return None
@@ -847,6 +921,9 @@ class MachineStore:
                     'thinking': row['thinking'],
                 })
             con.commit()
+        if changed:
+            ADMISSION_BARRIERS.supersede(self._admission_key, str(row['workspace_id']),
+                                         str(row['chat_id']), 'queue-' + str(row['id']))
         return self.get_run_job(str(row['id'])) if changed else None
 
     def finish_run_job(self, job_id: str, *, status: str, outcome: str = '', error: str = '') -> bool:
@@ -890,7 +967,19 @@ class MachineStore:
     def rebalance_run_queue_lanes(self, limit: int) -> int:
         """Keep legacy lanes global; release unavailable slot preferences."""
         capacity = max(1, min(int(limit or 1), 32))
-        with self._connect() as con:
+        with self._connect(timeout=0.0) as con:
+            # Polling an already-balanced queue is a read, including when it
+            # is empty. Even an UPDATE matching zero rows otherwise waits for
+            # another writer's SQLite lock before returning.
+            pending = con.execute(
+                "SELECT 1 FROM run_queue_jobs WHERE status='pending' "
+                "AND (lane<>1 OR preferred_slot>?) LIMIT 1", (capacity,),
+            ).fetchone()
+            if pending is None:
+                return 0
+            # This periodic maintenance must not wait on a writer while its
+            # captured slot limit gets stale. The supervisor retries a busy
+            # poll with fresh settings rather than discarding preferences.
             changed = con.execute(
                 "UPDATE run_queue_jobs SET lane=1 WHERE status='pending' AND lane<>1"
             ).rowcount
