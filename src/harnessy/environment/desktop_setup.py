@@ -702,7 +702,7 @@ def select_boot(release):
         raise
     return True
 
-def configure_session():
+def configure_session(*, start_now=True):
     action('CHECK', 'Checking the graphical session configuration', 'session')
     code, output = run(['id', '-un', os.environ.get('SUDO_USER', '')], 3) if os.environ.get('SUDO_USER') else (1, b'')
     user = output.decode(errors='replace').strip()
@@ -712,7 +712,10 @@ def configure_session():
     payload = ('[Seat:*]\nautologin-user=' + user + '\nautologin-user-timeout=0\nuser-session=xfce\n').encode()
     atomic(OWN_LIGHTDM, payload)
     action('CONFIGURE', 'Graphical session: /etc/lightdm/lightdm.conf.d/50-harnessy.conf', 'session')
-    for arguments in (['systemctl', 'set-default', 'graphical.target'], ['systemctl', 'enable', 'lightdm'], ['systemctl', 'restart', 'lightdm']):
+    commands = [['systemctl', 'set-default', 'graphical.target'], ['systemctl', 'enable', 'lightdm']]
+    if start_now:
+        commands.append(['systemctl', 'restart', 'lightdm'])
+    for arguments in commands:
         if run(arguments, 20)[0]:
             raise Failure('DESKTOP_SESSION_NOT_READY')
 
@@ -752,7 +755,7 @@ def main():
         if not select_boot(release):
             RESULT.update(state='manual_boot_required', error_code='DESKTOP_BOOT_POLICY_CUSTOM', requires_reboot=False)
             return
-        configure_session()
+        configure_session(start_now=False)
         RESULT.update(state='reboot_required', error_code='NONE', boot_configured=True, requires_reboot=True)
         action('REBOOT_REQUIRED', 'Verified generic kernel staged; the existing VM disk and fallback kernel are retained')
         return

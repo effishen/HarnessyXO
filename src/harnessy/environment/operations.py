@@ -22,6 +22,10 @@ class _OperationDeadlineExpired(Exception):
     """The registry's own timer expired, rather than a provider's timer."""
 
 
+class _DesktopSetupIncomplete(RuntimeError):
+    error_code = 'DESKTOP_SETUP_INCOMPLETE'
+
+
 @dataclass(slots=True)
 class EnvironmentOperationState:
     snapshot_tag: str = ''
@@ -217,13 +221,22 @@ class EnvironmentOperationRegistry:
             pass
 
     @classmethod
-    def _workflow_progress(cls, action: str, stage: str, stage_percent: float | None = None) -> tuple[float | None, int, int]:
+    def _workflow_stages(cls, action: str, *, setup_desktop: bool = False) -> tuple[str, ...]:
         stages = cls.WORKFLOW_STAGES.get(str(action), ())
+        if setup_desktop and action in {'start', 'reset', 'rebuild'}:
+            stages = tuple(stage for stage in stages if not stage.startswith('desktop_') and stage != 'ready')
+            stages += (*cls.WORKFLOW_STAGES['desktop'], 'ready')
+        return stages
+
+    @classmethod
+    def _workflow_progress(cls, action: str, stage: str, stage_percent: float | None = None,
+                           *, setup_desktop: bool = False) -> tuple[float | None, int, int]:
+        stages = cls._workflow_stages(action, setup_desktop=setup_desktop)
         if not stages or stage not in stages:
             return None, 0, len(stages)
         index = stages.index(stage)
         total = len(stages)
-        if stage == 'ready':
+        if stage in {'ready', 'desktop_ready'} and stage == stages[-1]:
             return 100.0, total, total
         within = 0.0 if stage_percent is None else max(0.0, min(100.0, float(stage_percent))) / 100.0
         percent = max(0.0, min(99.0, ((index + within) / total) * 100.0))
@@ -366,6 +379,15 @@ class EnvironmentOperationRegistry:
         manager = EnvironmentManager(workspace_root, environment_id=environment_id)
         if manager.config is None:
             raise RuntimeError('Create a VM environment before starting an environment operation.')
+        # Only the human lifecycle controls opt into package/kernel setup. Model
+        # brokers supply their trusted origin marker; inbound flags cannot turn
+        # an internal Start into a GUI install or a guest reboot.
+        payload.pop('setup_desktop', None)
+        payload.pop('reservation_held', None)
+        setup_desktop = (manager.config.provider == 'lima' and manager.config.desktop
+                         and action in {'start', 'reset', 'rebuild'}
+                         and '_model_project_id' not in payload)
+        payload['_setup_desktop'] = setup_desktop
         if action == 'desktop' and (manager.config.provider != 'lima' or not manager.config.desktop):
             raise ValueError('Desktop repair is available for a Lima Linux VM with its desktop enabled.')
         if action == 'tools' and payload.get('expected_preset') is not None:
@@ -395,6 +417,8 @@ class EnvironmentOperationRegistry:
             policy_release = reserve_environment_change(workspace_root, 'VM removal', environment_id=environment_id)
         elif action == 'desktop':
             policy_release = reserve_environment_change(workspace_root, 'desktop repair', environment_id=environment_id)
+        elif setup_desktop:
+            policy_release = reserve_environment_change(workspace_root, 'desktop setup', environment_id=environment_id)
         else:
             policy_release = None
         try:
@@ -426,7 +450,7 @@ class EnvironmentOperationRegistry:
                 stage_progress_percent=None,
                 progress_source='workflow',
                 step_index=0,
-                step_total=len(self.WORKFLOW_STAGES.get(action, ())),
+                step_total=len(self._workflow_stages(action, setup_desktop=setup_desktop)),
                 expected_total_seconds=self._timing_estimate(workspace_root, action, environment_id=environment_id),
                 eta_seconds=self._timing_estimate(workspace_root, action, environment_id=environment_id),
             )
@@ -467,7 +491,8 @@ class EnvironmentOperationRegistry:
         }.get(action, 'Working…')
 
     @staticmethod
-    def _validate_result(action: str, result: Any, *, snapshot_tag: str = '') -> None:
+    def _validate_result(action: str, result: Any, *, snapshot_tag: str = '',
+                         require_desktop: bool = False) -> None:
         # Provider lifecycle methods normally raise on failure, but the operation
         # manager is the final authority shown to the UI. Never advertise success
         # if a provider returns a non-Ready start/rebuild result or a still-running
@@ -479,11 +504,14 @@ class EnvironmentOperationRegistry:
                     'is not in the provider list. Refresh/reconcile before taking another snapshot.'
                 )
             return
-        if action == 'desktop':
+        if action == 'desktop' or require_desktop:
             if (getattr(result, 'desktop_ready', None) is not True
                     or getattr(result, 'running', None) is not True
                     or getattr(result, 'ready', None) is not True):
                 detail = str(getattr(result, 'desktop_error', '') or 'The guest desktop did not become ready.')
+                if require_desktop:
+                    raise _DesktopSetupIncomplete('Desktop setup is incomplete. ' + detail
+                        + ' CLI readiness is checked separately; the VM disk and project files were preserved.')
                 raise RuntimeError(detail)
             return
         if result is None:
@@ -518,22 +546,44 @@ class EnvironmentOperationRegistry:
         }
 
     @staticmethod
-    async def _wait_for_operation(awaitable, timeout: float):
+    async def _wait_for_operation(awaitable, timeout: float, *, drain_on_cancel: bool = False):
         # wait_for raises TimeoutError for both its own timer and a provider's
         # timer. Wait for completion explicitly so the UI can distinguish them.
         task = asyncio.create_task(awaitable)
+        async def drain() -> bool:
+            interrupted = False
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    if not task.done():
+                        interrupted = True
+                except Exception:
+                    break
+            try:
+                task.result()
+            except BaseException:
+                pass
+            return interrupted
         try:
             done, _ = await asyncio.wait({task}, timeout=timeout)
         except asyncio.CancelledError:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            if drain_on_cancel:
+                await drain()
+            else:
+                await asyncio.gather(task, return_exceptions=True)
             raise
         if done:
             return task.result()
         task.cancel()
         # A cancelled child becomes a result, while a cancellation of this
         # registry task still propagates, including during deadline cleanup.
-        await asyncio.gather(task, return_exceptions=True)
+        if drain_on_cancel:
+            if await drain():
+                raise asyncio.CancelledError
+        else:
+            await asyncio.gather(task, return_exceptions=True)
         raise _OperationDeadlineExpired
 
     @classmethod
@@ -548,6 +598,7 @@ class EnvironmentOperationRegistry:
         initial = self.state(workspace_root, environment_id=environment_id)
         operation_id = initial.operation_id
         progress_open = True
+        setup_desktop = payload.get('_setup_desktop') is True
 
         def set_phase(
             stage: str, message: str, *, detail: str = '',
@@ -566,7 +617,7 @@ class EnvironmentOperationRegistry:
             now = time.time()
             stage_changed = previous.stage != stage
             workflow_percent, step_index, step_total = self._workflow_progress(
-                action, stage, stage_progress_percent,
+                action, stage, stage_progress_percent, setup_desktop=setup_desktop,
             )
             expected_total = previous.expected_total_seconds
             elapsed = max(0.0, now - previous.started_at) if previous.started_at else 0.0
@@ -669,7 +720,8 @@ class EnvironmentOperationRegistry:
                     expected=payload.get('expected'), progress=progress, reservation_held=True,
                 )
             if action == 'start':
-                return await provider.start(progress=progress)
+                return await provider.start(progress=progress, **(
+                    {'setup_desktop': True, 'reservation_held': True} if setup_desktop else {}))
             if action == 'desktop':
                 return await provider.repair_desktop(progress=progress, reservation_held=True)
             if action == 'network':
@@ -729,12 +781,16 @@ class EnvironmentOperationRegistry:
             if action == 'reset':
                 set_phase('factory_reset', 'Factory resetting VM while preserving working roots…')
                 method = provider.reset
+                if setup_desktop:
+                    return await method(progress=progress, setup_desktop=True, reservation_held=True)
                 if self._accepts_progress(method):
                     return await method(progress=progress)
                 return await method()
             if action == 'rebuild':
                 set_phase('rebuilding', 'Rebuilding VM while preserving working roots…')
                 method = provider.rebuild
+                if setup_desktop:
+                    return await method(progress=progress, setup_desktop=True, reservation_held=True)
                 if self._accepts_progress(method):
                     return await method(progress=progress)
                 return await method()
@@ -769,8 +825,10 @@ class EnvironmentOperationRegistry:
             state = self.state(workspace_root, environment_id=environment_id)
             remaining = max(0.1, state.deadline - time.time()) if state.deadline else self._deadline_seconds(action)
             with environment_operation_context(operation_id, action):
-                result = await self._wait_for_operation(execute_selected(), remaining)
-            self._validate_result(action, result, snapshot_tag=str(payload.get('name') or ''))
+                result = await self._wait_for_operation(execute_selected(), remaining,
+                    drain_on_cancel=setup_desktop or action == 'desktop')
+            self._validate_result(action, result, snapshot_tag=str(payload.get('name') or ''),
+                                  require_desktop=setup_desktop)
             if action == 'snapshot':
                 from .status import ENVIRONMENT_STATUS
                 ENVIRONMENT_STATUS.publish_snapshots(workspace_root, result, environment_id=environment_id)
@@ -788,6 +846,10 @@ class EnvironmentOperationRegistry:
                 'resources': 'VM resources saved. Start the VM to use them.',
                 'remove': 'VM environment removed. Workspace project files were preserved.',
             }.get(action, 'Environment operation complete.')
+            if setup_desktop:
+                success = ('Environment and desktop are Ready.' if action == 'start' else
+                           f'VM {"reset" if action == "reset" else "rebuild"} complete. '
+                           'Desktop is Ready; workspace project files were preserved.')
             if (str(getattr(result, 'provider', '')) == 'managed'
                     and str(getattr(result, 'phase', '')) == 'installer_pending'):
                 success = 'Windows VM is running. Finish setup in its graphical tab before using model tools.'
@@ -864,13 +926,16 @@ class EnvironmentOperationRegistry:
             error = str(exc) or type(exc).__name__
             if provider_timeout:
                 error += f'\nFailed stage: {stage_label}.'
+            desktop_error_code = str(getattr(exc, 'error_code', '') or '')
+            desktop_failure = setup_desktop and desktop_error_code.startswith('DESKTOP_')
             state = self._update(
                 workspace_root, environment_id=environment_id,
                 busy=False,
                 status='failed',
                 stage='failed',
-                message='Environment operation failed.',
+                message='Desktop setup incomplete.' if desktop_failure else 'Environment operation failed.',
                 error=error,
+                **({'error_code': desktop_error_code} if desktop_failure else {}),
                 success='',
                 **({'detail': f'Timed out during {stage_label}.'} if provider_timeout else {}),
             )
