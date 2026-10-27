@@ -43,6 +43,32 @@ class LimaUnavailableError(RuntimeError):
     pass
 
 
+class SSHFSSetupError(RuntimeError):
+    def __init__(self, code: str, *, failure_reason: str = '') -> None:
+        messages = {
+            'SSHFS_SETUP_OFFLINE': 'File-sharing prerequisites are missing and public outbound is disabled. Enable public outbound to install file-sharing support, then retry Start.',
+            'SSHFS_SETUP_TIMEOUT': 'SSHFS setup exceeded its time limit. Retry Start after checking the guest package manager and network access.',
+            'SSHFS_SETUP_GUARD_FAILED': 'The saved network policy could not be applied before SSHFS setup.',
+            'SSHFS_SETUP_APT_UPDATE_FAILED': 'SSHFS setup could not refresh the guest package list. Check public network access and retry Start.',
+            'SSHFS_SETUP_APT_INSTALL_FAILED': 'SSHFS setup could not install the guest package. Check the guest package manager and retry Start.',
+            'SSHFS_SETUP_PREREQUISITE_MISSING': 'SSHFS setup is missing a required guest setup tool.',
+            'SSHFS_SETUP_VERIFY_FAILED': 'SSHFS or its FUSE configuration could not be verified.',
+        }
+        reasons = {
+            'dns_failed': 'The guest could not resolve its package repository.',
+            'network_timeout': 'The guest network request timed out.',
+            'repository_error': 'The guest package repository reported an error.',
+            'package_unavailable': 'A required package was unavailable from the configured guest repositories.',
+            'package_lock': 'Another guest package operation holds the package-manager lock.',
+            'storage_full': 'The guest ran out of space while preparing file sharing.',
+            'package_command_failed': 'The guest package command failed.',
+        }
+        self.error_code = code if isinstance(code, str) and code in messages else 'SSHFS_SETUP_VERIFY_FAILED'
+        self.failure_reason = failure_reason if isinstance(failure_reason, str) and failure_reason in reasons else 'unknown'
+        detail = (' ' + reasons[self.failure_reason]) if self.failure_reason in reasons else ''
+        super().__init__(messages[self.error_code] + detail + ' The VM disk and project files were preserved.')
+
+
 class _LimaDesktopView:
     """Read-only GUI adapter; lifecycle stays in the named VM registry."""
 
@@ -263,6 +289,8 @@ class LimaVMEnvironment(WorkspaceEnvironment):
     TIMEOUT_DIAGNOSTIC_STARTUP = 3.0
     TIMEOUT_DIAGNOSTIC_STARTUP_QUIET = 6.0
     TIMEOUT_WORKSPACE_MOUNTS = 5.0
+    TIMEOUT_SSHFS_SETUP = 195.0
+    SSHFS_SETUP_POLL_SECONDS = 3.0
     CONTROLLER_HEARTBEAT_SECONDS = 15.0
     STARTUP_QUIET_SECONDS = 30.0
     STARTUP_CAPTURE_INTERVAL_SECONDS = 60.0
@@ -319,7 +347,7 @@ class LimaVMEnvironment(WorkspaceEnvironment):
     async def _guest_diagnostic_probe(self, script: str, timeout: float) -> tuple[int, bytes, bytes]:
         from harnessy.diagnostics.guest_logs import GuestProbeUnavailable
         _validate_registry_path(self.environment_root, self.workspace_root)
-        if self._read_readiness().get('phase') in {'stopped', 'destroyed', 'deleted', 'creating'}:
+        if self._read_readiness().get('phase') in {'stopped', 'destroyed', 'deleted'}:
             raise GuestProbeUnavailable(state='stopped', code='guest_stopped')
         # limactl shell only inspects an already-running guest. In particular,
         # do not call _ensure_running or prepare a project execution view.
@@ -409,6 +437,8 @@ class LimaVMEnvironment(WorkspaceEnvironment):
         binding.update(references_host_path=str(self.canonical_files_root.resolve()),
                        references_backing_guest_path=REFERENCES_BACKING_GUEST_PATH,
                        references_parent_device=parent.st_dev, references_parent_inode=parent.st_ino)
+        if self._mount_type() == 'reverse-sshfs':
+            binding['sshfs_setup_hash'] = self._sshfs_setup_hash()
         return binding
 
     def _references_backing_guest_path(self) -> str:
@@ -436,7 +466,7 @@ class LimaVMEnvironment(WorkspaceEnvironment):
         # Stop/Start on an otherwise usable older running VM. It cannot revoke
         # readiness of independent, already verified Project views.
         references_fields = {'references_host_path', 'references_backing_guest_path',
-                             'references_parent_device', 'references_parent_inode'}
+                             'references_parent_device', 'references_parent_inode', 'sshfs_setup_hash'}
         return (isinstance(raw, dict)
                 and {key: value for key, value in raw.items() if key not in references_fields}
                 == {key: value for key, value in self._desired_runtime_binding().items()
@@ -481,16 +511,16 @@ class LimaVMEnvironment(WorkspaceEnvironment):
         host-specific bindings are repaired while the instance is stopped and
         tracked only under state/.
         """
-        if not force and self._runtime_binding_matches() and self._references_binding_matches():
+        if (not force and self._runtime_binding_matches() and self._references_binding_matches()
+                and self._sshfs_setup_binding_matches()):
             return
         await self._run(
             'edit', self.INSTANCE,
             '--mount-type', self._mount_type(),
             '--set', self._mounts_set_expression(),
-            # Older HarnessyXO instances embedded apt-get provisioning in Lima's
-            # per-boot provision list. Remove it while the VM is stopped so an
-            # upgraded existing workspace also gets fast normal boots.
-            '--set', '.provision=[]',
+            # Remove legacy heavy tool provisioning while stopped, retaining
+            # only the short transport prerequisite needed before Lima mounts.
+            '--set', '.provision=' + json.dumps(self._sshfs_dependency_provision(), separators=(',', ':')),
             timeout=self.TIMEOUT_EDIT, check=True,
         )
         self._write_runtime_binding()
@@ -504,6 +534,165 @@ class LimaVMEnvironment(WorkspaceEnvironment):
             workspace_view_guest_path=WORKSPACE_VIEW_GUEST_PATH,
             mount_type=self._mount_type(), boot_provisioning='explicit-once',
         )
+
+    def _sshfs_dependency_provision(self) -> list[dict[str, Any]]:
+        if self._mount_type() != 'reverse-sshfs':
+            return []
+        from .sshfs_setup import build_sshfs_setup_script
+        return [{'mode': 'dependency', 'skipDefaultDependencyResolution': True,
+                 'script': build_sshfs_setup_script(
+            public_network=bool(self.config.network), guard_script=self._network_guard_script())}]
+
+    def _sshfs_setup_hash(self) -> str:
+        return hashlib.sha256(json.dumps(self._sshfs_dependency_provision(),
+            sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
+
+    def _sshfs_setup_binding_matches(self) -> bool:
+        if self._mount_type() != 'reverse-sshfs':
+            return True
+        try:
+            value = json.loads(self.runtime_binding_path.read_text('utf-8'))
+        except (OSError, ValueError):
+            return False
+        return isinstance(value, dict) and value.get('sshfs_setup_hash') == self._sshfs_setup_hash()
+
+    async def _read_sshfs_setup_status(self, *, expected_boot_id: str = '') -> dict:
+        from .sshfs_setup import build_sshfs_status_script, parse_sshfs_status
+
+        try:
+            rc, stdout, _ = await self._run(
+                'shell', '--workdir', '/', self.INSTANCE, 'sudo', '-n', '--', '/bin/sh', '-c',
+                build_sshfs_status_script(), timeout=4.0, check=False, diagnostic_probe=True,
+            )
+            if rc == 0:
+                return parse_sshfs_status(stdout, expected_boot_id=expected_boot_id)
+        except (OSError, ValueError, RuntimeError, asyncio.TimeoutError):
+            pass
+        return {'state': 'unavailable', 'stage': 'checking', 'error_code': 'SSHFS_SETUP_STATUS_MISSING'}
+
+    async def _raise_sshfs_setup_failure(self, code: str, *, failure_reason: str = '') -> None:
+        error = SSHFSSetupError(code, failure_reason=failure_reason)
+        await self._probe_workspace_backing_mounts(phase='verification_failed')
+        self._write_readiness(ready=False, phase='sshfs_setup_failed', error=str(error))
+        log_event('runtime', 'vm_sshfs_setup_failed', workspace=str(self.workspace_root),
+                  provider='lima', error_code=error.error_code,
+                  reason=error.failure_reason,
+                  **self._controller_diagnostic_fields())
+        raise error
+
+    async def _prepare_running_sshfs(self, progress=None) -> None:
+        from .sshfs_setup import build_sshfs_setup_script
+
+        await self._emit_progress(progress, 'preparing_file_sharing', 'Preparing guest file sharing…',
+            detail='Checking SSHFS and FUSE before restarting the file-sharing connection.',
+            stage_timeout_seconds=self.TIMEOUT_SSHFS_SETUP)
+        self._write_readiness(ready=False, phase='preparing_file_sharing')
+        try:
+            boot_id = await self._guest_boot_id()
+        except Exception:
+            await self._raise_sshfs_setup_failure('SSHFS_SETUP_VERIFY_FAILED')
+        if not boot_id:
+            await self._raise_sshfs_setup_failure('SSHFS_SETUP_VERIFY_FAILED')
+        try:
+            rc, _, _ = await self._run(
+                'shell', '--workdir', '/', self.INSTANCE, 'sudo', '-n', '--', '/bin/sh', '-c',
+                build_sshfs_setup_script(public_network=bool(self.config.network),
+                                         guard_script=self._network_guard_script()),
+                timeout=self.TIMEOUT_SSHFS_SETUP, check=False, diagnostic_probe=True,
+            )
+        except asyncio.TimeoutError:
+            await self._raise_sshfs_setup_failure('SSHFS_SETUP_TIMEOUT')
+        except Exception:
+            await self._raise_sshfs_setup_failure('SSHFS_SETUP_VERIFY_FAILED')
+        state = await self._read_sshfs_setup_status(expected_boot_id=boot_id)
+        if state.get('state') == 'failed':
+            await self._raise_sshfs_setup_failure(str(state.get('error_code') or 'SSHFS_SETUP_VERIFY_FAILED'),
+                                                failure_reason=str(state.get('failure_reason') or ''))
+        if rc != 0 or state.get('state') != 'ready':
+            await self._raise_sshfs_setup_failure('SSHFS_SETUP_VERIFY_FAILED')
+
+    async def _start_lima_with_sshfs_monitor(self, progress=None) -> None:
+        """Wait for native readiness; a same-boot setup failure can finish sooner."""
+        task = asyncio.create_task(self._run(
+            'start', self.INSTANCE, f'--timeout={self.TIMEOUT_START:g}s',
+            timeout=self.TIMEOUT_START + self.TIMEOUT_START_CONTROLLER_GRACE, check=True,
+        ))
+        async def drain_controller() -> bool:
+            """Own cleanup until it settles, including repeated outer cancellation."""
+            interrupted = False
+            if not task.done():
+                task.cancel()
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    if not task.done():
+                        interrupted = True
+                except Exception:
+                    break
+            try:
+                task.result()
+            except BaseException:
+                pass
+            return interrupted
+
+        last_stage = ''
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=self.SSHFS_SETUP_POLL_SECONDS)
+                if done:
+                    await task
+                    return
+                state = await self._read_sshfs_setup_status()
+                if state.get('state') == 'failed':
+                    if await drain_controller():
+                        raise asyncio.CancelledError
+                    await self._raise_sshfs_setup_failure(str(state.get('error_code') or 'SSHFS_SETUP_VERIFY_FAILED'),
+                                                        failure_reason=str(state.get('failure_reason') or ''))
+                stage = str(state.get('stage') or '')
+                if state.get('state') in {'pending', 'ready'} and stage != last_stage:
+                    last_stage = stage
+                    details = {'checking': 'Checking guest SSHFS and FUSE…',
+                               'installing': 'Installing guest file-sharing support…',
+                               'ready': 'Guest file-sharing support verified; waiting for Lima readiness…'}
+                    await self._emit_progress(progress, 'starting_vm', 'Starting workspace VM…',
+                        detail=details.get(stage, 'Waiting for guest file-sharing setup…'),
+                        stage_progress_percent=None, progress_source='controller_observation',
+                        stage_timeout_seconds=self.TIMEOUT_START)
+        except asyncio.CancelledError:
+            raise
+        except SSHFSSetupError:
+            raise
+        except Exception:
+            state = await self._read_sshfs_setup_status()
+            if state.get('state') == 'failed':
+                await self._raise_sshfs_setup_failure(str(state.get('error_code') or 'SSHFS_SETUP_VERIFY_FAILED'),
+                                                    failure_reason=str(state.get('failure_reason') or ''))
+            await self._probe_workspace_backing_mounts(phase='verification_failed')
+            log_event('runtime', 'vm_sshfs_start_failed', workspace=str(self.workspace_root),
+                      provider='lima', error_code='SSHFS_SETUP_VERIFY_FAILED', reason='unknown',
+                      **self._controller_diagnostic_fields())
+            raise
+        finally:
+            if await drain_controller():
+                raise asyncio.CancelledError
+
+    async def _recover_running_sshfs(self, progress=None) -> EnvironmentStatus:
+        release = reserve_environment_change(self.workspace_root, 'file sharing setup', environment_id=self.config.id)
+        try:
+            await self._prepare_running_sshfs(progress=progress)
+            await self.stop()
+            status = await self.status()
+            if status.running or status.state != 'stopped':
+                message = 'The VM did not stop. Its file-sharing configuration was not changed. Stop it before trying Start again.'
+                self._write_readiness(ready=False, phase='binding_reconcile_failed', error=message)
+                raise RuntimeError(message)
+            await self._reconcile_runtime_binding(force=True)
+            self._clear_readiness('starting_vm')
+            await self._start_lima_with_sshfs_monitor(progress=progress)
+            return await self.status()
+        finally:
+            release()
 
     @staticmethod
     def _q(value: str) -> str:
@@ -1411,6 +1600,7 @@ mounts:
   writable: {"false" if self.config.files_mode == "readonly" else "true"}
 {references_mount.rstrip()}
 mountInotify: false
+provision: {json.dumps(self._sshfs_dependency_provision(), ensure_ascii=False, separators=(',', ':'))}
 ssh:
 {"  overVsock: false" if preset.image_id.startswith("fedora") else ""}
   loadDotSSHPubKeys: false
@@ -3754,7 +3944,15 @@ print(json.dumps(facts))
             await report('creating_vm', 'Creating workspace VM…')
             status = await self._call_with_optional_progress(self.create, progress=progress)
         binding_needs_reconcile = not self._runtime_binding_matches()
-        if status.running and binding_needs_reconcile:
+        if status.running and not binding_needs_reconcile and await self._current_boot_is_verified():
+            if not self._read_verified_guest():
+                await self._record_verified_guest()
+            await self._emit_progress(progress, 'ready', 'Environment Ready', stage_progress_percent=100.0, progress_source='lima')
+            return await self.status()
+        if status.running and self._mount_type() == 'reverse-sshfs':
+            status = await self._recover_running_sshfs(progress=progress)
+            binding_needs_reconcile = False
+        elif status.running and binding_needs_reconcile:
             self._preflight_acceleration_access()
             await report(
                 'reconciling_environment', 'Updating workspace VM configuration…',
@@ -3803,10 +4001,13 @@ print(json.dumps(facts))
                 # Bound Lima's own hostagent event watch as well as the outer
                 # application wait. Native SSH requirements retain their own
                 # retry limits, and success still requires our isolation guard.
-                await self._run(
-                    'start', self.INSTANCE, f'--timeout={self.TIMEOUT_START:g}s',
-                    timeout=self.TIMEOUT_START + self.TIMEOUT_START_CONTROLLER_GRACE, check=True,
-                )
+                if self._mount_type() == 'reverse-sshfs':
+                    await self._start_lima_with_sshfs_monitor(progress=progress)
+                else:
+                    await self._run(
+                        'start', self.INSTANCE, f'--timeout={self.TIMEOUT_START:g}s',
+                        timeout=self.TIMEOUT_START + self.TIMEOUT_START_CONTROLLER_GRACE, check=True,
+                    )
             finally:
                 self._controller_output_callback = previous_observer
             log_event('harnessy', 'vm_started', workspace=str(self.workspace_root), provider='lima')

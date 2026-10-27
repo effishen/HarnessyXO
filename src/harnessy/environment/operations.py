@@ -84,7 +84,7 @@ class EnvironmentOperationRegistry:
         'resources': ('resources_checking', 'resources_applying', 'resources_saving', 'resources_complete'),
         'network': ('checking_host_dependencies', 'network_stopping', 'network_applying', 'network_starting', 'ready'),
         'start': (
-            'creating_vm', 'reconciling_environment', 'starting_vm', 'waiting_for_guest',
+            'creating_vm', 'reconciling_environment', 'preparing_file_sharing', 'starting_vm', 'waiting_for_guest',
             'checking_provisioning', 'adopting_provisioning', 'provisioning_packages',
             'provisioning_package_index', 'provisioning_required_packages',
             'provisioning_optional_packages', 'provisioning_ghidra',
@@ -107,7 +107,7 @@ class EnvironmentOperationRegistry:
             'reconciling_restore_files', 'restarting_restore_vm', 'verifying_restore_restart',
         ),
         'reset': (
-            'factory_reset', 'restarting_reset_vm', 'starting_vm', 'waiting_for_guest',
+            'factory_reset', 'restarting_reset_vm', 'preparing_file_sharing', 'starting_vm', 'waiting_for_guest',
             'checking_provisioning', 'adopting_provisioning', 'provisioning_packages', 'provisioning_package_index',
             'provisioning_required_packages', 'provisioning_optional_packages',
             'provisioning_ghidra', 'provisioning_ghidra_arm64', 'provisioning_python_re',
@@ -116,7 +116,7 @@ class EnvironmentOperationRegistry:
             'verifying_isolation', 'ready',
         ),
         'rebuild': (
-            'rebuilding', 'creating_vm', 'starting_vm', 'waiting_for_guest',
+            'rebuilding', 'creating_vm', 'preparing_file_sharing', 'starting_vm', 'waiting_for_guest',
             'checking_provisioning', 'adopting_provisioning', 'provisioning_packages', 'provisioning_package_index',
             'provisioning_required_packages', 'provisioning_optional_packages',
             'provisioning_ghidra', 'provisioning_ghidra_arm64', 'provisioning_python_re',

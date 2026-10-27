@@ -565,8 +565,11 @@ def _open_capture_directory(runtime: Path) -> int:
             os.close(parent)
             parent = child
         info = os.fstat(parent)
-        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
-            raise ValueError('Guest runtime is not privately writable.')
+        # Environment roots can legitimately inherit group write from umask
+        # 0002. The pinned, account-owned root is not the receipt directory:
+        # observations below still require their own private 0700 directory.
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o002:
+            raise ValueError('Guest runtime is unsafe.')
         try:
             os.mkdir('guest-diagnostics', 0o700, dir_fd=parent)
         except FileExistsError:
