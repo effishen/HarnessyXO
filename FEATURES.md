@@ -1,7 +1,13 @@
-# HarnessyXO v0.7.19 Features
+# HarnessyXO v0.7.21 Features
+
+- Double-click a project to open its own writable folder. Upload or drop files, edit and save, create folders, move, rename and delete its own files. Live parents, Project Access sources and References stay read-only; locked and archived projects stay read-only. Permissions are checked again when an action writes, including open editors, File History restores, archive extraction and streamed uploads.
+- Dropping several files or directories preserves the entire drop and its original project destination when tabs change. Read-only destinations show an error. Failed uploads remove their own partial file without deleting another upload's existing file.
+- Before sending a prompt, see a composer warning if no VM is enabled and allowed for that exact project. The warning refreshes saved grants and links to VM Settings. Permitted stopped VMs can be started normally; the warning does not start or probe a guest.
+- VM Manage uses **Details → Settings → Snapshots**. Settings contains model enablement, allowed projects, VM name/purpose, tool preset, resources, optional tools, network policy and destructive controls. Details keeps status and measurements.
+- Long workspace paths use a short, real Lima home on the same volume for Unix sockets. Existing disks stay on their volume, and existing VM state is adopted only when stopped. Workspace source paths stay unchanged. Details shows the actual VM storage directory; include it with your workspace when backing up VM disks. Unsafe absolute disk backing paths are preserved and require separate relocation.
 
 - OpenWrt VM commands and probes reuse an authenticated SSH connection with separate sessions for each task. Long-running tasks retain their existing runtime allowance; the connection closes after all sessions finish and 60 idle seconds pass. SSHFS file streams use dedicated connections, and each VM launch or identity change gets its own private control socket.
-- Workspace proof timeouts receive bounded recovery before a run stops. OpenWrt retries only the controller-created nonce read over independent SSH, then changes the connection used by future commands after exact verification. Existing jobs, terminals and file streams remain attached to their original connections; model commands are never replayed and recovery never starts or restarts a VM. Guest diagnostic captures also use independent SSH.
+- Temporary OpenWrt SSH outages receive up to three minutes of cancellable recovery after the first failed workspace proof. **Waiting for VM connection** shows that the pending tool is waiting. Spaced independent checks retry only the same controller-created nonce; exact verification selects a fresh connection for future commands. Existing jobs, terminals and file streams retain their sessions. Model commands are never replayed and recovery never starts or restarts a VM. Guest diagnostic captures also use independent SSH.
 - OpenWrt SSH/SSHFS failures trigger a bounded host-side snapshot independent of guest SSH. **Download Diagnostics** includes **VM_STALLS.json** with saved QEMU monitor observations, serial signals, Linux host pressure, verified QEMU process progress and local forwarding socket states. A later healthy VM does not overwrite these failure-time facts. Unsupported or unavailable sources remain explicit; raw process arguments, monitor replies and addresses are excluded.
 - SSH evidence distinguishes an observed TCP connection failure from banner exchange, key exchange, authentication and session opening. A silent command deadline stays unknown. Guest session exits before authentication keep their fixed timeout reason, and bounded process-state counts can identify blocked SSH/FUSE processes without revealing command lines.
 
@@ -519,8 +525,8 @@ Workspace and machine databases use WAL so background reads can coexist with mes
 
 ## Transient workspace-verification recovery
 
-- A fresh host mapping nonce is durably written once and kept alive through a bounded four-attempt verification window spanning 1.1 seconds of backoff.
-- Inconclusive nonzero probe executions without a structured projection error, and probe timeouts, are retried. Each attempt has a 15-second deadline; the four-attempt window includes 1.1 seconds of backoff. OpenWrt retries bypass the shared command connection while preserving the authorized isolated project view.
+- A fresh host mapping nonce is durably written once and kept alive through verification. The usual four quick attempts handle short visibility delays; recognized temporary OpenWrt transport failures receive up to three minutes of recovery after the first failure, with spaced retries and a finite attempt limit.
+- Recovery checks bypass the shared command connection and retain the authorized isolated project view. Each independent check is bounded by 15 seconds or the remaining recovery time. Normal first-use VM startup keeps its existing allowance. Stop generation cancels the wait and cleans up the proof.
 - A zero-exit probe containing different bytes is an immediate `WORKSPACE_MAPPING_MISMATCH`; an exact host/VM file digest mismatch remains an immediate `FILE_VIEW_MISMATCH`; structured projection failures and access denials remain terminal. Exhausted timeout recovery still stops the run.
 - The final Tool receipt records attempt count, transient failures, and whether the probe recovered. Probe files are still removed before any model-requested command executes.
 - A saved workspace-safety terminal answer now says **Blocked after …** in red instead of incorrectly saying **Completed in …**.
@@ -602,7 +608,7 @@ Workspace and machine databases use WAL so background reads can coexist with mes
 - Project title, ID and current/queued status form one sidebar selection target.
 - Explorer title annotations do not alter real folder names.
 - Human explorer, structured tools, Git/LSP, and VM commands use the same canonical bytes.
-- Chat **Project Files** opens at `/workspace/Files` but exposes only `References` and the current `Project-XXXX`; live ancestors use nested model-visible paths and unrelated sibling projects stay hidden.
+- Chat **Project Files** starts inside its own writable `Project-XXXX` folder. Go up to `/workspace/Files` to browse References and direct Project Access sources; live ancestors use nested model-visible paths and unrelated sibling projects stay hidden. Linked inputs stay read-only in this project view.
 - No active private working copies and no separate output folders.
 - Final deliverables, source, research, and intermediate work remain together in the owning project.
 - Uploaded archives extract into the owning canonical project without switching to a hidden working root.

@@ -468,7 +468,8 @@ def validate_workspace_recovery_event(event: Any, value: Any) -> dict[str, Any] 
 _VM_COMMAND_ID_KEYS = frozenset({'command_id', 'parent_start_command_id', 'startup_attempt_id'})
 _MAPPING_RECOVERY_ENUMS = {
     'probe_connection_mode': frozenset({'provider_default', 'independent', 'reused'}),
-    'probe_failure_kind': frozenset({'timeout', 'ssh_exit', 'probe_exit'}),
+    'probe_failure_kind': frozenset({'timeout', 'ssh_exit', 'probe_exit', 'transport_error'}),
+    'mapping_recovery_state': frozenset({'waiting', 'recovered', 'blocked', 'exhausted', 'cancelled'}),
 }
 
 

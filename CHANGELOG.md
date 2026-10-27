@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.7.21
+
+- Double-click a project to open its own folder with uploads, editing, new files/folders, moves, renames and deletes available. Apply permissions per folder: live parents, Project Access sources and References stay read-only. Locked projects and permanent archives stay read-only.
+- Keep those permissions when saving an open editor, confirming an operation, restoring File History or extracting an archive. Read-only inputs can be copied into the project's own folder; its canonical root cannot be renamed, moved or deleted from this view.
+- Restore drag-and-drop uploads into the project folder. Capture every dropped file/directory before the browser protects the drag data, retain the original project destination when switching tabs, and show a clear error for read-only destinations. The upload picker uses the same destination handling.
+- Accept the Project Files scope in both upload APIs and recheck access while streaming. Failed or cancelled uploads remove only their own partial file; an exclusive-create collision preserves the other file.
+- Show a warning above the composer before the first prompt when the project has no VM it can use. Distinguish missing VMs, disabled model use and missing project access; open VM settings from the warning. A stopped but permitted VM still counts as available.
+- Put VM configuration and project-access permissions in **Manage → Settings**, between **Details** and **Snapshots**. Keep monitoring in Details and snapshots in Snapshots, and remember the selected tab.
+- Use a real short Lima home on the VM's existing disk when a long workspace path would exceed the Unix socket limit. Preserve VM disks and workspace files; adopt existing state only after the VM is confirmed stopped. Details shows the actual VM storage folder to include in backups. Older disks with unsafe absolute backing paths stay in place and report that separate relocation is required.
+- Include the pending v0.7.20 OpenWrt connection-recovery changes below. The cause of the original Spark connectivity stall remains unverified.
+
+## v0.7.20
+
+- Wait for a temporary OpenWrt SSH outage to clear before ending the agent run. After a workspace proof first loses its connection, allow up to three minutes of cancellable recovery with spaced independent checks. Show **Waiting for VM connection** while the pending tool waits.
+- Verify the same fresh workspace nonce before admitting the pending command. Once the proof succeeds, use a fresh shared connection for future commands. Existing jobs, terminals and SSHFS streams keep their sessions; recovery never replays a model command.
+- Keep changed workspace identities, access denials, authentication failures, different-byte proofs and structured projection errors blocked. Stop if the recovery window expires, and remove the temporary proof on success, failure or cancellation. Preserve normal first-use VM startup.
+- Retain recovery timing and outcomes in diagnostics alongside the failure-time VM snapshots from v0.7.19. This improves recovery from a temporary outage; the cause of the original guest/host connectivity stall remains unverified.
+
 ## v0.7.19
 
 - Save a failure-time VM snapshot when OpenWrt SSH times out, fails, or an owned SSHFS stream disconnects. Capture the owned QEMU monitor, host resource pressure, QEMU process/progress counters and local forwarding socket states without contacting guest SSH. Keep a bounded receipt for the normal **Download Diagnostics** bundle instead of relying only on a healthy snapshot taken later.
