@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.7.34
+
+- Start a newly created Windows VM without the immediate “No host prerequisite installer exists for provider managed” failure. Windows now checks its Lima/QEMU host runtime while keeping its saved Windows configuration and architecture.
+- Refresh project-file access status after failed, cancelled or timed-out VM setup. A stopped VM no longer remains labelled **Update pending** because its Start failed. Retry Start on the existing VM; its disk and project files are preserved.
+- Keep fixed host prerequisite failure reasons in diagnostics so a setup failure can be identified without exposing raw command output or private paths.
+- Full Microsoft ISO download and native Windows installation still need host verification. This update fixes the confirmed failure before the download begins.
+
 ## v0.7.33
 
 - Choose **Windows 11** and **x86-64 or ARM64** to download matching English (United States) installation media from Microsoft automatically. Both VM creators default to automatic download; an ISO already on the host remains an option. Windows 11 Pro installs through Lima's unattended setup. Activation remains separate and requires an appropriate Windows licence.

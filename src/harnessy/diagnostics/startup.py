@@ -32,8 +32,10 @@ HOST_SETUP_ERROR_CODES = frozenset({
     'non_additive_transaction', 'post_install_verification_failed',
     'package_install_failed', 'package_manager_unavailable', 'KVM_ACCESS_DENIED',
     'controller_version_unsupported',
-    'package_plan_unverified', 'dependency_update_requires_idle',
+    'package_plan_unverified', 'dependency_update_requires_idle', 'provider_unsupported',
 })
+HOST_ENVIRONMENT_PROVIDERS = frozenset({'lima', 'managed', 'openwrt'})
+HOST_RUNTIME_BACKENDS = frozenset({'lima', 'qemu'})
 KVM_SETUP_STATUSES = frozenset({'skipped', 'ready', 'relaunch', 'action_required', 'cancelled'})
 KVM_SETUP_REASONS = frozenset({
     'KVM_NOT_REQUIRED', 'KVM_DEVICE_ABSENT', 'KVM_READY', 'KVM_GROUP_REFRESH_VERIFIED',

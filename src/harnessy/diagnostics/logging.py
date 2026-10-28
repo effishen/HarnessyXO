@@ -25,6 +25,7 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
+from .startup import HOST_SETUP_ERROR_CODES, HOST_ENVIRONMENT_PROVIDERS, HOST_RUNTIME_BACKENDS
 
 _LOG_NAMES = ('harnessy', 'backend', 'tools', 'runtime', 'system', 'context_tuning', 'database', 'targets')
 _MAX_LOG_BYTES = 25 * 1024 * 1024
@@ -313,6 +314,9 @@ _PRIVACY_SAFE_STRING_LIST_KEYS = {
 # These startup fields are evidence from reviewed controller observations,
 # never arbitrary guest output or inferred failure causes.
 _VM_DIAGNOSTIC_ENUMS = {
+    'host_prerequisite_error_code': HOST_SETUP_ERROR_CODES,
+    'environment_provider': HOST_ENVIRONMENT_PROVIDERS,
+    'runtime_backend': HOST_RUNTIME_BACKENDS,
     'lock_kind': frozenset({'thread', 'process'}),
     'controller_action': frozenset({'start', 'stop', 'create', 'delete', 'edit', 'clone', 'snapshot', 'list', 'shell',
                                     'factory-reset', 'restart', '--version', 'other', 'unknown'}),
@@ -478,6 +482,8 @@ _MAPPING_RECOVERY_ENUMS = {
 
 def _safe_event_field(key: str, value: Any) -> Any:
     """Keep reviewed structured evidence intact, without widening raw limits."""
+    if key in {'host_prerequisite_error_code', 'environment_provider', 'runtime_backend'}:
+        return _privacy_safe_value(value, key=key)
     if key.lower() in _MAPPING_RECOVERY_ENUMS or key.lower() == 'command_transport_rotated':
         return _privacy_safe_value(value, key=key)
     if key.lower() == 'external_device':
