@@ -792,7 +792,8 @@ async def ensure_lima_controller(*, progress=None) -> str | None:
 async def _ensure_workspace_prerequisites(config, *, vm_type: str | None = None, progress=None,
                                            allow_install: bool = True, interactive: bool = False) -> dict[str, Any]:
     if str(config.provider) != 'lima':
-        raise HostPrerequisiteError(f'No host prerequisite installer exists for provider {config.provider}.')
+        raise HostPrerequisiteError(f'No host prerequisite installer exists for provider {config.provider}.',
+                                    code='provider_unsupported')
     vm_type = vm_type or execution_mode(config.architecture, host_arch=platform.machine(), host_os=platform.system())[0]
     loop_key = id(asyncio.get_running_loop())
     async with _INSTALL_LOCKS.setdefault(loop_key, asyncio.Lock()):

@@ -1,4 +1,6 @@
-# HarnessyXO v0.7.33 Features
+# HarnessyXO v0.7.34 Features
+
+- Windows VM creation checks the Lima/QEMU host runtime without treating the saved Windows provider as unsupported. Failed or cancelled setup releases the controls for another Start and refreshes project-file status; host prerequisite failures retain a fixed diagnostic reason. Existing VM disks and project files are preserved.
 
 - Create **Windows 11 Pro** VMs for **x86-64 or ARM64** with automatic Microsoft ISO download and unattended installation. Validate the official checksum and compatible installer layout, resume downloads, and keep installed VM disks on later starts. Setup reports its phase and waits for actual guest readiness; **Cancel setup** preserves the VM and reusable download data. Initial setup uses guest internet access before applying the requested outbound policy. Windows activation is separate. Microsoft download restrictions and host prerequisites can still block setup; full native Windows installation remains unverified.
 

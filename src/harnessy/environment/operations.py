@@ -616,6 +616,7 @@ class EnvironmentOperationRegistry:
         progress_open = True
         setup_desktop = payload.get('_setup_desktop') is True
         setup_windows = payload.get('_setup_windows') is True
+        config = None
 
         def set_phase(
             stage: str, message: str, *, detail: str = '',
@@ -814,6 +815,7 @@ class EnvironmentOperationRegistry:
             raise ValueError(f'Unknown environment action: {action}')
 
         async def execute_selected():
+            nonlocal config
             check_model_access()
             manager = EnvironmentManager(workspace_root, environment_id=environment_id)
             config = manager.config
@@ -893,9 +895,6 @@ class EnvironmentOperationRegistry:
                 duration_seconds=duration_seconds, **fields,
             )
             log_event('harnessy', 'environment_action_complete', workspace=str(workspace_root), environment_id=environment_id, action=action)
-            if action in {'create', 'start', 'stop', 'reset', 'rebuild', 'restore'}:
-                from .file_views import FILE_VIEWS
-                FILE_VIEWS.request(workspace_root, reason='vm_operation_' + action, environment_id=environment_id)
         except EnvironmentModelAccessError as exc:
             state = self._update(
                 workspace_root, environment_id=environment_id, busy=False,
@@ -943,14 +942,26 @@ class EnvironmentOperationRegistry:
             desktop_error_code = str(getattr(exc, 'error_code', '') or '')
             desktop_failure = setup_desktop and desktop_error_code.startswith('DESKTOP_')
             windows_failure = setup_windows and re.fullmatch(r'WINDOWS_[A-Z0-9_]{1,64}', desktop_error_code) is not None
+            from .host_prerequisites import HostPrerequisiteError
+            from harnessy.diagnostics.startup import HOST_SETUP_ERROR_CODES
+            host_failure = isinstance(exc, HostPrerequisiteError)
+            host_code = exc.code if host_failure and exc.code in HOST_SETUP_ERROR_CODES else 'setup_failed'
+            host_fields = {}
+            if host_failure:
+                host_fields['host_prerequisite_error_code'] = host_code
+                provider_name = getattr(config, 'provider', '')
+                if provider_name in {'lima', 'managed', 'openwrt'}:
+                    host_fields['environment_provider'] = provider_name
+                    host_fields['runtime_backend'] = 'qemu' if provider_name == 'openwrt' else 'lima'
             state = self._update(
                 workspace_root, environment_id=environment_id,
                 busy=False,
                 status='failed',
                 stage='failed',
-                message='Desktop setup incomplete.' if desktop_failure else 'Windows setup incomplete.' if windows_failure else 'Environment operation failed.',
+                message=('Windows host setup incomplete.' if setup_windows else 'Host prerequisites incomplete.') if host_failure else
+                    'Desktop setup incomplete.' if desktop_failure else 'Windows setup incomplete.' if windows_failure else 'Environment operation failed.',
                 error=error,
-                **({'error_code': desktop_error_code} if desktop_failure or windows_failure else {}),
+                **({'error_code': host_code} if host_failure else {'error_code': desktop_error_code} if desktop_failure or windows_failure else {}),
                 success='',
                 **({'detail': f'Timed out during {stage_label}.'} if provider_timeout else {}),
             )
@@ -959,6 +970,7 @@ class EnvironmentOperationRegistry:
                 workspace_id=state.workspace_id, operation_id=state.operation_id,
                 kind=action, stage=state.stage, error=error, deadline=state.deadline,
                 failed_stage=failed_stage, error_type=type(exc).__name__,
+                **host_fields,
                 **({'error_code': desktop_error_code} if windows_failure else {}),
                 **({'timeout_scope': 'provider'} if provider_timeout else {}),
             )
@@ -973,6 +985,16 @@ class EnvironmentOperationRegistry:
             current = self._tasks.get(key)
             if current is asyncio.current_task():
                 self._tasks.pop(key, None)
+            if action in {'create', 'start', 'stop', 'reset', 'rebuild', 'restore'}:
+                # A file-view worker can have paused while this operation owned
+                # the VM. Every terminal outcome must wake it after releasing
+                # the task, including failed/cancelled first-boot setup.
+                try:
+                    from .file_views import FILE_VIEWS
+                    FILE_VIEWS.request(workspace_root, reason='vm_operation_' + action, environment_id=environment_id)
+                except Exception as exc:
+                    log_event('runtime', 'file_view_reconciliation_failed', environment_id=environment_id,
+                              error_code='FILE_VIEW_LIFECYCLE_REFRESH_FAILED', error_type=type(exc).__name__)
 
     async def reconcile(self, workspace_root: str | Path, *, environment_id: str | None = None) -> EnvironmentOperationState:
         """Reconcile an interrupted persisted operation with current VM state.

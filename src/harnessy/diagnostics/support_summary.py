@@ -15,7 +15,8 @@ import re
 import sqlite3
 from typing import Any
 from .permissions import PERMISSION_EVENTS
-from .startup import STARTUP_EVENTS
+from .startup import (STARTUP_EVENTS, HOST_SETUP_ERROR_CODES,
+                      HOST_ENVIRONMENT_PROVIDERS, HOST_RUNTIME_BACKENDS)
 from harnessy.agent.permission_provenance import (PERMISSION_ACKNOWLEDGEMENT_EVENTS,
                                                 build_permission_acknowledgement_audit)
 
@@ -401,6 +402,10 @@ def _permission_failure_classification(row: dict[str, Any]) -> str | None:
 
 
 def _startup_failure_classification(row: dict[str, Any]) -> str | None:
+    code = row.get('host_prerequisite_error_code')
+    if (row.get('event') == 'environment_operation_failed'
+            and isinstance(code, str) and code in HOST_SETUP_ERROR_CODES):
+        return 'environment_host_prerequisite_failed'
     if row.get('event') == 'host_prerequisite_setup':
         from .startup import validate_startup_event
         receipt = validate_startup_event('host_prerequisite_setup', row)
@@ -410,6 +415,28 @@ def _startup_failure_classification(row: dict[str, Any]) -> str | None:
         from .startup import validate_storage_issue
         return 'rea_storage_validation_failed' if validate_storage_issue(row.get('storage_issue')) else 'rea_setup_failed'
     return None
+
+
+def _host_prerequisite_failure_lines(row: dict[str, Any]) -> list[str]:
+    """Describe fixed host setup facts without retaining the exception text."""
+    code = row.get('host_prerequisite_error_code', row.get('error_code'))
+    if not isinstance(code, str) or code not in HOST_SETUP_ERROR_CODES:
+        return []
+    lines = ['  Host prerequisite setup failed; recorded code: ' + code + '.']
+    for key, allowed in (('environment_provider', HOST_ENVIRONMENT_PROVIDERS),
+                         ('runtime_backend', HOST_RUNTIME_BACKENDS)):
+        value = row.get(key)
+        if isinstance(value, str) and value in allowed:
+            lines.append('  ' + key + ': ' + value + '.')
+    stage = row.get('failed_stage')
+    if isinstance(stage, str):
+        from .logging import _VM_DIAGNOSTIC_ENUMS
+        if stage in _VM_DIAGNOSTIC_ENUMS['failed_stage']:
+            lines.append('  Recorded operation stage: ' + stage + '.')
+    if code == 'provider_unsupported':
+        lines.append('  The host prerequisite check rejected the environment provider. '
+                     'Runtime setup did not proceed through this prerequisite check.')
+    return lines
 
 
 def _rows(latest: Path, *, session_scope: str = 'current', tail_bytes: int = _TAIL_BYTES,
@@ -774,6 +801,12 @@ def _evidence(row: dict[str, Any]) -> dict[str, Any]:
         'capture_scope', 'pending_progress', 'post_exit_output_not_collected',
     )
     evidence = {key: row[key] for key in keys if key in row}
+    for key, allowed in (('host_prerequisite_error_code', HOST_SETUP_ERROR_CODES),
+                         ('environment_provider', HOST_ENVIRONMENT_PROVIDERS),
+                         ('runtime_backend', HOST_RUNTIME_BACKENDS)):
+        value = row.get(key)
+        if isinstance(value, str) and value in allowed:
+            evidence[key] = value
     if 'guest_transport' in row:
         from .guest_logs import validate_transport_evidence
         evidence['guest_transport'] = validate_transport_evidence(row['guest_transport'])
@@ -1163,6 +1196,8 @@ def _startup_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str
                 lines.append(f'    Recorded package-manager return code: {row["returncode"]}.')
             if 'checks_failed' in row:
                 lines.append(f'    Failed launcher checks: {row["checks_failed"]}.')
+            if row['status'] in {'failed', 'action_required'}:
+                lines.extend(_host_prerequisite_failure_lines(row))
         lines.append(f'  Source checks recorded: {len(checks)}; skipped/uncompleted update outcome records: {audit["source_update_skip_records"]}.')
         if outcomes:
             lines.append('  Update outcomes: ' + '; '.join(f'{key} {count}' for key, count in sorted(outcomes.items())) + '.')
@@ -1708,6 +1743,9 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
             lines.append('  Page restoration reported this failure; it is separate from password verification.')
             if failure.get('error_class'):
                 lines.append('  Exception class: ' + failure['error_class'] + '.')
+        if classification in {'environment_host_prerequisite_failed', 'host_prerequisite_setup_failed',
+                              'host_prerequisite_action_required'}:
+            lines.extend(_host_prerequisite_failure_lines(failure))
         if classification == 'environment_provider_timeout':
             lines.append('  A provider/controller phase raised TimeoutError before the operation deadline was reached; this is not a recorded expiration of the overall operation budget.')
         elif classification == 'environment_operation_deadline':

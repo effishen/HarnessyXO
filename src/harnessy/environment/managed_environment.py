@@ -306,7 +306,11 @@ boot_id=$os.LastBootUpTime.ToUniversalTime().ToString('o');build_number=[int]$os
             return current
         await self._progress(progress, 'checking_host_dependencies', 'Checking Windows VM prerequisites…')
         await ensure_test_target_prerequisites(self.config.architecture, windows=True, progress=progress)
-        await ensure_host_prerequisites(self.config, vm_type='qemu', progress=progress)
+        # ``managed`` describes our Windows guest integration. Its native host
+        # controller is Lima/QEMU, as it is for standalone Windows test VMs.
+        # Keep that host selection separate from the saved Windows definition.
+        await ensure_host_prerequisites(EnvironmentConfig(architecture=self.config.architecture),
+                                        vm_type='qemu', progress=progress)
         from .windows_media import ensure_windows_iso, validate_windows_iso
         if self.config.iso_path:
             iso = Path(self.config.iso_path).expanduser()
