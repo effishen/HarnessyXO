@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import platform
+from pathlib import Path
+import stat
 import time
 from dataclasses import replace
 from typing import Any
@@ -133,6 +135,67 @@ async def save_emulated_radio_selection(workspace_root, environment_id: str, *,
                 raise ValueError('The radio selection changed while this dialog was open. Reopen Emulated radios to review it.')
             saved = manager.save(replace(latest, emulation=wanted))
         provider.controller.forget_radios()
+        ENVIRONMENT_STATUS.invalidate(workspace_root, environment_id=environment_id)
+        return saved
+    finally:
+        release()
+
+
+async def save_windows_installation_media(workspace_root, environment_id: str, *,
+                                           source: str, iso_path: str, expected: str,
+                                           expected_architecture: str):
+    """Update a stopped Windows VM's next installation source, keeping its disk."""
+    from harnessy.environment.base import environment_config_lock
+    if source not in {'auto', 'local'}:
+        raise ValueError('Choose automatic download or an ISO on this host.')
+    raw_path = str(iso_path or '') if source == 'local' else ''
+    if any(ord(value) < 32 or ord(value) == 127 for value in raw_path):
+        raise ValueError('Invalid Windows installer ISO path.')
+    selected = raw_path.strip()
+    if source == 'local' and not selected:
+        raise ValueError('Enter the Windows installer ISO path on this host.')
+
+    def host_iso_path() -> str:
+        path = Path(selected).expanduser().absolute()
+        try:
+            if not stat.S_ISREG(path.lstat().st_mode):
+                raise ValueError('Choose a regular ISO file on this host, without a symlink.')
+        except OSError as exc:
+            raise ValueError('The Windows installer ISO is unavailable on this host. Check its path and permissions.') from exc
+        return str(path)
+
+    manager = EnvironmentManager(workspace_root, environment_id=environment_id)
+    current = manager.config
+    if current is None or current.provider != 'managed':
+        raise ValueError('Windows installation media is available for Windows VMs only.')
+    if current.preset != 'windows-11' or current.architecture != expected_architecture:
+        raise ValueError('This VM’s OS or architecture changed while Settings was open. Reopen Settings before changing installation media.')
+    release = reserve_environment_change(workspace_root, 'Windows installation media', environment_id=environment_id)
+    try:
+        if ENVIRONMENT_OPERATIONS.state(workspace_root, environment_id=environment_id).busy:
+            raise RuntimeError('Wait for this VM operation to finish before changing installation media.')
+        status = await manager.provider().status()
+        if status.running:
+            raise RuntimeError('Stop this VM before changing its installation media.')
+        if status.state == 'backend_missing':
+            from harnessy.environment.lima_runtime import verify_uncreated_lima_home
+            if await asyncio.to_thread(verify_uncreated_lima_home, manager.environment_root) is None:
+                raise RuntimeError('The VM could not be verified as stopped. Restore its host runtime before changing installation media.')
+        if status.state not in {'stopped', 'not_created', 'backend_missing'}:
+            raise RuntimeError('The VM could not be verified as stopped. Refresh its status before changing installation media.')
+        if source == 'local':
+            selected = await asyncio.to_thread(host_iso_path)
+        with environment_config_lock(workspace_root, environment_id):
+            latest = manager.get(environment_id)
+            if latest is None or latest.provider != 'managed':
+                raise ValueError('This Windows VM is no longer registered.')
+            if (latest.preset, latest.architecture) != (current.preset, expected_architecture):
+                raise ValueError('This VM’s OS or architecture changed while Settings was open. Reopen Settings before changing installation media.')
+            if latest.iso_path != expected and latest.iso_path != selected:
+                raise ValueError('Installation media changed while Settings was open. Reopen Settings before changing it.')
+            if ENVIRONMENT_OPERATIONS.state(workspace_root, environment_id=environment_id).busy:
+                raise RuntimeError('Wait for this VM operation to finish before changing installation media.')
+            saved = manager.save(replace(latest, iso_path=selected))
         ENVIRONMENT_STATUS.invalidate(workspace_root, environment_id=environment_id)
         return saved
     finally:
@@ -425,6 +488,53 @@ def render_vm_settings(workbench, workspace, environment_id: str, *, on_saved=No
             elif ENVIRONMENT_OPERATIONS.is_busy(workspace.root, environment_id=config.id) or active_work(workspace.root, environment_id=config.id):
                 tool_preset.disable()
                 ui.label('Finish this VM’s current operation and active work before changing its tool preset.').classes('text-xs hy-muted')
+        if config.provider == 'managed':
+            with ui.card().classes('hy-env-card w-full p-4 gap-3').props('data-hy-windows-installation-media=true'):
+                ui.label('Windows installation media').classes('font-semibold')
+                media_source = ui.select(
+                    {'auto': 'Download automatically from Microsoft', 'local': 'Use an ISO on this host'},
+                    value='local' if config.iso_path else 'auto', label='Installation media source').props('outlined').classes('w-full')
+                media_iso = ui.input('Windows installer ISO on the HarnessyXO host', value=config.iso_path,
+                                     placeholder='/path/to/windows.iso').props('outlined').classes('w-full')
+                media_iso.set_visibility(media_source.value == 'local')
+                media_source.on_value_change(lambda event: media_iso.set_visibility(event.value == 'local'))
+                architecture_label = 'ARM64' if config.architecture == 'arm64' else 'x64'
+                download_page = 'https://www.microsoft.com/en-us/software-download/windows11' + ('arm64' if config.architecture == 'arm64' else '')
+                ui.link(f'Download Windows 11 {architecture_label} from Microsoft', download_page, new_tab=True).classes('text-sm')
+                ui.label('If automatic download fails, download the English (United States) ISO in your browser and copy it to the HarnessyXO host, then choose its path here. Start validates the ISO before creating this VM.').classes('text-xs hy-muted')
+                ui.label('This selection applies when the VM is created. Start resumes an existing installed disk; changing installation media does not reinstall Windows.').classes('text-xs hy-muted')
+                media_error = ui.label('').classes('text-sm text-negative').props('role=alert data-hy-windows-media-error=true')
+                media_state = {'saving': False, 'expected': config.iso_path}
+
+                async def save_media(_event=None) -> None:
+                    if media_state['saving']:
+                        return
+                    media_state['saving'] = True
+                    media_save.disable(); media_save.props('loading')
+                    media_source.disable(); media_iso.disable()
+                    media_error.set_text('')
+                    try:
+                        saved = await save_windows_installation_media(workspace.root, config.id,
+                            source=str(media_source.value or ''), iso_path=str(media_iso.value or ''),
+                            expected=media_state['expected'], expected_architecture=config.architecture)
+                        media_state['expected'] = saved.iso_path
+                        if not media_save.is_deleted:
+                            ui.notify('Installation media saved. Use Start to continue setup.', type='positive')
+                            if on_saved is not None:
+                                on_saved(config.id)
+                            else:
+                                workbench.refresh_tabs()
+                    except Exception as exc:
+                        if not media_error.is_deleted:
+                            media_error.set_text(str(exc))
+                    finally:
+                        media_state['saving'] = False
+                        if not media_save.is_deleted:
+                            media_save.enable(); media_save.props(remove='loading')
+                            media_source.enable(); media_iso.enable()
+
+                with ui.row().classes('w-full justify-end gap-2'):
+                    media_save = ui.button('Save installation media', icon='save', on_click=save_media).props('unelevated no-caps data-hy-windows-media-save=true')
         opened_scope = (config.project_access, frozenset(config.allowed_project_ids))
         error = ui.label('').classes('text-sm text-negative').props('role=alert')
 

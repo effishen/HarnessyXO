@@ -482,6 +482,9 @@ _MAPPING_RECOVERY_ENUMS = {
 
 def _safe_event_field(key: str, value: Any) -> Any:
     """Keep reviewed structured evidence intact, without widening raw limits."""
+    if key.lower() == 'windows_media_browser':
+        from .windows_media import validate_windows_media_browser_observation
+        return validate_windows_media_browser_observation(value)
     if key in {'host_prerequisite_error_code', 'environment_provider', 'runtime_backend'}:
         return _privacy_safe_value(value, key=key)
     if key.lower() in _MAPPING_RECOVERY_ENUMS or key.lower() == 'command_transport_rotated':
@@ -1605,6 +1608,9 @@ def _safe_error_summary(value: Any) -> Any:
 
 def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
     lowered = key.lower()
+    if lowered == 'windows_media_browser':
+        from .windows_media import validate_windows_media_browser_observation
+        return validate_windows_media_browser_observation(value)
     if lowered in _MAPPING_RECOVERY_ENUMS:
         return value if isinstance(value, str) and value in _MAPPING_RECOVERY_ENUMS[lowered] else None
     if lowered == 'command_transport_rotated':
@@ -2087,6 +2093,7 @@ _ENVIRONMENT_TIMELINE_PREFIXES = (
     'vm_', 'environment_operation_', 'environment_command_', 'workspace_mapping_', 'test_target_',
 )
 _ENVIRONMENT_TIMELINE_EVENTS = {
+    'windows_media_browser_observation',
     'vm_tool_exec_start', 'vm_tool_exec_complete', 'vm_tool_exec_timeout',
     'vm_tool_exec_cancelled', 'vm_tool_exec_error',
 }
