@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
 import statistics
 import time
 import uuid
@@ -85,6 +86,10 @@ class EnvironmentOperationRegistry:
     TERMINAL_STATUSES = {'succeeded', 'failed', 'timed_out', 'cancelled', 'interrupted'}
 
     WORKFLOW_STAGES = {
+        'windows_setup': ('checking_host_dependencies', 'windows_media_resolving',
+                          'windows_media_downloading', 'windows_media_verifying',
+                          'creating_vm', 'starting_vm', 'windows_installing',
+                          'windows_applying_network', 'windows_verifying', 'ready'),
         'desktop': ('desktop_checking', 'desktop_installing', 'desktop_kernel',
                     'desktop_restarting', 'desktop_verifying', 'desktop_ready'),
         'remove': ('removal_checking', 'removal_destroying', 'removal_complete'),
@@ -224,7 +229,10 @@ class EnvironmentOperationRegistry:
             pass
 
     @classmethod
-    def _workflow_stages(cls, action: str, *, setup_desktop: bool = False) -> tuple[str, ...]:
+    def _workflow_stages(cls, action: str, *, setup_desktop: bool = False,
+                         setup_windows: bool = False) -> tuple[str, ...]:
+        if setup_windows and action in {'start', 'reset', 'rebuild', 'restore'}:
+            return cls.WORKFLOW_STAGES['windows_setup']
         stages = cls.WORKFLOW_STAGES.get(str(action), ())
         if setup_desktop and action in {'start', 'reset', 'rebuild'}:
             stages = tuple(stage for stage in stages if not stage.startswith('desktop_') and stage != 'ready')
@@ -233,8 +241,8 @@ class EnvironmentOperationRegistry:
 
     @classmethod
     def _workflow_progress(cls, action: str, stage: str, stage_percent: float | None = None,
-                           *, setup_desktop: bool = False) -> tuple[float | None, int, int]:
-        stages = cls._workflow_stages(action, setup_desktop=setup_desktop)
+                           *, setup_desktop: bool = False, setup_windows: bool = False) -> tuple[float | None, int, int]:
+        stages = cls._workflow_stages(action, setup_desktop=setup_desktop, setup_windows=setup_windows)
         if not stages or stage not in stages:
             return None, 0, len(stages)
         index = stages.index(stage)
@@ -386,11 +394,14 @@ class EnvironmentOperationRegistry:
         # brokers supply their trusted origin marker; inbound flags cannot turn
         # an internal Start into a GUI install or a guest reboot.
         payload.pop('setup_desktop', None)
+        payload.pop('setup_windows', None)
         payload.pop('reservation_held', None)
         setup_desktop = (manager.config.provider == 'lima' and manager.config.desktop
                          and action in {'start', 'reset', 'rebuild'}
                          and '_model_project_id' not in payload)
         payload['_setup_desktop'] = setup_desktop
+        setup_windows = (manager.config.provider == 'managed' and action in {'start', 'reset', 'rebuild', 'restore'})
+        payload['_setup_windows'] = setup_windows
         if action == 'desktop' and (manager.config.provider != 'lima' or not manager.config.desktop):
             raise ValueError('Desktop repair is available for a Lima Linux VM with its desktop enabled.')
         if action == 'tools' and payload.get('expected_preset') is not None:
@@ -422,12 +433,18 @@ class EnvironmentOperationRegistry:
             policy_release = reserve_environment_change(workspace_root, 'desktop repair', environment_id=environment_id)
         elif setup_desktop:
             policy_release = reserve_environment_change(workspace_root, 'desktop setup', environment_id=environment_id)
+        elif setup_windows and '_model_project_id' not in payload:
+            policy_release = reserve_environment_change(workspace_root, 'Windows setup', environment_id=environment_id)
         else:
             policy_release = None
         try:
             now = time.time()
             operation_id = uuid.uuid4().hex
             deadline_seconds = self._deadline_seconds(action)
+            if setup_windows:
+                # Bound the full first-install path: large ISO, drivers, Lima
+                # preparation and cross-architecture Windows installation.
+                deadline_seconds = max(deadline_seconds, 5 * 60 * 60)
             state = self._update(
                 workspace_root, environment_id=environment_id,
                 operation_id=operation_id,
@@ -453,7 +470,7 @@ class EnvironmentOperationRegistry:
                 stage_progress_percent=None,
                 progress_source='workflow',
                 step_index=0,
-                step_total=len(self._workflow_stages(action, setup_desktop=setup_desktop)),
+                step_total=len(self._workflow_stages(action, setup_desktop=setup_desktop, setup_windows=setup_windows)),
                 expected_total_seconds=self._timing_estimate(workspace_root, action, environment_id=environment_id),
                 eta_seconds=self._timing_estimate(workspace_root, action, environment_id=environment_id),
             )
@@ -520,10 +537,6 @@ class EnvironmentOperationRegistry:
         if result is None:
             return
         if action in {'start', 'restore', 'reset', 'rebuild'} and hasattr(result, 'ready'):
-            if (str(getattr(result, 'provider', '')) == 'managed'
-                    and bool(getattr(result, 'running', False))
-                    and str(getattr(result, 'phase', '')) == 'installer_pending'):
-                return  # A booted Windows installer needs user setup, not SSH readiness.
             if not bool(getattr(result, 'running', False)) or not bool(getattr(result, 'ready', False)):
                 detail = str(getattr(result, 'error', '') or getattr(result, 'detail', '') or getattr(result, 'state', 'not ready'))
                 raise RuntimeError(f'Environment did not become Ready: {detail}')
@@ -602,6 +615,7 @@ class EnvironmentOperationRegistry:
         operation_id = initial.operation_id
         progress_open = True
         setup_desktop = payload.get('_setup_desktop') is True
+        setup_windows = payload.get('_setup_windows') is True
 
         def set_phase(
             stage: str, message: str, *, detail: str = '',
@@ -620,7 +634,7 @@ class EnvironmentOperationRegistry:
             now = time.time()
             stage_changed = previous.stage != stage
             workflow_percent, step_index, step_total = self._workflow_progress(
-                action, stage, stage_progress_percent, setup_desktop=setup_desktop,
+                action, stage, stage_progress_percent, setup_desktop=setup_desktop, setup_windows=setup_windows,
             )
             expected_total = previous.expected_total_seconds
             elapsed = max(0.0, now - previous.started_at) if previous.started_at else 0.0
@@ -853,9 +867,6 @@ class EnvironmentOperationRegistry:
                 success = ('Environment and desktop are Ready.' if action == 'start' else
                            f'VM {"reset" if action == "reset" else "rebuild"} complete. '
                            'Desktop is Ready; workspace project files were preserved.')
-            if (str(getattr(result, 'provider', '')) == 'managed'
-                    and str(getattr(result, 'phase', '')) == 'installer_pending'):
-                success = 'Windows VM is running. Finish setup in its graphical tab before using model tools.'
             completed_at = time.time()
             duration_seconds = max(0.0, completed_at - initial.started_at) if initial.started_at else 0.0
             if action != 'remove':
@@ -931,14 +942,15 @@ class EnvironmentOperationRegistry:
                 error += f'\nFailed stage: {stage_label}.'
             desktop_error_code = str(getattr(exc, 'error_code', '') or '')
             desktop_failure = setup_desktop and desktop_error_code.startswith('DESKTOP_')
+            windows_failure = setup_windows and re.fullmatch(r'WINDOWS_[A-Z0-9_]{1,64}', desktop_error_code) is not None
             state = self._update(
                 workspace_root, environment_id=environment_id,
                 busy=False,
                 status='failed',
                 stage='failed',
-                message='Desktop setup incomplete.' if desktop_failure else 'Environment operation failed.',
+                message='Desktop setup incomplete.' if desktop_failure else 'Windows setup incomplete.' if windows_failure else 'Environment operation failed.',
                 error=error,
-                **({'error_code': desktop_error_code} if desktop_failure else {}),
+                **({'error_code': desktop_error_code} if desktop_failure or windows_failure else {}),
                 success='',
                 **({'detail': f'Timed out during {stage_label}.'} if provider_timeout else {}),
             )
@@ -947,6 +959,7 @@ class EnvironmentOperationRegistry:
                 workspace_id=state.workspace_id, operation_id=state.operation_id,
                 kind=action, stage=state.stage, error=error, deadline=state.deadline,
                 failed_stage=failed_stage, error_type=type(exc).__name__,
+                **({'error_code': desktop_error_code} if windows_failure else {}),
                 **({'timeout_scope': 'provider'} if provider_timeout else {}),
             )
             log_event('harnessy', 'environment_action_failed', workspace=str(workspace_root), environment_id=environment_id, action=action, error=error)
@@ -1003,6 +1016,29 @@ class EnvironmentOperationRegistry:
                 await self.reconcile(root)
             except Exception as exc:
                 log_event('runtime', 'environment_operation_reconcile_failed', workspace=str(Path(root).expanduser().resolve()), error=str(exc))
+
+    async def cancel(self, workspace_root: str | Path, *, environment_id: str | None = None) -> bool:
+        """Cancel one setup task and drain its accepted work without powering off its VM."""
+        task = self.task(workspace_root, environment_id=environment_id)
+        if task is None:
+            return False
+        if task is asyncio.current_task():
+            raise RuntimeError('A VM setup task cannot cancel itself.')
+        task.cancel()
+        # The operation owns its worker and idle reservation until cleanup is
+        # complete. A browser request disappearing must not cancel it again or
+        # allow another operation to start while its download is still draining.
+        cleanup = asyncio.gather(task, return_exceptions=True)
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+        cleanup.result()
+        if cancelled:
+            raise asyncio.CancelledError
+        return True
 
     async def cancel_all(self) -> None:
         tasks = [task for task in self._tasks.values() if not task.done()]

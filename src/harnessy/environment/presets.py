@@ -42,7 +42,7 @@ IMAGES = {
         'Verified official Kali generic cloud image; isolated project files and optional desktop.',
         qemu_mount='reverse-sshfs'),
     'windows-11': GuestImage('windows-11', 'Windows 11', 'windows-11', 'windows',
-        'Install from your own English (United States) ISO. PowerShell, graphical console and explicit project copies.',
+        'Download the matching English (United States) ISO from Microsoft and install Windows 11 Pro automatically. PowerShell, graphical console and explicit project copies.',
         integration='managed', qemu_mount='separate-copy', file_modes=('copy',),
         capabilities=('PowerShell command execution', 'Separate deployed project copies', 'Graphical installer / desktop', 'Stopped VM snapshots')),
 }

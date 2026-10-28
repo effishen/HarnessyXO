@@ -40,8 +40,6 @@ def normalize_vm_config(raw: dict[str, Any]) -> dict[str, Any]:
     iso = str(raw.get('iso_path') or '').strip()
     if any(c in iso for c in ('\x00', '\n', '\r')):
         raise ValueError('Invalid installer path.')
-    if os_name == 'windows-11' and not iso:
-        raise ValueError('Select a Windows 11 English (United States) ISO on the HarnessyXO host.')
     emulation = raw.get('emulation', {})
     if not isinstance(emulation, dict) or any(
         not isinstance(emulation.get(key, False), bool) for key in ('wifi', 'bluetooth')
@@ -377,6 +375,9 @@ class TestTargetManager:
         return path
 
     async def _run(self, *args: str, timeout: float = 120, input_bytes: bytes | None = None, check=True) -> tuple[int, str, str]:
+        if args and args[0] in {'create', 'start', 'stop', 'delete'}:
+            return await self._run_lifecycle_controller(*args, timeout=timeout,
+                                                         input_bytes=input_bytes, check=check)
         proc = await asyncio.create_subprocess_exec(
             self._binary(), *args, env=self._env(), cwd=self.root,
             stdin=asyncio.subprocess.PIPE if input_bytes is not None else asyncio.subprocess.DEVNULL,
@@ -406,6 +407,99 @@ class TestTargetManager:
             raise RuntimeError((buffers[1] or buffers[0] or f'Lima exited {rc}')[-3000:])
         return rc, buffers[0], buffers[1]
 
+    async def _run_lifecycle_controller(self, *args: str, timeout: float,
+                                        input_bytes: bytes | None, check: bool) -> tuple[int, str, str]:
+        """Capture a direct lifecycle controller without waiting for daemon pipe EOF.
+
+        Lima's hostagent can inherit the controller's output descriptors. Only
+        the direct controller is owned here; guest/daemon lifetime is separate.
+        Shell commands retain the pipe-based execution path above.
+        """
+        captures = []
+        proc = None
+        buffers = ['', '']
+        offsets = [0, 0]
+
+        def collect(sizes=None):
+            for index, stream in enumerate(captures):
+                size = sizes[index] if sizes is not None else os.fstat(stream.fileno()).st_size
+                # At most four UTF-8 bytes per retained character. Skip old
+                # excess output instead of reading an unbounded capture.
+                position = max(offsets[index], size - 400000)
+                while position < size:
+                    data = os.pread(stream.fileno(), min(65536, size - position), position)
+                    if not data:
+                        break
+                    position += len(data)
+                    text = data.decode('utf-8', errors='replace')
+                    buffers[index] = (buffers[index] + text)[-100000:]
+                    if self.operation and self.busy:
+                        self.operation.note(text)
+                offsets[index] = size
+
+        try:
+            for _ in range(2):
+                stream = tempfile.TemporaryFile(mode='w+b')
+                captures.append(stream)
+                os.fchmod(stream.fileno(), 0o600)
+            proc = await asyncio.create_subprocess_exec(
+                self._binary(), *args, env=self._env(), cwd=self.root,
+                stdin=asyncio.subprocess.PIPE if input_bytes is not None else asyncio.subprocess.DEVNULL,
+                stdout=captures[0], stderr=captures[1],
+            )
+
+            async def drive():
+                waiter = None
+                try:
+                    if input_bytes is not None:
+                        proc.stdin.write(input_bytes)
+                        await proc.stdin.drain()
+                        proc.stdin.close()
+
+                    async def wait_parent():
+                        code = await proc.wait()
+                        # Freeze the observed direct-controller capture. Later
+                        # output from an inherited daemon is not collected.
+                        return code, [os.fstat(stream.fileno()).st_size for stream in captures]
+
+                    waiter = asyncio.create_task(wait_parent(), name='harnessy-target-controller-wait')
+                    while not waiter.done():
+                        collect()
+                        await asyncio.wait({waiter}, timeout=0.1)
+                    code, sizes = waiter.result()
+                    collect(sizes)
+                    return code
+                finally:
+                    if waiter is not None and not waiter.done():
+                        waiter.cancel()
+                        await asyncio.gather(waiter, return_exceptions=True)
+
+            rc = await asyncio.wait_for(drive(), timeout)
+        finally:
+            cancelled = False
+            try:
+                if proc is not None:
+                    if proc.returncode is None:
+                        try:
+                            proc.kill()
+                        except ProcessLookupError:
+                            pass
+                    drain = asyncio.create_task(proc.wait())
+                    while not drain.done():
+                        try:
+                            await asyncio.shield(drain)
+                        except asyncio.CancelledError:
+                            cancelled = True
+                    drain.result()
+            finally:
+                for stream in captures:
+                    stream.close()
+            if cancelled:
+                raise asyncio.CancelledError
+        if check and rc:
+            raise RuntimeError((buffers[1] or buffers[0] or f'Lima exited {rc}')[-3000:])
+        return rc, buffers[0], buffers[1]
+
     def vm_document(self) -> dict[str, Any]:
         c = self.config
         document = {
@@ -422,9 +516,12 @@ class TestTargetManager:
             'video': {'display': 'vnc', 'vnc': {'display': '127.0.0.1:0,to=99'}} if c['desktop'] else {'display': 'none'},
         }
         if self.windows:
+            iso = str(c.get('iso_path') or '').strip()
+            if not iso:
+                raise ValueError('Resolve the Windows installation media before creating its VM configuration.')
             document['os'] = 'Windows'
             document['tpm'] = True
-            document['images'] = [{'location': str(Path(c['iso_path']).expanduser().resolve()), 'arch': document['arch']}]
+            document['images'] = [{'location': str(Path(iso).expanduser().resolve()), 'arch': document['arch']}]
         else:
             if self.config['os'].startswith('kali-'):
                 document.pop('base')
@@ -605,8 +702,19 @@ systemctl restart lightdm
         )
         await self.prerequisites()
         if not self.instance_dir.exists():
-            if self.windows and not Path(self.config['iso_path']).expanduser().is_file():
-                raise RuntimeError('The Windows installer ISO was not found on the HarnessyXO host.')
+            if self.windows:
+                from .windows_media import ensure_windows_iso, validate_windows_iso
+                iso_text = str(self.config.get('iso_path') or '').strip()
+                if iso_text:
+                    self.stage('prepare_disk')
+                    await asyncio.to_thread(validate_windows_iso, Path(iso_text).expanduser(), self.config['architecture'])
+                else:
+                    self.stage('download')
+                    iso = await ensure_windows_iso(self.config['architecture'], self.root / 'images',
+                                                   progress=self._prerequisite_progress)
+                    # Resolved media belongs to this controller invocation. The
+                    # saved target stays in automatic mode for later rebuilds.
+                    self.config['iso_path'] = str(iso)
             if self.config['os'].startswith('kali-'):
                 self.stage('download')
                 from .test_images import download_verified, extract_cloud_disk, finish_thread

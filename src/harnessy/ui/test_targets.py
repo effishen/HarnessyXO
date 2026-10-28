@@ -38,8 +38,13 @@ def open_vm_creator(ws, refresh, os_name='ubuntu-24.04', *, machine=None):
             desktop = ui.switch('Enable graphical interface', value=True)
             interface_hint = ui.label('Xfce desktop over VNC; turn off for a smaller shell-only VM.').classes('text-xs hy-muted')
             with ui.column().classes('w-full gap-2') as windows_options:
+                installer_source = ui.select(
+                    {'auto': 'Download automatically from Microsoft', 'local': 'Use an ISO on this host'},
+                    value='auto', label='Windows installation media').props('outlined').classes('w-full')
                 iso = ui.input('Windows 11 ISO path on the HarnessyXO host', placeholder='/Users/you/Downloads/Windows11.iso').props('outlined').classes('w-full')
-                ui.label('Use an English (United States) installer matching the architecture below. Installation and activation use your own media and licence.').classes('text-xs hy-muted')
+                iso.set_visibility(False)
+                installer_source.on_value_change(lambda _event: iso.set_visibility(installer_source.value == 'local'))
+                ui.label('Windows 11 Pro installs automatically from matching English (United States) media. Activation requires your own valid Windows licence.').classes('text-xs hy-muted')
                 with ui.row().classes('gap-3'):
                     ui.link('Download ARM64 ISO', 'https://www.microsoft.com/software-download/windows11arm64', new_tab=True)
                     ui.link('Download x64 ISO', 'https://www.microsoft.com/software-download/windows11', new_tab=True)
@@ -112,13 +117,15 @@ def open_vm_creator(ws, refresh, os_name='ubuntu-24.04', *, machine=None):
                     guest = guest_os(operating_system.value)
                     if not str(name.value or '').strip():
                         raise ValueError('Enter a name for this test VM.')
+                    if guest.family == 'windows' and installer_source.value == 'local' and not str(iso.value or '').strip():
+                        raise ValueError('Select an ISO on this host, or choose automatic download.')
                     target = ws.upsert_external_target(
                         name=name.value, host='managed-local', username='root' if guest.family == 'openwrt' else 'harnessy',
                         remote_root='C:/HarnessyTest' if guest.family == 'windows' else ('/root/hx-test' if guest.family == 'openwrt' else '/home/harnessy/hx-test'),
                         approval_mode=access.approval_mode, policy=access.policy(),
                         managed_vm={'os': guest.id, 'architecture': arch.value, 'cpu': int(cpu.value),
                                     'memory_mb': int(memory.value), 'disk_gb': int(disk.value),
-                                    'desktop': bool(desktop.value), 'iso_path': str(iso.value or ''),
+                                    'desktop': bool(desktop.value), 'iso_path': str(iso.value or '') if guest.family == 'windows' and installer_source.value == 'local' else '',
                                     'emulation': {'wifi': bool(wifi.value) if guest.family == 'openwrt' else False,
                                                   'bluetooth': bool(bluetooth.value) if guest.family == 'openwrt' else False}})
                     if start_now.value:

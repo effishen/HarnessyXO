@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.7.33
+
+- Choose **Windows 11** and **x86-64 or ARM64** to download matching English (United States) installation media from Microsoft automatically. Both VM creators default to automatic download; an ISO already on the host remains an option. Windows 11 Pro installs through Lima's unattended setup. Activation remains separate and requires an appropriate Windows licence.
+- Check Microsoft's published SHA256, the ISO's EFI architecture and its Windows 11 Pro image before creating the VM. Cache verified media per VM and resume interrupted downloads when their saved bytes remain compatible. Existing VM restarts reuse the installed disk.
+- Use Microsoft's ordinary anonymous download-page flow in a fresh background browser. Reuse an installed browser where available; prepare official Playwright Chromium when it is missing. A Microsoft challenge or rejection stops the request with a specific error rather than bypassing it or claiming a completed download.
+- Keep Windows setup running through installation, automatic restarts and OpenSSH preparation. Report Ready only after the guest's setup-complete marker, Windows version, architecture, fresh PowerShell proof and requested firewall policy pass verification. A running installer is no longer reported as successful setup.
+- Show download and setup progress with bounded waits. **Cancel setup** drains the setup task and preserves the VM disk and reusable download data; a running VM keeps running. Initial trusted Windows setup uses guest internet access; the saved outbound policy is applied before Ready. Cross-architecture emulation can take substantially longer than native virtualization.
+- Handle native VM-controller completion separately from inherited background output pipes so setup can finish when the launcher exits. Preserve the existing lifetime of guest shell commands.
+- Full Microsoft ISO download and native Windows installation on Spark or Mac remain unverified in this release. Microsoft's metadata was reachable during validation, but the local download-browser installation failed. Microsoft can also reject automated download requests; the host-ISO option remains available.
+
 ## v0.7.32
 
 - Make **Pack as ZIP** show its result in Project Files. Track work under the actual project tab, show its busy state and refresh the listing when it finishes. The ZIP is created alongside the selected file or folder; use Download on the resulting ZIP when you want a browser download.
