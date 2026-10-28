@@ -34,7 +34,7 @@ def network_policy_text(provider: str) -> tuple[str, str]:
     if provider == 'openwrt':
         return 'Outbound network', 'QEMU NAT provides guest networking. When enabled, the guest can reach destinations permitted by the host network; this backend has no public-only destination filter. Verified setup downloads run through HarnessyXO even when guest outbound is off.'
     if provider == 'managed':
-        return 'Outbound network', 'Windows Firewall applies the outbound policy inside the guest. Guest administrators can change that firewall.'
+        return 'Outbound network after setup', 'Initial Windows setup uses internet access to install guest drivers and OpenSSH. This outbound policy is applied through Windows Firewall before Ready. Guest administrators can change that firewall.'
     return 'Public outbound network', 'The guest firewall filters host, LAN, private and reserved destinations. Disabling public outbound also skips downloadable optional tools.'
 
 
@@ -165,7 +165,11 @@ def open_vm_creator(workbench, workspace, on_saved) -> None:
             limits = ui.label('').classes('text-xs hy-muted')
             files = ui.select(FILE_MODES, value='live', label='Project files').props('outlined').classes('w-full')
             file_note = ui.label('').classes('text-xs hy-muted')
+            installer_source = ui.select(
+                {'auto': 'Download automatically from Microsoft', 'local': 'Use an ISO on this host'},
+                value='auto', label='Windows installation media').props('outlined').classes('w-full')
             installer_iso = ui.input('Windows installer ISO on the HarnessyXO host', placeholder='/path/to/windows.iso').props('outlined').classes('w-full')
+            installer_note = ui.label('Windows 11 Pro installs automatically using English (United States) media for the selected architecture. Activation requires your own valid Windows licence.').classes('text-xs hy-muted')
             desktop = ui.switch('Enable graphical interface (desktop / Web UI)', value=False)
             with ui.expansion('Emulated radios', icon='wifi').classes('w-full') as radio_options:
                 wifi = ui.checkbox('Emulated Wi-Fi radios (mac80211_hwsim)', value=False)
@@ -191,6 +195,14 @@ def open_vm_creator(workbench, workspace, on_saved) -> None:
             if not options:
                 raise ValueError('Choose a compatible operating system and tool preset.')
             return options[0]
+
+        def update_installer(_event=None) -> None:
+            windows = str(image.value or '') == 'windows-11'
+            installer_source.set_visibility(windows)
+            installer_iso.set_visibility(windows and installer_source.value == 'local')
+            installer_note.set_visibility(windows)
+
+        installer_source.on_value_change(update_installer)
 
         def optional_for(preset) -> set[str]:
             return state['optional'].setdefault(preset.id, set())
@@ -280,7 +292,7 @@ def open_vm_creator(workbench, workspace, on_saved) -> None:
                 windows = selected.id.startswith('windows')
                 cpu.set_value('4'); ram.set_value('8' if windows else '4'); disk.set_value('80' if windows else '40')
                 cpu.props('max=64'); ram.props('max=256'); disk.props('max=4096')
-                limits.set_text('Windows requires your own compatible installer ISO and guest setup.' if windows else 'Kali uses its own guest filesystem. Desktop access is optional.')
+                limits.set_text('Microsoft ISO download and unattended installation run on Start. Cross-architecture emulation can take substantially longer.' if windows else 'Kali uses its own guest filesystem. Desktop access is optional.')
             else:
                 cpu.set_value('4'); ram.set_value('8'); disk.set_value('128')
                 cpu.props('max=64'); ram.props('max=256'); disk.props('max=4096')
@@ -290,7 +302,7 @@ def open_vm_creator(workbench, workspace, on_saved) -> None:
             if files.value not in files.options:
                 files.set_value(next(iter(files.options), None))
             files.update()
-            installer_iso.set_visibility(managed and selected.id.startswith('windows'))
+            update_installer()
             desktop.set_visibility(managed or selected.integration == 'openwrt' or selected.id.startswith('kali'))
             desktop.set_value((managed and selected.id.startswith('windows')) or selected.integration == 'openwrt')
             radio_options.set_visibility(selected.integration == 'openwrt')
@@ -306,6 +318,9 @@ def open_vm_creator(workbench, workspace, on_saved) -> None:
                     raise ValueError('Enter a name for this VM.')
                 preset = selected_preset()
                 resources = resource_values(cpu.value, ram.value, disk.value)
+                if (preset.image.integration == 'managed' and installer_source.value == 'local'
+                        and not str(installer_iso.value or '').strip()):
+                    raise ValueError('Select an ISO on this host, or choose automatic download.')
                 if preset.image.integration == 'openwrt':
                     mips = str(architecture.value or '').startswith('mips')
                     if resources['disk_gb'] > 64 or resources['memory_mb'] > (2048 if mips else 131072) or (mips and resources['cpu'] != 1):
@@ -315,7 +330,7 @@ def open_vm_creator(workbench, workspace, on_saved) -> None:
                     preset=preset.id, provider={'openwrt': 'openwrt', 'managed': 'managed'}.get(preset.image.integration, 'lima'),
                     architecture=str(architecture.value or ''), **resources, network=bool(network.value),
                     files_mode=str(files.value), optional_tools=tuple(tool for tool in preset.optional_tool_ids if tool in optional_for(preset)),
-                    iso_path=str(installer_iso.value or '').strip() if preset.image.integration == 'managed' else '',
+                    iso_path=str(installer_iso.value or '').strip() if preset.image.integration == 'managed' and installer_source.value == 'local' else '',
                     desktop=bool(desktop.value) if (preset.image.integration in {'managed', 'openwrt'} or preset.image_id.startswith('kali')) else False,
                     emulation={'wifi': bool(wifi.value), 'bluetooth': bool(bluetooth.value)} if preset.image.integration == 'openwrt' else {},
                     project_access=project_access.project_access,
@@ -719,6 +734,37 @@ def render_vm_environments(workbench, tab, workspace) -> None:
                                 ui.notify(str(exc), type='negative')
                         start_button = ui.button('Start', icon='play_arrow', on_click=lambda _=None, callback=queue: callback('start')).props('flat no-caps')
                         stop_button = ui.button('Stop', icon='stop', on_click=lambda _=None, callback=queue: callback('stop')).props('flat no-caps')
+                        cancel_setup_button = None
+                        cancel_setup_state = {'pending': False}
+                        if config.provider == 'managed' and config.preset == 'windows-11':
+                            async def cancel_setup(_event=None, environment_id=config.id, state=cancel_setup_state) -> None:
+                                if state['pending']:
+                                    return
+                                client = ui.context.client
+                                state['pending'] = True
+                                try:
+                                    if not local_panel.is_deleted:
+                                        sync_cards()
+                                    cancelled = await ENVIRONMENT_OPERATIONS.cancel(
+                                        workspace.root, environment_id=environment_id)
+                                    if not client.is_deleted:
+                                        with client:
+                                            ui.notify(
+                                                'Windows setup task cancelled. A running VM keeps running; use Start to check it again.'
+                                                if cancelled else 'No Windows setup task is running.',
+                                                type='info')
+                                except Exception as exc:
+                                    if not client.is_deleted:
+                                        with client:
+                                            ui.notify(str(exc), type='negative')
+                                finally:
+                                    state['pending'] = False
+                                    if not client.is_deleted and not local_panel.is_deleted:
+                                        with client:
+                                            sync_cards()
+                            cancel_setup_button = ui.button('Cancel setup', icon='cancel', on_click=cancel_setup).props('flat no-caps color=negative')
+                            cancel_setup_button.tooltip('Cancel this setup task and keep the VM disk and completed download data. A running VM keeps running.')
+                            cancel_setup_button.set_visibility(False)
                         terminal = ui.button('Terminal', icon='terminal', on_click=lambda _=None, eid=config.id: workbench.open_tool_tab('terminal', workbench._find_reg(workspace.id), environment_id=eid)).props('flat no-caps')
                         terminal_options = ui.button(icon='arrow_drop_down', on_click=lambda _=None, eid=config.id: workbench._choose_vm_terminal(workbench._find_reg(workspace.id), eid)).props('flat dense aria-label="Choose terminal mode and project"')
                         terminal_options.tooltip('Choose Project files or Guest console')
@@ -732,7 +778,7 @@ def render_vm_environments(workbench, tab, workspace) -> None:
                         delete = ui.button(icon='delete_outline', on_click=lambda _=None, item=config: remove(item)).props('flat round dense color=negative aria-label="Remove VM environment"')
                     details = ui.column().classes('w-full gap-0 mt-2 pt-2').style('min-width:0;border-top:1px solid var(--hy-border)').props(f'data-hy-vm-details={config.id}')
                     details.set_visibility(False)
-                    card_states[config.id] = dict(config=config, card=vm_card, spinner=spinner, status=status, operation=operation, detail=detail, timing=timing, progress=progress, progress_panel=progress_panel, progress_icon=progress_icon, start=start_button, stop=stop_button, terminal=terminal, terminal_options=terminal_options, graphical=graphical, desktop_status=desktop_status, manage=manage, details=details, delete=delete, radio_wifi=radio_wifi, radio_bluetooth=radio_bluetooth, running=False)
+                    card_states[config.id] = dict(config=config, card=vm_card, spinner=spinner, status=status, operation=operation, detail=detail, timing=timing, progress=progress, progress_panel=progress_panel, progress_icon=progress_icon, start=start_button, stop=stop_button, cancel_setup=cancel_setup_button, cancel_setup_state=cancel_setup_state, terminal=terminal, terminal_options=terminal_options, graphical=graphical, desktop_status=desktop_status, manage=manage, details=details, delete=delete, radio_wifi=radio_wifi, radio_bluetooth=radio_bluetooth, running=False)
         tab_syncing['value'] = False
         sync_details()
 
@@ -811,6 +857,13 @@ def render_vm_environments(workbench, tab, workspace) -> None:
             controls['start'].set_enabled(can_retry and (not known or not (controls.get('running') and controls.get('ready')) or desktop_pending))
             controls['start'].set_text('Retry Setup' if controls.get('running') and (not controls.get('ready') or desktop_pending) else 'Start')
             controls['stop'].set_enabled(can_retry and (not known or bool(controls.get('running'))))
+            cancel_setup = controls.get('cancel_setup')
+            if cancel_setup is not None:
+                show_cancel = busy and op.action in {'start', 'reset', 'rebuild', 'restore'}
+                pending = bool(controls['cancel_setup_state']['pending'])
+                cancel_setup.set_visibility(show_cancel)
+                cancel_setup.set_enabled(show_cancel and not pending)
+                cancel_setup.set_text('Cancelling…' if pending else 'Cancel setup')
             controls['terminal'].set_enabled(not busy and bool(controls.get('ready')))
             controls['terminal_options'].set_enabled(not busy and bool(controls.get('ready')))
             if controls['graphical'] is not None:

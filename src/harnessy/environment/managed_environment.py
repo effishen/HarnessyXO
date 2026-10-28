@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import inspect
 import json
 import os
 import re
@@ -19,6 +20,7 @@ import time
 import unicodedata
 import uuid
 from pathlib import Path, PurePosixPath
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 
@@ -30,6 +32,18 @@ from .test_catalog import guest_os
 from .test_targets import TestTargetManager, normalize_vm_config
 
 _LOCKS: dict[tuple[str, int], asyncio.Lock] = {}
+
+
+class WindowsSetupError(RuntimeError):
+    def __init__(self, code: str) -> None:
+        messages = {
+            'WINDOWS_INSTALL_TIMEOUT': 'Windows automatic setup did not finish before its time limit. Start again to check and resume this VM; its disk and project files were preserved.',
+            'WINDOWS_GUEST_ARCH_MISMATCH': 'The installed Windows architecture does not match this VM. Its disk was preserved; choose matching installation media before rebuilding.',
+            'WINDOWS_GUEST_OS_MISMATCH': 'The guest is not a supported Windows 11 client installation. Its disk was preserved.',
+            'WINDOWS_SETUP_STOPPED': 'The Windows VM stopped before setup finished. Start again to resume its existing disk.',
+        }
+        self.error_code = code if code in messages else 'WINDOWS_INSTALL_TIMEOUT'
+        super().__init__(messages[self.error_code])
 
 
 class _UnsupportedProjectFiles(RuntimeError):
@@ -120,7 +134,9 @@ class _ManagedController(TestTargetManager):
 
 
 class ManagedEnvironment(WorkspaceEnvironment):
-    TIMEOUT_START = 120.0
+    TIMEOUT_START = 7200.0
+    TIMEOUT_INSTALL = 7200.0
+    INSTALL_POLL_SECONDS = 5.0
 
     def file_view_capabilities(self) -> dict[str, Any]:
         # A deployed Windows tree is not a revocable live share. Keep this
@@ -212,11 +228,56 @@ class ManagedEnvironment(WorkspaceEnvironment):
                                     'error': error, 'updated_at': time.time()}) + '\n', encoding='utf-8')
         path.replace(self.readiness_path)
 
-    async def _progress(self, callback, phase: str, message: str) -> None:
+    async def _progress(self, callback, phase: str, message: str, **metadata) -> None:
         if callback is not None:
-            value = callback(phase, message)
+            parameters = inspect.signature(callback).parameters
+            accepts_meta = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+            value = callback(phase, message, **metadata) if accepts_meta else callback(
+                phase, message, **{key: value for key, value in metadata.items() if key in parameters})
             if hasattr(value, '__await__'):
                 await value
+
+    @staticmethod
+    def _ready_probe_script(nonce: str) -> str:
+        if not re.fullmatch(r'[0-9a-f]{32}', nonce):
+            raise ValueError('Invalid Windows readiness identity.')
+        return r"""$ErrorActionPreference='Stop';
+$marker=Join-Path $env:ProgramData 'Lima\lima-boot-done.txt';
+if (!(Test-Path -LiteralPath $marker) -or (Get-Content -LiteralPath $marker -Raw).Trim() -ne 'done') {exit 20};
+$setup=Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\Setup';
+if ([int]$setup.SystemSetupInProgress -ne 0 -or [int]$setup.OOBEInProgress -ne 0) {exit 21};
+$os=Get-CimInstance Win32_OperatingSystem;
+$native=[System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant();
+$arch=if ($native -eq 'arm64') {'arm64'} elseif ($native -eq 'x64') {'x86_64'} else {'unsupported'};
+[pscustomobject]@{schema_version=1;nonce='""" + nonce + r"""';setup_complete=$true;architecture=$arch;
+boot_id=$os.LastBootUpTime.ToUniversalTime().ToString('o');build_number=[int]$os.BuildNumber;product_type=[int]$os.ProductType} | ConvertTo-Json -Compress"""
+
+    async def _probe_installed_windows(self) -> dict[str, Any] | None:
+        nonce = uuid.uuid4().hex
+        try:
+            rc, out, _ = await self._raw(self._ready_probe_script(nonce), timeout=12, check=False)
+            if rc or not isinstance(out, str) or len(out) > 4096:
+                return None
+            value = json.loads(out)
+            if (not isinstance(value, dict) or type(value.get('schema_version')) is not int or value['schema_version'] != 1
+                    or value.get('nonce') != nonce or value.get('setup_complete') is not True):
+                return None
+            if value.get('architecture') != self.config.architecture:
+                raise WindowsSetupError('WINDOWS_GUEST_ARCH_MISMATCH')
+            if (type(value.get('build_number')) is not int or value['build_number'] < 22000
+                    or type(value.get('product_type')) is not int or value['product_type'] != 1):
+                raise WindowsSetupError('WINDOWS_GUEST_OS_MISMATCH')
+            boot = value.get('boot_id')
+            if not isinstance(boot, str) or len(boot) > 64:
+                return None
+            stamp = datetime.fromisoformat(boot.replace('Z', '+00:00'))
+            if stamp.tzinfo is None or stamp.utcoffset() != timezone.utc.utcoffset(stamp):
+                return None
+            return {'boot_id': boot, 'architecture': value['architecture'], 'setup_complete': True}
+        except WindowsSetupError:
+            raise
+        except (OSError, RuntimeError, ValueError, TypeError, asyncio.TimeoutError):
+            return None
 
     async def status(self) -> EnvironmentStatus:
         fields = dict(environment_id=self.config.id, environment_name=self.config.name,
@@ -231,7 +292,7 @@ class ManagedEnvironment(WorkspaceEnvironment):
         ready = bool(running and marker.get('ready'))
         phase = 'ready' if ready else (str(marker.get('phase') or 'installer_pending') if running else str(data.get('state') or 'not_created'))
         detail = ('Ready for PowerShell commands; project files are separate deployed copies.' if ready else
-                  'Windows is running. Finish Windows setup in its graphical tab; guest SSH and PowerShell must become available.'
+                  'Windows is running. Automatic installation and guest PowerShell readiness have not yet been verified. Start resumes the readiness checks.'
                   if running else 'Windows VM has not been created.' if not data.get('created') else 'Stopped')
         if phase == 'network_policy_failed':
             detail = 'Windows is running, but its requested firewall policy is unverified. Finish administrator setup and retry Start.'
@@ -243,16 +304,21 @@ class ManagedEnvironment(WorkspaceEnvironment):
         current = await self.status()
         if current.created:
             return current
-        iso = Path(self.config.iso_path).expanduser()
-        if not iso.is_file():
-            raise ValueError('The selected Windows installer ISO does not exist on the HarnessyXO host.')
         await self._progress(progress, 'checking_host_dependencies', 'Checking Windows VM prerequisites…')
         await ensure_test_target_prerequisites(self.config.architecture, windows=True, progress=progress)
         await ensure_host_prerequisites(self.config, vm_type='qemu', progress=progress)
+        from .windows_media import ensure_windows_iso, validate_windows_iso
+        if self.config.iso_path:
+            iso = Path(self.config.iso_path).expanduser()
+            await self._progress(progress, 'windows_media_verifying', 'Checking the selected Windows installation media…')
+            await asyncio.to_thread(validate_windows_iso, iso, self.config.architecture)
+        else:
+            iso = await ensure_windows_iso(self.config.architecture, self.environment_root / 'images', progress=progress)
+        self.controller.config['iso_path'] = str(iso)
         self.controller._env()
         specification = self.environment_root / 'windows.json'
         specification.write_text(json.dumps(self.controller.vm_document(), indent=2) + '\n', encoding='utf-8')
-        await self._progress(progress, 'creating_vm', 'Creating Windows VM from the selected ISO…')
+        await self._progress(progress, 'creating_vm', 'Preparing Windows unattended installation…')
         await self.controller._run('create', '--tty=false', '--name', self.controller.instance,
                                    str(specification), timeout=1200)
         self._record(ready=False, phase='stopped')
@@ -278,22 +344,46 @@ class ManagedEnvironment(WorkspaceEnvironment):
             state = await self.status()
             if not state.running:
                 raise RuntimeError('Windows VM did not enter the running state. Check the VM diagnostics.')
+            self._record(ready=False, phase='windows_installing')
+            started = asyncio.get_running_loop().time()
+            deadline = started + self.TIMEOUT_INSTALL
+            proof = None
+            while asyncio.get_running_loop().time() < deadline:
+                elapsed = max(0, int(asyncio.get_running_loop().time() - started))
+                await self._progress(progress, 'windows_installing', 'Installing Windows and preparing guest access…',
+                    detail=f'{elapsed // 60}m {elapsed % 60}s elapsed. Setup includes automatic restarts, drivers and OpenSSH. Guest PowerShell readiness is checked separately.',
+                    stage_timeout_seconds=self.TIMEOUT_INSTALL,
+                    progress_source='controller_observation')
+                proof = await self._probe_installed_windows()
+                if proof is not None:
+                    break
+                observed = await self.controller.status()
+                if (observed.get('created') is True
+                        and str(observed.get('state') or '').lower() == 'stopped'):
+                    self._record(ready=False, phase='windows_setup_stopped')
+                    raise WindowsSetupError('WINDOWS_SETUP_STOPPED')
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining > 0:
+                    await asyncio.sleep(min(self.INSTALL_POLL_SECONDS, remaining))
+            if proof is None:
+                self._record(ready=False, phase='windows_install_timeout')
+                raise WindowsSetupError('WINDOWS_INSTALL_TIMEOUT')
             try:
-                rc, out, _ = await self._raw(
-                    "$ErrorActionPreference='Stop'; (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')",
-                    timeout=12, check=False)
-                if rc or not out.strip():
-                    raise RuntimeError('Guest PowerShell is not ready.')
-            except (RuntimeError, asyncio.TimeoutError):
-                self._record(ready=False, phase='installer_pending')
-                await self._progress(progress, 'installer_pending', 'Windows is running; finish setup in its graphical tab.')
-                return await self.status()
-            try:
+                await self._progress(progress, 'windows_applying_network', 'Applying the saved Windows outbound policy…',
+                                     stage_timeout_seconds=30)
                 await self._apply_network(self.config.network)
-            except BaseException:
+            except asyncio.CancelledError:
+                self._record(ready=False, phase='windows_verifying')
+                raise
+            except Exception:
                 self._record(ready=False, phase='network_policy_failed')
                 raise RuntimeError('Windows started, but its requested firewall policy could not be verified. Finish administrator setup and retry Start.')
-            self._record(ready=True, phase='ready', boot_id=out.strip())
+            await self._progress(progress, 'windows_verifying', 'Verifying the installed Windows guest…', stage_timeout_seconds=15)
+            verified = await self._probe_installed_windows()
+            if verified is None or verified['boot_id'] != proof['boot_id']:
+                self._record(ready=False, phase='windows_verifying')
+                raise RuntimeError('Windows restarted during final verification. Start again to check the current boot; the VM disk was preserved.')
+            self._record(ready=True, phase='ready', boot_id=verified['boot_id'])
             await self._progress(progress, 'ready', 'Windows VM Ready')
             return await self.status()
 

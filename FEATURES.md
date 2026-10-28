@@ -1,4 +1,6 @@
-# HarnessyXO v0.7.32 Features
+# HarnessyXO v0.7.33 Features
+
+- Create **Windows 11 Pro** VMs for **x86-64 or ARM64** with automatic Microsoft ISO download and unattended installation. Validate the official checksum and compatible installer layout, resume downloads, and keep installed VM disks on later starts. Setup reports its phase and waits for actual guest readiness; **Cancel setup** preserves the VM and reusable download data. Initial setup uses guest internet access before applying the requested outbound policy. Windows activation is separate. Microsoft download restrictions and host prerequisites can still block setup; full native Windows installation remains unverified.
 
 - **Pack as ZIP** creates an archive beside the selected items and refreshes the correct Project Files, Workspace Files or Home File Explorer tab. File operations retain visible completion/error messages and busy state while running in the background. Download the completed ZIP from its file row, or create and download whole-project packages in **ZIP / Downloads**.
 

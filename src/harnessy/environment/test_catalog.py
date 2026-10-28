@@ -38,7 +38,7 @@ GUESTS = {item.id: item for item in (
             family='openwrt', cpu=1, memory=1024, disk=8, min_memory=256, min_disk=1, shell='ash', interface='web'),
     GuestOS('openwrt-25.12.5', 'OpenWrt 25.12.5', 'Router test VM with an ash shell and LuCI web interface. Internet through private NAT.',
             family='openwrt', cpu=2, memory=512, disk=2, min_memory=256, min_disk=1, shell='ash', interface='web'),
-    GuestOS('windows-11', 'Windows 11', 'Install from your own English (United States) ISO. Windows support in Lima is experimental.',
+    GuestOS('windows-11', 'Windows 11', 'Download the matching Microsoft ISO and install Windows 11 Pro automatically. Windows support in Lima is experimental.',
             'windows-11', family='windows', memory=8192, disk=80, min_memory=4096, min_disk=64, shell='PowerShell'),
 )}
 

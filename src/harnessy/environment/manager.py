@@ -150,8 +150,8 @@ class EnvironmentManager:
                 raise ValueError('This guest supports separate deployed project copies only.')
             if cfg.preset != 'windows-11':
                 raise ValueError('Unsupported managed guest image.')
-            if not cfg.iso_path or any(value in cfg.iso_path for value in ('\x00', '\n', '\r')):
-                raise ValueError('Select the Windows installer ISO on the HarnessyXO host.')
+            if any(value in cfg.iso_path for value in ('\x00', '\n', '\r')):
+                raise ValueError('Invalid Windows installer ISO path.')
             if cfg.cpu < 2 or cfg.memory_mb < 4096 or cfg.disk_gb < 64:
                 raise ValueError('Windows needs at least 2 CPUs, 4096 MiB RAM and 64 GiB storage.')
 
