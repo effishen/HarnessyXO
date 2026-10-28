@@ -17,6 +17,8 @@ from typing import Any
 from .permissions import PERMISSION_EVENTS
 from .startup import (STARTUP_EVENTS, HOST_SETUP_ERROR_CODES,
                       HOST_ENVIRONMENT_PROVIDERS, HOST_RUNTIME_BACKENDS)
+from .windows_media import (WINDOWS_MEDIA_BROWSER_EVENT,
+                            validate_windows_media_browser_observation)
 from harnessy.agent.permission_provenance import (PERMISSION_ACKNOWLEDGEMENT_EVENTS,
                                                 build_permission_acknowledgement_audit)
 
@@ -439,6 +441,57 @@ def _host_prerequisite_failure_lines(row: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _windows_media_failure_classification(row: dict[str, Any]) -> str | None:
+    if row.get('event') != 'environment_operation_failed':
+        return None
+    observed = validate_windows_media_browser_observation(row.get('windows_media_browser'))
+    if observed is None or observed['result'] == 'info':
+        return None
+    return 'windows_media_' + observed['result']
+
+
+def _windows_media_failure_lines(row: dict[str, Any]) -> list[str]:
+    observed = validate_windows_media_browser_observation(row.get('windows_media_browser'))
+    if observed is None:
+        return []
+    explanations = {
+        'challenge': 'A visible browser challenge stopped the ordinary Windows download page flow.',
+        'rejected': 'The Windows download page reported a rejected request.',
+        'page_error': 'The Windows download page reported an error; a download rejection was not established.',
+        'network_error': 'A network error was observed during the Windows download page flow.',
+        'http_error': 'A Windows download page request returned a failing HTTP status.',
+        'timeout': 'The Windows download browser reached its recorded time limit.',
+        'browser_unavailable': 'The Windows download browser could not be prepared or started.',
+    }
+    lines = ['  Windows media browser phase: ' + observed['phase'] + '; result: ' + observed['result'] + '.']
+    if observed['result'] in explanations:
+        lines.append('  ' + explanations[observed['result']])
+    facts = {key: observed[key] for key in ('http_status', 'browser_version', 'error_kind') if key in observed}
+    if facts:
+        lines.append('  Recorded browser facts: ' + json.dumps(facts, sort_keys=True) + '.')
+    return lines
+
+
+def _windows_media_browser_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
+    observed = [row for row in rows if row.get('event') == WINDOWS_MEDIA_BROWSER_EVENT
+                and validate_windows_media_browser_observation(row.get('windows_media_browser')) is not None]
+    records = [_evidence(row) for row in observed[-40:]]
+    audit = {'schema_version': 1, 'scope': 'bounded_log_observations',
+             'records_available': len(observed), 'records_retained': len(records),
+             'record_limit': 40, 'limited': len(observed) > 40, 'records': records}
+    if not records:
+        return audit, []
+    lines = ['Windows download browser: fixed observations from the examined log tails.']
+    for row in records[-8:]:
+        browser = row['windows_media_browser']
+        lines.append(f'  {row["timestamp"]} [{row["session_scope"]}]: phase {browser["phase"]}; result {browser["result"]}.')
+        facts = {key: browser[key] for key in ('http_status', 'browser_version', 'error_kind') if key in browser}
+        if facts:
+            lines.append('    Recorded browser facts: ' + json.dumps(facts, sort_keys=True) + '.')
+    lines.extend(['  These are observed page/browser outcomes; a generic page error alone does not establish a Microsoft rejection or browser challenge.', ''])
+    return audit, lines
+
+
 def _rows(latest: Path, *, session_scope: str = 'current', tail_bytes: int = _TAIL_BYTES,
           rotations: bool = True) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     # Lazy import avoids a logger/exporter import cycle.
@@ -801,6 +854,12 @@ def _evidence(row: dict[str, Any]) -> dict[str, Any]:
         'capture_scope', 'pending_progress', 'post_exit_output_not_collected',
     )
     evidence = {key: row[key] for key in keys if key in row}
+    environment_id = row.get('environment_id')
+    if isinstance(environment_id, str) and re.fullmatch(r'[0-9a-f]{32}', environment_id):
+        evidence['environment_id'] = environment_id
+    observed_browser = validate_windows_media_browser_observation(row.get('windows_media_browser'))
+    if observed_browser is not None:
+        evidence['windows_media_browser'] = observed_browser
     for key, allowed in (('host_prerequisite_error_code', HOST_SETUP_ERROR_CODES),
                          ('environment_provider', HOST_ENVIRONMENT_PROVIDERS),
                          ('runtime_backend', HOST_RUNTIME_BACKENDS)):
@@ -1469,6 +1528,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         target_classification = _target_failure_classification(failure)
         permission_classification = _permission_failure_classification(failure)
         startup_classification = _startup_failure_classification(failure)
+        windows_media_classification = _windows_media_failure_classification(failure)
         timeout_classification = _timeout_failure_classification(failure)
         terminal_classification = _terminal_failure_classification(failure)
         access_restore_classification = _ACCESS_RESTORE_FAILURES.get(failure.get('event'))
@@ -1507,7 +1567,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         stalls = [row for row in before if row.get('event') in {'event_loop_stall', 'event_loop_stall_sample'}]
         transcript_deferrals = [row for row in related if row.get('event') == 'transcript_refresh_deferred']
         missing: list[str] = []
-        if not vm_classification and not target_classification and not permission_classification and not startup_classification and not timeout_classification and not access_restore_classification and terminal_classification in {None, 'workspace_terminal_start_failed'} and not _has_frames(failure) and not any(_has_frames(row) for row in database_errors):
+        if not vm_classification and not target_classification and not permission_classification and not startup_classification and not windows_media_classification and not timeout_classification and not access_restore_classification and terminal_classification in {None, 'workspace_terminal_start_failed'} and not _has_frames(failure) and not any(_has_frames(row) for row in database_errors):
             missing.append('exception_traceback_unavailable')
         if vm_classification and not vm_cause and not any(
                 isinstance(row.get('controller_evidence'), dict) and any(
@@ -1528,7 +1588,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         identity = json.dumps(_evidence(failure), sort_keys=True)
         incidents.append({
             'incident_id': hashlib.sha256(identity.encode()).hexdigest()[:24],
-            'classification': database_classification or access_restore_classification or ('sqlite_lock_contention' if lock else startup_classification or permission_classification or target_classification or vm_classification or timeout_classification or terminal_classification or 'operation_error'),
+            'classification': database_classification or access_restore_classification or ('sqlite_lock_contention' if lock else startup_classification or windows_media_classification or permission_classification or target_classification or vm_classification or timeout_classification or terminal_classification or 'operation_error'),
             'failure': _evidence(failure),
             'nearby_database_errors': [_evidence(row) for row in database_errors[-3:]],
             'last_successful_tool': successful_tool,
@@ -1566,6 +1626,8 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
     index['permission_audit'] = permission_audit
     startup_audit, startup_lines = _startup_audit(rows)
     index['startup_audit'] = startup_audit
+    browser_audit, browser_lines = _windows_media_browser_audit(rows)
+    index['windows_media_browser_observations'] = browser_audit
     if safe_vm_report is not None:
         index['vm_log_evidence'] = safe_vm_report
     target_rows = [row for row in rows if str(row.get('event')).startswith('test_target_')]
@@ -1643,6 +1705,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
     control_rows = [row for row in rows if row.get('level') in {'WARNING', 'ERROR', 'CRITICAL'}
                     or str(row.get('event')).startswith(('vm_', 'environment_', 'workspace_mapping_', 'test_target_'))
                     or row.get('event') in STARTUP_EVENTS
+                    or row.get('event') == WINDOWS_MEDIA_BROWSER_EVENT
                     or row.get('event') in QUEUE_EVENTS
                     or row.get('event') in _ACCESS_RESTORE_EVENTS or row.get('event') in _WORKSPACE_RECOVERY_EVENTS
                     or row.get('event') in {'headless_run_error', 'agent_run_error', 'run_blocked_by_infrastructure'}]
@@ -1673,6 +1736,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         *model_lines,
         *permission_acknowledgement_lines,
         *controller_lines,
+        *browser_lines,
         f'Recorded failures in examined logs: {len(failures)} (latest {len(incidents)} shown)',
         f'Workspace terminal start failures: {index["workspace_terminal_start_failures"]}; project synchronization limit observations: {index["project_sync_limit_failures"]}.',
         f'Event-loop stalls: {counts["event_loop_stall"]}; maximum recorded delay: {max(durations, default=0):.3f}s',
@@ -1694,6 +1758,8 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
             if failure.get(key):
                 lines.append(f'  {key}: {failure[key]}')
         classification = incident['classification']
+        if classification.startswith('windows_media_'):
+            lines.extend(_windows_media_failure_lines(failure))
         if failure.get('event') == 'workspace_terminal_start_failed':
             descriptions = {
                 'project_sync_byte_limit': 'Project synchronization reached its byte limit before the terminal opened.',

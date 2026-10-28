@@ -7,23 +7,30 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import signal
 import sys
 import time
 from urllib.parse import urlsplit
 
+from harnessy.diagnostics.windows_media import validate_windows_media_browser
+
 
 class WindowsMediaBrowserError(RuntimeError):
-    def __init__(self, code: str):
+    def __init__(self, code: str, *, windows_media_browser=None):
         messages = {
             'WINDOWS_ISO_BROWSER_MISSING': 'Windows automatic download needs Playwright. Restart HarnessyXO through run.py to prepare its dependencies.',
             'WINDOWS_ISO_BROWSER_UNAVAILABLE': 'The Windows download browser could not start. Install Chrome, Chromium or Edge on this host, or choose an ISO on this host.',
             'WINDOWS_ISO_BROWSER_INSTALL_FAILED': 'The Windows download browser could not be downloaded. Check host internet access and retry, or choose an ISO on this host.',
             'WINDOWS_ISO_BROWSER_TIMEOUT': 'Microsoft’s Windows download page did not finish in time. Retry later, or choose an ISO on this host.',
             'WINDOWS_ISO_DOWNLOAD_BLOCKED': 'Microsoft declined this host’s Windows download request or requires a browser challenge. HarnessyXO stopped the request. Use Microsoft’s download page in your browser, then choose the downloaded ISO on this host.',
+            'WINDOWS_ISO_PAGE_ERROR': 'Microsoft’s Windows download page reported a request error. Retry later, or choose an ISO on this host.',
+            'WINDOWS_ISO_NETWORK_ERROR': 'The Windows download browser could not complete its connection to Microsoft. Check host internet access and retry, or choose an ISO on this host.',
+            'WINDOWS_ISO_HTTP_ERROR': 'Microsoft’s Windows download page returned an HTTP error. Retry later, or choose an ISO on this host.',
             'WINDOWS_ISO_LINK_UNAVAILABLE': 'Microsoft’s Windows download page did not provide a compatible English (United States) ISO. Retry later, or choose an ISO on this host.',
         }
         self.error_code = code if code in messages else 'WINDOWS_ISO_LINK_UNAVAILABLE'
+        self.windows_media_browser = validate_windows_media_browser(windows_media_browser)
         super().__init__(messages[self.error_code])
 
 
@@ -35,10 +42,14 @@ _INSTALL_TIMEOUT = 900.0
 _FLOW_TIMEOUT = 180.0
 
 
-async def _emit(callback, message: str, *, detail: str = '', timeout: float = _INSTALL_TIMEOUT + _FLOW_TIMEOUT) -> None:
+async def _emit(callback, message: str, *, detail: str = '', timeout: float = _INSTALL_TIMEOUT + _FLOW_TIMEOUT,
+                windows_media_browser=None) -> None:
     if callback is None:
         return
     metadata = {'detail': detail, 'stage_timeout_seconds': timeout}
+    observation = validate_windows_media_browser(windows_media_browser)
+    if observation is not None:
+        metadata['windows_media_browser'] = observation
     try:
         parameters = inspect.signature(callback).parameters
         if not any(p.kind == p.VAR_KEYWORD for p in parameters.values()):
@@ -249,31 +260,72 @@ def _download_link(links, architecture: str) -> str | None:
     return choices[0] if len(set(choices)) == 1 else None
 
 
-async def _check_page_error(page) -> None:
+def _page_error(code: str, result: str, observation=None, *, error_kind='unknown') -> WindowsMediaBrowserError:
+    current = dict(observation or {})
+    current.update(schema_version=1, phase=current.get('phase', 'page_open'),
+                   result=result, error_kind=error_kind)
+    return WindowsMediaBrowserError(code, windows_media_browser=current)
+
+
+def _request_api(url: str) -> bool:
+    """Observe only the page's normal language/link requests, never log URLs."""
+    try:
+        parsed = urlsplit(url)
+        return (_allowed_resource(url) and parsed.hostname == 'www.microsoft.com'
+                and parsed.path.rstrip('/').rsplit('/', 1)[-1] in {
+                    'GetSkuInformationByProductEdition', 'GetProductDownloadLinksBySku'}
+                and parsed.path.startswith('/software-download-connector/api/'))
+    except ValueError:
+        return False
+
+
+async def _check_page_error(page, observation=None) -> None:
     challenge = page.locator('iframe[src*="captcha" i], iframe[src*="challenge" i], [id*="captcha" i]')
     for index in range(min(await challenge.count(), 16)):
         if await challenge.nth(index).is_visible():
-            raise WindowsMediaBrowserError('WINDOWS_ISO_DOWNLOAD_BLOCKED')
+            raise _page_error('WINDOWS_ISO_DOWNLOAD_BLOCKED', 'challenge', observation)
     error = page.locator('#errorModalMessage')
     for index in range(min(await error.count(), 16)):
-        if await error.nth(index).is_visible() and (await error.nth(index).inner_text()).strip():
-            raise WindowsMediaBrowserError('WINDOWS_ISO_DOWNLOAD_BLOCKED')
+        if not await error.nth(index).is_visible():
+            continue
+        text = (await error.nth(index).inner_text()).strip()
+        if not text:
+            continue
+        # Microsoft's own SDS script uses this modal for SentinelReject,
+        # GenericError and Network. A generic message is not evidence of a ban.
+        if re.search(r'(?<!\d)(?:715-123130|123130-715)(?!\d)', text):
+            raise _page_error('WINDOWS_ISO_DOWNLOAD_BLOCKED', 'rejected', observation,
+                              error_kind='SentinelReject')
+        generic = ' '.join(text.split()).casefold() == (
+            'we encountered a problem processing your request. please try again later.')
+        error_kind = 'GenericError' if generic else 'unknown'
+        if observation and observation.get('_network_failed'):
+            raise _page_error('WINDOWS_ISO_NETWORK_ERROR', 'network_error', observation,
+                              error_kind='Network')
+        if observation and type(observation.get('http_status')) is int and observation['http_status'] >= 400:
+            raise _page_error('WINDOWS_ISO_HTTP_ERROR', 'http_error', observation, error_kind=error_kind)
+        raise _page_error('WINDOWS_ISO_PAGE_ERROR', 'page_error', observation, error_kind=error_kind)
+    if observation and observation.get('_network_failed'):
+        raise _page_error('WINDOWS_ISO_NETWORK_ERROR', 'network_error', observation,
+                          error_kind='Network')
+    if observation and type(observation.get('http_status')) is int and observation['http_status'] >= 400:
+        raise _page_error('WINDOWS_ISO_HTTP_ERROR', 'http_error', observation)
 
 
 _OPTIONS_JS = "selector => Array.from(document.querySelectorAll(selector + ' option')).map(e => ({value:e.value,text:e.textContent}))"
 _LINKS_JS = "() => Array.from(document.querySelectorAll('#download-links a[href]')).map(e => ({href:e.href,text:e.textContent}))"
 
 
-async def _wait_value(page, read, *, cancel_event=None, timeout=45.0):
+async def _wait_value(page, read, *, cancel_event=None, timeout=45.0, observation=None):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         _check_cancelled(cancel_event)
-        await _check_page_error(page)
+        await _check_page_error(page, observation)
         value = await read()
         if value is not None:
             return value
         await asyncio.sleep(0.25)
-    raise WindowsMediaBrowserError('WINDOWS_ISO_BROWSER_TIMEOUT')
+    raise _page_error('WINDOWS_ISO_BROWSER_TIMEOUT', 'timeout', observation)
 
 
 async def resolve_windows_iso_link(architecture: str, *, progress=None, cancel_event=None) -> str:
@@ -282,11 +334,22 @@ async def resolve_windows_iso_link(architecture: str, *, progress=None, cancel_e
         raise ValueError('Windows ISO architecture must be x86_64 or arm64.')
     _check_cancelled(cancel_event)
     try:
-        from playwright.async_api import async_playwright
+        from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
     except ImportError:
         raise WindowsMediaBrowserError('WINDOWS_ISO_BROWSER_MISSING') from None
     playwright = browser = context = manager = None
     watcher = None
+    observation = {'schema_version': 1, 'phase': 'browser_launch', 'result': 'info'}
+
+    async def report(phase, message, *, detail=''):
+        observation.update(phase=phase, result='info')
+        observation.pop('http_status', None)
+        observation.pop('error_kind', None)
+        observation.pop('_network_failed', None)
+        await _emit(progress, message, detail=detail, windows_media_browser=observation)
+
+    async def preparation_progress(_stage, message, **metadata):
+        await report('browser_preparing', message, detail=str(metadata.get('detail') or ''))
 
     async def cleanup():
         if watcher is not None:
@@ -308,7 +371,13 @@ async def resolve_windows_iso_link(architecture: str, *, progress=None, cancel_e
         nonlocal playwright, browser, context, manager
         manager = async_playwright()
         playwright = await manager.start()
-        browser = await _launch_browser(playwright, progress, cancel_event)
+        await report('browser_launch', 'Starting the Windows download browser…')
+        browser = await _launch_browser(playwright, preparation_progress, cancel_event)
+        version = getattr(browser, 'version', None)
+        if isinstance(version, str):
+            checked = validate_windows_media_browser({**observation, 'browser_version': version})
+            if checked and 'browser_version' in checked:
+                observation['browser_version'] = checked['browser_version']
         context = await browser.new_context(accept_downloads=False)
 
         async def route(request_route):
@@ -319,25 +388,45 @@ async def resolve_windows_iso_link(architecture: str, *, progress=None, cancel_e
         await context.route('**/*', route)
         page = await context.new_page()
         page.set_default_timeout(15000)
-        await _emit(progress, 'Opening Microsoft’s Windows download page…',
-                    detail='Using a fresh browser session to request the selected architecture and English (United States).')
-        await page.goto(_PAGES[architecture], wait_until='domcontentloaded', timeout=45000)
+
+        def response_received(response):
+            if _request_api(response.url) and type(response.status) is int and 100 <= response.status <= 599:
+                observation['http_status'] = response.status
+
+        def request_failed(request):
+            if _request_api(request.url):
+                observation['_network_failed'] = True
+
+        page.on('response', response_received)
+        page.on('requestfailed', request_failed)
+        await report('page_open', 'Opening Microsoft’s Windows download page…',
+                     detail='Using a fresh browser session to request the selected architecture and English (United States).')
+        response = await page.goto(_PAGES[architecture], wait_until='load', timeout=45000)
+        if response is not None and type(response.status) is int and 100 <= response.status <= 599:
+            observation['http_status'] = response.status
+        await _check_page_error(page, observation)
+        # The native SDS initializer prepares its views and browser session
+        # before showing body.loaded. Do not click a pre-initialized template.
+        await page.locator('body.loaded').wait_for(state='visible', timeout=15000)
+        await report('edition', 'Selecting the Windows installation edition…')
 
         async def edition():
             return _edition_value(await page.evaluate(_OPTIONS_JS, '#product-edition'))
-        value = await _wait_value(page, edition, cancel_event=cancel_event)
+        value = await _wait_value(page, edition, cancel_event=cancel_event, observation=observation)
         await page.locator('#product-edition').select_option(value)
+        await report('language', 'Checking available installation languages…')
         await page.locator('#submit-product-edition').click()
 
         async def language():
             return _english_value(await page.evaluate(_OPTIONS_JS, '#product-languages'))
-        value = await _wait_value(page, language, cancel_event=cancel_event)
+        value = await _wait_value(page, language, cancel_event=cancel_event, observation=observation)
         await page.locator('#product-languages').select_option(value)
+        await report('download_links', 'Waiting for Microsoft’s Windows download link…')
         await page.locator('#submit-sku').click()
 
         async def link():
             return _download_link(await page.evaluate(_LINKS_JS), architecture)
-        return await _wait_value(page, link, cancel_event=cancel_event)
+        return await _wait_value(page, link, cancel_event=cancel_event, observation=observation)
 
     work = asyncio.create_task(flow())
 
@@ -354,12 +443,18 @@ async def resolve_windows_iso_link(architecture: str, *, progress=None, cancel_e
         # page interaction remains bounded as well, including launch/cleanup.
         return await asyncio.wait_for(work, _INSTALL_TIMEOUT + _FLOW_TIMEOUT)
     except asyncio.TimeoutError:
-        raise WindowsMediaBrowserError('WINDOWS_ISO_BROWSER_TIMEOUT') from None
-    except WindowsMediaBrowserError:
+        raise _page_error('WINDOWS_ISO_BROWSER_TIMEOUT', 'timeout', observation) from None
+    except PlaywrightTimeoutError:
+        raise _page_error('WINDOWS_ISO_BROWSER_TIMEOUT', 'timeout', observation) from None
+    except WindowsMediaBrowserError as error:
+        if error.windows_media_browser is None:
+            result = ('timeout' if error.error_code == 'WINDOWS_ISO_BROWSER_TIMEOUT' else
+                      'browser_unavailable' if error.error_code.startswith('WINDOWS_ISO_BROWSER_') else 'page_error')
+            error.windows_media_browser = validate_windows_media_browser({**observation, 'result': result})
         raise
     except asyncio.CancelledError:
         raise
     except Exception:
-        raise WindowsMediaBrowserError('WINDOWS_ISO_LINK_UNAVAILABLE') from None
+        raise _page_error('WINDOWS_ISO_LINK_UNAVAILABLE', 'page_error', observation) from None
     finally:
         await _drain(asyncio.create_task(cleanup()))

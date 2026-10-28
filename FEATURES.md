@@ -1,4 +1,6 @@
-# HarnessyXO v0.7.34 Features
+# HarnessyXO v0.7.35 Features
+
+- Windows ISO discovery waits for Microsoft’s normal page initialization before selecting an edition. Generic page and network errors are distinguished from explicit rejections or visible challenges, and diagnostics retain the browser step and fixed failure category. Existing Windows VMs have an installation-media selector in Settings for automatic download or an ISO already on the host.
 
 - Windows VM creation checks the Lima/QEMU host runtime without treating the saved Windows provider as unsupported. Failed or cancelled setup releases the controls for another Start and refreshes project-file status; host prerequisite failures retain a fixed diagnostic reason. Existing VM disks and project files are preserved.
 

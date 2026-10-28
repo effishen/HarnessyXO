@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.35
+
+- Wait for Microsoft’s normal download-page initialization before selecting a Windows edition. The previous flow could submit as soon as HTML parsing finished, before the page’s load handlers ran.
+- Distinguish a visible browser challenge or explicit Microsoft rejection from a generic page or network error. A generic error dialog no longer claims that Microsoft blocked your host. Challenges and rejections still stop the request.
+- Keep the Windows download browser’s step and fixed error category in diagnostics, including available HTTP status and browser version. Raw page text, cookies and signed download links stay excluded.
+- Change **Windows installation media** in an existing VM’s **Settings**. Choose automatic download or an English (United States) ISO already on the HarnessyXO host, save, then use **Start** to retry setup. Existing installed disks remain in use; changing the media selection does not reinstall Windows.
+- Full Microsoft ISO download and native Windows installation remain unverified here. These changes address page sequencing, error classification and recovery; they do not guarantee that Microsoft will authorize a download.
+
 ## v0.7.34
 
 - Start a newly created Windows VM without the immediate “No host prerequisite installer exists for provider managed” failure. Windows now checks its Lima/QEMU host runtime while keeping its saved Windows configuration and architecture.

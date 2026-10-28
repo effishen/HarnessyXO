@@ -678,6 +678,17 @@ class EnvironmentOperationRegistry:
                 progress_source=str(meta.get('progress_source') or ''),
                 stage_timeout_seconds=meta.get('stage_timeout_seconds'),
             )
+            from harnessy.diagnostics.windows_media import validate_windows_media_browser_observation
+            observation = validate_windows_media_browser_observation(meta.get('windows_media_browser'))
+            current = self._states.get(key)
+            if (observation is not None and progress_open and current is not None
+                    and current.operation_id == operation_id and current.busy
+                    and current.status in {'queued', 'running'}):
+                log_event(
+                    'runtime', 'windows_media_browser_observation', workspace=str(workspace_root),
+                    workspace_id=current.workspace_id, environment_id=environment_id,
+                    operation_id=operation_id, kind=action, windows_media_browser=observation,
+                )
 
         def check_model_access() -> None:
             # The marker comes only from the model-tool broker, never model
@@ -942,6 +953,8 @@ class EnvironmentOperationRegistry:
             desktop_error_code = str(getattr(exc, 'error_code', '') or '')
             desktop_failure = setup_desktop and desktop_error_code.startswith('DESKTOP_')
             windows_failure = setup_windows and re.fullmatch(r'WINDOWS_[A-Z0-9_]{1,64}', desktop_error_code) is not None
+            from harnessy.diagnostics.windows_media import validate_windows_media_browser_observation
+            browser_observation = validate_windows_media_browser_observation(getattr(exc, 'windows_media_browser', None))
             from .host_prerequisites import HostPrerequisiteError
             from harnessy.diagnostics.startup import HOST_SETUP_ERROR_CODES
             host_failure = isinstance(exc, HostPrerequisiteError)
@@ -971,6 +984,7 @@ class EnvironmentOperationRegistry:
                 kind=action, stage=state.stage, error=error, deadline=state.deadline,
                 failed_stage=failed_stage, error_type=type(exc).__name__,
                 **host_fields,
+                **({'windows_media_browser': browser_observation} if browser_observation is not None else {}),
                 **({'error_code': desktop_error_code} if windows_failure else {}),
                 **({'timeout_scope': 'provider'} if provider_timeout else {}),
             )
