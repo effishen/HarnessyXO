@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.7.32
+
+- Make **Pack as ZIP** show its result in Project Files. Track work under the actual project tab, show its busy state and refresh the listing when it finishes. The ZIP is created alongside the selected file or folder; use Download on the resulting ZIP when you want a browser download.
+- Keep file-operation success and failure messages attached to the browser page that started the work. The same fix applies to copy, move, paste, extract and delete actions in Project Files, Workspace Files and Home File Explorer. Finishing after a tab switch does not redraw the wrong tab; a closed page does not interrupt accepted file work.
+- Show a warning for an unavailable ZIP selection. Publish single-file and multiple-selection ZIPs only after compression succeeds, remove their own temporary output on failure, and skip linked descendants consistently with folder ZIPs. Folder and whole-project ZIPs use their own temporary files without deleting an existing `.zip.tmp` file.
+
 ## v0.7.31
 
 - Close a VM desktop tab without printing an ASGI cancellation traceback. Treat the cancellation deliberately requested by closing or revoking that view as normal connection cleanup.

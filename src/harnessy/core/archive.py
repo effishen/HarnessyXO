@@ -154,42 +154,44 @@ def make_zip(
     exclude_names = exclude_names or set()
     chunk_size = max(64 * 1024, int(chunk_size or 1024 * 1024))
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    tmp = output_file.with_suffix(output_file.suffix + '.tmp')
-    if tmp.exists():
-        tmp.unlink()
+    tmp = output_file.with_name('.harnessy-zip-' + uuid.uuid4().hex + '.tmp')
+    created = False
 
     def check_cancelled() -> None:
         if cancel_event is not None and cancel_event.is_set():
             raise ArchiveCancelled('ZIP creation cancelled')
 
     try:
-        with zipfile.ZipFile(tmp, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-            for path in sorted(source_dir.rglob('*')):
-                check_cancelled()
-                rel = path.relative_to(source_dir)
-                if any(part in exclude_names for part in rel.parts):
-                    continue
-                if path.is_symlink() or not path.is_file():
-                    continue
+        with tmp.open('xb') as destination:
+            created = True
+            with zipfile.ZipFile(destination, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                for path in sorted(source_dir.rglob('*')):
+                    check_cancelled()
+                    rel = path.relative_to(source_dir)
+                    if any(part in exclude_names for part in rel.parts):
+                        continue
+                    if path.is_symlink() or not path.is_file():
+                        continue
 
-                # Preserve the same useful metadata as ZipFile.write(), while
-                # copying ourselves so cancellation can be observed mid-file.
-                info = zipfile.ZipInfo.from_file(path, rel.as_posix())
-                info.compress_type = zipfile.ZIP_DEFLATED
-                info._compresslevel = 6
-                with path.open('rb') as src, zf.open(info, 'w', force_zip64=True) as dst:
-                    while True:
-                        check_cancelled()
-                        chunk = src.read(chunk_size)
-                        if not chunk:
-                            break
-                        dst.write(chunk)
+                    # Preserve the same useful metadata as ZipFile.write(), while
+                    # copying ourselves so cancellation can be observed mid-file.
+                    info = zipfile.ZipInfo.from_file(path, rel.as_posix())
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                    info._compresslevel = 6
+                    with path.open('rb') as src, zf.open(info, 'w', force_zip64=True) as dst:
+                        while True:
+                            check_cancelled()
+                            chunk = src.read(chunk_size)
+                            if not chunk:
+                                break
+                            dst.write(chunk)
         check_cancelled()
         tmp.replace(output_file)
         return output_file
     except BaseException:
         try:
-            tmp.unlink(missing_ok=True)
+            if created:
+                tmp.unlink(missing_ok=True)
         except OSError:
             pass
         raise
