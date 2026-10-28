@@ -4311,6 +4311,10 @@ class HarnessyPage:
 
     @staticmethod
     def _tool_tab_key(kind: str, workspace_id: str) -> str:
+        if kind == 'files':
+            project = parse_project_files_scope(workspace_id)
+            if project is not None:
+                return f'files:{project[0]}:{project[1]}'
         return f'{kind}:{workspace_id}'
 
     @staticmethod
@@ -4433,7 +4437,7 @@ class HarnessyPage:
         except (ValueError, KeyError, OSError) as exc:
             ui.notify(str(exc), type='warning')
             return
-        key = f'files:{ws.id}:{chat_id}'
+        key = self._tool_tab_key('files', scope.id)
         self.file_paths[scope.id] = scope.project_root or scope.root
         if not any(t.key == key for t in self.open_tabs):
             self.open_tabs.append(OpenTab(key, 'files', ws.id, chat_id, scope.name))
@@ -19073,6 +19077,10 @@ window.harnessyTerminalFocus = function(terminalId) {
         dialog.open()
 
     def _launch_file_operation(self, ws: WorkspaceStore | ToolScope, label: str, work, success_text) -> None:
+        # asyncio tasks do not inherit NiceGUI's task-local slot stack. Keep
+        # the initiating client, rather than a context-menu slot which a redraw
+        # can delete while filesystem work runs.
+        client = ui.context.client
         tab_key = self._tool_tab_key('files', ws.id)
         if TAB_ACTIVITY.busy(tab_key):
             ui.notify('File Explorer is already working. Wait for the current operation to finish.', type='warning')
@@ -19091,24 +19099,29 @@ window.harnessyTerminalFocus = function(terminalId) {
                     await asyncio.shield(worker)
                     raise
                 message = success_text(result) if callable(success_text) else str(success_text)
-                if message:
+                if message and not client.is_deleted:
                     try:
-                        ui.notify(message, type='positive')
+                        with client:
+                            ui.notify(message, type='positive')
                     except RuntimeError as exc:
                         if not _is_stale_ui_error(exc):
                             raise
             except Exception as exc:
                 log_event('harnessy', 'file_operation_failed', operation=label, error=str(exc))
                 try:
-                    ui.notify(f'{label} failed: {exc}', type='negative', timeout=8000)
+                    if not client.is_deleted:
+                        with client:
+                            ui.notify(f'{label} failed: {exc}', type='negative', timeout=8000)
                 except RuntimeError:
                     pass
             finally:
                 release_activity()
                 try:
-                    if self.active_tab_key == tab_key:
-                        self.refresh_tabs()
-                    self._sync_tab_activity_ui()
+                    if not client.is_deleted:
+                        with client:
+                            if self.active_tab_key == tab_key:
+                                self.refresh_tabs()
+                            self._sync_tab_activity_ui()
                 except RuntimeError as exc:
                     if not _is_stale_ui_error(exc):
                         raise
@@ -19347,6 +19360,7 @@ window.harnessyTerminalFocus = function(terminalId) {
         items = [paths] if isinstance(paths, Path) else list(paths)
         items = [p.resolve() for p in items if p.exists()]
         if not items:
+            ui.notify('Select an available file or folder to pack as ZIP.', type='warning')
             return
 
         def work() -> Path:
@@ -19357,23 +19371,32 @@ window.harnessyTerminalFocus = function(terminalId) {
                     output = _unique_external_path(path.parent / f'{path.name}.zip')
                     self._file_require_write(ws, output)
                     make_zip(path, output, exclude_names={FILES_PROBE_DIR_NAME})
-                else:
-                    output = _unique_external_path(path.parent / f'{path.stem}.zip')
-                    self._file_require_write(ws, output)
-                    with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
-                        zf.write(path, path.name)
+                    return output
+                output = _unique_external_path(path.parent / f'{path.stem}.zip')
             else:
                 parent = items[0].parent
                 output = _unique_external_path(parent / 'selection.zip')
+            self._file_require_write(ws, output)
+            staging = output.with_name('.harnessy-zip-' + uuid.uuid4().hex + '.tmp')
+            created = False
+            try:
+                self._file_require_write(ws, staging)
+                with staging.open('xb') as destination:
+                    created = True
+                    with zipfile.ZipFile(destination, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+                        for item in items:
+                            if item.is_dir() and not item.is_symlink():
+                                for child in item.rglob('*'):
+                                    if (not child.is_symlink() and child.is_file()
+                                            and FILES_PROBE_DIR_NAME not in child.relative_to(item).parts):
+                                        zf.write(child, Path(item.name) / child.relative_to(item))
+                            elif not item.is_symlink() and item.is_file() and item.name != FILES_PROBE_DIR_NAME:
+                                zf.write(item, item.name)
                 self._file_require_write(ws, output)
-                with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
-                    for item in items:
-                        if item.is_dir() and not item.is_symlink():
-                            for child in item.rglob('*'):
-                                if child.is_file() and FILES_PROBE_DIR_NAME not in child.relative_to(item).parts:
-                                    zf.write(child, Path(item.name) / child.relative_to(item))
-                        elif item.is_file() and item.name != FILES_PROBE_DIR_NAME:
-                            zf.write(item, item.name)
+                staging.replace(output)
+            finally:
+                if created:
+                    staging.unlink(missing_ok=True)
             return output
 
         self._launch_file_operation(ws, 'ZIP', work, lambda output: f'Created {output.name}')

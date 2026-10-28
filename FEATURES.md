@@ -1,4 +1,6 @@
-# HarnessyXO v0.7.31 Features
+# HarnessyXO v0.7.32 Features
+
+- **Pack as ZIP** creates an archive beside the selected items and refreshes the correct Project Files, Workspace Files or Home File Explorer tab. File operations retain visible completion/error messages and busy state while running in the background. Download the completed ZIP from its file row, or create and download whole-project packages in **ZIP / Downloads**.
 
 - Close VM desktop tabs cleanly, including views revoked during a connection or cleanup. Expected view cancellation finishes socket cleanup without an application traceback; genuine display transport failures remain visible in diagnostics.
 
