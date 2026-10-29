@@ -20,7 +20,8 @@ import uuid
 from typing import Any
 
 from . import vm_logs
-from .technical import technical_error_evidence, validate_technical_evidence
+from .vm_logs import (_fixed_technical_evidence as technical_error_evidence,
+                      _fixed_validated_technical_evidence as validate_technical_evidence)
 from .radio_setup import RADIO_SETUP_FILENAME, MAX_RADIO_RECEIPTS, radio_setup_tail
 
 MAX_TARGETS = 16
@@ -98,8 +99,8 @@ def open_qemu_control_plane_capture(runtime: Path):
     """Keep daemon stdout/stderr readable without waiting for inherited FD EOF.
 
     Guest serial is explicitly redirected elsewhere by qemu_argv. Raw host
-    control-plane output stays in this private local file; default diagnostics
-    sanitize a bounded tail. Earlier output is scrubbed into bounded receipts
+    control-plane output stays in this private local file; all diagnostics
+    retain fixed facts from a bounded tail. Earlier facts enter bounded receipts
     before replacing the current capture for a new launch attempt.
     """
     parent = _open_private_runtime(runtime)
@@ -171,7 +172,7 @@ def record_qemu_launcher_evidence(runtime: Path, data: bytes, *, stage: str = 'l
                                   operation_id: str = '', returncode: int | None = None,
                                   timeout_seconds: float = 0, error: BaseException | None = None,
                                   capture_context: str = 'launch_handoff') -> bool:
-    """Persist scrubbed launcher output, keeping bounded earlier attempts.
+    """Persist fixed launcher facts, keeping bounded earlier attempts.
 
     The input is QEMU's host stdout/stderr capture. Guest serial is a different
     file and must never be passed here. A failed evidence write cannot change
@@ -268,10 +269,11 @@ def _qemu_control_plane_tail(data: bytes, truncated: bool, deadline: float) -> t
     signals, measurements = vm_logs._technical_tail(data, 'serial', truncated, deadline)
     diagnostic = technical_error_evidence('\n'.join(lines), source='qemu')
     text = diagnostic.get('diagnostic_text', '')
-    if text:
+    fixed = vm_logs._has_fixed_technical_facts(diagnostic)
+    if fixed:
         signals += (json.dumps({'relative_tail_line': len(lines), 'diagnostic': diagnostic},
                               ensure_ascii=True, separators=(',', ':')) + '\n').encode('ascii')
-    measurements.update(technical_records_exported=int(bool(text)),
+    measurements.update(technical_records_exported=int(fixed),
                         technical_lines_exported=len(text.splitlines()),
                         omitted_lines=max(0, len(lines) - len(text.splitlines())),
                         content_omitted=diagnostic['omitted_content'])
@@ -317,6 +319,8 @@ def register_test_target_runtime(target_root: Path, backend: str) -> None:
         _REGISTRY[item] = None
         while len(_REGISTRY) > MAX_REGISTRY_TARGETS:
             _REGISTRY.popitem(last=False)
+    from .runtime_locations import remember_runtime_location
+    remember_runtime_location('target', root, backend)
     if fresh:
         from .logging import log_event
         log_event('runtime', 'test_target_runtime_registered', target_runtime_root=str(root),
@@ -326,9 +330,14 @@ def register_test_target_runtime(target_root: Path, backend: str) -> None:
 def _discover(latest: Path, deadline: float) -> tuple[list[tuple[Path, str]], dict[str, Any]]:
     with _LOCK:
         registered = list(reversed(_REGISTRY))
-    candidates = list(registered)
+    from .runtime_locations import load_runtime_locations
+    index = load_runtime_locations(latest.parent)
+    indexed = [(str(root), row['backend']) for row in index['locations']
+               if row['kind'] == 'target' and (root := _target_root(row['path'])) is not None]
+    candidates = list(registered) + indexed
     coverage = {'registered_targets': len(registered), 'app_bytes_read': 0,
-                'records_examined': 0, 'discovery_limited': False, 'unsafe_app_sources': 0}
+                'records_examined': 0, 'discovery_limited': False, 'unsafe_app_sources': 0,
+                'runtime_index_status': index['status'], 'runtime_index_roots': len(indexed)}
     previous, limited = vm_logs._previous_sessions(latest)
     coverage['discovery_limited'] = limited
     sources = [latest / (name + suffix) for name in ('targets.log', 'runtime.log') for suffix in ('', '.1', '.2', '.3')]
@@ -374,7 +383,7 @@ def collect_test_target_diagnostics(latest: Path, include_content: bool = False)
     deadline = time.monotonic() + COLLECTION_SECONDS
     targets, discovery = _discover(Path(latest).absolute(), deadline)
     report: dict[str, Any] = {'schema_version': 1, 'status': 'collected' if targets else 'no_targets',
-                              'mode': 'raw_bounded_tails' if include_content else 'signals_only',
+                              'mode': 'signals_only',
                               'discovery': discovery, 'targets': []}
     members: dict[str, bytes] = {}
     read_total = export_total = 0
@@ -407,14 +416,6 @@ def collect_test_target_diagnostics(latest: Path, include_content: bool = False)
                 members[name] = projected
                 source.update(archive_member=name, bytes_exported=len(projected), signals_exported=projected.count(b'\n'))
                 export_total += len(projected)
-                if include_content:
-                    raw = data[-(MAX_EXPORT_BYTES - export_total):] if export_total < MAX_EXPORT_BYTES else b''
-                    name = f'target-logs/{identity}/{backend}.{filename}.raw.log'
-                    members[name] = raw
-                    source.update(raw_archive_member=name, raw_bytes_exported=len(raw),
-                                  bytes_exported=source['bytes_exported'] + len(raw))
-                    source['truncated'] |= len(raw) < len(data)
-                    export_total += len(raw)
             target['sources'].append(source)
         report['targets'].append(target)
     return {'report': validate_test_target_report(report), 'members': members}
@@ -423,7 +424,7 @@ def collect_test_target_diagnostics(latest: Path, include_content: bool = False)
 def validate_test_target_report(report: Any) -> dict[str, Any]:
     """Rebuild persisted metadata using fixed enums and bounded measurements."""
     report = report if isinstance(report, dict) else {}
-    mode = _safe_enum(report.get('mode'), {'signals_only', 'raw_bounded_tails'}, 'signals_only')
+    mode = 'signals_only'
     status = _safe_enum(report.get('status'), {'collected', 'no_targets', 'unavailable'}, 'unavailable')
     safe = {'schema_version': 1, 'status': status, 'mode': mode, 'limits': dict(_LIMITS), 'targets': [], 'discovery': {}}
     if status == 'unavailable':
@@ -431,8 +432,10 @@ def validate_test_target_report(report: Any) -> dict[str, Any]:
     discovery = report.get('discovery') if isinstance(report.get('discovery'), dict) else {}
     for key, cap in {'registered_targets': MAX_REGISTRY_TARGETS, 'candidate_targets': vm_logs.MAX_DISCOVERY_RECORDS,
                      'app_bytes_read': MAX_DISCOVERY_BYTES, 'records_examined': vm_logs.MAX_DISCOVERY_RECORDS + 1,
-                     'unsafe_app_sources': 8 + 2 * vm_logs.MAX_PREVIOUS_SESSIONS}.items():
+                     'unsafe_app_sources': 8 + 2 * vm_logs.MAX_PREVIOUS_SESSIONS, 'runtime_index_roots': MAX_REGISTRY_TARGETS}.items():
         safe['discovery'][key] = vm_logs._integer(discovery.get(key), cap)
+    from .runtime_locations import INDEX_STATUSES
+    safe['discovery']['runtime_index_status'] = _safe_enum(discovery.get('runtime_index_status'), INDEX_STATUSES, 'missing')
     for key in ('targets_limited', 'discovery_limited'):
         safe['discovery'][key] = discovery.get(key) is True
     targets = report.get('targets') if isinstance(report.get('targets'), list) else []
@@ -455,7 +458,7 @@ def validate_test_target_report(report: Any) -> dict[str, Any]:
             state = _safe_enum(source.get('status'), {'included', 'missing', 'unsafe', 'unreadable', 'limited'}, 'unreadable')
             kind = 'radio_setup' if filename == RADIO_SETUP_FILENAME else 'qemu' if filename.startswith('qemu.') else 'hostagent' if filename.startswith('ha.') else 'serial'
             item = {'filename': filename, 'status': state, 'kind': kind,
-                    'projection': 'fixed_guest_radio_setup' if kind == 'radio_setup' else 'fixed_boot_signals' if kind == 'serial' else 'sanitized_control_plane'}
+                    'projection': 'fixed_guest_radio_setup' if kind == 'radio_setup' else 'fixed_boot_signals' if kind == 'serial' else 'fixed_control_plane_facts'}
             for key, cap in {'bytes_available': 2**63 - 1, 'bytes_read': vm_logs.PER_FILE_TAIL_BYTES,
                              'bytes_exported': MAX_EXPORT_BYTES, 'raw_bytes_exported': vm_logs.PER_FILE_TAIL_BYTES,
                              'line_count': vm_logs.PER_FILE_TAIL_BYTES, 'signals_count': vm_logs.MAX_PARSE_LINES * len(vm_logs.EVIDENCE_CODES),
@@ -479,16 +482,15 @@ def validate_test_target_report(report: Any) -> dict[str, Any]:
             expected = f'target-logs/{identity}/{backend}.{filename}.technical.jsonl'
             if state == 'included' and source.get('archive_member') == expected:
                 item['archive_member'] = expected
-            expected = f'target-logs/{identity}/{backend}.{filename}.raw.log'
-            if state == 'included' and mode == 'raw_bounded_tails' and source.get('raw_archive_member') == expected:
-                item['raw_archive_member'] = expected
+            item['raw_bytes_exported'] = 0
+            item['content_omitted'] = True
             clean['sources'].append(item)
         safe['targets'].append(clean)
     sources = [source for target in safe['targets'] for source in target['sources']]
     safe['coverage'] = {'scope': 'registered_and_logged_targets_only',
                         'undiscovered_targets': 'unknown', 'runtime_state': 'not_probed',
                         'guest_serial_policy': 'fixed_signals_only',
-                        'controller_output_policy': 'sanitized_technical_evidence',
+                        'controller_output_policy': 'fixed_operational_facts',
                         'qemu_control_plane_scope': 'current_controller_output_and_bounded_handoff_history',
                         'radio_setup_scope': 'fixed_script_results_and_typed_transport_errors',
                         'absence_of_evidence_proves_no_failure': False}

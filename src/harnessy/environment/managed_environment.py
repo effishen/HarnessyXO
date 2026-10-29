@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from contextvars import ContextVar
+import functools
 import io
 import inspect
 import json
@@ -32,6 +34,50 @@ from .test_catalog import guest_os
 from .test_targets import TestTargetManager, normalize_vm_config
 
 _LOCKS: dict[tuple[str, int], asyncio.Lock] = {}
+_DIRECT_CONTROLLER_PROGRESS: ContextVar[dict | None] = ContextVar('managed_controller_progress', default=None)
+
+
+def _observed_managed_lifecycle(action: str):
+    def decorate(method):
+        @functools.wraps(method)
+        async def observed(self, *args, **kwargs):
+            from harnessy.diagnostics import log_event
+            from .manager import current_environment_operation, environment_operation_context
+            callback = kwargs.get('progress')
+            if callback is None and args and action not in {'stop', 'destroy'}:
+                callback = args[-1] if callable(args[-1]) else None
+            token = None
+            if callback is not None:
+                token = _DIRECT_CONTROLLER_PROGRESS.set({
+                    'owner': self, 'callback': callback,
+                    'stage': 'checking_host_dependencies', 'message': 'Checking Windows VM prerequisites…',
+                })
+            started = time.monotonic()
+            outcome = 'failed'
+            with environment_operation_context(action=action):
+                fields = {'provider': 'lima', 'environment_id': self.config.id,
+                          'lifecycle_action': action, **current_environment_operation()}
+                try:
+                    try:
+                        log_event('runtime', 'vm_lifecycle_requested', **fields)
+                    except Exception:
+                        pass
+                    result = await method(self, *args, **kwargs)
+                    outcome = 'completed'
+                    return result
+                except asyncio.CancelledError:
+                    outcome = 'cancelled'
+                    raise
+                finally:
+                    if token is not None:
+                        _DIRECT_CONTROLLER_PROGRESS.reset(token)
+                    try:
+                        log_event('runtime', 'vm_lifecycle_finished', outcome=outcome,
+                                  elapsed_seconds=max(0.0, time.monotonic() - started), **fields)
+                    except Exception:
+                        pass
+        return observed
+    return decorate
 
 
 class WindowsSetupError(RuntimeError):
@@ -89,6 +135,40 @@ class _ManagedController(TestTargetManager):
     def busy(self) -> bool:
         from .operations import ENVIRONMENT_OPERATIONS
         return ENVIRONMENT_OPERATIONS.state(self.owner.workspace_root, environment_id=self.environment_id).busy
+
+    async def _controller_observation(self, event: str, **fields) -> None:
+        from harnessy.diagnostics import log_event
+        from harnessy.diagnostics.controller_observations import validate_controller_observation
+        from .manager import current_environment_operation
+        from .operations import current_controller_observer
+
+        context, observer = current_controller_observer(self.owner.workspace_root, self.environment_id)
+        # Only opaque identities and reviewed numeric/category fields enter the
+        # log. Controller argv, project paths and command output stay out.
+        safe = validate_controller_observation(event, {
+            **fields, **current_environment_operation(), **context,
+            'environment_id': self.environment_id,
+        })
+        if safe is None or safe.get('observation_status') == 'invalid_context':
+            return
+        payload = {key: value for key, value in safe.items() if key != 'event'}
+        try:
+            log_event('runtime', event, **payload)
+        finally:
+            if observer is not None:
+                await observer(safe)
+            else:
+                direct = _DIRECT_CONTROLLER_PROGRESS.get()
+                if direct is not None and direct['owner'] is self.owner:
+                    from .operations import controller_activity_detail
+                    meta = {'detail': controller_activity_detail(safe),
+                            'progress_source': 'controller_observation', 'stage_progress_percent': None}
+                    timeout = safe.get('timeout_seconds')
+                    if (type(timeout) in {int, float} and timeout > 0
+                            and (direct['stage'], safe.get('controller_action')) in {
+                                ('creating_vm', 'create'), ('starting_vm', 'start')}):
+                        meta['stage_timeout_seconds'] = timeout
+                    await self.owner._progress(direct['callback'], direct['stage'], direct['message'], **meta)
 
     def _env(self):
         _validate_registry_path(self.root, self.owner.workspace_root)
@@ -229,6 +309,9 @@ class ManagedEnvironment(WorkspaceEnvironment):
         path.replace(self.readiness_path)
 
     async def _progress(self, callback, phase: str, message: str, **metadata) -> None:
+        direct = _DIRECT_CONTROLLER_PROGRESS.get()
+        if direct is not None and direct['owner'] is self:
+            direct['stage'], direct['message'] = phase, message
         if callback is not None:
             parameters = inspect.signature(callback).parameters
             accepts_meta = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
@@ -300,6 +383,7 @@ boot_id=$os.LastBootUpTime.ToUniversalTime().ToString('o');build_number=[int]$os
                                  bool(data.get('created')), running, detail,
                                  ready=ready, phase=phase, **fields)
 
+    @_observed_managed_lifecycle('create')
     async def create(self, progress=None) -> EnvironmentStatus:
         current = await self.status()
         if current.created:
@@ -328,6 +412,7 @@ boot_id=$os.LastBootUpTime.ToUniversalTime().ToString('o');build_number=[int]$os
         self._record(ready=False, phase='stopped')
         return await self.status()
 
+    @_observed_managed_lifecycle('start')
     async def start(self, progress=None) -> EnvironmentStatus:
         async with self._lock():
             saved = load_environment_config(self.workspace_root, self.config.id)
@@ -391,6 +476,7 @@ boot_id=$os.LastBootUpTime.ToUniversalTime().ToString('o');build_number=[int]$os
             await self._progress(progress, 'ready', 'Windows VM Ready')
             return await self.status()
 
+    @_observed_managed_lifecycle('stop')
     async def stop(self, *, force: bool = False) -> EnvironmentStatus:
         state = await self.status()
         if state.running:
@@ -601,19 +687,67 @@ finally {
         root = Path(active_root or self.files_root)
         release = acquire_activity(self.workspace_root, 'Windows process', environment_id=self.config.id,
                                    project_id=(output_policy or {}).get('_model_project_id'), owner_id=uuid.uuid4().hex)
+        process = None
+        spawn_attempted = False
+        command_id = uuid.uuid4().hex
+        started = time.monotonic()
+
+        async def observe(event, outcome='running'):
+            await self.controller._notify_controller_observation(event,
+                provider='lima', command_id=command_id, controller_action='shell',
+                controller_state='not_started' if process is None else 'running' if process.returncode is None else 'exited',
+                controller_returncode=None if process is None else process.returncode,
+                completion_phase='running_controller' if process is None or process.returncode is None else 'collecting_output',
+                elapsed_seconds=max(0.0, time.monotonic() - started),
+                output_capture='pipe_streams', capture_scope='command_output_lifetime', outcome=outcome)
+
         try:
             await self._deploy(root, refresh=False, output_policy=output_policy)
             script = self._command_script(command, cwd, root)
             self._authorize_model_project(output_policy)
+            spawn_attempted = True
+            started = time.monotonic()
             process = await asyncio.create_subprocess_exec(
                 self.controller._binary(), 'shell', '--workdir', 'C:/', self.controller.instance,
                 *self._ps(script), env=self.controller._env(), stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         except BaseException:
-            release(); raise
+            if spawn_attempted:
+                try:
+                    await observe('environment_controller_spawn_failed', 'spawn_failed')
+                except BaseException:
+                    pass
+            release()
+            raise
         async def finished():
-            try: await process.wait()
-            finally: release()
+            waiter = asyncio.create_task(process.wait())
+            parent_observed = False
+            try:
+                await observe('environment_controller_started')
+                while not waiter.done():
+                    done, _ = await asyncio.wait({waiter}, timeout=self.controller.CONTROLLER_HEARTBEAT_SECONDS)
+                    if process.returncode is not None and not parent_observed:
+                        parent_observed = True
+                        await observe('environment_controller_parent_exited')
+                    if not done:
+                        await observe('environment_controller_heartbeat')
+                code = waiter.result()
+                if not parent_observed:
+                    await observe('environment_controller_parent_exited')
+                await observe('environment_controller_finished', 'succeeded' if code == 0 else 'failed')
+            except asyncio.CancelledError:
+                # The caller owns this process and its streams. Ending our
+                # observer neither reads its output nor stops the command.
+                try:
+                    await observe('environment_controller_output_handoff')
+                except BaseException:
+                    pass
+                raise
+            finally:
+                if not waiter.done():
+                    waiter.cancel()
+                    await asyncio.gather(waiter, return_exceptions=True)
+                release()
         task = asyncio.create_task(finished()); self._process_tasks.add(task)
         task.add_done_callback(self._process_tasks.discard)
         return process
@@ -646,6 +780,7 @@ finally {
                 'powershell.exe', '-NoLogo', '-NoProfile', '-NoExit', '-EncodedCommand', encoded]
         return argv, self.controller._env(), self.workspace_root
 
+    @_observed_managed_lifecycle('snapshot')
     async def snapshot(self, tag: str, progress=None) -> list[str]:
         await self.controller.snapshot(tag)
         return await self.list_snapshots()
@@ -653,14 +788,17 @@ finally {
     async def list_snapshots(self) -> list[str]:
         return self.controller.snapshots()
 
+    @_observed_managed_lifecycle('restore')
     async def restore_snapshot(self, tag: str, progress=None) -> EnvironmentStatus:
         await self.controller.restore(tag)
         self._record(ready=False, phase='stopped')
         return await self.start(progress=progress)
 
+    @_observed_managed_lifecycle('reset')
     async def reset(self, progress=None) -> EnvironmentStatus:
         return await self.rebuild(progress=progress)
 
+    @_observed_managed_lifecycle('rebuild')
     async def rebuild(self, progress=None) -> EnvironmentStatus:
         await self.stop(force=True)
         if self.controller.instance_dir.exists():
@@ -669,6 +807,7 @@ finally {
         await self.create(progress=progress)
         return await self.start(progress=progress)
 
+    @_observed_managed_lifecycle('destroy')
     async def destroy(self) -> None:
         state = await self.status()
         if not state.available:

@@ -14,6 +14,8 @@ import re
 import shutil
 import signal
 import sys
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +36,8 @@ _E2FS_BINARIES = ('debugfs', 'e2fsck', 'resize2fs')
 _INSTALL_LOCKS: dict[int, asyncio.Lock] = {}
 _TERMINAL_AUTH_ATTEMPTED = False
 _OUTPUT_TRUNCATED = '[HarnessyXO output truncated]'
+_HOST_COMMAND_HEARTBEAT_SECONDS = 5.0
+_HOST_OBSERVATION_CALLBACK_TIMEOUT_SECONDS = 1.0
 
 
 class HostPrerequisiteError(RuntimeError):
@@ -262,64 +266,167 @@ def _attach_report(error: HostPrerequisiteError, report: dict[str, Any]) -> None
 async def _run_command(argv: list[str], *, env: dict[str, str] | None = None,
                        timeout: float = 30, progress=None, retain_session: bool = False,
                        terminal_input: bool = False) -> tuple[int, str]:
-    """Bounded fixed host-controller/package-manager invocation, no shell."""
-    # Python 3.11 can give a noninteractive sudo child its own process group
-    # while retaining this terminal session and its sudo timestamp. That lets
-    # cancellation terminate the whole package process tree without ever
-    # signaling HarnessyXO's process group. Foreground sudo -v must stay in the
-    # foreground group; Python 3.10 relies on sudo forwarding termination.
+    """Bounded fixed host invocation with content-free process observations."""
+    from harnessy.diagnostics import log_event
+    from harnessy.diagnostics.controller_observations import HOST_PROGRAMS, validate_controller_observation
+    from .manager import current_environment_operation
+    from .operations import current_controller_operation_context
+
+    context, observer = current_controller_operation_context()
+    context = {**current_environment_operation(), **context}
+    package_programs = {'apt', 'apt-get', 'brew', 'dnf', 'yum', 'apk', 'pacman', 'zypper'}
+    candidates = [Path(value).name for value in argv[:5] if isinstance(value, str)]
+    package = next((value for value in candidates if value in package_programs), None)
+    program = package or (candidates[0] if candidates and candidates[0] in HOST_PROGRAMS else 'other')
+    action = 'package_manager' if package is not None else 'prerequisite_check'
+    command_id, started = uuid.uuid4().hex, time.monotonic()
+    proc = heartbeat = None
+    observed_bytes = 0
+    last_output_at = None
+    terminal = 'environment_controller_finished'
+    outcome = 'running'
+    interrupted_during_cleanup = False
+    chunks: list[str] = []
+    truncated = False
+
+    async def emit(event):
+        now = time.monotonic()
+        fields = dict(provider='host', command_id=command_id, controller_action=action,
+            controller_program=program, controller_state='not_started' if proc is None else
+                'running' if proc.returncode is None else 'exited',
+            completion_phase='running_controller', elapsed_seconds=max(0.0, now - started),
+            timeout_seconds=max(0.0, float(timeout)), controller_returncode=None if proc is None else proc.returncode,
+            output_capture='inherited_terminal' if terminal_input else 'merged_pipe',
+            capture_scope='direct_controller_lifetime' if terminal_input else 'command_output_lifetime',
+            outcome=outcome, **context)
+        if proc is not None:
+            fields['controller_pid'] = proc.pid
+        if not terminal_input:
+            # stderr is merged into stdout. These are observed combined bytes,
+            # not separate stderr counts or complete post-cancellation output.
+            fields.update(stdout_bytes=observed_bytes,
+                last_output_age_seconds=max(0.0, now - (last_output_at or started)))
+        safe = validate_controller_observation(event, fields)
+        if safe is None:
+            return
+        try:
+            log_event('runtime', event, **{key: value for key, value in safe.items() if key != 'event'})
+        except Exception:
+            pass
+        try:
+            if observer is not None:
+                await asyncio.wait_for(observer(safe), _HOST_OBSERVATION_CALLBACK_TIMEOUT_SECONDS)
+            if progress is not None:
+                detail = (f"Host command {action.replace('_', ' ')} · {now - started:.1f}s elapsed · "
+                    + ('output is not captured for this interactive command' if terminal_input else
+                       f"{observed_bytes} combined output bytes · {now - (last_output_at or started):.1f}s since last output"))
+                await asyncio.wait_for(_progress(progress, 'installing_host_dependencies' if action == 'package_manager' else 'checking_host_dependencies', 'Running host prerequisite command…',
+                    detail=detail, progress_source='package_manager' if action == 'package_manager' else 'host_prerequisites', controller_observation=safe), _HOST_OBSERVATION_CALLBACK_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            if asyncio.current_task().cancelling():
+                raise
+        except Exception:
+            pass
+
+    async def pulse():
+        while True:
+            await asyncio.sleep(_HOST_COMMAND_HEARTBEAT_SECONDS)
+            await emit('environment_controller_heartbeat')
+
+    async def settle(task):
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        task.result()
+        return cancelled
+
+    # Preserve the existing sudo session and owned-process-group boundaries.
     private_group = bool(os.name == 'posix' and retain_session and not terminal_input
                          and sys.version_info >= (3, 11))
     group_options = {'process_group': 0} if private_group else {}
     owns_group = os.name == 'posix' and (not retain_session or private_group)
-    proc = await asyncio.create_subprocess_exec(
-        *argv, stdin=None if terminal_input else asyncio.subprocess.DEVNULL,
-        stdout=None if terminal_input else asyncio.subprocess.PIPE,
-        stderr=None if terminal_input else asyncio.subprocess.STDOUT,
-        env=env, start_new_session=(os.name == 'posix' and not retain_session), **group_options,
-    )
-    chunks: list[str] = []
-    truncated = False
+
+    async def stop_owned():
+        if proc is None:
+            return
+        try:
+            if proc.returncode is None or owns_group:
+                try:
+                    if owns_group:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    else:
+                        proc.terminate()
+                    await asyncio.wait_for(proc.wait(), 5)
+                except (ProcessLookupError, asyncio.TimeoutError):
+                    if owns_group:
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    elif proc.returncode is None:
+                        proc.kill()
+        finally:
+            # An escaped session may keep the inherited writer open. Close
+            # only our captured reader after failure/cancellation; never kill
+            # an unowned descendant or wait for its pipe EOF.
+            transport = getattr(proc.stdout, '_transport', None)
+            if transport is not None:
+                transport.close()
+            if proc.returncode is None:
+                await proc.wait()
+
     async def drain():
-        nonlocal truncated
-        pending = ''
+        nonlocal truncated, observed_bytes, last_output_at
         if proc.stdout is None:
             return await proc.wait()
         while data := await proc.stdout.read(4096):
-            text = data.decode('utf-8', errors='replace')
-            chunks.append(text)
+            observed_bytes += len(data)
+            last_output_at = time.monotonic()
+            chunks.append(data.decode('utf-8', errors='replace'))
             if sum(map(len, chunks)) > 64000:
                 truncated = True
                 chunks[:] = [''.join(chunks)[-48000:]]
-            pending += text
-            if progress and ('\n' in pending or len(pending) >= 500):
-                await _progress(progress, 'installing_host_dependencies', 'Installing selected host prerequisites…',
-                                detail=pending.strip()[-300:], progress_source='package_manager')
-                pending = ''
         return await proc.wait()
+
     try:
+        await emit('environment_controller_started')
+        heartbeat = asyncio.create_task(pulse(), name='harnessy-host-command-heartbeat')
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv, stdin=None if terminal_input else asyncio.subprocess.DEVNULL,
+                stdout=None if terminal_input else asyncio.subprocess.PIPE,
+                stderr=None if terminal_input else asyncio.subprocess.STDOUT,
+                env=env, start_new_session=(os.name == 'posix' and not retain_session), **group_options,
+            )
+        except (OSError, ValueError):
+            terminal, outcome = 'environment_controller_spawn_failed', 'spawn_failed'
+            raise
         code = await asyncio.wait_for(drain(), timeout)
-    except (asyncio.CancelledError, asyncio.TimeoutError):
-        # A child can outlive its direct parent and keep the captured pipe
-        # open. Its private group still needs cleanup after the parent exits.
-        if proc.returncode is None or owns_group:
-            try:
-                if owns_group:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                else:
-                    proc.terminate()
-                await asyncio.wait_for(proc.wait(), 5)
-            except (ProcessLookupError, asyncio.TimeoutError):
-                if owns_group:
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                elif proc.returncode is None:
-                    proc.kill()
-                if proc.returncode is None:
-                    await proc.wait()
+        outcome = 'succeeded' if code == 0 else 'failed'
+    except asyncio.TimeoutError:
+        terminal, outcome = 'environment_controller_timed_out', 'timed_out'
+        interrupted_during_cleanup = await settle(asyncio.create_task(stop_owned())) or interrupted_during_cleanup
         raise
+    except asyncio.CancelledError:
+        terminal, outcome = 'environment_controller_cancelled', 'cancelled'
+        interrupted_during_cleanup = await settle(asyncio.create_task(stop_owned())) or interrupted_during_cleanup
+        raise
+    except BaseException:
+        if outcome != 'spawn_failed':
+            outcome = 'failed'
+            interrupted_during_cleanup = await settle(asyncio.create_task(stop_owned())) or interrupted_during_cleanup
+        raise
+    finally:
+        cleanup_cancelled = interrupted_during_cleanup
+        if heartbeat is not None:
+            heartbeat.cancel()
+            cleanup_cancelled = await settle(asyncio.gather(heartbeat, return_exceptions=True)) or cleanup_cancelled
+        cleanup_cancelled = await settle(asyncio.create_task(emit(terminal))) or cleanup_cancelled
+        if cleanup_cancelled:
+            raise asyncio.CancelledError
     output = ''.join(chunks)
     return int(code), (_OUTPUT_TRUNCATED + '\n' + output) if truncated else output
 

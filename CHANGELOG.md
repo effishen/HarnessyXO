@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.7.36
+
+- Record native VM controller commands from start through completion, timeout, cancellation or launch failure. Keep periodic observations even when the controller is silent: elapsed time, output byte counts, time since the last output, controller state and fixed activity categories.
+- Show the current Windows VM controller activity in the existing setup banner. Creation and startup no longer wait without observable controller activity. A live controller or new output is an observation, not proof that Windows is installed or Ready.
+- Retain sanitized controller observations with the correct VM, operation and command identities in diagnostic timelines and support summaries. Existing VM disks and project files are preserved.
+- Stop content searches as soon as their result limit is reached, before requesting another file from the directory iterator. Directory enumeration order can no longer cause extra descent after the result limit.
+- Exclude workspace, project and reference files and their contents from diagnostic recording and exports, including file contents echoed through commands, exceptions or logs. Keep fixed operational codes, timings, counts and resource observations; omit arbitrary output and page prose.
+- Remove the raw-content diagnostics option. Legacy requests for a content-inclusive bundle produce sanitized diagnostics instead. Collection does not traverse workspace file trees or copy project files into the archive.
+- Full native Windows creation and installation remain unverified here. This release makes controller activity observable and tightens diagnostic privacy; it does not assert that a waiting VM is healthy.
+
 ## v0.7.35
 
 - Wait for Microsoft’s normal download-page initialization before selecting a Windows edition. The previous flow could submit as soon as HTML parsing finished, before the page’s load handlers ran.

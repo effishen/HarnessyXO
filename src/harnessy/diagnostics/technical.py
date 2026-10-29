@@ -1,9 +1,8 @@
-"""Bounded technical evidence from explicitly trusted control-plane channels.
+"""Bounded, content-free facts from native control-plane channels.
 
-This is not a sanitizer for arbitrary model, tool, guest-console or file text.
-Those channels must never be passed as trusted controller output. Runtime
-stderr keeps unfamiliar diagnostic wording; paths, credentials and command /
-guest-output records are removed before persistence and again before export.
+Controller, guest and console wording can contain workspace file contents.
+Only reviewed fixed reason codes, typed errors and numeric facts are retained;
+provenance never authorizes free-form diagnostic prose.
 """
 from __future__ import annotations
 
@@ -250,10 +249,10 @@ def sanitize_control_plane_text(value: Any, *, max_lines: int = MAX_TECHNICAL_LI
 
 
 def technical_error_evidence(value: Any, *, source: str = 'exception') -> dict[str, Any]:
-    """Retain structured facts; prose requires an explicit trusted source."""
+    """Retain fixed technical facts, never arbitrary controller or file prose."""
     source = source if isinstance(source, str) and source in TECHNICAL_SOURCES else 'exception'
     result: dict[str, Any] = {'schema_version': 1, 'source': source,
-                              'omitted_content': source not in _TRUSTED, 'truncated': False}
+                              'omitted_content': True, 'truncated': False}
     actual_error = isinstance(value, BaseException)
     if actual_error:
         from .faults import exception_evidence
@@ -287,9 +286,7 @@ def technical_error_evidence(value: Any, *, source: str = 'exception') -> dict[s
             result['reason_codes'].append('process')
     if source in _TRUSTED:
         diagnostic, omitted, truncated = _sanitize(text, MAX_TECHNICAL_LINES, MAX_TECHNICAL_CHARS)
-        if diagnostic:
-            result['diagnostic_text'] = diagnostic
-        result['omitted_content'] = omitted
+        result['omitted_content'] = True
         result['truncated'] = truncated
         status = re.search(r'\b(?:exit status|exit code|returncode)[ =:]*(-?\d{1,3})\b', diagnostic)
         if status and -255 <= int(status.group(1)) <= 255:
@@ -339,12 +336,6 @@ def validate_technical_evidence(value: Any, *, trusted_source: str | None = None
     if (isinstance(basis, str) and basis in PROJECT_SYNC_FAILURE_BASES
             and any(code in PROJECT_SYNC_FAILURE_CODES for code in result['reason_codes'])):
         result['project_sync_failure_basis'] = basis
-    if source in _TRUSTED and source == trusted_source and isinstance(value.get('diagnostic_text'), str):
-        text, omitted, truncated = _sanitize(value['diagnostic_text'], MAX_TECHNICAL_LINES, MAX_TECHNICAL_CHARS)
-        if text:
-            result['diagnostic_text'] = text
-        result['omitted_content'] |= omitted
-        result['truncated'] |= truncated
-    else:
-        result['omitted_content'] = True
+    # Provenance cannot make arbitrary stderr/guest/file wording safe to export.
+    result['omitted_content'] = True
     return result

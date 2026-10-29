@@ -1,4 +1,6 @@
-# HarnessyXO v0.7.35 Features
+# HarnessyXO v0.7.36 Features
+
+- Follow VM controller activity through create, start, stop and removal, including quiet periods, parent exit, timeout and cancellation. The VM card shows elapsed time, output counts and time since the last output; diagnostics retain the same sanitized command observations. Workspace, project and reference files and their contents are never diagnostic payloads, including content echoed through tool output or errors. Raw-content diagnostics are disabled.
 
 - Windows ISO discovery waits for Microsoft’s normal page initialization before selecting an edition. Generic page and network errors are distinguished from explicit rejections or visible challenges, and diagnostics retain the browser step and fixed failure category. Existing Windows VMs have an installation-media selector in Settings for automatic download or an ISO already on the host.
 
@@ -43,7 +45,7 @@
 - Lima create/start automatically saves selected-instance observations after 30 seconds without new output, at most once a minute afterward, and at failure before controller cleanup. **LIMA_STARTUP.json** and **lima-startup/** include verified hostagent/controller/QEMU process state, capability-check children, owned QMP status and serial-log coverage. Early and final captures are retained together. Missing and unsupported sources are explicit; diagnostics export reads saved observations without starting a VM or contacting its guest.
 - The startup card reports controller liveness and how long there has been no new output, separately from guest boot progress. The Kali running-status timeout remains under investigation; the new captures help identify its cause.
 - **Download Diagnostics** includes **GUEST_LOGS.json** and sanitized guest-log records alongside VM boot/controller evidence. Available OpenWrt and Linux connections receive fixed read-only system, kernel and SSH checks; stopped VMs are not started. Windows guest-log capture is reported as unsupported. Offline packaging uses saved observations.
-- Keep collection bounded and rate-limited. Failure captures retain reviewed SSH/SSHFS error codes and the last successful guest observation, with timestamps and an observed boot ID. Unknown messages, commands, paths, addresses and credentials are omitted; saved records are validated again when exported, including in content-rich diagnostics.
+- Keep collection bounded and rate-limited. Failure captures retain reviewed SSH/SSHFS error codes and the last successful guest observation, with timestamps and an observed boot ID. Unknown messages, commands, paths, addresses and credentials are omitted; saved records are validated again when exported, in every diagnostics export.
 - **EXTERNAL_DEVICES.json** uses host-side observations of existing external SSH activity only: operation outcomes, transport errors, timing and byte counts. Diagnostics never connect to those devices, send additional commands or retrieve their logs.
 - Open an OpenWrt VM's **Emulated radios** control from its main card. The card separates saved Wi-Fi/Bluetooth selections from the last verified software-radio counts. Stop the VM to change the selections, then Start to apply them. Emulated radios have no physical RF access or USB dongle identity.
 - Turning Wi-Fi setup off skips automatic setup and preserves installed interfaces. Bluetooth setup off stops the managed controllers when applied. The status lines keep actual observations separate from those setup selections.
@@ -207,7 +209,7 @@ Workspace and machine databases use WAL so background reads can coexist with mes
 - Capture bounded code-stack samples during event-loop stalls with an independent observer.
 - Record sign-in verification and workspace-restoration stages separately. Capture native Python fault signals and reviewed code frames when no existing crash handler is enabled; default exports exclude raw paths, locals and source contents.
 - Distinguish successful tool execution from failure to save its result.
-- Keep database evidence content-free in both modes and avoid opening application databases while collecting diagnostics.
+- Keep database evidence content-free in every export and avoid opening application databases while collecting diagnostics.
 
 ## OpenWrt test-target releases
 

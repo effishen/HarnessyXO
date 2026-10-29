@@ -1,7 +1,7 @@
 """Bounded, read-only Lima boot evidence for the normal diagnostics bundle.
 
-The default projection contains boot signals plus scrubbed control-plane errors,
-never a guest message. Raw tails require the existing content-rich export opt-in.
+Every projection contains fixed boot and control-plane facts only. Workspace
+content echoed by a guest or controller never enters diagnostics, in any mode.
 This module deliberately has no database or VM/controller dependency.
 """
 from __future__ import annotations
@@ -24,8 +24,28 @@ from typing import Any
 
 from ..core.paths import settings_path
 from .technical import (MAX_TECHNICAL_CHARS, MAX_TECHNICAL_LINES,
-                        technical_error_evidence, validate_technical_evidence)
+                        technical_error_evidence as _technical_error_evidence,
+                        validate_technical_evidence as _validate_technical_evidence)
 from .radio_setup import RADIO_SETUP_FILENAME, radio_setup_tail
+
+def _fixed_validated_technical_evidence(value: Any, *, trusted_source: str | None = None) -> dict[str, Any]:
+    """A trusted controller can still echo a workspace file; retain no prose."""
+    evidence = _validate_technical_evidence(value, trusted_source=trusted_source)
+    evidence.pop('diagnostic_text', None)
+    evidence['omitted_content'] = True
+    return evidence
+
+
+def _fixed_technical_evidence(value: Any, *, source: str = 'exception') -> dict[str, Any]:
+    return _fixed_validated_technical_evidence(_technical_error_evidence(value, source=source),
+                                              trusted_source=source)
+
+
+def _has_fixed_technical_facts(value: dict[str, Any]) -> bool:
+    return bool(value.get('reason_codes') or any(key in value for key in (
+        'exception_type', 'errno', 'errno_name', 'exit_code', 'status_code',
+        'timeout_seconds', 'signal', 'native_fault_class')))
+
 
 VM_LOG_FILENAMES = ('serial.log', 'serialp.log', 'serialv.log', 'ha.stderr.log', 'ha.stdout.log')
 NAMED_VM_LOG_FILENAMES = VM_LOG_FILENAMES + ('qemu.stderr.log', 'qemu.control-plane.log', RADIO_SETUP_FILENAME)
@@ -121,6 +141,8 @@ def register_workspace_runtime(workspace_root: Path | str, *, environment_id: st
         _REGISTRY[key] = None
         while len(_REGISTRY) > MAX_REGISTRY_ROOTS:
             _REGISTRY.popitem(last=False)
+    from .runtime_locations import remember_runtime_location
+    remember_runtime_location('workspace', path)
 
 
 def _runtime_root(root: Path, environment_id: str = '', runtime_root: Path | str | None = None) -> Path:
@@ -411,7 +433,12 @@ def _discover_workspaces(latest: Path, deadline: float) -> tuple[list[tuple[Path
     with _REGISTRY_LOCK:
         registered = list(reversed(_REGISTRY))
     coverage['registered_roots'] = len(registered)
-    candidates = current_roots + [(Path(path), 'registered') for path in registered] + previous_roots
+    from .runtime_locations import load_runtime_locations
+    index = load_runtime_locations(latest.parent)
+    indexed = [(Path(row['path']), 'registered') for row in index['locations'] if row['kind'] == 'workspace']
+    coverage['runtime_index_status'] = index['status']
+    coverage['runtime_index_roots'] = len(indexed)
+    candidates = current_roots + [(Path(path), 'registered') for path in registered] + indexed + previous_roots
     distinct: OrderedDict[str, tuple[Path, str]] = OrderedDict()
     for root, origin in candidates:
         if _allowed_path(root):
@@ -577,7 +604,7 @@ def _control_plane_evidence(lines: list[str], source: str) -> dict[str, Any]:
         recent = [index for index in range(len(lines) - 1, -1, -1) if index not in indices]
         indices.update(recent[:MAX_TECHNICAL_LINES - len(indices)])
         selected = [lines[index] for index in sorted(indices)]
-    evidence = technical_error_evidence('\n'.join(selected), source=source)
+    evidence = _fixed_technical_evidence('\n'.join(selected), source=source)
     evidence['truncated'] |= len(selected) < len(lines)
     return evidence
 
@@ -603,13 +630,13 @@ def _technical_tail(data: bytes, kind: str, truncated: bool, deadline: float) ->
     if kind in {'hostagent', 'qemu'} and time.monotonic() < deadline:
         diagnostic = _control_plane_evidence(lines[-MAX_PARSE_LINES:], kind)
         diagnostic['truncated'] |= truncated or len(lines) > MAX_PARSE_LINES
-        if diagnostic.get('diagnostic_text'):
+        if _has_fixed_technical_facts(diagnostic):
             rows.append({'kind': 'control_plane', 'diagnostic': diagnostic})
     output = b''.join((json.dumps(row, sort_keys=True, ensure_ascii=True, separators=(',', ':')) + '\n').encode('ascii') for row in rows)
     return output, {'line_count': len(lines), 'signals_count': recognized,
                     'signals_exported': len(retained), 'signals_limited': limited or recognized > MAX_SIGNAL_ROWS,
                     'evidence_codes': sorted(codes),
-                    'control_plane_included': bool(diagnostic and diagnostic.get('diagnostic_text')),
+                    'control_plane_included': bool(diagnostic and _has_fixed_technical_facts(diagnostic)),
                     'control_plane_truncated': bool(diagnostic and diagnostic.get('truncated')),
                     'content_omitted': kind == 'serial' or bool(diagnostic and diagnostic.get('omitted_content'))}
 
@@ -671,7 +698,7 @@ def validate_failure_receipt(value: Any) -> dict[str, Any] | None:
                 or source.get('name') not in {'controller_stderr', 'controller_stdout', 'ha.stderr.log', 'ha.stdout.log'}):
             continue
         expected = 'hostagent' if source['name'].startswith('ha.') else source['name']
-        evidence = validate_technical_evidence(source.get('evidence'), trusted_source=expected)
+        evidence = _fixed_validated_technical_evidence(source.get('evidence'), trusted_source=expected)
         if evidence['source'] != expected:
             continue
         item = {'name': source['name'], 'status': _enum(source.get('status'),
@@ -797,7 +824,7 @@ def preserve_vm_failure(workspace_root: Path | str, *, reason: str, operation: s
             receipt['sources'].append({'name': name, 'status': 'included',
                 'bytes_read': min(len(text.encode('utf-8', errors='replace')), PER_FILE_TAIL_BYTES),
                 'truncated': len(text) > PER_FILE_TAIL_BYTES,
-                'evidence': technical_error_evidence(text[-PER_FILE_TAIL_BYTES:], source=name)})
+                'evidence': _fixed_technical_evidence(text[-PER_FILE_TAIL_BYTES:], source=name)})
         for name in ('ha.stderr.log', 'ha.stdout.log'):
             _check_capture_cancelled(cancel_event)
             from harnessy.environment.lima_runtime import bound_lima_home
@@ -931,7 +958,8 @@ def collect_vm_diagnostics(latest: Path, include_content: bool = False) -> dict[
     """Collect existing known VM logs; never open SQLite or run a VM command."""
     deadline = time.monotonic() + COLLECTION_SECONDS
     roots, discovery = _discover_workspaces(Path(latest).absolute(), deadline)
-    mode = 'raw_bounded_tails' if include_content else 'signals_only'
+    # The legacy flag is accepted for callers, but never enables file content.
+    mode = 'signals_only'
     report: dict[str, Any] = {'schema_version': 1, 'status': 'collected' if roots else 'no_workspaces',
                               'mode': mode, 'limits': dict(_LIMITS), 'discovery': discovery, 'workspaces': []}
     members: dict[str, bytes] = {}
@@ -1001,17 +1029,6 @@ def collect_vm_diagnostics(latest: Path, include_content: bool = False) -> dict[
                     source['bytes_exported'] = len(output)
                     source['technical_bytes_exported'] = len(output)
                     export_total += len(output)
-                    if include_content:
-                        cap = MAX_EXPORT_BYTES - export_total
-                        raw = data[-cap:] if cap else b''
-                        if len(raw) < len(data):
-                            source['truncated'] = True
-                        raw_member = f'{member_prefix}/{filename}.raw.log'
-                        members[raw_member] = raw
-                        source['raw_archive_member'] = raw_member
-                        source['raw_bytes_exported'] = len(raw)
-                        source['bytes_exported'] += len(raw)
-                        export_total += len(raw)
                     workspace_codes.update(source['evidence_codes'])
                 workspace['sources'].append(source)
             receipts, receipt_bytes, receipt_limited = _failure_receipts(root, deadline, MAX_READ_BYTES - read_total,
@@ -1043,7 +1060,7 @@ def validate_vm_report(report: Any) -> dict[str, Any]:
     """Rebuild metadata using fixed enums and bounded numbers, ignoring prose."""
     if not isinstance(report, dict):
         report = {'status': 'unavailable', 'reason': 'collector_result_invalid'}
-    mode = _enum(report.get('mode'), {'signals_only', 'raw_bounded_tails'}, 'signals_only')
+    mode = 'signals_only'
     status = _enum(report.get('status'), {'collected', 'no_workspaces', 'unavailable'}, 'unavailable')
     safe: dict[str, Any] = {'schema_version': 1, 'status': status, 'mode': mode, 'limits': dict(_LIMITS),
                            'discovery': {}, 'workspaces': []}
@@ -1053,8 +1070,10 @@ def validate_vm_report(report: Any) -> dict[str, Any]:
     for key, cap in {'app_bytes_read': MAX_DISCOVERY_BYTES, 'records_examined': MAX_DISCOVERY_RECORDS,
                      'candidate_roots': MAX_DISCOVERY_RECORDS + MAX_REGISTRY_ROOTS,
                      'unsafe_app_sources': 15 + MAX_PREVIOUS_SESSIONS, 'registered_roots': MAX_REGISTRY_ROOTS,
-                     'launcher_sessions_skipped': MAX_PREVIOUS_SESSIONS}.items():
+                     'launcher_sessions_skipped': MAX_PREVIOUS_SESSIONS, 'runtime_index_roots': MAX_REGISTRY_ROOTS}.items():
         safe['discovery'][key] = _integer(discovery.get(key), cap)
+    from .runtime_locations import INDEX_STATUSES
+    safe['discovery']['runtime_index_status'] = _enum(discovery.get('runtime_index_status'), INDEX_STATUSES, 'missing')
     for key in ('workspaces_limited', 'discovery_limited', 'previous_session_scanned'):
         safe['discovery'][key] = discovery.get(key) is True
     seen_ids = set()
@@ -1117,9 +1136,8 @@ def validate_vm_report(report: Any) -> dict[str, Any]:
             expected = f'{prefix}/{filename}.technical.jsonl'
             if source.get('archive_member') == expected and source_status == 'included':
                 item['archive_member'] = expected
-            raw_expected = f'{prefix}/{filename}.raw.log'
-            if mode == 'raw_bounded_tails' and source.get('raw_archive_member') == raw_expected and source_status == 'included':
-                item['raw_archive_member'] = raw_expected
+            item['raw_bytes_exported'] = 0
+            item['content_omitted'] = True
             retained['sources'].append(item)
         retained['evidence_codes'] = sorted({code for source in retained['sources'] for code in source['evidence_codes']})
         safe['workspaces'].append(retained)
@@ -1130,9 +1148,9 @@ def validate_vm_report(report: Any) -> dict[str, Any]:
                        'bytes_exported': sum(source['bytes_exported'] for source in all_sources),
                        'recognized_signals': sum(source['signals_count'] for source in all_sources)}
     safe['summary']['failure_receipts'] = sum(len(workspace['failure_receipts']) for workspace in safe['workspaces'])
-    safe['omissions'] = {'guest_console_text': mode != 'raw_bounded_tails', 'command_and_guest_output_records': True,
+    safe['omissions'] = {'guest_console_text': True, 'command_and_guest_output_records': True,
                          'credentials_and_identifying_paths': True,
-                         'control_plane_policy': 'scrubbed_technical_text', 'raw_control_plane_included': mode == 'raw_bounded_tails'}
+                         'control_plane_policy': 'fixed_operational_facts', 'raw_control_plane_included': False}
     for source_status in ('included', 'missing', 'unsafe', 'unreadable', 'limited'):
         safe['summary'][source_status] = sum(source['status'] == source_status for source in all_sources)
     safe['summary']['bounded'] = sum(source['truncated'] or source['signals_limited'] or source['control_plane_truncated'] or source['status'] == 'limited' for source in all_sources)

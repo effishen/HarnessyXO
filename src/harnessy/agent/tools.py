@@ -3468,6 +3468,10 @@ class WorkspaceToolbox:
                     })
                     if len(results) >= max_results:
                         break
+            # Do not advance a lazy directory iterator after reaching the
+            # limit: its next yield can first descend through more folders.
+            if len(results) >= max_results:
+                break
         payload = {
             'ok': True, 'query': query, 'results': results,
             'provenance_by_path': provenance_by_path,
