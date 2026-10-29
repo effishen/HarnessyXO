@@ -7,6 +7,7 @@ import re
 import statistics
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,67 @@ from .manager import EnvironmentManager, environment_operation_context
 from .base import environment_root, ENVIRONMENT_ID_RE, _validate_registry_path, EnvironmentModelAccessError
 from .activity import reserve_policy_change, reserve_environment_change
 from .base import environment_config_lock
+
+
+# Controller callbacks inherit this task-local binding through wait_for/tasks.
+# Status polls on the same cached provider never inherit another operation's UI.
+_CONTROLLER_OBSERVER: ContextVar[tuple | None] = ContextVar('environment_controller_observer', default=None)
+
+
+def current_controller_operation_context():
+    """Return only task-owned identities and its guarded progress callback."""
+    from .manager import current_environment_operation
+    binding = _CONTROLLER_OBSERVER.get()
+    if binding is None or current_environment_operation().get('operation_id') != binding[2]:
+        return {}, None
+    context = {}
+    if isinstance(binding[1], str) and re.fullmatch(r'[0-9a-f]{32}', binding[1]):
+        context['environment_id'] = binding[1]
+    if isinstance(binding[3], str) and re.fullmatch(r'[0-9a-f]{32}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', binding[3]):
+        context['workspace_id'] = binding[3]
+    return context, binding[4]
+
+
+def current_controller_observer(workspace_root: str | Path, environment_id: str):
+    binding = _CONTROLLER_OBSERVER.get()
+    if (binding is None or str(workspace_root) != binding[0]
+            or environment_id != binding[1]):
+        return {}, None
+    return current_controller_operation_context()
+
+
+def controller_activity_detail(observation: dict[str, Any]) -> str:
+    """Format reviewed activity facts without carrying any command output."""
+    action = str(observation.get('controller_action') or 'other').replace('_', ' ')
+    state = str(observation.get('controller_state') or 'not_started').replace('_', ' ')
+    elapsed = float(observation.get('elapsed_seconds') or 0)
+    label = f'Host {action}' if observation.get('provider') == 'host' else f'Controller {action}'
+    program = observation.get('controller_program')
+    if observation.get('provider') == 'host' and isinstance(program, str) and program != 'other':
+        label += f' ({program})'
+    detail = f'{label}: {state} · {elapsed:.0f}s elapsed'
+    stdout, stderr = observation.get('stdout_bytes'), observation.get('stderr_bytes')
+    if type(stdout) is int and type(stderr) is int:
+        detail += f' · stdout {stdout:,} bytes · stderr {stderr:,} bytes'
+        if stdout == 0 and stderr == 0:
+            detail += ' · no output observed'
+        elif observation.get('last_output_age_seconds') is not None:
+            detail += f' · last output {float(observation["last_output_age_seconds"]):.0f}s ago'
+    elif observation.get('output_capture') == 'merged_pipe' and type(stdout) is int:
+        detail += f' · captured output {stdout:,} bytes (combined)'
+        if stdout == 0:
+            detail += ' · no output observed'
+        elif observation.get('last_output_age_seconds') is not None:
+            detail += f' · last output {float(observation["last_output_age_seconds"]):.0f}s ago'
+    else:
+        detail += ' · output counts unavailable'
+    activity = observation.get('controller_activity')
+    if isinstance(activity, str) and activity not in {'unknown', 'none'}:
+        detail += ' · ' + activity.replace('_', ' ')
+    returncode = observation.get('controller_returncode')
+    if type(returncode) is int:
+        detail += f' · exit {returncode}'
+    return detail
 
 
 class _OperationDeadlineExpired(Exception):
@@ -690,6 +752,20 @@ class EnvironmentOperationRegistry:
                     operation_id=operation_id, kind=action, windows_media_browser=observation,
                 )
 
+        async def controller_progress(observation: dict[str, Any]) -> None:
+            current = self._states.get(key)
+            if (not progress_open or current is None or current.operation_id != operation_id
+                    or not current.busy or current.status not in {'queued', 'running'}):
+                return
+            action_name = observation.get('controller_action', 'other')
+            changes: dict[str, Any] = {'detail': controller_activity_detail(observation),
+                                       'progress_source': 'controller_observation'}
+            timeout = observation.get('timeout_seconds')
+            if (type(timeout) in {int, float} and timeout > 0
+                    and (current.stage, action_name) in {('creating_vm', 'create'), ('starting_vm', 'start')}):
+                changes['stage_deadline'] = (current.stage_started_at or time.time()) + timeout
+            self._update(workspace_root, environment_id=environment_id, **changes)
+
         def check_model_access() -> None:
             # The marker comes only from the model-tool broker, never model
             # arguments. Browser lifecycle controls deliberately have no marker.
@@ -855,8 +931,13 @@ class EnvironmentOperationRegistry:
             state = self.state(workspace_root, environment_id=environment_id)
             remaining = max(0.1, state.deadline - time.time()) if state.deadline else self._deadline_seconds(action)
             with environment_operation_context(operation_id, action):
-                result = await self._wait_for_operation(execute_selected(), remaining,
-                    drain_on_cancel=setup_desktop or action == 'desktop')
+                observer_token = _CONTROLLER_OBSERVER.set(
+                    (str(workspace_root), environment_id, operation_id, state.workspace_id, controller_progress))
+                try:
+                    result = await self._wait_for_operation(execute_selected(), remaining,
+                        drain_on_cancel=setup_desktop or action == 'desktop')
+                finally:
+                    _CONTROLLER_OBSERVER.reset(observer_token)
             self._validate_result(action, result, snapshot_tag=str(payload.get('name') or ''),
                                   require_desktop=setup_desktop)
             if action == 'snapshot':

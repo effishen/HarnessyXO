@@ -374,58 +374,223 @@ class TestTargetManager:
             raise RuntimeError('Lima is required on the HarnessyXO host. Install Lima and QEMU, then retry Start.')
         return path
 
+    CONTROLLER_HEARTBEAT_SECONDS = 5.0
+    CONTROLLER_OBSERVER_TIMEOUT_SECONDS = 1.0
+
+    async def _controller_observation(self, event: str, **fields: Any) -> None:
+        """Record fixed controller facts; named environments supply their own identity."""
+        from harnessy.diagnostics import log_event
+        from harnessy.diagnostics.controller_observations import validate_controller_observation
+        operation = self.operation
+        context = dict(fields)
+        backend = getattr(self, 'backend', None)
+        if backend in {'lima', 'qemu'}:
+            context['target_backend'] = backend
+        target_id = getattr(getattr(self, 'target', None), 'id', None)
+        if isinstance(target_id, str) and re.fullmatch(r'[a-f0-9]{32}', target_id):
+            context['target_id'] = target_id
+        workspace_id = getattr(getattr(self, 'workspace', None), 'id', None)
+        if isinstance(workspace_id, str):
+            context['workspace_id'] = workspace_id
+        if operation is not None:
+            context['operation_id'] = operation.operation_id
+            context['environment_action'] = operation.action
+            context['target_action'] = operation.action
+        safe = validate_controller_observation(event, context)
+        if safe is not None:
+            log_event('runtime', event, **{key: value for key, value in safe.items() if key != 'event'})
+
+    async def _notify_controller_observation(self, event: str, **fields: Any) -> None:
+        """A diagnostic consumer cannot take over the command's result or lifetime."""
+        current = asyncio.current_task()
+        cancelling = current.cancelling() if current is not None else 0
+        try:
+            await asyncio.wait_for(self._controller_observation(event, **fields),
+                                   timeout=self.CONTROLLER_OBSERVER_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            if current is not None and current.cancelling() > cancelling:
+                raise
+        except Exception:
+            pass
+
+    @staticmethod
+    async def _drain_controller_cleanup(task: asyncio.Task) -> bool:
+        interrupted = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                interrupted = True
+        task.result()
+        return interrupted
+
     async def _run(self, *args: str, timeout: float = 120, input_bytes: bytes | None = None, check=True) -> tuple[int, str, str]:
         if args and args[0] in {'create', 'start', 'stop', 'delete'}:
             return await self._run_lifecycle_controller(*args, timeout=timeout,
                                                          input_bytes=input_bytes, check=check)
-        proc = await asyncio.create_subprocess_exec(
-            self._binary(), *args, env=self._env(), cwd=self.root,
-            stdin=asyncio.subprocess.PIPE if input_bytes is not None else asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
+        from harnessy.diagnostics.controller_observations import CONTROLLER_ACTIONS
+        action = args[0] if args and args[0] in CONTROLLER_ACTIONS else 'other'
+        command_id = uuid.uuid4().hex
+        started = time.monotonic()
+        proc = None
         buffers = ['', '']
+        sizes = [0, 0]
+        last_output_at = None
+        failure = None
+        rc = None
+        readers = []
+        parent = heartbeat = None
+
+        async def observe(event, outcome='running'):
+            now = time.monotonic()
+            await self._notify_controller_observation(event,
+                provider='lima', command_id=command_id, controller_action=action,
+                controller_state='not_started' if proc is None else 'running' if proc.returncode is None else 'exited',
+                controller_returncode=None if proc is None else proc.returncode,
+                controller_pid=None if proc is None else proc.pid,
+                completion_phase='running_controller' if proc is None or proc.returncode is None else 'collecting_output',
+                elapsed_seconds=max(0.0, now - started), timeout_seconds=max(0.0, timeout),
+                stdout_bytes=sizes[0], stderr_bytes=sizes[1],
+                last_output_age_seconds=max(0.0, now - (last_output_at if last_output_at is not None else started)),
+                output_capture='pipe_streams', capture_scope='command_output_lifetime', outcome=outcome)
+
         async def read(stream, index):
+            nonlocal last_output_at
             while chunk := await stream.read(4096):
-                text = chunk.decode('utf-8', errors='replace')
-                buffers[index] = (buffers[index] + text)[-100000:]
-                if self.operation and self.busy and args and args[0] in {'create', 'start', 'stop', 'delete'}:
-                    self.operation.note(text)
+                sizes[index] += len(chunk)
+                last_output_at = time.monotonic()
+                buffers[index] = (buffers[index] + chunk.decode('utf-8', errors='replace'))[-100000:]
+
+        async def wait_parent():
+            # Process.wait() can wait for inherited pipe EOF after the native
+            # parent has exited. Observe its returncode independently, while
+            # drive() still retains the normal output/descendant lifetime.
+            while proc.returncode is None:
+                await asyncio.sleep(.01)
+            await observe('environment_controller_parent_exited')
+            return proc.returncode
+
+        async def beats():
+            while True:
+                await asyncio.sleep(self.CONTROLLER_HEARTBEAT_SECONDS)
+                await observe('environment_controller_heartbeat')
+
         async def drive():
+            nonlocal parent, heartbeat
+            # Read both output streams and run heartbeats before waiting for
+            # potentially large copied input to drain into the guest command.
+            parent = asyncio.create_task(wait_parent(), name='harnessy-target-controller-wait')
+            heartbeat = asyncio.create_task(beats(), name='harnessy-target-controller-heartbeat')
+            readers.extend(asyncio.create_task(read(stream, index))
+                           for index, stream in enumerate((proc.stdout, proc.stderr)))
             if input_bytes is not None:
                 proc.stdin.write(input_bytes)
                 await proc.stdin.drain()
                 proc.stdin.close()
-            await asyncio.gather(read(proc.stdout, 0), read(proc.stderr, 1))
-            return await proc.wait()
+            await asyncio.gather(*readers)
+            return await parent
+
         try:
+            proc = await asyncio.create_subprocess_exec(
+                self._binary(), *args, env=self._env(), cwd=self.root,
+                stdin=asyncio.subprocess.PIPE if input_bytes is not None else asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            await observe('environment_controller_started')
             rc = await asyncio.wait_for(drive(), timeout)
-        finally:
-            if proc.returncode is None:
-                proc.kill()
-                await proc.wait()
+        except BaseException as exc:
+            failure = exc
+
+        async def cleanup():
+            try:
+                if heartbeat is not None and not heartbeat.done():
+                    heartbeat.cancel()
+                    await asyncio.gather(heartbeat, return_exceptions=True)
+                if proc is not None:
+                    if proc.returncode is None:
+                        try:
+                            proc.kill()
+                        except ProcessLookupError:
+                            pass
+                    if failure is not None:
+                        # A shell descendant can retain the pipe descriptors.
+                        # Cancellation owns only this direct parent: wait for
+                        # its exit status, then close our pipe transports.
+                        # Normal command completion still waits for every EOF.
+                        while proc.returncode is None:
+                            await asyncio.sleep(.01)
+                        transport = getattr(proc, '_transport', None)
+                        for descriptor in (0, 1, 2):
+                            pipe = transport.get_pipe_transport(descriptor) if transport is not None else None
+                            if pipe is not None:
+                                pipe.close()
+                    await proc.wait()
+                if failure is not None and readers:
+                    try:
+                        await asyncio.wait_for(asyncio.gather(*readers, return_exceptions=True), .25)
+                    except asyncio.TimeoutError:
+                        pass
+                for task in (*readers, parent):
+                    if task is not None and not task.done():
+                        task.cancel()
+                await asyncio.gather(*(task for task in (*readers, parent) if task is not None),
+                                     return_exceptions=True)
+                event, outcome = self._controller_terminal(failure, proc)
+                await observe(event, outcome)
+            finally:
+                if proc is not None and proc.stdin is not None:
+                    proc.stdin.close()
+
+        interrupted = await self._drain_controller_cleanup(asyncio.create_task(cleanup()))
+        if interrupted:
+            raise asyncio.CancelledError
+        if failure is not None:
+            raise failure
         if check and rc:
             raise RuntimeError((buffers[1] or buffers[0] or f'Lima exited {rc}')[-3000:])
         return rc, buffers[0], buffers[1]
 
+    @staticmethod
+    def _controller_terminal(failure, process):
+        if isinstance(failure, asyncio.CancelledError):
+            return 'environment_controller_cancelled', 'cancelled'
+        if isinstance(failure, asyncio.TimeoutError):
+            return 'environment_controller_timed_out', 'timed_out'
+        if process is None:
+            return 'environment_controller_spawn_failed', 'spawn_failed'
+        return 'environment_controller_finished', 'failed' if failure is not None or process.returncode else 'succeeded'
+
     async def _run_lifecycle_controller(self, *args: str, timeout: float,
                                         input_bytes: bytes | None, check: bool) -> tuple[int, str, str]:
-        """Capture a direct lifecycle controller without waiting for daemon pipe EOF.
-
-        Lima's hostagent can inherit the controller's output descriptors. Only
-        the direct controller is owned here; guest/daemon lifetime is separate.
-        Shell commands retain the pipe-based execution path above.
-        """
+        """Observe a controller without confusing inherited daemon output with its lifetime."""
+        from harnessy.diagnostics.controller_observations import ControllerActivityParser, CONTROLLER_ACTIONS
+        action = args[0] if args and args[0] in CONTROLLER_ACTIONS else 'other'
+        command_id = uuid.uuid4().hex
+        started = time.monotonic()
         captures = []
         proc = None
         buffers = ['', '']
         offsets = [0, 0]
+        sizes = [0, 0]
+        parsers = [ControllerActivityParser(), ControllerActivityParser()]
+        activity = 'unknown'
+        signals = set()
+        last_output_at = None
+        final_sizes = None
+        failure = None
+        rc = None
+        parent_waiter = None
 
-        def collect(sizes=None):
+        def collect(observed_sizes=None):
+            nonlocal last_output_at, activity
             for index, stream in enumerate(captures):
-                size = sizes[index] if sizes is not None else os.fstat(stream.fileno()).st_size
-                # At most four UTF-8 bytes per retained character. Skip old
-                # excess output instead of reading an unbounded capture.
+                size = observed_sizes[index] if observed_sizes is not None else os.fstat(stream.fileno()).st_size
+                if size > sizes[index]:
+                    last_output_at = time.monotonic()
+                sizes[index] = size
                 position = max(offsets[index], size - 400000)
+                if position > offsets[index]:
+                    parsers[index] = ControllerActivityParser()
                 while position < size:
                     data = os.pread(stream.fileno(), min(65536, size - position), position)
                     if not data:
@@ -433,9 +598,28 @@ class TestTargetManager:
                     position += len(data)
                     text = data.decode('utf-8', errors='replace')
                     buffers[index] = (buffers[index] + text)[-100000:]
+                    parsers[index].feed(text)
+                    parsed = parsers[index].snapshot()
+                    if parsed['controller_activity'] != 'unknown':
+                        activity = parsed['controller_activity']
+                    signals.update(parsed['controller_signals'])
                     if self.operation and self.busy:
                         self.operation.note(text)
                 offsets[index] = size
+
+        async def observe(event, outcome='running'):
+            now = time.monotonic()
+            await self._notify_controller_observation(event,
+                provider='lima', command_id=command_id, controller_action=action,
+                controller_state='not_started' if proc is None else 'running' if proc.returncode is None else 'exited',
+                controller_returncode=None if proc is None else proc.returncode,
+                controller_pid=None if proc is None else proc.pid,
+                completion_phase='running_controller' if proc is None or proc.returncode is None else 'collecting_output',
+                elapsed_seconds=max(0.0, now - started), timeout_seconds=max(0.0, timeout),
+                stdout_bytes=sizes[0], stderr_bytes=sizes[1],
+                last_output_age_seconds=max(0.0, now - (last_output_at if last_output_at is not None else started)),
+                output_capture='anonymous_files', capture_scope='direct_controller_lifetime',
+                controller_activity=activity, controller_signals=sorted(signals), outcome=outcome)
 
         try:
             for _ in range(2):
@@ -447,36 +631,53 @@ class TestTargetManager:
                 stdin=asyncio.subprocess.PIPE if input_bytes is not None else asyncio.subprocess.DEVNULL,
                 stdout=captures[0], stderr=captures[1],
             )
+            async def wait_parent():
+                nonlocal final_sizes
+                code = await proc.wait()
+                final_sizes = [os.fstat(stream.fileno()).st_size for stream in captures]
+                collect(final_sizes)
+                await observe('environment_controller_parent_exited')
+                return code, final_sizes
+
+            parent_waiter = asyncio.create_task(wait_parent(), name='harnessy-target-controller-wait')
+            await observe('environment_controller_started')
 
             async def drive():
-                waiter = None
+                nonlocal final_sizes
+                waiter = parent_waiter
+
+                async def monitor_capture():
+                    next_heartbeat = time.monotonic() + self.CONTROLLER_HEARTBEAT_SECONDS
+                    while True:
+                        collect(final_sizes)
+                        if time.monotonic() >= next_heartbeat:
+                            await observe('environment_controller_heartbeat')
+                            next_heartbeat = time.monotonic() + self.CONTROLLER_HEARTBEAT_SECONDS
+                        await asyncio.sleep(min(.1, self.CONTROLLER_HEARTBEAT_SECONDS))
+
+                monitor = asyncio.create_task(monitor_capture(), name='harnessy-target-controller-heartbeat')
                 try:
                     if input_bytes is not None:
                         proc.stdin.write(input_bytes)
                         await proc.stdin.drain()
                         proc.stdin.close()
-
-                    async def wait_parent():
-                        code = await proc.wait()
-                        # Freeze the observed direct-controller capture. Later
-                        # output from an inherited daemon is not collected.
-                        return code, [os.fstat(stream.fileno()).st_size for stream in captures]
-
-                    waiter = asyncio.create_task(wait_parent(), name='harnessy-target-controller-wait')
-                    while not waiter.done():
-                        collect()
-                        await asyncio.wait({waiter}, timeout=0.1)
-                    code, sizes = waiter.result()
-                    collect(sizes)
+                    code, final_sizes = await waiter
+                    collect(final_sizes)
+                    await observe('environment_controller_output_handoff')
                     return code
                 finally:
+                    monitor.cancel()
+                    await asyncio.gather(monitor, return_exceptions=True)
                     if waiter is not None and not waiter.done():
                         waiter.cancel()
                         await asyncio.gather(waiter, return_exceptions=True)
 
             rc = await asyncio.wait_for(drive(), timeout)
-        finally:
-            cancelled = False
+        except BaseException as exc:
+            failure = exc
+
+        async def cleanup():
+            nonlocal final_sizes
             try:
                 if proc is not None:
                     if proc.returncode is None:
@@ -484,18 +685,25 @@ class TestTargetManager:
                             proc.kill()
                         except ProcessLookupError:
                             pass
-                    drain = asyncio.create_task(proc.wait())
-                    while not drain.done():
-                        try:
-                            await asyncio.shield(drain)
-                        except asyncio.CancelledError:
-                            cancelled = True
-                    drain.result()
+                    await proc.wait()
+                if parent_waiter is not None and not parent_waiter.done():
+                    parent_waiter.cancel()
+                    await asyncio.gather(parent_waiter, return_exceptions=True)
+                if captures:
+                    if final_sizes is None:
+                        final_sizes = [os.fstat(stream.fileno()).st_size for stream in captures]
+                    collect(final_sizes)
+                event, outcome = self._controller_terminal(failure, proc)
+                await observe(event, outcome)
             finally:
                 for stream in captures:
                     stream.close()
-            if cancelled:
-                raise asyncio.CancelledError
+
+        interrupted = await self._drain_controller_cleanup(asyncio.create_task(cleanup()))
+        if interrupted:
+            raise asyncio.CancelledError
+        if failure is not None:
+            raise failure
         if check and rc:
             raise RuntimeError((buffers[1] or buffers[0] or f'Lima exited {rc}')[-3000:])
         return rc, buffers[0], buffers[1]

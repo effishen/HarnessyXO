@@ -12,6 +12,8 @@ import errno
 import hashlib
 import json
 import math
+import os
+import stat
 import re
 import signal
 import socket
@@ -104,7 +106,8 @@ def _module_for_path(path: Path) -> str | None:
             relative = path.relative_to(root)
         except ValueError:
             continue
-        if relative.suffix != '.py':
+        from .operational import _APPLICATION_DATA_DIRECTORIES
+        if relative.suffix != '.py' or any(part.casefold() in _APPLICATION_DATA_DIRECTORIES for part in relative.parts):
             return None
         parts = list(relative.with_suffix('').parts)
         if parts and parts[-1] == '__init__':
@@ -120,9 +123,17 @@ def _source_symbols(path_text: str) -> tuple[frozenset[str], frozenset[str]]:
     """Only static identifiers are retained; never retain or emit source text."""
     try:
         path = Path(path_text)
-        if path.stat().st_size > 4_000_000:
+        info = path.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 4_000_000
+                or any(part.is_symlink() for part in (path, *path.parents))
+                or _module_for_path(path) is None):
             return frozenset(), frozenset()
-        tree = ast.parse(path.read_text(encoding='utf-8'))
+        from .vm_logs import _open_regular
+        with os.fdopen(_open_regular(path), 'rb') as source:
+            payload = source.read(4_000_001)
+        if len(payload) > 4_000_000:
+            return frozenset(), frozenset()
+        tree = ast.parse(payload.decode('utf-8'))
         functions = {node.name for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
         classes = {node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)}
         return frozenset(functions) | _COMPILER_FUNCTIONS, frozenset(classes)
@@ -146,7 +157,9 @@ def _path_for_module(module: str) -> Path | None:
             try:
                 resolved = candidate.resolve()
                 resolved.relative_to(root)
-                if resolved.is_file() and _module_for_path(resolved) == module:
+                if (resolved.is_file() and resolved.stat().st_nlink == 1
+                        and not any(part.is_symlink() for part in (candidate, *candidate.parents))
+                        and _module_for_path(resolved) == module):
                     return resolved
             except (OSError, ValueError, RuntimeError):
                 continue

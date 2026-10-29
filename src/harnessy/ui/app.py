@@ -1796,9 +1796,9 @@ class HarnessyPage:
                                  close_button=False)
         try:
             # Record the request *before* snapshotting so the exported ZIP itself
-            # contains the event which caused it to be collected. The default
-            # export is privacy-safe; raw content requires explicit opt-in.
-            log_event('harnessy', 'diagnostics_download_requested', include_content=bool(include_content))
+            # contains the event which caused it to be collected. Keep the
+            # legacy argument compatible without permitting content exports.
+            log_event('harnessy', 'diagnostics_download_requested', include_content=False)
             _observe_run_queue_snapshot(self.machine, source='diagnostics_download', force=True)
             from harnessy.diagnostics.guest_logs import refresh_guest_logs
             try:
@@ -1811,7 +1811,7 @@ class HarnessyPage:
                 from harnessy.diagnostics.technical import technical_error_evidence
                 log_event('harnessy', 'guest_log_refresh_failed', technical_error=technical_error_evidence(exc))
             notice.message = 'Packaging diagnostics…'
-            path = await asyncio.to_thread(refresh_diagnostics_bundle, include_content=bool(include_content))
+            path = await asyncio.to_thread(refresh_diagnostics_bundle, include_content=False)
             if path is None or not Path(path).is_file():
                 ui.notify('Could not create the diagnostics bundle.', type='negative')
                 return
@@ -1840,26 +1840,18 @@ class HarnessyPage:
                 'truncated sources.'
             ).classes('text-sm hy-muted')
             ui.label(
-                'Chat messages, model reasoning/answers, file contents, tool commands/results and '
-                'credentials are excluded. Guest logs retain reviewed technical events only. '
+                'Workspace, project and reference files and their contents are never included. '
+                'Chat messages, model reasoning/answers, raw tool commands/results and credentials are excluded. '
+                'Command and guest logs retain reviewed operational facts only, including when output echoes file contents. '
                 'Fixed read-only checks refresh available running VMs; stopped VMs are not started.'
             ).classes('text-sm hy-muted')
             ui.label(
                 'External-device evidence comes from existing Harnessy activity only. '
                 'Diagnostics never connect to external devices or run commands on them.'
             ).classes('text-sm hy-muted')
-            include_content = ui.checkbox(
-                'Include conversation/model/tool content', value=False,
-            ).classes('w-full')
-            ui.label(
-                'Enable only when raw content is needed. This adds chat/model/tool payloads and bounded '
-                'raw VM log tails, which may include guest output and credentials.'
-            ).classes('text-xs hy-muted')
-
             async def download() -> None:
-                raw = bool(include_content.value)
                 dialog.close()
-                await self._download_diagnostics(include_content=raw)
+                await self._download_diagnostics()
 
             with ui.row().classes('w-full justify-end gap-2'):
                 ui.button('Cancel', on_click=dialog.close).props('flat no-caps')

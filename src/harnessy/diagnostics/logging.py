@@ -263,7 +263,7 @@ def _diagnostic_source_allowed(source: Path) -> bool:
             info = source.lstat()
         except FileNotFoundError:
             info = None
-        if info is not None and not stat.S_ISREG(info.st_mode):
+        if info is not None and (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
             return False
         for part in (source, *source.parents):
             if part.is_symlink() or part.name == '.settings':
@@ -481,58 +481,14 @@ _MAPPING_RECOVERY_ENUMS = {
 
 
 def _safe_event_field(key: str, value: Any) -> Any:
-    """Keep reviewed structured evidence intact, without widening raw limits."""
-    if key.lower() == 'windows_media_browser':
-        from .windows_media import validate_windows_media_browser_observation
-        return validate_windows_media_browser_observation(value)
-    if key in {'host_prerequisite_error_code', 'environment_provider', 'runtime_backend'}:
-        return _privacy_safe_value(value, key=key)
-    if key.lower() in _MAPPING_RECOVERY_ENUMS or key.lower() == 'command_transport_rotated':
-        return _privacy_safe_value(value, key=key)
-    if key.lower() == 'external_device':
-        from .external_devices import validate_external_device_observation
-        return validate_external_device_observation(value)
-    if key.lower() == 'guest_transport':
-        from .guest_logs import validate_transport_evidence
-        return validate_transport_evidence(value)
-    if key.lower() in _CONTEXT_TOKEN_ACCOUNTING_KEYS:
-        return _privacy_safe_value(value, key=key)
-    if _is_sensitive_log_key(key):
-        return '<redacted>'
-    if key == 'environment_id':
-        return value if isinstance(value, str) and re.fullmatch(r'[0-9a-f]{32}', value) else None
-    if key in {'project_access', 'allowed_project_ids'}:
-        return _privacy_safe_value(value, key=key)
-    if key in {'technical_error', 'controller_evidence', 'host_resources', 'requested_vm_config', 'environment_action',
-               'error_type', 'terminal_stop_reason', 'terminal_reason', 'backend_done_reason',
-               'completion_state', 'last_error_code', 'source', 'state', 'component', 'missing_dependency'}:
-        return _privacy_safe_value(value, key=key)
-    if key in _WORKSPACE_DATABASE_ENUMS or key in {'database_worker_returncode', 'sqlite_errorcode', 'sqlite_errorname'}:
-        return _privacy_safe_value(value, key=key)
-    if key in {'archive_check', 'storage_issue'}:
-        return _privacy_safe_value(value, key=key)
-    if key == 'error_class':
-        return _privacy_safe_value(value, key=key)
-    if key in {'client_request_id', 'usage', 'timings', 'backend_timings',
-               'prompt_progress', 'native_prompt_progress', 'throughput_source',
-               'prefill_throughput_source', 'timing_source', 'tps_source', 'provenance', 'output_provenance'}:
-        return _privacy_safe_value(value, key=key)
-    if key in {
-        'permission_decision', 'permission_states', 'required_permissions', 'target_action_permissions',
-        'permission_source', 'permission_reason', 'permission_target_mode',
-        'permission_target_state', 'target_validation', 'approval_wait_seconds',
-        'execution_duration_seconds', 'coordination_wait_seconds',
-    }:
-        return _privacy_safe_value(value, key=key)
+    """Apply the same content-free projection before persistence and export."""
     if key in {'fault', 'exception_evidence'}:
         from .faults import validate_fault_evidence
-
         return validate_fault_evidence(value)
     if key in {'frames', 'frame_stack'}:
         from .faults import validate_frames
-
         return validate_frames(value)
-    return DiagnosticsManager._safe(value)
+    return _privacy_safe_value(value, key=key)
 
 
 def _validated_session_id(value: Any) -> str | None:
@@ -807,6 +763,39 @@ def shell_result_diagnostics(command: str, stdout: str, stderr: str, returncode:
     }
 
 
+_CONTENT_PROJECTED = object()
+
+
+class _ContentFreeLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if getattr(record, '_harnessy_content_projected', None) is _CONTENT_PROJECTED:
+            return True
+        try:
+            raw = record.getMessage()
+            try:
+                decoded = json.loads(raw)
+            except (ValueError, TypeError, RecursionError):
+                decoded = None
+            if isinstance(decoded, dict):
+                safe = _privacy_safe_value(decoded)
+            else:
+                safe = {'content_omitted': True, 'chars': len(raw),
+                        'sha256_12': hashlib.sha256(raw.encode()).hexdigest()[:12],
+                        'technical_error': _safe_error_summary(raw)}
+            if record.exc_info and isinstance(record.exc_info[1], BaseException):
+                from .faults import exception_evidence
+                safe = {'observation': safe, 'fault': exception_evidence(record.exc_info[1])}
+            record.msg = json.dumps(safe, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
+        except Exception:
+            record.msg = '{"content_omitted":true,"event":"diagnostic_projection_failed"}'
+        record.args = ()
+        record.exc_info = None
+        record.exc_text = None
+        record.stack_info = None
+        record._harnessy_content_projected = _CONTENT_PROJECTED
+        return True
+
+
 class _Tee:
     def __init__(self, primary, secondary) -> None:
         self.primary = primary
@@ -818,7 +807,11 @@ class _Tee:
         except Exception:
             pass
         try:
-            self.secondary.write(data)
+            from .technical import technical_error_evidence
+            payload = {'content_omitted': True, 'chars': len(data or ''),
+                       'sha256_12': hashlib.sha256(str(data or '').encode()).hexdigest()[:12],
+                       'technical_error': technical_error_evidence(data)}
+            self.secondary.write(json.dumps(payload, separators=(',', ':')) + '\n')
             self.secondary.flush()
         except Exception:
             pass
@@ -870,6 +863,8 @@ class DiagnosticsManager:
             crashes = self.root / 'crashes'
             for path in (self.root, sessions, crashes):
                 path.mkdir(parents=True, exist_ok=True)
+            from .runtime_locations import configure_runtime_locations
+            configure_runtime_locations(self.root)
             previous_sessions = sorted(
                 (p for p in sessions.iterdir() if p.is_dir()),
                 key=lambda p: p.stat().st_mtime,
@@ -964,6 +959,7 @@ class DiagnosticsManager:
                 max_bytes, backups = _CONTEXT_LOG_MAX_BYTES, _CONTEXT_LOG_BACKUPS
             handler = RotatingFileHandler(path, maxBytes=max_bytes, backupCount=backups, encoding='utf-8')
             handler.setFormatter(formatter)
+            handler.addFilter(_ContentFreeLogFilter())
             logger.addHandler(handler)
 
     def _configure_console_capture(self) -> None:
@@ -1010,7 +1006,7 @@ class DiagnosticsManager:
             target_fd = os.open('console-error.log', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                                 0o600, dir_fd=session_fd)
             with os.fdopen(target_fd, 'wb') as target:
-                target.write(payload)
+                target.write(_project_freeform_technical_bytes(payload))
         except Exception:
             # Preservation cannot block launch if this platform lacks dir_fd
             # support or the prior diagnostic filesystem is unavailable.
@@ -1035,10 +1031,9 @@ class DiagnosticsManager:
             try:
                 from .faults import exception_evidence
 
-                text = ''.join(traceback.format_exception(exc_type, exc, tb))
-                self.event('harnessy', 'uncaught_exception', level=logging.ERROR,
-                           detail=text[-12000:], fault=exception_evidence(exc))
-                self._write_crash(text)
+                fault = exception_evidence(exc)
+                self.event('harnessy', 'uncaught_exception', level=logging.ERROR, fault=fault)
+                self._write_crash(json.dumps({'event': 'uncaught_exception', 'fault': fault}))
                 self.capture_system_snapshot('uncaught_exception')
             finally:
                 old(exc_type, exc, tb)
@@ -1049,37 +1044,19 @@ class DiagnosticsManager:
             return
         stamp = datetime.now().astimezone().strftime('%Y-%m-%d_%H%M%S')
         try:
-            (self.root / 'crashes' / f'crash-{stamp}.log').write_text(text, encoding='utf-8')
+            try:
+                decoded = json.loads(text)
+            except (ValueError, TypeError, RecursionError):
+                decoded = None
+            payload = (json.dumps(_privacy_safe_value(decoded), separators=(',', ':')).encode()
+                       if isinstance(decoded, dict) else _project_freeform_technical_bytes(str(text).encode()))
+            (self.root / 'crashes' / f'crash-{stamp}.log').write_bytes(payload)
         except OSError:
             pass
 
     @staticmethod
     def _safe(value: Any, *, depth: int = 0) -> Any:
-        if depth > 4:
-            return '<depth-limit>'
-        if value is None or isinstance(value, (bool, int, float)):
-            return value
-        if isinstance(value, str):
-            if len(value) > 4000:
-                return value[:4000] + f'… <{len(value) - 4000} chars omitted>'
-            return value
-        if isinstance(value, bytes):
-            return f'<{len(value)} bytes>'
-        if isinstance(value, Path):
-            return str(value)
-        if isinstance(value, dict):
-            out = {}
-            for key, item in list(value.items())[:80]:
-                if str(key).lower() in _CONTEXT_TOKEN_ACCOUNTING_KEYS:
-                    out[str(key)] = _privacy_safe_value(item, key=str(key))
-                elif _is_sensitive_log_key(str(key)):
-                    out[str(key)] = '<redacted>'
-                else:
-                    out[str(key)] = DiagnosticsManager._safe(item, depth=depth + 1)
-            return out
-        if isinstance(value, (list, tuple, set)):
-            return [DiagnosticsManager._safe(v, depth=depth + 1) for v in list(value)[:80]]
-        return DiagnosticsManager._safe(str(value), depth=depth + 1)
+        return _privacy_safe_value(value)
 
     def event(self, channel: str, event: str, *, level: int = logging.INFO, **fields: Any) -> None:
         if event.startswith('test_target_'):
@@ -1149,8 +1126,8 @@ class DiagnosticsManager:
         # Process the field names too: passing only each value bypassed the
         # secret-key checks for top-level password/token fields.
         payload = {
-            'event': event,
-            **{k: (_controller_evidence(v, trusted=True) if k == 'controller_evidence'
+            'event': _metadata_label(event),
+            **{_metadata_key(k): (_controller_evidence(v, trusted=True) if k == 'controller_evidence'
                     and _trusted_controller_event({'event': event, **fields})
                     else _safe_event_field(k, v)) for k, v in fields.items()},
         }
@@ -1186,7 +1163,9 @@ class DiagnosticsManager:
         script = self.root / 'collect_diagnostics.py'
         payload = '''#!/usr/bin/env python3
 from pathlib import Path
+from zipfile import ZipFile
 import sys
+import time
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 SRC = APP_ROOT / "src"
@@ -1201,13 +1180,21 @@ import argparse
 parser = argparse.ArgumentParser(description="Create a HarnessyXO diagnostics bundle.")
 parser.add_argument(
     "--include-content", action="store_true",
-    help="Include raw conversation/model/tool payload content and raw bounded VM boot logs. Default export is privacy-safe.",
+    help=argparse.SUPPRESS,
 )
 args = parser.parse_args()
-path = collect_existing_diagnostics(APP_ROOT, include_content=args.include_content)
+print(f"[{int(time.time())}] COLLECT sanitized diagnostics: {APP_ROOT}", flush=True)
+path = collect_existing_diagnostics(APP_ROOT)
 if path is None:
-    raise SystemExit("Could not create HarnessyXO diagnostics bundle.")
-print(path)
+    raise SystemExit(f"[{int(time.time())}] ERROR COLLECT sanitized diagnostics: {APP_ROOT}; archive creation failed.")
+print(f"[{int(time.time())}] WRITE diagnostics archive: {path}", flush=True)
+try:
+    with ZipFile(path) as archive:
+        if archive.testzip() is not None:
+            raise ValueError("archive CRC check failed")
+except Exception as error:
+    raise SystemExit(f"[{int(time.time())}] ERROR VERIFY diagnostics archive: {path}; {type(error).__name__}.") from None
+print(f"[{int(time.time())}] VERIFY diagnostics archive: {path}", flush=True)
 '''
         try:
             script.write_text(payload, encoding='utf-8')
@@ -1231,9 +1218,9 @@ print(path)
             if event.get('kind') == 'model_protocol_receipt':
                 event = validate_protocol_receipt(event)
         try:
-            line = json.dumps(self._safe(event), ensure_ascii=False, separators=(',', ':'))
+            line = json.dumps(_privacy_safe_value(event), ensure_ascii=False, separators=(',', ':'), allow_nan=False)
         except Exception:
-            line = repr(event)[:4000]
+            line = json.dumps({'event': 'stream_receipt_invalid', 'content_omitted': True})
         encoded = line + '\n'
         with self._lock:
             if self._stream_tail.maxlen and len(self._stream_tail) >= self._stream_tail.maxlen:
@@ -1342,8 +1329,8 @@ print(path)
     def refresh_bundle(self, *, include_content: bool = False) -> Path | None:
         """Create a point-in-time support ZIP only when explicitly requested.
 
-        The default export is privacy-safe and omits conversation/model/tool
-        payload content. Raw payload export requires an explicit opt-in.
+        Every export omits workspace files and conversation/model/tool payload
+        content. The legacy include_content argument is ignored.
         """
         with self._bundle_lock:
             if self.root is None:
@@ -1362,7 +1349,7 @@ print(path)
                             handle.flush()
                     except Exception:
                         pass
-            return collect_existing_diagnostics(self.root.parent, include_content=include_content)
+            return collect_existing_diagnostics(self.root.parent)
 
     def close(self) -> None:
         with self._lock:
@@ -1411,24 +1398,20 @@ def _session_is_launcher_only(path: Path) -> bool:
 
 
 def _zip_snapshot_file(zf: zipfile.ZipFile, source: Path, arcname: str, *, tail_bytes: int | None = None) -> None:
-    """Write exactly the bytes present at snapshot time, even if logs keep growing."""
-    payload, row = (zf.read_log(source, arcname, tail_bytes=tail_bytes)
-                    if isinstance(zf, _DiagnosticsZipFile) else
-                    (_read_snapshot_bytes(source, tail_bytes=tail_bytes), None))
-    if payload is None:
-        return
+    """Compatibility helper: raw log bytes are never written into diagnostics."""
     if re.fullmatch(r'.+\.log(?:\.\d+)?', source.name):
-        # Launcher/storage receipts are reviewed metadata in both export modes;
-        # content-rich mode does not turn those records into raw error exports.
-        payload = _sanitize_startup_log_bytes(payload)
-        payload = _sanitize_model_receipt_bytes(payload)
-    try:
-        if isinstance(zf, _DiagnosticsZipFile):
-            zf.write_log(arcname, payload, row, 'explicit_content_mode')
-        else:
-            zf.writestr(arcname, payload)
-    except OSError:
-        return
+        _zip_privacy_safe_log(zf, source, arcname, tail_bytes=tail_bytes)
+
+
+def _metadata_label(value: Any) -> str:
+    from .operational import diagnostic_metadata_label
+    known = diagnostic_metadata_label(value)
+    return known if known is not None else _privacy_marker(value, label='metadata')
+
+
+def _metadata_key(value: Any) -> str:
+    from .operational import diagnostic_metadata_key
+    return diagnostic_metadata_key(value)
 
 
 def _privacy_marker(value: Any, *, label: str = 'content') -> str:
@@ -1443,6 +1426,8 @@ def _privacy_marker(value: Any, *, label: str = 'content') -> str:
         raw = text.encode('utf-8', errors='replace')
         chars = len(text)
     digest = hashlib.sha256(raw).hexdigest()[:12]
+    from .operational import diagnostic_metadata_label
+    label = diagnostic_metadata_label(label) or 'content'
     return f'<redacted {label}; chars={chars}; sha256_12={digest}>'
 
 
@@ -1451,8 +1436,8 @@ def _json_shape(value: Any) -> Any:
     if isinstance(value, dict):
         return {
             'type': 'object',
-            'keys': [str(k) for k in list(value.keys())[:80]],
-            'value_types': {str(k): type(v).__name__ for k, v in list(value.items())[:80]},
+            'keys': [_metadata_key(k) for k in list(value.keys())[:80]],
+            'value_types': {_metadata_key(k): type(v).__name__ for k, v in list(value.items())[:80]},
         }
     if isinstance(value, (list, tuple)):
         return {
@@ -1480,8 +1465,8 @@ def _summarize_arguments(value: Any) -> dict[str, Any]:
             summary['json_error'] = {'line': exc.lineno, 'column': exc.colno, 'char': exc.pos}
             return summary
     if isinstance(parsed, dict):
-        summary['top_level_keys'] = [str(k) for k in list(parsed.keys())[:80]]
-        summary['value_types'] = {str(k): type(v).__name__ for k, v in list(parsed.items())[:80]}
+        summary['top_level_keys'] = [_metadata_key(k) for k in list(parsed.keys())[:80]]
+        summary['value_types'] = {_metadata_key(k): type(v).__name__ for k, v in list(parsed.items())[:80]}
     elif isinstance(parsed, list):
         summary['top_level_type'] = 'array'
         summary['count'] = len(parsed)
@@ -1504,7 +1489,7 @@ def _summarize_tool_calls(value: Any) -> dict[str, Any]:
             'index': item.get('index', index),
             'id_present': bool(item.get('id')),
             'type': str(item.get('type') or 'function'),
-            'function_name': name[:160] if name else '',
+            'function_name': _metadata_label(name) if name else '',
         }
         if raw_args is not None:
             call['arguments'] = _summarize_arguments(raw_args)
@@ -1518,7 +1503,7 @@ def _summarize_stream_segments(value: Any) -> dict[str, Any]:
     for row in rows[:2500]:
         if not isinstance(row, dict):
             continue
-        kind = str(row.get('kind') or 'unknown')[:80]
+        kind = _metadata_label(row.get('kind') or 'unknown')
         content = str(row.get('content') or '')
         bucket = kinds.setdefault(kind, {'segments': 0, 'chars': 0})
         bucket['segments'] += 1
@@ -1608,6 +1593,12 @@ def _safe_error_summary(value: Any) -> Any:
 
 def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
     lowered = key.lower()
+    if lowered in {'fault', 'exception_evidence'}:
+        from .faults import validate_fault_evidence
+        return validate_fault_evidence(value)
+    if lowered in {'frames', 'frame_stack'}:
+        from .faults import validate_frames
+        return validate_frames(value)
     if lowered == 'windows_media_browser':
         from .windows_media import validate_windows_media_browser_observation
         return validate_windows_media_browser_observation(value)
@@ -1645,7 +1636,7 @@ def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
         if isinstance(value.get('event'), str) and value['event'] in CONTROLLER_OBSERVATION_EVENTS:
             return validate_controller_observation(value['event'], value)
     if not key and _trusted_controller_event(value):
-        return {str(name): (_controller_evidence(item, trusted=True) if name == 'controller_evidence'
+        return {_metadata_key(name): (_controller_evidence(item, trusted=True) if name == 'controller_evidence'
                            else _privacy_safe_value(item, key=str(name)))
                 for name, item in list(value.items())[:120]}
     from .operational import LABEL_FIELDS, operational_label
@@ -1853,7 +1844,8 @@ def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
             return _privacy_marker(value, label=lowered)
     if lowered == 'operation_id':
         text = str(value or '')
-        return text if re.fullmatch(r'[A-Za-z0-9_.:-]{1,160}', text) else _privacy_marker(value, label=lowered)
+        from .controller_observations import _uuid
+        return _uuid(text) or _privacy_marker(value, label=lowered)
     if lowered in {'working_root_kind', 'scope', 'algorithm', 'source', 'mapping_status'}:
         permitted = {
             'working_root_kind': {'base_files', 'imported_copy', 'historical_branch', 'timeline_rewind', 'files_subdirectory', 'isolated_copy', 'unknown'},
@@ -1886,23 +1878,25 @@ def _privacy_safe_value(value: Any, *, key: str = '') -> Any:
     if isinstance(value, Path):
         return _privacy_marker(str(value), label='path')
     if isinstance(value, dict):
-        return {str(k): _privacy_safe_value(v, key=str(k)) for k, v in list(value.items())[:120]}
+        return {_metadata_key(k): _privacy_safe_value(v, key=str(k))
+                for k, v in list(value.items())[:120]}
     if isinstance(value, (list, tuple, set)):
         # Key/name lists and HarnessyXO-generated semantic labels describe
         # protocol/execution structure and contain no model/project text.
         if lowered.endswith('_keys') or lowered in {'keys', 'delta_keys', 'message_keys'} or lowered in _PRIVACY_SAFE_STRING_LIST_KEYS:
-            return [str(v)[:160] for v in list(value)[:120]]
+            return [_metadata_label(v) for v in list(value)[:120]]
         return [_privacy_safe_value(v, key=key) for v in list(value)[:120]]
     text = str(value)
     if lowered == 'stage' and text in {'scan', 'large_files', 'project_git'}:
         return text
     if lowered in _PRIVACY_SAFE_STRING_KEYS:
-        return text[:1000]
+        return _metadata_label(text)
     if lowered in {'workspace_id', 'chat_id', 'run_id', 'call_id', 'owner_id'}:
-        return text[:160]
+        from .controller_observations import _uuid
+        return _uuid(text) or _privacy_marker(text, label=lowered)
     # Preserve short machine-like reason labels, but never arbitrary prose.
-    if lowered == 'reason' and len(text) <= 128 and re.fullmatch(r'[A-Za-z0-9_.:/-]+', text):
-        return text
+    if lowered == 'reason':
+        return _metadata_label(text)
     return _privacy_marker(text, label=lowered or 'string')
 
 
@@ -2090,7 +2084,7 @@ def _sanitize_stream_tail_bytes(payload: bytes) -> bytes:
 
 
 _ENVIRONMENT_TIMELINE_PREFIXES = (
-    'vm_', 'environment_operation_', 'environment_command_', 'workspace_mapping_', 'test_target_',
+    'vm_', 'environment_operation_', 'environment_command_', 'environment_controller_', 'workspace_mapping_', 'test_target_',
 )
 _ENVIRONMENT_TIMELINE_EVENTS = {
     'windows_media_browser_observation',
@@ -2285,7 +2279,7 @@ def _export_retained_technical_logs(zf, root: Path, latest: Path, *, include_con
     sessions = root / 'sessions'
     folders = []
     try:
-        for folder in islice(sessions.iterdir(), 256):
+        for folder in islice(sessions.iterdir() if sessions.is_dir() and not sessions.is_symlink() else (), 256):
             if folder.is_dir() and not folder.is_symlink():
                 folders.append(folder)
         folders.sort(key=lambda path: path.stat().st_mtime, reverse=True)
@@ -2316,7 +2310,7 @@ def _export_retained_technical_logs(zf, root: Path, latest: Path, *, include_con
             existing.add(member)
     crash_dir = root / 'crashes'
     try:
-        crashes = sorted(islice(crash_dir.glob('*.log'), 256), key=lambda path: path.lstat().st_mtime, reverse=True)
+        crashes = sorted(islice(crash_dir.glob('*.log') if not crash_dir.is_symlink() else (), 256), key=lambda path: path.lstat().st_mtime, reverse=True)
     except OSError:
         crashes = []
     for source in crashes[:20]:
@@ -2325,12 +2319,13 @@ def _export_retained_technical_logs(zf, root: Path, latest: Path, *, include_con
 
 
 def _privacy_manifest(*, include_content: bool = False) -> str:
+    include_content = False
     return (
         ('HarnessyXO diagnostics privacy manifest\n' if include_content else 'HarnessyXO privacy-safe diagnostics export\n') +
         '==========================================\n\n'
         + ('Conversation/model/tool content was explicitly requested for this export. '\
            'Curated content-free evidence is still validated as described below.\n\n' if include_content else
-        'This is the default diagnostics mode. Conversation text, model reasoning/answers, '\
+        'Every diagnostics export is content-free. Conversation text, model reasoning/answers, '\
         'raw tool arguments/results, prompt bodies, file contents, stream payload previews, '\
         'and path/location values are omitted or replaced with length/hash/shape metadata.\n\n') +
         ('Raw console/crash captures and payload logs are included in content-rich mode. '\
@@ -2448,8 +2443,8 @@ def _privacy_manifest(*, include_content: bool = False) -> str:
         'and same-process transaction/cursor/operation candidates. It never '\
         'includes SQL text, bound parameters, database rows, credentials, or plaintext paths. '\
         'Candidates are not proven lock holders; external processes are not identified. '\
-        'Database, fault, incident-summary, and metadata evidence remain content-free even in '\
-        'an explicitly content-rich export.\n\n'
+        'Database, fault, incident-summary, and metadata evidence remain content-free in '\
+        'every export.\n\n'
         'FILE_OPERATIONS.json retains the latest 1,000 available file-tool/UI observations '\
         '(bounded tails of current and rotated tool logs): hashed path identities, working-root '\
         'identities/kinds, exact whole-file SHA-256 digests, byte counts, observation times, '\
@@ -2462,16 +2457,16 @@ def _privacy_manifest(*, include_content: bool = False) -> str:
         '(8 MiB each). CONTEXT_TUNING_RETENTION.json states retained-record counts and '
         'bounds. The ledger records only reviewed IDs, fixed labels, numeric request sizes '
         'and counters; arbitrary model names/non-UUID IDs are represented by digests. '
-        'Prompt/error bodies and credentials are excluded even in a content-rich export. '
+        'Prompt/error bodies and credentials are excluded in every export. '
         'Backend-reported usage and estimates are identified separately.\n\n'
-        'To intentionally include raw conversation/model/tool content, use the explicit '\
-        '"Include conversation/model/tool content" option in the UI or run '\
-        '.logs/collect_diagnostics.py --include-content.\n'
+        'Workspace/project/reference files and their contents are never included. '
+        'Raw-content export is disabled, including for legacy --include-content callers.\n'
     )
 
 
 def _collect_vm_export(latest: Path, *, include_content: bool) -> tuple[dict[str, Any], dict[str, bytes]]:
-    """Keep VM collection optional and bounded; its failure never blocks export."""
+    """Keep VM collection optional, bounded and always content-free."""
+    include_content = False
     try:
         from .vm_logs import (MAX_EXPORT_BYTES, MAX_VM_FILES, PER_FILE_TAIL_BYTES,
                               NAMED_VM_LOG_FILENAMES, collect_vm_diagnostics, validate_vm_report)
@@ -2514,6 +2509,7 @@ def _collect_vm_export(latest: Path, *, include_content: bool) -> tuple[dict[str
 
 
 def _collect_test_target_export(latest: Path, *, include_content: bool) -> tuple[dict[str, Any], dict[str, bytes]]:
+    include_content = False
     try:
         from .test_target_logs import (MAX_EXPORT_BYTES, MAX_TARGET_FILES,
                                       collect_test_target_diagnostics, validate_test_target_report)
@@ -2546,7 +2542,7 @@ def _collect_test_target_export(latest: Path, *, include_content: bool) -> tuple
 
 
 def _collect_guest_export(latest: Path) -> tuple[dict[str, Any], dict[str, bytes]]:
-    """Guest output is always projected, including in a content-rich bundle."""
+    """Guest output is always projected, in every export."""
     try:
         from .guest_logs import (MAX_ENVIRONMENTS, MAX_EXPORT_BYTES,
                                  collect_guest_log_diagnostics, validate_guest_log_report)
@@ -2658,13 +2654,14 @@ def _collect_lima_startup_export(latest: Path) -> tuple[dict[str, Any], dict[str
 def collect_existing_diagnostics(app_root: Path, *, include_content: bool = False) -> Path | None:
     """Build a fresh diagnostics ZIP from current logs.
 
-    Privacy-safe export is the default. Raw conversation/model/tool payloads are
-    included only when ``include_content=True`` is explicitly requested.
+    Workspace files and arbitrary conversation/model/tool contents never enter
+    diagnostics. The legacy ``include_content`` argument is accepted and ignored.
     """
+    include_content = False
     app_root = Path(app_root).resolve()
     root = app_root / '.logs'
     latest = root / 'latest'
-    if not latest.is_dir():
+    if (not latest.is_dir() or latest.is_symlink() or root.is_symlink()):
         try:
             from .technical import technical_error_evidence
             log_event('harnessy', 'diagnostics_export_unavailable', reason='latest_logs_missing',
@@ -2866,6 +2863,8 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
                     _zip_privacy_safe_log(zf, path, arcname)
                     continue
                 if path.name == 'SESSION_METADATA.json':
+                    if path.parent != latest:
+                        continue
                     try:
                         decoded = json.loads(_read_snapshot_bytes(path, tail_bytes=16 * 1024) or b'{}')
                     except (ValueError, RecursionError):
@@ -2873,6 +2872,8 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
                     zf.writestr(arcname, json.dumps(_validated_session_metadata(decoded), ensure_ascii=False, indent=2))
                     continue
                 if path.name == 'CURRENT_SESSION.txt':
+                    if path.parent != latest:
+                        continue
                     identity = _validated_session_id((_read_snapshot_bytes(path, tail_bytes=256) or b'').decode('utf-8', errors='replace').strip())
                     zf.writestr(arcname, (identity or 'unknown') + '\n')
                     continue
@@ -2891,10 +2892,10 @@ def collect_existing_diagnostics(app_root: Path, *, include_content: bool = Fals
                 pass
             sessions_dir = root / 'sessions'
             candidates: list[Path] = []
-            if sessions_dir.is_dir():
+            if sessions_dir.is_dir() and not sessions_dir.is_symlink():
                 try:
                     candidates = sorted(
-                        (p for p in sessions_dir.iterdir() if p.is_dir() and p.name != current_name),
+                        (p for p in sessions_dir.iterdir() if not p.is_symlink() and p.is_dir() and p.name != current_name),
                         key=lambda p: p.stat().st_mtime,
                         reverse=True,
                     )

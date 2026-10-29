@@ -17,6 +17,8 @@ from typing import Any
 from .permissions import PERMISSION_EVENTS
 from .startup import (STARTUP_EVENTS, HOST_SETUP_ERROR_CODES,
                       HOST_ENVIRONMENT_PROVIDERS, HOST_RUNTIME_BACKENDS)
+from .controller_observations import (CONTROLLER_OBSERVATION_EVENTS,
+                                      validate_controller_observation)
 from .windows_media import (WINDOWS_MEDIA_BROWSER_EVENT,
                             validate_windows_media_browser_observation)
 from harnessy.agent.permission_provenance import (PERMISSION_ACKNOWLEDGEMENT_EVENTS,
@@ -80,7 +82,7 @@ def _bounded_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     from .model_requests import MODEL_EVENTS
     models = [row for row in rows if row.get('event') in MODEL_EVENTS][-600:]
     from .controller_observations import CONTROLLER_OBSERVATION_EVENTS
-    controllers = [row for row in rows if row.get('event') in CONTROLLER_OBSERVATION_EVENTS][-120:]
+    controllers = _retained_controller_rows([row for row in rows if row.get('event') in CONTROLLER_OBSERVATION_EVENTS])
     from .queue_observations import QUEUE_EVENTS
     queues = [row for row in rows if row.get('event') in QUEUE_EVENTS][-160:]
     access_restore = [row for row in rows if row.get('event') in _ACCESS_RESTORE_EVENTS][-120:]
@@ -125,10 +127,17 @@ def _terminal_failure_evidence(row: dict[str, Any]) -> dict[str, Any]:
 
 def _vm_failure_classification(row: dict[str, Any]) -> str | None:
     event = row.get('event')
+    if row.get('provider') == 'host':
+        if event == 'environment_controller_timed_out':
+            return 'host_prerequisite_command_timeout'
+        if event == 'environment_controller_spawn_failed':
+            return 'host_prerequisite_command_spawn_failed'
+        if event == 'environment_controller_finished' and type(row.get('controller_returncode')) is int and row['controller_returncode'] != 0:
+            return 'host_prerequisite_command_failed'
     if (event == 'vm_host_preflight_failed' and row.get('error_code') == 'KVM_ACCESS_DENIED'
             and row.get('kvm_present') is True and row.get('kvm_accessible') is False):
         return 'vm_host_kvm_access_denied'
-    if event == 'environment_command_spawn_failed':
+    if event in {'environment_command_spawn_failed', 'environment_controller_spawn_failed'}:
         return 'vm_controller_spawn_failed'
     if event == 'vm_lifecycle_finished' and row.get('outcome') == 'failed':
         return 'vm_lifecycle_failed'
@@ -140,9 +149,13 @@ def _vm_failure_classification(row: dict[str, Any]) -> str | None:
                 return 'vm_ssh_requirement_failed'
             code = row.get('controller_returncode')
             return 'vm_controller_interrupted' if type(code) is int and code < 0 else 'vm_startup_failed'
-    if event == 'environment_command_timeout':
+    if event in {'environment_command_timeout', 'environment_controller_timed_out'}:
         return 'vm_controller_timeout'
     action = row.get('controller_action')
+    if event == 'environment_controller_finished' and isinstance(action, str) and action in {'start', 'stop', 'create', 'delete', 'edit', 'clone', 'snapshot', 'restart', 'factory-reset'}:
+        code = row.get('controller_returncode')
+        if type(code) is int and code != 0:
+            return 'vm_controller_interrupted' if code < 0 else 'vm_controller_failed'
     if event == 'environment_command_finished' and isinstance(action, str) and action in {'start', 'stop', 'create', 'delete', 'edit', 'clone', 'snapshot', 'restart', 'factory-reset'}:
         code = row.get('returncode')
         if type(code) is int and code != 0:
@@ -152,34 +165,6 @@ def _vm_failure_classification(row: dict[str, Any]) -> str | None:
     return None
 
 
-_KVM_PERMISSION_ERROR = re.compile(
-    r'(?:Could not access KVM kernel module|failed to initialize kvm):\s*Permission denied\b', re.I)
-
-
-def _saved_kvm_error(source: dict[str, Any], receipt: dict[str, Any]) -> bool:
-    evidence = source.get('evidence', {})
-    text = evidence.get('diagnostic_text', '') if isinstance(evidence, dict) else ''
-    if not isinstance(text, str):
-        return False
-    if source.get('name') == 'controller_stderr':
-        return bool(_KVM_PERMISSION_ERROR.search(text))
-    try:
-        started = math.floor(receipt['command_started_at_epoch'])
-        captured = math.ceil(datetime.fromisoformat(receipt['captured_at']).timestamp())
-    except (KeyError, ValueError, TypeError, OverflowError):
-        return False
-    for line in text.splitlines():
-        if not _KVM_PERMISSION_ERROR.search(line):
-            continue
-        stamp = re.search(r'\btime=(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d))\b', line)
-        if stamp:
-            try:
-                observed = datetime.fromisoformat(stamp[1].replace('Z', '+00:00')).timestamp()
-            except (ValueError, OverflowError):
-                continue
-            if started <= observed <= captured:
-                return True
-    return False
 
 
 def _host_kvm_facts(report: dict[str, Any] | None) -> dict[str, Any]:
@@ -222,33 +207,8 @@ def _kvm_permission_cause(failure: dict[str, Any], rows: list[dict[str, Any]],
             continue
         return {'code': 'KVM_ACCESS_DENIED', 'source': 'host_kvm_preflight',
                 'host_access': host_facts}
-    command = failure.get('command_id')
-    if not isinstance(command, str) or not re.fullmatch(r'[0-9a-f]{32}', command):
-        return None
-    for row in rows:
-        if (row.get('command_id') != command or row.get('session_scope') != failure.get('session_scope')
-                or row.get('event') not in {'environment_command_finished', 'vm_startup_observation'}):
-            continue
-        evidence = row.get('controller_evidence')
-        stderr = evidence.get('stderr', {}) if isinstance(evidence, dict) else {}
-        if isinstance(stderr, dict) and _KVM_PERMISSION_ERROR.search(str(stderr.get('diagnostic_text', ''))):
-            return {'code': 'KVM_ACCESS_DENIED', 'source': 'current_controller_stderr',
-                    'command_id': command, 'host_access': host_facts}
-    for workspace in (vm_report or {}).get('workspaces', []):
-        for receipt in workspace.get('failure_receipts', []):
-            if (receipt.get('command_id') != command or receipt.get('correlation_scope') != 'controller_command'
-                    or receipt.get('reason') not in {'controller_error', 'controller_timeout', 'controller_cancelled'}
-                    or (isinstance(operation, str) and receipt.get('operation_id') != operation)):
-                continue
-            for source in receipt.get('sources', []):
-                if (source.get('name') not in {'controller_stderr', 'ha.stderr.log'}
-                        or source.get('status') != 'included'
-                        or source.get('timestamp_scope') not in {'current_controller_output', 'file_updated_during_attempt'}):
-                    continue
-                if _saved_kvm_error(source, receipt):
-                    return {'code': 'KVM_ACCESS_DENIED', 'source': 'same_attempt_saved_qemu_stderr',
-                            'command_id': command, 'receipt_id': receipt['receipt_id'],
-                            'host_access': host_facts}
+    # Raw native/guest prose is deliberately absent from diagnostics. Only
+    # the explicit host preflight above establishes this precise cause.
     return None
 
 
@@ -810,6 +770,16 @@ def _is_lock(row: dict[str, Any]) -> bool:
 
 def _evidence(row: dict[str, Any]) -> dict[str, Any]:
     # Keep identifiers and reviewed diagnostic structures, never error bodies.
+    if row.get('event') in CONTROLLER_OBSERVATION_EVENTS:
+        safe = validate_controller_observation(row['event'], row) or {}
+        stamp = row.get('timestamp')
+        if isinstance(stamp, str) and re.fullmatch(r'\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d(?:[,.]\d{1,6})?', stamp):
+            safe['timestamp'] = stamp
+        if isinstance(row.get('session_scope'), str) and row['session_scope'] in {'current', 'previous', 'launcher'}:
+            safe['session_scope'] = row['session_scope']
+        if isinstance(row.get('channel'), str) and row['channel'] in _CHANNELS:
+            safe['channel'] = row['channel']
+        return safe
     if row.get('event') == 'workspace_terminal_start_failed':
         return _terminal_failure_evidence(row)
     if row.get('event') in _WORKSPACE_RECOVERY_EVENTS:
@@ -1110,50 +1080,102 @@ def _native_fault_audit(latest: Path, previous: Path | None) -> tuple[dict[str, 
             'signature_limit': 20, 'signatures_limited': len(signatures) > 20, 'signatures': rows}, lines
 
 
+def _retained_controller_rows(observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Reserve lifecycle terminal evidence while recent probes keep producing logs."""
+    lifecycle = {'start', 'create', 'stop', 'delete', 'factory-reset', 'restart', 'prerequisite_check', 'package_manager'}
+    terminal_events = {'environment_controller_finished', 'environment_controller_timed_out',
+                       'environment_controller_cancelled', 'environment_controller_spawn_failed'}
+    terminal = [row for row in observations
+                if row.get('event') in terminal_events and row.get('controller_action') in lifecycle][-40:]
+    latest: dict[tuple[Any, Any], dict[str, Any]] = {}
+    for row in observations:
+        latest[(row.get('session_scope'), row.get('command_id'))] = row
+    active = [row for row in latest.values() if row.get('controller_action') in lifecycle
+              and row.get('controller_state') == 'running'][-32:]
+    recent = observations[-(120 - len(terminal) - len(active)):]
+    retained = {id(row): row for row in terminal + active + recent}
+    return sorted(retained.values(), key=lambda row: row.get('timestamp', ''))
+
+
 def _controller_observation_audit(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
-    from .controller_observations import CONTROLLER_OBSERVATION_EVENTS
     observations = [row for row in rows if row.get('event') in CONTROLLER_OBSERVATION_EVENTS
-                    and row.get('provider') == 'lima' and isinstance(row.get('command_id'), str)]
-    retained = observations[-120:]
+                    and row.get('provider') in {'lima', 'host'} and isinstance(row.get('command_id'), str)]
+    retained = _retained_controller_rows(observations)
     groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for row in retained:
         groups.setdefault((row['session_scope'], row['command_id']), []).append(row)
+    ordered = sorted(groups.items(), key=lambda item: item[1][-1]['timestamp'], reverse=True)
+    lifecycle = {'start', 'create', 'stop', 'delete', 'factory-reset', 'restart', 'prerequisite_check', 'package_manager'}
+    active = [item for item in ordered if item[1][-1].get('controller_state') == 'running'
+              and item[1][-1].get('controller_action') in lifecycle]
+    selected = {key: values for key, values in active + ordered}
+    selected_items = list(selected.items())[:16]
     commands: list[dict[str, Any]] = []
-    lines = ['Lima controller observations: parent process state and captured output are separate from guest readiness.']
-    for (scope, command), items in sorted(groups.items(), key=lambda item: item[1][-1]['timestamp'])[-4:]:
+    lines = ['Lima controller and host prerequisite observations: process state and captured output are separate from guest readiness.']
+    for (scope, command), items in selected_items:
         latest = items[-1]
-        parent = next((row for row in reversed(items) if row['event'] == 'environment_command_parent_exited'), None)
-        handoff = next((row for row in reversed(items) if row['event'] == 'environment_command_output_handoff'), None)
-        terminal = any(row.get('command_id') == command and row.get('session_scope') == scope
-                       and row.get('event') in {'environment_command_finished', 'environment_command_timeout',
-                                               'environment_command_cancelled', 'environment_command_spawn_failed'}
-                       for row in rows)
+        parent = next((row for row in reversed(items) if row['event'] in {
+            'environment_command_parent_exited', 'environment_controller_parent_exited'}), None)
+        handoff = next((row for row in reversed(items) if row['event'] in {
+            'environment_command_output_handoff', 'environment_controller_output_handoff'}), None)
+        terminal = next((row for row in reversed(rows)
+                         if row.get('command_id') == command and row.get('session_scope') == scope
+                         and row.get('event') in {'environment_command_finished', 'environment_command_timeout',
+                             'environment_command_cancelled', 'environment_command_spawn_failed',
+                             'environment_controller_finished', 'environment_controller_timed_out',
+                             'environment_controller_cancelled', 'environment_controller_spawn_failed'}), None)
         commands.append({'command_id': command, 'session_scope': scope,
                          'latest_observation': _evidence(latest),
                          'parent_exit': _evidence(parent) if parent else None,
                          'output_handoff': _evidence(handoff) if handoff else None,
-                         'terminal_receipt_recorded': terminal})
+                         'terminal_receipt_recorded': terminal is not None,
+                         'terminal_receipt': _evidence(terminal) if terminal else None})
         action = latest.get('controller_action', 'unknown')
+        ident = latest.get('environment_id', latest.get('target_id', ''))
+        owner = f' VM {ident[:12]}' if isinstance(ident, str) and ident else ''
         elapsed = latest.get('elapsed_seconds')
         duration = f' after {elapsed:g}s' if type(elapsed) in {int, float} else ''
+        kind = 'host command' if latest.get('provider') == 'host' else 'controller'
+        lines.append(f'  {latest["timestamp"]} [{scope}]{owner}: {action} {kind} state was {latest.get("controller_state", "unrecorded")}{duration}; phase {latest.get("completion_phase", "unrecorded")}.')
         if parent:
-            lines.append(f'  {parent["timestamp"]} [{scope}]: the spawned {action} controller exited with return code {parent.get("controller_returncode", "unrecorded")}; this records the parent, not descendant completion.')
-        else:
-            lines.append(f'  {latest["timestamp"]} [{scope}]: {action} controller state was {latest.get("controller_state", "unrecorded")}{duration}; phase {latest.get("completion_phase", "unrecorded")}. This is a timestamped observation, not a current liveness probe.')
-        facts = {key: latest[key] for key in ('stdout_bytes', 'stderr_bytes', 'last_output_age_seconds', 'pending_progress') if key in latest}
+            lines.append(f'    The spawned controller exited with return code {parent.get("controller_returncode", "unrecorded")}; this records the parent, not descendant completion.')
+        facts = {key: latest[key] for key in ('controller_program', 'controller_pid', 'stdout_bytes', 'stderr_bytes',
+                 'last_output_age_seconds', 'timeout_seconds', 'pending_progress',
+                 'controller_activity', 'controller_signals') if key in latest}
         if facts:
             lines.append('    Recorded capture facts: ' + json.dumps(facts, sort_keys=True) + '.')
+        if latest.get('output_capture') == 'inherited_terminal':
+            lines.append('    This interactive host command inherited its terminal. Output counts and output age are unobserved, not zero; it may be waiting for terminal input.')
+        elif latest.get('output_capture') == 'merged_pipe':
+            lines.append('    Captured output bytes combine stdout and stderr; separate stderr bytes were not measured.')
+        if latest.get('controller_state') == 'running':
+            if latest.get('stdout_bytes') == 0 and latest.get('stderr_bytes') == 0:
+                lines.append('    No controller output had been observed at this heartbeat. A living controller can still be waiting; silence does not establish a stall.')
+            else:
+                lines.append('    Output counts and time since the last output describe controller activity, not verified download progress or guest readiness.')
+        if terminal:
+            event = terminal['event']
+            if event.endswith('timed_out') or event == 'environment_command_timeout':
+                lines.append('    The controller command reached its timeout; its final output counts were retained after owned-process cleanup.')
+            elif event.endswith('cancelled'):
+                lines.append('    The controller command was cancelled; this is separate from an unexpected failure.')
+            elif event.endswith('spawn_failed'):
+                lines.append('    The controller could not be spawned; guest setup was not verified.')
+            else:
+                code = terminal.get('controller_returncode', terminal.get('returncode'))
+                lines.append(f'    A terminal controller receipt was recorded with return code {code if type(code) is int else "unrecorded"}.')
+        else:
+            lines.append('    No terminal controller receipt was retained for this command; its final result is not established by this observation.')
         if handoff and handoff.get('post_exit_output_not_collected') is True:
             lines.append('    Anonymous output files were snapshotted for the direct controller lifetime; later descendant output is not collected. No pipe-EOF or descendant-exit claim is made.')
-        if not terminal:
-            lines.append('    No terminal controller receipt was retained for this command; its final result is not established by this observation.')
     if not retained:
         lines.append('  No parent-exit, heartbeat or capture-handoff receipts were recorded in the examined logs; native-controller versus output-collection waits cannot be distinguished from their absence.')
-    lines.append('  These receipts do not establish Environment Ready; guest provisioning and isolation verification remain separate checks.')
+    lines.append('  These are timestamped observations, not current liveness probes. Parsed output categories contain no excerpts and do not establish Environment Ready.')
     lines.append('')
     return {'scope': 'bounded_controller_observations', 'records_available': len(observations),
             'records_retained': len(retained), 'record_limit': 120,
             'record_limit_reached': len(observations) > len(retained),
+            'command_limit': 16, 'commands_limited': len(groups) > len(selected_items),
             'commands': commands, 'recent_receipts': [_evidence(row) for row in retained]}, lines
 
 
@@ -1451,9 +1473,11 @@ def _vm_log_coverage(report: dict[str, Any] | None) -> tuple[dict[str, Any] | No
                      f'{receipt.get("reason", "unrecorded")} / {receipt.get("operation", "unrecorded")}.')
         for source in receipt.get('sources', []):
             evidence = source.get('evidence') or {}
-            text = evidence.get('diagnostic_text') if isinstance(evidence, dict) else None
-            if isinstance(text, str) and text:
-                lines.append('    Sanitized ' + source.get('name', 'controller') + ': ' + text[-2000:].replace('\n', '\n    '))
+            if isinstance(evidence, dict):
+                from .technical import validate_technical_evidence
+                facts = validate_technical_evidence(evidence)
+                if facts.get('reason_codes'):
+                    lines.append('    Recorded source reason codes: ' + json.dumps(facts['reason_codes']) + '.')
     discovery = safe.get('discovery', {})
     if discovery.get('workspaces_limited') or discovery.get('discovery_limited'):
         lines.append('  Workspace discovery reached a configured bound; additional workspace/log sources may be absent.')
@@ -1547,7 +1571,7 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
                                (row.get('command_id') == controller_id or row.get('parent_start_command_id') == controller_id)
                                and row.get('event') in {'environment_command_started', 'environment_command_finished',
                                                        'environment_command_timeout', 'vm_startup_observation',
-                                                       'vm_startup_post_failure_state'}]
+                                                       'vm_startup_post_failure_state'} | CONTROLLER_OBSERVATION_EVENTS]
         # A database event immediately before the run error is a correlation,
         # unless both events carry the same connection/transaction identity.
         database_errors = [row for row in related if row.get('event') == 'sqlite_operation_error'
@@ -1570,10 +1594,11 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
         if not vm_classification and not target_classification and not permission_classification and not startup_classification and not windows_media_classification and not timeout_classification and not access_restore_classification and terminal_classification in {None, 'workspace_terminal_start_failed'} and not _has_frames(failure) and not any(_has_frames(row) for row in database_errors):
             missing.append('exception_traceback_unavailable')
         if vm_classification and not vm_cause and not any(
+                row.get('event') in CONTROLLER_OBSERVATION_EVENTS or
                 isinstance(row.get('controller_evidence'), dict) and any(
-                    isinstance(value, dict) and value.get('diagnostic_text') for value in row['controller_evidence'].values())
+                    isinstance(value, dict) and value.get('reason_codes') for value in row['controller_evidence'].values())
                 for row in controller_evidence):
-            missing.append('controller_diagnostic_text_not_recorded')
+            missing.append('controller_activity_observation_not_recorded')
         if target_analysis and target_analysis['launch_wait'] == 'timeout':
             if target_analysis['launcher_returncode'] is None:
                 missing.append('target_launcher_exit_status_not_recorded')
@@ -1885,8 +1910,10 @@ def build_support_summary(latest: Path, *, vm_report: dict[str, Any] | None = No
             for receipt in reversed(incident['controller_evidence']):
                 evidence = receipt.get('controller_evidence') or {}
                 stderr = evidence.get('stderr') if isinstance(evidence, dict) else None
-                if isinstance(stderr, dict) and stderr.get('diagnostic_text'):
-                    lines.append('  Sanitized controller stderr: ' + stderr['diagnostic_text'][-3000:].replace('\n', '\n    '))
+                if isinstance(stderr, dict) and stderr.get('reason_codes'):
+                    from .technical import validate_technical_evidence
+                    facts = validate_technical_evidence(stderr)
+                    lines.append('  Controller stderr reason codes: ' + json.dumps(facts.get('reason_codes', [])) + '.')
                     break
         if failure.get('terminal_stop_reason'):
             lines.append(f'  Terminal stop reason: {failure["terminal_stop_reason"]}.')

@@ -224,3 +224,9 @@ The existing Lima backing export is hidden from scoped project commands; it
 does not provide protection against a human guest administrator. Providers
 which cannot enforce the requested view must fail with a clear capability
 error and leave the source files untouched.
+
+## Diagnostics privacy
+
+Workspace, project, worktree and reference files and their contents must never become diagnostic payloads. This applies to recording, streaming tails, crash records, offline collection and every export API, including legacy content-inclusive requests. Raw tool output, exceptions and logs can echo workspace contents; retain only validated operational states, fixed codes, timing, counts and opaque identities. Unknown text, metadata labels, file names and paths are omitted or replaced by opaque identifiers.
+
+Collection reads only curated application and VM runtime metadata/log sources. It must not traverse workspace file trees or follow symlink/hardlink aliases into them. A private owner-only runtime-location index may retain validated root references for offline collection; that index and its raw paths are never exported. Controller activity and a live process are observations, not proof of guest readiness or installation progress.
